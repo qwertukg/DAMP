@@ -8,11 +8,11 @@ from layout import Layout
 
 def main() -> None:
     layers = [
-        LayerConfig(detectors=360, window=3),
-        LayerConfig(detectors=180, window=3),
-        LayerConfig(detectors=90, window=3),
-        LayerConfig(detectors=45, window=3),
-        LayerConfig(detectors=22, window=3),
+        LayerConfig(detectors=360, window=1),
+        LayerConfig(detectors=180, window=1),
+        LayerConfig(detectors=90, window=1),
+        LayerConfig(detectors=45, window=1),
+        LayerConfig(detectors=22, window=1),
     ]
     encoder = Encoder(
         code_bits=128,
@@ -24,6 +24,7 @@ def main() -> None:
     end = 360.0
     step = 1.0
     codes = encoder.encode(start=start, end=end, step=step)
+    encoder.print_codes(codes)
     layout = Layout(
         codes,
         grid_size=32,
