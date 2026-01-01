@@ -81,21 +81,30 @@ class Encoder:
             bits.set(idx)
         return bits
 
-    def print_codes(
-        self,
-        start: float,
-        end: float,
-        step: float,
-    ) -> None:
-        """Print 0/1 codes with density and overlap for angles in the inclusive range [start, end]."""
+    def encode(
+        self, start: float, end: float, step: float
+    ) -> list[tuple[BitArray, float, float]]:
+        """Return (code, angle, hue) tuples for angles in the inclusive range [start, end]."""
         if step <= 0:
             raise ValueError("step must be positive")
 
         angle = start
         epsilon = step * 1e-9
-        prev_code: BitArray | None = None
+        codes: list[tuple[BitArray, float, float]] = []
         while angle <= end + epsilon:
             code = self.encode_dense(angle)
+            hue = angle % 360.0
+            codes.append((code, angle, hue))
+            angle += step
+        return codes
+
+    def print_codes(
+        self,
+        codes: list[tuple[BitArray, float, float]],
+    ) -> None:
+        """Print 0/1 codes with density and overlap for the given codes."""
+        prev_code: BitArray | None = None
+        for code, angle, _hue in codes:
             ones = code.count()
             density = (ones / len(code)) * 100
             if prev_code is None or ones == 0:
@@ -108,7 +117,6 @@ class Encoder:
                 f"{angle:7.3f}: {code_str} density={density:.2f}% common={common_pct:.2f}%"
             )
             prev_code = code
-            angle += step
 
     def _init_layer_bits(self) -> list[list[list[int]]]:
         layers_bits: list[list[list[int]]] = []
