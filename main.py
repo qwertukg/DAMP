@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import rerun as rr
 
+from BitArray import BitArray
 from Encoder import Encoder
 from EncoderReporter import EncoderReporter
 from LayerConfig import LayerConfig
@@ -18,19 +19,42 @@ def main() -> None:
         LayerConfig(detectors=128,  overlap=0.7),
         LayerConfig(detectors=256,  overlap=0.7),
     ]
-    encoder = Encoder(
+    angle_encoder = Encoder(
         code_bits=sum(layer.detectors for layer in layers),
         layers=layers,
         bits_per_detector=1,
         seed=0,
         bit_assignment="detector_index",
+        coordinate_mode="cyclic",
+        cycle_length=360.0,
     )
-    start = 0.0
-    end = 359.0
-    step = 1.0
-    codes = encoder.encode(start=start, end=end, step=step)
+    position_encoder = Encoder(
+        code_bits=sum(layer.detectors for layer in layers),
+        layers=layers,
+        bits_per_detector=1,
+        seed=1,
+        bit_assignment="detector_index",
+        coordinate_mode="linear",
+        value_range=(0.0, 1.0),
+    )
 
-    reporter = EncoderReporter(encoder)
+    positions = [0.0, 1.0]
+    total_bits = angle_encoder.code_bits + position_encoder.code_bits
+    codes: list[tuple[BitArray, float, float]] = []
+    for position_idx, position in enumerate(positions):
+        for angle in range(360):
+            angle_bits = angle_encoder.encode_sparse(angle)
+            position_bits = position_encoder.encode_sparse(position)
+            code = BitArray(total_bits)
+            for idx in angle_bits:
+                code.set(idx)
+            offset = angle_encoder.code_bits
+            for idx in position_bits:
+                code.set(offset + idx)
+            angle_label = angle + position_idx * 360
+            codes.append((code, float(angle_label), float(angle)))
+
+    reporter = EncoderReporter(angle_encoder)
     reporter.print_codes(codes)
     reporter.visualize_detectors()
 

@@ -8,10 +8,11 @@ from BitArray import BitArray
 from LayerConfig import LayerConfig
 
 BitAssignment = Literal["random", "detector_index"]
+CoordinateMode = Literal["cyclic", "linear"]
 
 
 class Encoder:
-    """Encode angles with layered detectors that overlap by a fraction of their arc length."""
+    """Encode scalar values with layered detectors that overlap by a fraction of their span."""
 
     def __init__(
         self,
@@ -21,6 +22,9 @@ class Encoder:
         bits_per_detector: int,
         seed: int,
         bit_assignment: BitAssignment = "random",
+        coordinate_mode: CoordinateMode = "cyclic",
+        value_range: tuple[float, float] | None = None,
+        cycle_length: float = 360.0,
     ) -> None:
         if code_bits <= 0:
             raise ValueError("code_bits must be positive")
@@ -36,41 +40,56 @@ class Encoder:
             raise ValueError("layers must be non-empty")
         if bit_assignment not in ("random", "detector_index"):
             raise ValueError("bit_assignment must be 'random' or 'detector_index'")
+        if coordinate_mode not in ("cyclic", "linear"):
+            raise ValueError("coordinate_mode must be 'cyclic' or 'linear'")
+        if cycle_length <= 0:
+            raise ValueError("cycle_length must be positive")
+        if coordinate_mode == "linear":
+            if value_range is None:
+                raise ValueError("value_range must be set for linear mode")
+            if value_range[1] <= value_range[0]:
+                raise ValueError("value_range must have max > min")
         self.bit_assignment = bit_assignment
+        self._coordinate_mode = coordinate_mode
+        self._value_range = value_range
+        self._cycle_length = cycle_length
 
         self._rng = random.Random(seed)
         self._layer_bits = self._init_layer_bits()
 
-    def encode_sparse(self, angle: float) -> list[int]:
-        """Return indices of active bits for the given angle (degrees)."""
+    def encode_sparse(self, value: float) -> list[int]:
+        """Return indices of active bits for the given coordinate value."""
         bits: set[int] = set()
         for layer, detector_bits in zip(self.layers, self._layer_bits):
-            for detector_index in self._active_detectors(angle, layer):
+            for detector_index in self._active_detectors(value, layer):
                 bits.update(detector_bits[detector_index])
         return sorted(bits)
 
-    def encode_dense(self, angle: float) -> BitArray:
+    def encode_dense(self, value: float) -> BitArray:
         """Return a BitArray with only the active bits set."""
         bits = BitArray(self.code_bits)
-        for idx in self.encode_sparse(angle):
+        for idx in self.encode_sparse(value):
             bits.set(idx)
         return bits
 
     def encode(
         self, start: float, end: float, step: float
     ) -> list[tuple[BitArray, float, float]]:
-        """Return (code, angle, hue) tuples for angles in the inclusive range [start, end]."""
+        """Return (code, value, hue) tuples for values in the inclusive range [start, end]."""
         if step <= 0:
             raise ValueError("step must be positive")
 
-        angle = start
+        value = start
         epsilon = step * 1e-9
         codes: list[tuple[BitArray, float, float]] = []
-        while angle <= end + epsilon:
-            code = self.encode_dense(angle)
-            hue = angle % 360.0
-            codes.append((code, angle, hue))
-            angle += step
+        while value <= end + epsilon:
+            code = self.encode_dense(value)
+            if self._coordinate_mode == "cyclic":
+                hue = value % self._cycle_length
+            else:
+                hue = value
+            codes.append((code, value, hue))
+            value += step
         return codes
 
     def _init_layer_bits(self) -> list[list[list[int]]]:
@@ -101,18 +120,29 @@ class Encoder:
                 layer_offset += layer.detectors * self.bits_per_detector
         return layers_bits
 
-    @staticmethod
-    def _active_detectors(angle: float, layer: LayerConfig) -> list[int]:
+    def _active_detectors(self, value: float, layer: LayerConfig) -> list[int]:
         detectors = layer.detectors
         overlap = layer.overlap
-        normalized = angle % 360.0
-        position = normalized / 360.0 * detectors
         span = 1.0 + overlap
         if span <= 0.0:
             return []
         if span >= detectors:
             return list(range(detectors))
-        # Detectors cover [j, j + span) in detector units; collect all j that cover position.
+        if self._coordinate_mode == "cyclic":
+            normalized = value % self._cycle_length
+            position = normalized / self._cycle_length * detectors
+            # Detectors cover [j, j + span) in detector units; collect all j that cover position.
+            max_idx = math.floor(position + 1e-9)
+            start_idx = math.floor(position - span + 1e-12) + 1
+            return [(idx % detectors) for idx in range(start_idx, max_idx + 1)]
+
+        min_value, max_value = self._value_range if self._value_range else (0.0, 1.0)
+        normalized = (value - min_value) / (max_value - min_value)
+        position = normalized * detectors
         max_idx = math.floor(position + 1e-9)
         start_idx = math.floor(position - span + 1e-12) + 1
-        return [(idx % detectors) for idx in range(start_idx, max_idx + 1)]
+        if max_idx < 0 or start_idx >= detectors:
+            return []
+        start_idx = max(start_idx, 0)
+        max_idx = min(max_idx, detectors - 1)
+        return list(range(start_idx, max_idx + 1))
