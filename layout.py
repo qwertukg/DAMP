@@ -27,7 +27,7 @@ class Layout:
         *,
         grid_size: int | None = None,
         empty_ratio: float = 0.15,
-        similarity: str = "cosine",
+        similarity: str = "jaccard",
         lambda_threshold: float = 0.65,
         eta: float | None = 10.0,
         precompute_similarity: bool = True,

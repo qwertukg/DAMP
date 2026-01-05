@@ -8,15 +8,14 @@ from layout import Layout
 
 def main() -> None:
     layers = [
-        LayerConfig(detectors=360, overlap=0.4),
-        LayerConfig(detectors=180, overlap=0.4),
-        LayerConfig(detectors=90, overlap=0.4),
-        LayerConfig(detectors=45, overlap=0.4),
-        LayerConfig(detectors=30, overlap=0.4),
-        LayerConfig(detectors=15, overlap=0.4),
-        LayerConfig(detectors=10, overlap=0.4),
-        LayerConfig(detectors=5, overlap=0.4),
-
+        LayerConfig(detectors=360,  overlap=0.4),
+        LayerConfig(detectors=180,  overlap=0.4),
+        LayerConfig(detectors=90,   overlap=0.4),
+        LayerConfig(detectors=45,   overlap=0.4),
+        LayerConfig(detectors=30,   overlap=0.4),
+        LayerConfig(detectors=15,   overlap=0.4),
+        LayerConfig(detectors=10,   overlap=0.4),
+        LayerConfig(detectors=5,    overlap=0.4),
     ]
     encoder = Encoder(
         code_bits=sum(layer.detectors for layer in layers),
@@ -36,7 +35,7 @@ def main() -> None:
     layout = Layout(
         codes,
         grid_size=32,
-        similarity="cosine",
+        similarity="jaccard",
         lambda_threshold=0.2,
         eta=8.0,
         seed=0,
@@ -47,7 +46,7 @@ def main() -> None:
     step_offset = 1
     layout.run(
         steps=10000,
-        pairs_per_step=300,
+        pairs_per_step=600,
         pair_radius=layout.width // 2,
         mode="long",
         min_swap_ratio=0.0,

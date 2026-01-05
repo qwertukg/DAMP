@@ -220,6 +220,7 @@ class Encoder:
 
     def _init_layer_bits(self) -> list[list[list[int]]]:
         layers_bits: list[list[list[int]]] = []
+        layer_offset = 0
         for layer in self.layers:
             if layer.detectors <= 0:
                 raise ValueError("detectors must be positive")
@@ -233,13 +234,16 @@ class Encoder:
                         range(self.code_bits), self.bits_per_detector
                     )
                 else:
-                    base = detector_index % self.code_bits
-                    bits = [
-                        (base + offset) % self.code_bits
-                        for offset in range(self.bits_per_detector)
-                    ]
+                    base = layer_offset + detector_index * self.bits_per_detector
+                    if base + self.bits_per_detector > self.code_bits:
+                        raise ValueError(
+                            "code_bits too small for detector_index assignment"
+                        )
+                    bits = [base + offset for offset in range(self.bits_per_detector)]
                 layer_bits.append(bits)
             layers_bits.append(layer_bits)
+            if self.bit_assignment == "detector_index":
+                layer_offset += layer.detectors * self.bits_per_detector
         return layers_bits
 
     @staticmethod
