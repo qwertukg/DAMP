@@ -1,21 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import random
 from typing import Iterable, Sequence
 
-from encoder import BitArray
+from BitArray import BitArray
+from LayoutPoint import LayoutPoint
 
 _UNSET = object()
-
-
-@dataclass(frozen=True)
-class LayoutPoint:
-    code: BitArray
-    angle: float
-    hue: float
-    ones: int
 
 
 class Layout:

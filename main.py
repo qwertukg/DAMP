@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import rerun as rr
 
-from encoder import Encoder, LayerConfig
-from layout import Layout
+from Encoder import Encoder
+from EncoderReporter import EncoderReporter
+from LayerConfig import LayerConfig
+from Layout import Layout
 
 
 def main() -> None:
     layers = [
-        LayerConfig(detectors=360,  overlap=0.4),
-        LayerConfig(detectors=180,  overlap=0.4),
-        LayerConfig(detectors=90,   overlap=0.4),
-        LayerConfig(detectors=45,   overlap=0.4),
-        LayerConfig(detectors=30,   overlap=0.4),
-        LayerConfig(detectors=15,   overlap=0.4),
-        LayerConfig(detectors=10,   overlap=0.4),
-        LayerConfig(detectors=5,    overlap=0.4),
+        LayerConfig(detectors=4, overlap=0.4),
+        LayerConfig(detectors=8, overlap=0.4),
+        LayerConfig(detectors=16, overlap=0.4),
+        LayerConfig(detectors=32, overlap=0.4),
+        LayerConfig(detectors=64, overlap=0.4),
+        LayerConfig(detectors=128, overlap=0.4),
     ]
     encoder = Encoder(
         code_bits=sum(layer.detectors for layer in layers),
@@ -29,8 +29,9 @@ def main() -> None:
     step = 1.0
     codes = encoder.encode(start=start, end=end, step=step)
 
-    encoder.print_codes(codes)
-    encoder.visualize_detectors()
+    reporter = EncoderReporter(encoder)
+    reporter.print_codes(codes)
+    reporter.visualize_detectors()
 
     layout = Layout(
         codes,
