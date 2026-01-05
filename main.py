@@ -11,13 +11,13 @@ from Layout import Layout
 
 def main() -> None:
     layers = [
-        LayerConfig(detectors=4,    overlap=0.7),
-        LayerConfig(detectors=8,    overlap=0.7),
-        LayerConfig(detectors=16,   overlap=0.7),
-        LayerConfig(detectors=32,   overlap=0.7),
-        LayerConfig(detectors=64,   overlap=0.7),
-        LayerConfig(detectors=128,  overlap=0.7),
-        LayerConfig(detectors=256,  overlap=0.7),
+        LayerConfig(detectors=4,    overlap=0.4),
+        LayerConfig(detectors=8,    overlap=0.4),
+        LayerConfig(detectors=16,   overlap=0.4),
+        LayerConfig(detectors=32,   overlap=0.4),
+        LayerConfig(detectors=64,   overlap=0.4),
+        LayerConfig(detectors=128,  overlap=0.4),
+        LayerConfig(detectors=256,  overlap=0.4),
     ]
     angle_encoder = Encoder(
         code_bits=sum(layer.detectors for layer in layers),
