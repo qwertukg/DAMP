@@ -30,7 +30,6 @@ class Layout:
         similarity: str = "cosine",
         lambda_threshold: float = 0.65,
         eta: float | None = 10.0,
-        angle_weight: float = 0.0,
         precompute_similarity: bool = True,
         max_precompute: int = 2000,
         seed: int = 0,
@@ -39,12 +38,10 @@ class Layout:
             raise ValueError("codes must be non-empty")
         if empty_ratio < 0:
             raise ValueError("empty_ratio must be >= 0")
-        if similarity not in ("cosine", "jaccard", "angle"):
-            raise ValueError("similarity must be 'cosine', 'jaccard', or 'angle'")
+        if similarity not in ("cosine", "jaccard"):
+            raise ValueError("similarity must be 'cosine' or 'jaccard'")
         if not 0 <= lambda_threshold <= 1:
             raise ValueError("lambda_threshold must be in [0, 1]")
-        if not 0 <= angle_weight <= 1:
-            raise ValueError("angle_weight must be in [0, 1]")
         if max_precompute <= 0:
             raise ValueError("max_precompute must be positive")
 
@@ -56,7 +53,6 @@ class Layout:
         self._similarity = similarity
         self._lambda = lambda_threshold
         self._eta = eta
-        self._angle_weight = angle_weight
         self._rng = random.Random(seed)
 
         if grid_size is None:
@@ -164,7 +160,6 @@ class Layout:
         *,
         lambda_threshold: float | object = _UNSET,
         eta: float | None | object = _UNSET,
-        angle_weight: float | object = _UNSET,
     ) -> None:
         if lambda_threshold is not _UNSET:
             if not 0 <= lambda_threshold <= 1:
@@ -172,10 +167,6 @@ class Layout:
             self._lambda = lambda_threshold
         if eta is not _UNSET:
             self._eta = eta
-        if angle_weight is not _UNSET:
-            if not 0 <= angle_weight <= 1:
-                raise ValueError("angle_weight must be in [0, 1]")
-            self._angle_weight = angle_weight
 
     def step(
         self,
@@ -455,9 +446,6 @@ class Layout:
         return sim * (1.0 / (1.0 + math.exp(-self._eta * (sim - self._lambda))))
 
     def _similarity_base(self, a: LayoutPoint, b: LayoutPoint) -> float:
-        angle_sim = self._angle_similarity(a.angle, b.angle)
-        if self._similarity == "angle":
-            return angle_sim
         if a.ones == 0 or b.ones == 0:
             code_sim = 0.0
         else:
@@ -468,11 +456,7 @@ class Layout:
             else:
                 union = a.ones + b.ones - common
                 code_sim = 0.0 if union == 0 else common / union
-        if self._angle_weight <= 0.0:
-            return code_sim
-        if self._angle_weight >= 1.0:
-            return angle_sim
-        return (1.0 - self._angle_weight) * code_sim + self._angle_weight * angle_sim
+        return code_sim
 
     @staticmethod
     def _angle_similarity(angle_a: float, angle_b: float) -> float:

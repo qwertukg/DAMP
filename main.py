@@ -8,7 +8,15 @@ from layout import Layout
 
 def main() -> None:
     layers = [
+        LayerConfig(detectors=360, overlap=0.4),
         LayerConfig(detectors=180, overlap=0.4),
+        LayerConfig(detectors=90, overlap=0.4),
+        LayerConfig(detectors=45, overlap=0.4),
+        LayerConfig(detectors=30, overlap=0.4),
+        LayerConfig(detectors=15, overlap=0.4),
+        LayerConfig(detectors=10, overlap=0.4),
+        LayerConfig(detectors=5, overlap=0.4),
+
     ]
     encoder = Encoder(
         code_bits=sum(layer.detectors for layer in layers),
@@ -29,7 +37,6 @@ def main() -> None:
         codes,
         grid_size=32,
         similarity="cosine",
-        angle_weight=0.7,
         lambda_threshold=0.2,
         eta=8.0,
         seed=0,
@@ -52,7 +59,7 @@ def main() -> None:
         energy_patience=3,
     )
     step_offset += layout.last_steps
-    layout.set_similarity_params(lambda_threshold=0.35, eta=8.0, angle_weight=0.5)
+    layout.set_similarity_params(lambda_threshold=0.35, eta=8.0)
     layout.run(
         steps=150,
         pairs_per_step=300,
