@@ -18,7 +18,7 @@ class EncoderReporter:
 
         dpi = 100
         line_width_px = 1
-        even_offset_px = 2
+        even_offset_px = 0.5
         layer_spacing_px = even_offset_px + line_width_px + 1
         min_arc_px = 1.0
         tick_length_px = 50

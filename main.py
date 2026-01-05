@@ -10,12 +10,13 @@ from Layout import Layout
 
 def main() -> None:
     layers = [
-        LayerConfig(detectors=4, overlap=0.4),
-        LayerConfig(detectors=8, overlap=0.4),
-        LayerConfig(detectors=16, overlap=0.4),
-        LayerConfig(detectors=32, overlap=0.4),
-        LayerConfig(detectors=64, overlap=0.4),
-        LayerConfig(detectors=128, overlap=0.4),
+        LayerConfig(detectors=4,    overlap=0.7),
+        LayerConfig(detectors=8,    overlap=0.7),
+        LayerConfig(detectors=16,   overlap=0.7),
+        LayerConfig(detectors=32,   overlap=0.7),
+        LayerConfig(detectors=64,   overlap=0.7),
+        LayerConfig(detectors=128,  overlap=0.7),
+        LayerConfig(detectors=256,  overlap=0.7),
     ]
     encoder = Encoder(
         code_bits=sum(layer.detectors for layer in layers),
@@ -35,10 +36,10 @@ def main() -> None:
 
     layout = Layout(
         codes,
-        grid_size=32,
+        grid_size=64,
         similarity="jaccard",
-        lambda_threshold=0.2,
-        eta=8.0,
+        lambda_threshold=0.06,
+        eta=14.0,
         seed=0,
     )
     rr.init("damp-layout")
@@ -46,27 +47,27 @@ def main() -> None:
     layout.log_rerun(step=0)
     step_offset = 1
     layout.run(
-        steps=10000,
-        pairs_per_step=600,
+        steps=22000,
+        pairs_per_step=1200,
         pair_radius=layout.width // 2,
         mode="long",
         min_swap_ratio=0.0,
         log_every=1,
         step_offset=step_offset,
-        energy_radius=5,
+        energy_radius=7,
         energy_check_every=5,
-        energy_delta=1e-3,
-        energy_patience=3,
+        energy_delta=5e-4,
+        energy_patience=4,
     )
     step_offset += layout.last_steps
-    layout.set_similarity_params(lambda_threshold=0.35, eta=8.0)
+    layout.set_similarity_params(lambda_threshold=0.16, eta=14.0)
     layout.run(
-        steps=150,
-        pairs_per_step=300,
-        pair_radius=5,
+        steps=900,
+        pairs_per_step=500,
+        pair_radius=7,
         mode="short",
-        local_radius=5,
-        min_swap_ratio=0.01,
+        local_radius=7,
+        min_swap_ratio=0.005,
         log_every=1,
         step_offset=step_offset,
     )
