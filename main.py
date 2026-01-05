@@ -8,23 +8,23 @@ from layout import Layout
 
 def main() -> None:
     layers = [
-        LayerConfig(detectors=360, window=1),
-        LayerConfig(detectors=180, window=1),
-        LayerConfig(detectors=90, window=1),
-        LayerConfig(detectors=45, window=1),
-        LayerConfig(detectors=22, window=1),
+        LayerConfig(detectors=180, overlap=0.4),
     ]
     encoder = Encoder(
-        code_bits=128,
+        code_bits=sum(layer.detectors for layer in layers),
         layers=layers,
-        bits_per_detector=2,
+        bits_per_detector=1,
         seed=0,
+        bit_assignment="detector_index",
     )
     start = 0.0
-    end = 360.0
+    end = 359.0
     step = 1.0
     codes = encoder.encode(start=start, end=end, step=step)
+
     encoder.print_codes(codes)
+    encoder.visualize_detectors()
+
     layout = Layout(
         codes,
         grid_size=32,
