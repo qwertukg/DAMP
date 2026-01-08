@@ -46,7 +46,7 @@ def main() -> None:
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
 
-    value = 0
+    value = 2
 
 
     count = 600
@@ -80,7 +80,7 @@ def main() -> None:
             total_codes += 1
             #show(encoder, values, code, img, int(label))
             
-            
+    
     print(f"{label}-{count}-{total_codes}")
     
 
