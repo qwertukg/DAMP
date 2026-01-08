@@ -613,9 +613,15 @@ class Layout:
             self._init_rerun(spawn=True)
 
         rr.set_time("step", sequence=step)
-        points = [(float(x), float(y)) for y, x in self.positions]
-        colors = [self._label_colors[label] for label in self.labels]
-        labels = [str(label) if label is not None else "" for label in self.labels]
+        points: List[Tuple[float, float]] = []
+        colors: List[Tuple[int, int, int]] = []
+        labels: List[str] = []
+        for (y, x), label in zip(self.positions, self.labels):
+            if label is None:
+                continue
+            points.append((float(x), float(y)))
+            colors.append(self._label_colors[label])
+            labels.append(str(label))
         rr.log("layout/points", rr.Points2D(points, colors=colors, labels=labels, radii=0.5))
         if energy_radius is not None and energy_radius > 0:
             energy = self.energy_matrix(energy_radius, lam)

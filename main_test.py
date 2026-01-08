@@ -26,6 +26,8 @@ def main() -> None:
 
     total_codes = 0
     codes = defaultdict(list)
+    empty_code = tuple(0.0 for _ in range(encoder.code_length))
+    codes[None].extend([empty_code] * 100)
 
     for a in range(360):
         values, code = encoder.encode(float(a))

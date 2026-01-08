@@ -44,7 +44,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    for i in range(7000):
+    for i in range(70):
         img_tensor, label = dataset[i]
         img = img_tensor.squeeze(0).numpy()
 
