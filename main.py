@@ -62,7 +62,7 @@ def main() -> None:
                 float(y)
             )
             print(f"Encoded to: {values} -> {code}")
-            #show(encoder, values, code, img, int(label))
+            show(encoder, values, code, img, int(label))
             codes[a].append(code)
             total_codes += 1
             

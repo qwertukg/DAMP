@@ -59,9 +59,38 @@ def plot_code_bits(ax: Axes, bits: Sequence[int], boundaries: Sequence[int]) -> 
     ax.set_title(f"Code bits (len={len(bit_values)}, ones={sum(bit_values)})")
 
 
-def plot_image_label(ax: Axes, img, label: int) -> None:
+def plot_image_label(
+    ax: Axes,
+    img,
+    label: int,
+    *,
+    patch_index: Tuple[int, int] | None = None,
+) -> None:
     if img is not None:
         ax.imshow(img, cmap="gray", interpolation="nearest")
+        if patch_index is not None:
+            px, py = patch_index
+            height, width = img.shape[:2]
+            patch_size = 4
+            if height % 7 == 0 and width % 7 == 0:
+                patch_size = min(height // 7, width // 7)
+            max_x = max(0, (width // patch_size) - 1)
+            max_y = max(0, (height // patch_size) - 1)
+            px = max(0, min(max_x, px))
+            py = max(0, min(max_y, py))
+            x0 = px * patch_size
+            y0 = py * patch_size
+            if 0 <= x0 < width and 0 <= y0 < height:
+                ax.add_patch(
+                    Rectangle(
+                        (x0, y0),
+                        patch_size,
+                        patch_size,
+                        edgecolor="red",
+                        facecolor="none",
+                        linewidth=1.5,
+                    )
+                )
     else:
         ax.text(0.5, 0.5, "No image", ha="center", va="center", transform=ax.transAxes)
     ax.set_xticks([])
@@ -141,6 +170,15 @@ def _normalize_values(encoder: Encoder, values: Sequence[float]) -> Tuple[float,
     return tuple(normalized)
 
 
+def _find_dimension_index(encoder: Encoder, title: str) -> Optional[int]:
+    title_lower = title.lower()
+    for index, dimension in enumerate(encoder.dimensions):
+        dim_title = getattr(dimension, "title", "")
+        if str(dim_title).lower() == title_lower:
+            return index
+    return None
+
+
 def _ensure_state(encoder: Encoder) -> FigureState:
     global _FIG_STATE
     if _FIG_STATE is not None and _FIG_STATE.encoder_id == id(encoder):
@@ -195,7 +233,20 @@ def show(encoder: Encoder, values: Sequence[float], codes: Sequence[int], img, l
     for ax in state.axes:
         ax.clear()
 
-    plot_image_label(state.axes[0], img, label)
+    patch_index = None
+    x_index = _find_dimension_index(encoder, "X")
+    y_index = _find_dimension_index(encoder, "Y")
+    if x_index is None or y_index is None:
+        if len(normalized_values) >= 3:
+            x_index, y_index = 1, 2
+        else:
+            x_index, y_index = None, None
+    if x_index is not None and y_index is not None:
+        x_value = int(round(normalized_values[x_index]))
+        y_value = int(round(normalized_values[y_index]))
+        patch_index = (x_value, y_value)
+
+    plot_image_label(state.axes[0], img, label, patch_index=patch_index)
 
     for dim_index, dimension in enumerate(encoder.dimensions):
         plot_dimension_layers(

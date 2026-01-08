@@ -42,11 +42,19 @@ def main() -> None:
 
     total_codes = 0
     codes = defaultdict(list)
-    dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
-    extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+    dataset = MNIST(
+        root="./data",  # локальный кэш для MNIST
+        train=True,  # использовать обучающую выборку
+        download=True,  # скачать, если нет на диске
+        transform=transforms.ToTensor(),  # перевод в тензор [0,1]
+    )
+    extractor = MnistSobelAngleMap(
+        angle_in_degrees=True,  # возвращать угол в градусах, а не в радианах
+        grad_threshold=0.05,  # пропускать квадраты со слабым градиентом
+    )
 
-    value = 1
-    count = 100
+    value = 9  # цифра для выборки
+    count = 100  # количество изображений этой цифры
     digits = []
     for img_tensor, label in dataset:
         if int(label) == value:
@@ -81,11 +89,11 @@ def main() -> None:
 
     layout = Layout(
         codes,
-        grid_size=None,
-        similarity="jaccard",
-        lambda_threshold=0.06,
-        eta=14.0,
-        seed=0,
+        grid_size=None,  # авто-размер сетки по числу точек
+        similarity="jaccard",  # метрика сходства кодов
+        lambda_threshold=0.06,  # порог сходства для притяжения
+        eta=14.0,  # плавность пороговой функции сходства
+        seed=0,  # сид ГПСЧ для начального размещения
     )
 
     rr.init("damp-layout")
@@ -94,29 +102,32 @@ def main() -> None:
 
     step_offset = 1
     layout.run(
-        steps=22000,
-        pairs_per_step=1200,
-        pair_radius=layout.width // 2,
-        mode="long",
-        min_swap_ratio=0.001,
-        log_every=1,
-        step_offset=step_offset,
-        energy_radius=7,
-        energy_check_every=5,
-        energy_delta=5e-4,
-        energy_patience=4,
+        steps=22000,  # максимум итераций оптимизации
+        pairs_per_step=1200,  # число кандидатных обменов на шаг
+        pair_radius=layout.width // 2,  # радиус выборки для дальних пар
+        mode="long",  # глобальный режим энергии
+        min_swap_ratio=0.005,  # ранняя остановка при малом числе обменов
+        log_every=1,  # логировать в rerun каждый N шагов
+        step_offset=step_offset,  # смещение таймлайна для логов
+        energy_radius=7,  # радиус соседства для энерго-проверок
+        energy_check_every=5,  # частота проверки стабильности энергии
+        energy_delta=5e-4,  # допуск изменения энергии
+        energy_patience=4,  # число проверок до остановки
     )
     step_offset += layout.last_steps
-    layout.set_similarity_params(lambda_threshold=0.16, eta=14.0)
+    layout.set_similarity_params(
+        lambda_threshold=0.16,  # повысить порог сходства для уточнения
+        eta=14.0,  # оставить ту же плавность
+    )
     layout.run(
-        steps=900,
-        pairs_per_step=500,
-        pair_radius=7,
-        mode="short",
-        local_radius=7,
-        min_swap_ratio=0.001,
-        log_every=1,
-        step_offset=step_offset,
+        steps=900,  # итерации локального уточнения
+        pairs_per_step=500,  # число кандидатных обменов на шаг
+        pair_radius=7,  # радиус выборки для локальных пар
+        mode="short",  # локальный режим энергии
+        local_radius=7,  # размер локального окружения
+        min_swap_ratio=0.005,  # ранняя остановка при малом числе обменов
+        log_every=1,  # логировать в rerun каждый N шагов
+        step_offset=step_offset,  # смещение таймлайна для логов
     )
 
     wait_for_close()

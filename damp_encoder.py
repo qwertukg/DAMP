@@ -200,7 +200,7 @@ class Encoder:
                 width = step / (1.0 - overlap)
             if width > dim.period:
                 width = dim.period
-            centers = [dim.min_value + i * step for i in range(count)]
+            centers = [dim.min_value + (i + 0.5) * step for i in range(count)]
         else:
             if count == 1:
                 width = dim.period

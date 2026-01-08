@@ -9,19 +9,19 @@ import json
 from pathlib import Path
 from damp_layout import Layout
 import rerun as rr
+import random
 
 
 def main() -> None:
     
     encoder = Encoder(
         ClosedDimension("Angle", (0.0, 360.0), [
-            Detectors(360, 0.4),
-            Detectors(180, 0.4),
-            Detectors(90, 0.4),
-            Detectors(45, 0.4),
-            Detectors(30, 0.4),
-            Detectors(10, 0.4),
-            Detectors(5, 0.4),
+            Detectors(360,  0.7),
+            Detectors(180,  0.7),
+            Detectors(90,   0.7),
+            Detectors(45,   0.7),
+            Detectors(30,   0.7),
+            Detectors(10,   0.7),
         ]),
     )
 
@@ -37,12 +37,15 @@ def main() -> None:
     
     print(f"{total_codes} codes saved to codes.json")
 
+    for angle_codes in codes.values():
+        random.shuffle(angle_codes)
+
     layout = Layout(
         codes,
-        grid_size=None,
-        similarity="jaccard",
-        lambda_threshold=0.06,
-        eta=14.0,
+        empty_ratio=0.5,
+        similarity="cosine",
+        lambda_threshold=0.00,
+        eta=0.0,
         seed=0,
     )
     rr.init("damp-layout")
@@ -54,23 +57,19 @@ def main() -> None:
         pairs_per_step=1200,
         pair_radius=layout.width // 2,
         mode="long",
-        min_swap_ratio=0.0,
+        min_swap_ratio=0.001,
         log_every=1,
         step_offset=step_offset,
-        energy_radius=7,
-        energy_check_every=5,
-        energy_delta=5e-4,
-        energy_patience=4,
     )
     step_offset += layout.last_steps
-    layout.set_similarity_params(lambda_threshold=0.16, eta=14.0)
+    layout.set_similarity_params(lambda_threshold=0.00, eta=0.0)
     layout.run(
         steps=900,
         pairs_per_step=500,
         pair_radius=7,
         mode="short",
         local_radius=7,
-        min_swap_ratio=0.005,
+        min_swap_ratio=0.001,
         log_every=1,
         step_offset=step_offset,
     )
