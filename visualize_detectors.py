@@ -203,22 +203,3 @@ def wait_for_close() -> None:
     while plt.fignum_exists(fig_number):
         plt.pause(0.1)
 
-
-def parse_values(
-    parser: argparse.ArgumentParser,
-    encoder: Encoder,
-) -> Tuple[float, ...]:
-    parser.add_argument(
-        "values",
-        nargs="*",
-        type=float,
-        help="Values to encode, one per dimension.",
-    )
-    args = parser.parse_args()
-    if args.values:
-        if len(args.values) != len(encoder.dimensions):
-            parser.error(f"Expected {len(encoder.dimensions)} values, got {len(args.values)}.")
-        values = tuple(args.values)
-    else:
-        values = DEFAULT_VALUES
-    return values
