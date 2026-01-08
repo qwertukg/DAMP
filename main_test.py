@@ -45,7 +45,7 @@ def main() -> None:
         empty_ratio=0.5,
         similarity="cosine",
         lambda_threshold=0.00, # 0.06
-        eta=0.0, # 14.0 - выворачивает пинвил в мебиуса
+        eta=0.0, # 1.0 - выворачивает пинвил в криветку мебиуса (0 - норм)
         seed=0,
     )
     rr.init("damp-layout")
