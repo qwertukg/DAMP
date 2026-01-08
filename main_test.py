@@ -1,4 +1,4 @@
-from damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
+from damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors, BitArray as EncoderBitArray
 from visualize_detectors import show, wait_for_close
 import numpy as np
 from MnistSobelAngleMap import MnistSobelAngleMap
@@ -7,7 +7,9 @@ from torchvision import transforms
 from collections import defaultdict
 import json
 from pathlib import Path
-from layout import Layout
+from damp_layout import Layout
+import rerun as rr
+from BitArray import BitArray as LayoutBitArray
 
 
 def main() -> None:
@@ -26,8 +28,6 @@ def main() -> None:
 
     total_codes = 0
     codes = defaultdict(list)
-    empty_code = tuple(0.0 for _ in range(encoder.code_length))
-    codes[None].extend([empty_code] * 100)
 
     for a in range(360):
         values, code = encoder.encode(float(a))
@@ -38,28 +38,58 @@ def main() -> None:
     
     print(f"{total_codes} codes saved to codes.json")
 
-
-    layout = Layout(
-        codes,
-        lambda_start=0.3,  # начальный порог λ для simλ
-        lambda_end=0.85,  # конечный порог λ к завершению раскладки
-        rr_app_id="mnist_layout",  # имя сессии для визуализации rerun
-    )
-
-    layout.layout(
-        long_steps=500,  # число шагов дальнего порядка
-        short_steps=0,  # число шагов ближнего порядка
-        pairs_per_step=64,  # количество тестируемых пар за шаг
-        long_pair_radius=None,  # без ограничения радиуса для дальних пар
-        short_pair_radius=6,  # радиус выбора второй точки для ближних пар
-        short_local_radius=6,  # минимальный радиус окрестности для локальной энергии
-        visualize=True,  # включить потоковую визуализацию
-        visualize_every=1,  # логировать каждый шаг
-        energy_radius=5,  # радиус для матрицы энергии в визуализации
-    )
-
     wait_for_close()
 
+    def to_layout_bitarray(code: EncoderBitArray) -> LayoutBitArray:
+        layout_code = LayoutBitArray(len(code))
+        for idx, bit in enumerate(code):
+            if bit:
+                layout_code.set(idx, 1)
+        return layout_code
+
+    layout_codes = []
+    for angle, angle_codes in codes.items():
+        angle_value = 0.0 if angle is None else float(angle)
+        for code in angle_codes:
+            layout_codes.append((to_layout_bitarray(code), angle_value, angle_value))
+
+    layout = Layout(
+        layout_codes,
+        grid_size=None,
+        similarity="jaccard",
+        lambda_threshold=0.06,
+        eta=14.0,
+        seed=0,
+    )
+    rr.init("damp-layout")
+    rr.spawn()
+    layout.log_rerun(step=0)
+    step_offset = 1
+    layout.run(
+        steps=22000,
+        pairs_per_step=1200,
+        pair_radius=layout.width // 2,
+        mode="long",
+        min_swap_ratio=0.0,
+        log_every=1,
+        step_offset=step_offset,
+        energy_radius=7,
+        energy_check_every=5,
+        energy_delta=5e-4,
+        energy_patience=4,
+    )
+    step_offset += layout.last_steps
+    layout.set_similarity_params(lambda_threshold=0.16, eta=14.0)
+    layout.run(
+        steps=900,
+        pairs_per_step=500,
+        pair_radius=7,
+        mode="short",
+        local_radius=7,
+        min_swap_ratio=0.005,
+        log_every=1,
+        step_offset=step_offset,
+    )
 
 
 if __name__ == "__main__":
