@@ -15,8 +15,7 @@ class Layout:
 
     def __init__(
         self,
-        codes: Sequence[tuple[BitArray | Iterable[int], float, float]]
-        | Mapping[float | None, Sequence[BitArray | Iterable[int]]],
+        codes: Mapping[float, Sequence[BitArray]],
         *,
         grid_size: int | None = None,
         empty_ratio: float = 0.15,
@@ -39,25 +38,23 @@ class Layout:
             raise ValueError("max_precompute must be positive")
 
         self._points = []
-        if isinstance(codes, Mapping):
-            for angle, angle_codes in codes.items():
-                angle_value = 0.0 if angle is None else float(angle)
-                for code in angle_codes:
-                    layout_code, ones = self._coerce_code(code)
-                    self._points.append(
-                        LayoutPoint(
-                            code=layout_code,
-                            angle=angle_value,
-                            hue=angle_value,
-                            ones=ones,
-                        )
-                    )
-        else:
-            for code, angle, hue in codes:
+        self._codes: dict[float, list[BitArray]] = {}
+        for label, label_codes in codes.items():
+            label_value = float(label)
+            bucket = self._codes.setdefault(label_value, [])
+            for code in label_codes:
                 layout_code, ones = self._coerce_code(code)
+                bucket.append(layout_code)
                 self._points.append(
-                    LayoutPoint(code=layout_code, angle=angle, hue=hue, ones=ones)
+                    LayoutPoint(
+                        code=layout_code,
+                        label=label_value,
+                        hue=label_value,
+                        ones=ones,
+                    )
                 )
+        self._labels = [self._format_label(point.label) for point in self._points]
+        self._values = [point.code.to01() for point in self._points]
         self._point_count = len(self._points)
         self._similarity = similarity
         self._lambda = lambda_threshold
@@ -219,7 +216,14 @@ class Layout:
         positions = [(x, y) for y, x in self._positions]
         rr.log(
             f"{path}/points",
-            rr.Points2D(positions, colors=self.colors_rgb(), radii=0.45),
+            rr.Points2D(
+                positions,
+                colors=self.colors_rgb(),
+                radii=0.45,
+                labels=self._labels,
+                show_labels=False,
+            ),
+            rr.AnyValues(values=self._values),
         )
 
     def visualize(self, *, app_id: str = "damp-layout", path: str = "layout") -> None:
@@ -469,6 +473,12 @@ class Layout:
                 union = a.ones + b.ones - common
                 code_sim = 0.0 if union == 0 else common / union
         return code_sim
+
+    @staticmethod
+    def _format_label(value: float) -> str:
+        if abs(value - round(value)) < 1e-6:
+            return str(int(round(value)))
+        return f"{value:.3f}"
 
     def _normalized_hues(self) -> list[float]:
         if not self._points:

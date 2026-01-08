@@ -31,6 +31,6 @@ class BitArray:
 @dataclass(frozen=True)
 class LayoutPoint:
     code: BitArray
-    angle: float
+    label: float
     hue: float
     ones: int

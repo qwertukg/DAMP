@@ -45,8 +45,17 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    for i in range(70):
-        img_tensor, label = dataset[i]
+    value = 1
+    count = 100
+    digits = []
+    for img_tensor, label in dataset:
+        if int(label) == value:
+            digits.append((img_tensor, label))
+            if len(digits) == count:
+                break
+
+    for i in range(len(digits)):
+        img_tensor, label = digits[i]
         img = img_tensor.squeeze(0).numpy()
 
         digitValues = extractor.extract(img, label)
@@ -62,9 +71,9 @@ def main() -> None:
                 float(y)
             )
             print(f"Encoded to: {values} -> {code}")
-            #show(encoder, values, code, img, int(label))
             codes[a].append(code)
             total_codes += 1
+            #show(encoder, values, code, img, int(label))
             
     print(f"{total_codes} codes saved to codes.json")
     
@@ -78,16 +87,18 @@ def main() -> None:
         eta=14.0,
         seed=0,
     )
+
     rr.init("damp-layout")
     rr.spawn()
     layout.log_rerun(step=0)
+
     step_offset = 1
     layout.run(
         steps=22000,
         pairs_per_step=1200,
         pair_radius=layout.width // 2,
         mode="long",
-        min_swap_ratio=0.0,
+        min_swap_ratio=0.001,
         log_every=1,
         step_offset=step_offset,
         energy_radius=7,
@@ -103,18 +114,11 @@ def main() -> None:
         pair_radius=7,
         mode="short",
         local_radius=7,
-        min_swap_ratio=0.005,
+        min_swap_ratio=0.001,
         log_every=1,
         step_offset=step_offset,
     )
 
-    #data = {str(k): v for k, v in codes.items()}
-    #Path("codes.json").write_text(
-    #    json.dumps(data, ensure_ascii=False),
-    #    encoding="utf-8"
-    #)
-            
-    
     wait_for_close()
 
 
