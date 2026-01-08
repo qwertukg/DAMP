@@ -45,8 +45,13 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    value = 1
-    count = 100
+
+    value = 3
+
+
+    count = 600
+
+
     digits = []
     for img_tensor, label in dataset:
         if int(label) == value:
