@@ -18,7 +18,14 @@ class Detectors:
 
 
 class Dimension:
-    def __init__(self, size: Tuple[float, float], detector_layers: Sequence[Detectors], closed: bool) -> None:
+    def __init__(
+        self,
+        title: str,
+        size: Tuple[float, float],
+        detector_layers: Sequence[Detectors],
+        closed: bool,
+    ) -> None:
+        self.title = str(title)
         if len(size) != 2:
             raise ValueError("size must contain exactly two values")
         self.min_value = float(size[0])
@@ -33,13 +40,13 @@ class Dimension:
 
 
 class ClosedDimension(Dimension):
-    def __init__(self, size: Tuple[float, float], detector_layers: Sequence[Detectors]) -> None:
-        super().__init__(size=size, detector_layers=detector_layers, closed=True)
+    def __init__(self, title: str, size: Tuple[float, float], detector_layers: Sequence[Detectors]) -> None:
+        super().__init__(title=title, size=size, detector_layers=detector_layers, closed=True)
 
 
 class OpenedDimension(Dimension):
-    def __init__(self, size: Tuple[float, float], detector_layers: Sequence[Detectors]) -> None:
-        super().__init__(size=size, detector_layers=detector_layers, closed=False)
+    def __init__(self, title: str, size: Tuple[float, float], detector_layers: Sequence[Detectors]) -> None:
+        super().__init__(title=title, size=size, detector_layers=detector_layers, closed=False)
 
 
 @dataclass

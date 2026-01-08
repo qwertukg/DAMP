@@ -59,6 +59,19 @@ def plot_code_bits(ax: Axes, bits: Sequence[int], boundaries: Sequence[int]) -> 
     ax.set_title(f"Code bits (len={len(bit_values)}, ones={sum(bit_values)})")
 
 
+def plot_image_label(ax: Axes, img, label: int) -> None:
+    ax.imshow(img, cmap="gray", interpolation="nearest")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(f"Label: {label}")
+
+
+def _format_value(value: float) -> str:
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return f"{value:.3f}"
+
+
 def plot_dimension_layers(
     ax: Axes,
     dimension_index: int,
@@ -101,7 +114,9 @@ def plot_dimension_layers(
     ax.set_xlabel("Value")
     ax.set_ylabel("Layer")
     status = "closed" if dimension.closed else "open"
-    ax.set_title(f"Dimension {dimension_index} ({status})")
+    encoded_value = _format_value(value)
+    title = getattr(dimension, "title", f"Dimension {dimension_index}")
+    ax.set_title(f"{title} ({status}) value={encoded_value}")
     ax.grid(True, axis="x", linestyle=":", linewidth=0.5, alpha=0.6)
 
 
@@ -142,8 +157,8 @@ def _ensure_state(encoder: Encoder) -> FigureState:
         boundaries.append(total)
 
     fig, axes = plt.subplots(
-        nrows=len(encoder.dimensions) + 1,
-        figsize=(12, 3 * len(encoder.dimensions) + 2),
+        nrows=len(encoder.dimensions) + 2,
+        figsize=(12, 3 * len(encoder.dimensions) + 4),
         constrained_layout=True,
     )
     axes_list = [axes] if isinstance(axes, Axes) else list(axes)
@@ -162,7 +177,7 @@ def _ensure_state(encoder: Encoder) -> FigureState:
     return _FIG_STATE
 
 
-def show(encoder: Encoder, values: Sequence[float], codes: Sequence[int]) -> None:
+def show(encoder: Encoder, values: Sequence[float], codes: Sequence[int], img, label: int) -> None:
     state = _ensure_state(encoder)
     normalized_values = _normalize_values(encoder, values)
 
@@ -177,9 +192,11 @@ def show(encoder: Encoder, values: Sequence[float], codes: Sequence[int]) -> Non
     for ax in state.axes:
         ax.clear()
 
+    plot_image_label(state.axes[0], img, label)
+
     for dim_index, dimension in enumerate(encoder.dimensions):
         plot_dimension_layers(
-            state.axes[dim_index],
+            state.axes[dim_index + 1],
             dim_index,
             dimension,
             state.detectors_by_layer,
@@ -201,4 +218,3 @@ def wait_for_close() -> None:
     fig_number = state.fig.number
     while plt.fignum_exists(fig_number):
         plt.pause(0.1)
-
