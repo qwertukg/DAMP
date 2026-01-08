@@ -44,8 +44,8 @@ def main() -> None:
         codes,
         empty_ratio=0.5,
         similarity="cosine",
-        lambda_threshold=0.00,
-        eta=0.0,
+        lambda_threshold=0.00, # 0.06
+        eta=0.0, # 14.0 - выворачивает пинвил в мебиуса
         seed=0,
     )
     rr.init("damp-layout")
@@ -60,9 +60,12 @@ def main() -> None:
         min_swap_ratio=0.001,
         log_every=1,
         step_offset=step_offset,
+        #energy_radius=7,
+        #energy_check_every=5,
+        #energy_delta=5e-4,
+        #energy_patience=4,
     )
     step_offset += layout.last_steps
-    layout.set_similarity_params(lambda_threshold=0.00, eta=0.0)
     layout.run(
         steps=900,
         pairs_per_step=500,
@@ -80,3 +83,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+#26.18s

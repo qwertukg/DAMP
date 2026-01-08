@@ -45,7 +45,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    value = 1
+    value = 0
     count = 100
     digits = []
     for img_tensor, label in dataset:
@@ -85,7 +85,7 @@ def main() -> None:
         codes,
         empty_ratio=0.5,
         similarity="cosine",
-        lambda_threshold=0.00,
+        lambda_threshold=0.06,
         eta=0.0,
         seed=0,
     )
@@ -99,6 +99,10 @@ def main() -> None:
         min_swap_ratio=0.001,
         log_every=1,
         step_offset=step_offset,
+        energy_radius=7,
+        energy_check_every=5,
+        energy_delta=5e-4,
+        energy_patience=4,
     )
     step_offset += layout.last_steps
     layout.run(
