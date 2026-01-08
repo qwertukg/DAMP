@@ -5,7 +5,8 @@ from MnistSobelAngleMap import MnistSobelAngleMap
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from collections import defaultdict
-
+import json
+from pathlib import Path
 
 
 def main() -> None:
@@ -38,10 +39,11 @@ def main() -> None:
     )
 
     codes = defaultdict(list)
-    ds = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
+    dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
-    for i in range(10000):
-        img_tensor, label = ds[i]
+
+    for i in range(7000): # ALL
+        img_tensor, label = dataset[i]
         img = img_tensor.squeeze(0).numpy()
 
         digitValues = extractor.extract(img, label)
@@ -62,7 +64,12 @@ def main() -> None:
 
 
 
-
+    data = {str(k): v for k, v in codes.items()}
+    Path("codes.json").write_text(
+        json.dumps(data, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    print("saved to codes.json")
                 
     
     wait_for_close()
