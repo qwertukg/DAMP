@@ -60,7 +60,10 @@ def plot_code_bits(ax: Axes, bits: Sequence[int], boundaries: Sequence[int]) -> 
 
 
 def plot_image_label(ax: Axes, img, label: int) -> None:
-    ax.imshow(img, cmap="gray", interpolation="nearest")
+    if img is not None:
+        ax.imshow(img, cmap="gray", interpolation="nearest")
+    else:
+        ax.text(0.5, 0.5, "No image", ha="center", va="center", transform=ax.transAxes)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_title(f"Label: {label}")

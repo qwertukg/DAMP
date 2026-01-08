@@ -34,28 +34,28 @@ def main() -> None:
         print(f"Encoded to: {values} -> {code}")
         codes[a].append(code)
         total_codes += 1
+        #show(encoder, values, code, None, int(a))
     
     print(f"{total_codes} codes saved to codes.json")
 
 
     layout = Layout(
         codes,
-        max_codes=70000,
-        lambda_start=0.3,
-        lambda_end=0.95,
-        rr_app_id="mnist_layout",
+        lambda_start=0.3,  # начальный порог λ для simλ
+        lambda_end=0.85,  # конечный порог λ к завершению раскладки
+        rr_app_id="mnist_layout",  # имя сессии для визуализации rerun
     )
 
     layout.layout(
-        long_steps=500,
-        short_steps=0,
-        pairs_per_step=64,
-        long_pair_radius=9,
-        short_pair_radius=6,
-        short_local_radius=6,
-        visualize=True,
-        visualize_every=1,
-        energy_radius=5,
+        long_steps=500,  # число шагов дальнего порядка
+        short_steps=0,  # число шагов ближнего порядка
+        pairs_per_step=64,  # количество тестируемых пар за шаг
+        long_pair_radius=None,  # без ограничения радиуса для дальних пар
+        short_pair_radius=6,  # радиус выбора второй точки для ближних пар
+        short_local_radius=6,  # минимальный радиус окрестности для локальной энергии
+        visualize=True,  # включить потоковую визуализацию
+        visualize_every=1,  # логировать каждый шаг
+        energy_radius=5,  # радиус для матрицы энергии в визуализации
     )
 
     wait_for_close()

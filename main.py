@@ -71,7 +71,6 @@ def main() -> None:
 
     layout = Layout(
         codes,
-        max_codes=70000,
         lambda_start=0.6,
         lambda_end=0.85,
         rr_app_id="mnist_layout",
