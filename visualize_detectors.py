@@ -12,7 +12,6 @@ from matplotlib.patches import Rectangle
 
 from damp_encoder import ClosedDimension, DetectorWindow, Detectors, Encoder, OpenedDimension
 
-DEFAULT_VALUES = (90.0, 450.0)
 _FIG_STATE: Optional["FigureState"] = None
 
 

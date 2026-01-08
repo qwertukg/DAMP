@@ -14,12 +14,19 @@ def main() -> None:
             Detectors(10, 0.4),
             Detectors(2, 0.4),
         ]),
+        OpenedDimension((0.0, 249.0), [
+            Detectors(250, 0.4),
+            Detectors(50, 0.4),
+            Detectors(10, 0.4),
+            Detectors(2, 0.4),
+        ]),
     )
 
     for angle in range(180):
         for x in range(249):
-            values, code = encoder.encode(float(angle), float(x))
-            show(encoder, values, code)
+            for y in range(249):
+                values, code = encoder.encode(float(angle), float(x), float(y))
+                show(encoder, values, code)
     
     wait_for_close()
 

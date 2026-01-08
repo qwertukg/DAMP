@@ -37,13 +37,9 @@ class ClosedDimension(Dimension):
         super().__init__(size=size, detector_layers=detector_layers, closed=True)
 
 
-class OpenDimension(Dimension):
+class OpenedDimension(Dimension):
     def __init__(self, size: Tuple[float, float], detector_layers: Sequence[Detectors]) -> None:
         super().__init__(size=size, detector_layers=detector_layers, closed=False)
-
-
-class OpenedDimension(OpenDimension):
-    pass
 
 
 @dataclass
