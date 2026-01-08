@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 import random
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from BitArray import BitArray, LayoutPoint
 
 _UNSET = object()
+HUE = 360.0
 
 
 class Layout:
@@ -14,7 +15,8 @@ class Layout:
 
     def __init__(
         self,
-        codes: Sequence[tuple[BitArray, float, float]],
+        codes: Sequence[tuple[BitArray | Iterable[int], float, float]]
+        | Mapping[float | None, Sequence[BitArray | Iterable[int]]],
         *,
         grid_size: int | None = None,
         empty_ratio: float = 0.15,
@@ -36,10 +38,26 @@ class Layout:
         if max_precompute <= 0:
             raise ValueError("max_precompute must be positive")
 
-        self._points = [
-            LayoutPoint(code=code, angle=angle, hue=hue, ones=code.count())
-            for code, angle, hue in codes
-        ]
+        self._points = []
+        if isinstance(codes, Mapping):
+            for angle, angle_codes in codes.items():
+                angle_value = 0.0 if angle is None else float(angle)
+                for code in angle_codes:
+                    layout_code, ones = self._coerce_code(code)
+                    self._points.append(
+                        LayoutPoint(
+                            code=layout_code,
+                            angle=angle_value,
+                            hue=angle_value,
+                            ones=ones,
+                        )
+                    )
+        else:
+            for code, angle, hue in codes:
+                layout_code, ones = self._coerce_code(code)
+                self._points.append(
+                    LayoutPoint(code=layout_code, angle=angle, hue=hue, ones=ones)
+                )
         self._point_count = len(self._points)
         self._similarity = similarity
         self._lambda = lambda_threshold
@@ -178,14 +196,16 @@ class Layout:
         return list(self._positions)
 
     def colors_rgb(self) -> list[tuple[int, int, int]]:
-        return [self._hue_to_rgb(point.hue) for point in self._points]
+        hues = self._normalized_hues()
+        return [self._hue_to_rgb(hue) for hue in hues]
 
     def render_image(self) -> "numpy.ndarray":
         import numpy as np
 
         image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        hues = self._normalized_hues()
         for idx, (y, x) in enumerate(self._positions):
-            image[y, x] = self._hue_to_rgb(self._points[idx].hue)
+            image[y, x] = self._hue_to_rgb(hues[idx])
         return image
 
     def log_rerun(self, *, path: str = "layout", step: int | None = None) -> None:
@@ -450,6 +470,41 @@ class Layout:
                 code_sim = 0.0 if union == 0 else common / union
         return code_sim
 
+    def _normalized_hues(self) -> list[float]:
+        if not self._points:
+            return []
+        hues = [point.hue for point in self._points]
+        min_hue = min(hues)
+        max_hue = max(hues)
+        if max_hue == min_hue:
+            return [0.0 for _ in hues]
+        scale = HUE / (max_hue - min_hue)
+        normalized = []
+        for hue in hues:
+            value = (hue - min_hue) * scale
+            if value >= HUE:
+                value = HUE - 1e-9
+            normalized.append(value)
+        return normalized
+
+    @staticmethod
+    def _coerce_code(code: BitArray | Iterable[int]) -> tuple[BitArray, int]:
+        if isinstance(code, BitArray):
+            return code, code.count()
+        try:
+            length = len(code)  # type: ignore[arg-type]
+            bits = code  # type: ignore[assignment]
+        except TypeError:
+            bits = list(code)
+            length = len(bits)
+        layout_code = BitArray(length)
+        ones = 0
+        for idx, bit in enumerate(bits):
+            if bit:
+                layout_code.set(idx, 1)
+                ones += 1
+        return layout_code, ones
+
     @staticmethod
     def _angle_similarity(angle_a: float, angle_b: float) -> float:
         diff = abs(angle_a - angle_b) % 360.0
@@ -460,5 +515,5 @@ class Layout:
     def _hue_to_rgb(hue: float) -> tuple[int, int, int]:
         import colorsys
 
-        r, g, b = colorsys.hsv_to_rgb((hue % 360.0) / 360.0, 1.0, 1.0)
+        r, g, b = colorsys.hsv_to_rgb((hue % HUE) / HUE, 1.0, 1.0)
         return int(r * 255), int(g * 255), int(b * 255)

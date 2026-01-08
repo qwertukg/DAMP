@@ -1,4 +1,4 @@
-from damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors, BitArray as EncoderBitArray
+from damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
 from visualize_detectors import show, wait_for_close
 import numpy as np
 from MnistSobelAngleMap import MnistSobelAngleMap
@@ -9,7 +9,6 @@ import json
 from pathlib import Path
 from damp_layout import Layout
 import rerun as rr
-from BitArray import BitArray as LayoutBitArray
 
 
 def main() -> None:
@@ -38,23 +37,8 @@ def main() -> None:
     
     print(f"{total_codes} codes saved to codes.json")
 
-    wait_for_close()
-
-    def to_layout_bitarray(code: EncoderBitArray) -> LayoutBitArray:
-        layout_code = LayoutBitArray(len(code))
-        for idx, bit in enumerate(code):
-            if bit:
-                layout_code.set(idx, 1)
-        return layout_code
-
-    layout_codes = []
-    for angle, angle_codes in codes.items():
-        angle_value = 0.0 if angle is None else float(angle)
-        for code in angle_codes:
-            layout_codes.append((to_layout_bitarray(code), angle_value, angle_value))
-
     layout = Layout(
-        layout_codes,
+        codes,
         grid_size=None,
         similarity="jaccard",
         lambda_threshold=0.06,
@@ -90,6 +74,9 @@ def main() -> None:
         log_every=1,
         step_offset=step_offset,
     )
+
+    wait_for_close()
+
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@ from torchvision import transforms
 from collections import defaultdict
 import json
 from pathlib import Path
-from layout import Layout
+from damp_layout import Layout
+import rerun as rr
 
 
 def main() -> None:
@@ -71,21 +72,40 @@ def main() -> None:
 
     layout = Layout(
         codes,
-        lambda_start=0.6,
-        lambda_end=0.85,
-        rr_app_id="mnist_layout",
+        grid_size=None,
+        similarity="jaccard",
+        lambda_threshold=0.06,
+        eta=14.0,
+        seed=0,
     )
-
-    layout.layout(
-        long_steps=200,
-        short_steps=0,
-        pairs_per_step=64,
-        long_pair_radius=42,
-        short_pair_radius=6,
-        short_local_radius=6,
-        visualize=True,
-        visualize_every=1,
-        energy_radius=5,
+    rr.init("damp-layout")
+    rr.spawn()
+    layout.log_rerun(step=0)
+    step_offset = 1
+    layout.run(
+        steps=22000,
+        pairs_per_step=1200,
+        pair_radius=layout.width // 2,
+        mode="long",
+        min_swap_ratio=0.0,
+        log_every=1,
+        step_offset=step_offset,
+        energy_radius=7,
+        energy_check_every=5,
+        energy_delta=5e-4,
+        energy_patience=4,
+    )
+    step_offset += layout.last_steps
+    layout.set_similarity_params(lambda_threshold=0.16, eta=14.0)
+    layout.run(
+        steps=900,
+        pairs_per_step=500,
+        pair_radius=7,
+        mode="short",
+        local_radius=7,
+        min_swap_ratio=0.005,
+        log_every=1,
+        step_offset=step_offset,
     )
 
     #data = {str(k): v for k, v in codes.items()}
