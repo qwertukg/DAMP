@@ -10,6 +10,16 @@ from pathlib import Path
 from layout.damp_layout import Layout
 from layout.visualize_layout import log_layout
 import rerun as rr
+import random
+from damp_hierarchy import (
+    DetectorBuildParams,
+    EmbedParams,
+    HierarchyConfig,
+    LayoutConfig,
+    infer,
+    space_from_layout,
+    train_hierarchy,
+)
 
 
 def main() -> None:
@@ -47,7 +57,7 @@ def main() -> None:
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
 
-    value = 0
+    value = 1
 
 
     count = 600
@@ -123,7 +133,174 @@ def main() -> None:
         step_offset=step_offset,
     )
 
-    cortex0 = layout.layout_codes(0) # will be used for next steps
+    # 
+    cortex = layout.layout_codes(value)
+    cortex_codes, _ = cortex
+    total_cortex_codes = sum(len(values) for values in cortex_codes.values())
+    if total_cortex_codes == 0:
+        raise ValueError("cortex is empty")
+
+    v0 = space_from_layout(layout)
+
+    build_l1 = DetectorBuildParams(
+        lambda_levels=[0.5, 0.6, 0.7],
+        activation_radius=7,
+        energy_radius=7,
+        detector_code_length=256,
+        cluster_eps=2.5,
+        cluster_min_points=3,
+        energy_threshold_mu=0.05,
+        energy_lambda=0.6,
+        max_attempts=800,
+        max_detectors_per_layer=120,
+        min_radius=1.0,
+        patience=200,
+        similarity="cosine",
+        eta=None,
+        seed=0,
+    )
+    build_l2 = DetectorBuildParams(
+        lambda_levels=[0.5, 0.65, 0.8],
+        activation_radius=5,
+        energy_radius=5,
+        detector_code_length=256,
+        cluster_eps=2.0,
+        cluster_min_points=3,
+        energy_threshold_mu=0.05,
+        energy_lambda=0.6,
+        max_attempts=600,
+        max_detectors_per_layer=100,
+        min_radius=1.0,
+        patience=160,
+        similarity="cosine",
+        eta=None,
+        seed=1,
+    )
+    build_l3 = DetectorBuildParams(
+        lambda_levels=[0.55, 0.7, 0.85],
+        activation_radius=4,
+        energy_radius=4,
+        detector_code_length=256,
+        cluster_eps=2.0,
+        cluster_min_points=3,
+        energy_threshold_mu=0.05,
+        energy_lambda=0.6,
+        max_attempts=500,
+        max_detectors_per_layer=80,
+        min_radius=1.0,
+        patience=120,
+        similarity="cosine",
+        eta=None,
+        seed=2,
+    )
+    embed_l1 = EmbedParams(
+        lambda_activation=0.55,
+        mu_e=0.05,
+        mu_d=0.5,
+        sigma=50,
+        similarity="cosine",
+        eta=None,
+        merge_order="high",
+    )
+    embed_l2 = EmbedParams(
+        lambda_activation=0.55,
+        mu_e=0.05,
+        mu_d=0.5,
+        sigma=40,
+        similarity="cosine",
+        eta=None,
+        merge_order="high",
+    )
+    embed_l3 = EmbedParams(
+        lambda_activation=0.6,
+        mu_e=0.05,
+        mu_d=0.5,
+        sigma=30,
+        similarity="cosine",
+        eta=None,
+        merge_order="high",
+    )
+    layout_l2 = LayoutConfig(
+        layout_kwargs=dict(
+            empty_ratio=0.5,
+            similarity="cosine",
+            lambda_threshold=0.06,
+            eta=0.0,
+            seed=0,
+            precompute_similarity=False,
+            use_gpu=True,
+        ),
+        run_schedule=(
+            dict(
+                steps=800,
+                pairs_per_step=400,
+                pair_radius=7,
+                mode="long",
+                min_swap_ratio=0.001,
+                log_every=None,
+            ),
+            dict(
+                steps=300,
+                pairs_per_step=200,
+                pair_radius=5,
+                mode="short",
+                local_radius=5,
+                min_swap_ratio=0.001,
+                log_every=None,
+            ),
+        ),
+    )
+    layout_l3 = LayoutConfig(
+        layout_kwargs=dict(
+            empty_ratio=0.5,
+            similarity="cosine",
+            lambda_threshold=0.06,
+            eta=0.0,
+            seed=1,
+            precompute_similarity=False,
+            use_gpu=True,
+        ),
+        run_schedule=(
+            dict(
+                steps=600,
+                pairs_per_step=300,
+                pair_radius=5,
+                mode="long",
+                min_swap_ratio=0.001,
+                log_every=None,
+            ),
+            dict(
+                steps=250,
+                pairs_per_step=160,
+                pair_radius=4,
+                mode="short",
+                local_radius=4,
+                min_swap_ratio=0.001,
+                log_every=None,
+            ),
+        ),
+    )
+    config = HierarchyConfig(
+        encoder=encoder,
+        extractor=extractor,
+        v0=v0,
+        build_l1=build_l1,
+        build_l2=build_l2,
+        build_l3=build_l3,
+        embed_l1=embed_l1,
+        embed_l2=embed_l2,
+        embed_l3=embed_l3,
+        layout_l2=layout_l2,
+        layout_l3=layout_l3,
+    )
+
+    model = train_hierarchy(digits, config)
+
+    n = random.randint(0, count-1)
+    test_image, _ = digits[n]
+    predicted, debug = infer(test_image, model, top_k=3, similarity="cosine")
+    print(f"infer for {value}:", predicted)
+    print("topk:", debug)
 
     wait_for_close()
 
