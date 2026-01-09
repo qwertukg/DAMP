@@ -729,7 +729,9 @@ class Layout:
             total_swaps += swaps
             steps_executed = step + 1
             if log_every is not None and step % log_every == 0:
-                self.log_rerun(path=log_path, step=step + step_offset)
+                from .visualize_layout import log_layout
+
+                log_layout(self, path=log_path, step=step + step_offset)
             if energy_radius is not None and mode == "long":
                 if step % energy_check_every == 0:
                     energy = self.average_local_energy(energy_radius)
@@ -839,6 +841,12 @@ class Layout:
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
 
+    def labels(self) -> list[str]:
+        return list(self._labels)
+
+    def values(self) -> list[str]:
+        return list(self._values)
+
     def colors_rgb(self) -> list[tuple[int, int, int]]:
         hues = self._normalized_hues()
         return [self._hue_to_rgb(hue) for hue in hues]
@@ -851,34 +859,6 @@ class Layout:
         for idx, (y, x) in enumerate(self._positions):
             image[y, x] = self._hue_to_rgb(hues[idx])
         return image
-
-    def log_rerun(self, *, path: str = "layout", step: int | None = None) -> None:
-        import rerun as rr
-
-        if step is not None:
-            if hasattr(rr, "set_time_sequence"):
-                rr.set_time_sequence("step", step)
-        rr.log(f"{path}/image", rr.Image(self.render_image()))
-
-        positions = [(x, y) for y, x in self._positions]
-        rr.log(
-            f"{path}/points",
-            rr.Points2D(
-                positions,
-                colors=self.colors_rgb(),
-                radii=0.45,
-                labels=self._labels,
-                show_labels=False,
-            ),
-            rr.AnyValues(values=self._values),
-        )
-
-    def visualize(self, *, app_id: str = "damp-layout", path: str = "layout") -> None:
-        import rerun as rr
-
-        rr.init(app_id)
-        rr.spawn()
-        self.log_rerun(path=path)
 
     def average_local_energy(self, radius: int) -> float:
         if radius <= 0:

@@ -8,6 +8,7 @@ from collections import defaultdict
 import json
 from pathlib import Path
 from layout.damp_layout import Layout
+from layout.visualize_layout import log_layout
 import rerun as rr
 
 
@@ -95,7 +96,7 @@ def main() -> None:
         eta=0.0,
         seed=0,
     )
-    layout.log_rerun(step=0)
+    log_layout(layout, step=0)
     step_offset = 1
     layout.run(
         steps=22000,

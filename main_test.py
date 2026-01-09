@@ -8,6 +8,7 @@ from collections import defaultdict
 import json
 from pathlib import Path
 from layout.damp_layout import Layout
+from layout.visualize_layout import log_layout
 import rerun as rr
 import random
 
@@ -50,7 +51,7 @@ def main() -> None:
     )
     rr.init("damp-layout")
     rr.spawn()
-    layout.log_rerun(step=0)
+    log_layout(layout, step=0)
     step_offset = 1
     layout.run(
         steps=22000,

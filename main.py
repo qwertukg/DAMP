@@ -9,6 +9,7 @@ from torchvision.datasets import MNIST
 from encoding.MnistSobelAngleMap import MnistSobelAngleMap
 from encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
 from layout.damp_layout import Layout
+from layout.visualize_layout import log_layout
 
 
 def _build_encoder() -> Encoder:
@@ -87,7 +88,7 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         eta=0.0,
         seed=0,
     )
-    layout.log_rerun(step=0)
+    log_layout(layout, step=0)
     step_offset = 1
     layout.run(
         steps=22000,
