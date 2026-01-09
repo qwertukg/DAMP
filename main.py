@@ -1,13 +1,14 @@
 from collections import defaultdict
+from encoding.visualize_encoding import show, wait_for_close
 
 import rerun as rr
 from PIL import Image
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
-from MnistSobelAngleMap import MnistSobelAngleMap
-from damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
-from damp_layout import Layout
+from encoding.MnistSobelAngleMap import MnistSobelAngleMap
+from encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
+from layout.damp_layout import Layout
 
 
 def _build_encoder() -> Encoder:
@@ -124,6 +125,8 @@ def main() -> None:
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
     count = 600
+
+
     for label in range(10):
         codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
         if not codes:
@@ -135,6 +138,8 @@ def main() -> None:
         rr.log("layout/image", rr.Image(image))
         filename = f"{label}-{count}-{total_codes}.png"
         Image.fromarray(image).save(filename)
+
+    wait_for_close()
 
 
 if __name__ == "__main__":

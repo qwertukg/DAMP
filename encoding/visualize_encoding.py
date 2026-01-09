@@ -10,7 +10,7 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
-from damp_encoder import ClosedDimension, DetectorWindow, Detectors, Encoder, OpenedDimension
+from encoding.damp_encoder import ClosedDimension, DetectorWindow, Detectors, Encoder, OpenedDimension
 
 _FIG_STATE: Optional["FigureState"] = None
 
