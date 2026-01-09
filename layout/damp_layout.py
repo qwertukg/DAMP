@@ -847,6 +847,19 @@ class Layout:
     def values(self) -> list[str]:
         return list(self._values)
 
+    def layout_codes(
+        self, class_label: float | int
+    ) -> tuple[Mapping[float, Sequence[BitArray]], float | int]:
+        ordered: dict[float, list[BitArray]] = {}
+        for y in range(self.height):
+            for x in range(self.width):
+                idx = self.grid[y][x]
+                if idx is None:
+                    continue
+                point = self._points[idx]
+                ordered.setdefault(point.label, []).append(point.code)
+        return ordered, class_label
+
     def colors_rgb(self) -> list[tuple[int, int, int]]:
         hues = self._normalized_hues()
         return [self._hue_to_rgb(hue) for hue in hues]

@@ -123,6 +123,8 @@ def main() -> None:
         step_offset=step_offset,
     )
 
+    cortex0 = layout.layout_codes(0) # will be used for next steps
+
     wait_for_close()
 
 
