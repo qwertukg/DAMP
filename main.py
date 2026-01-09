@@ -1,15 +1,15 @@
 from collections import defaultdict
-from encoding.visualize_encoding import show, wait_for_close
+from damp.encoding.visualize_encoding import show, wait_for_close
 
 import rerun as rr
 from PIL import Image
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
-from encoding.MnistSobelAngleMap import MnistSobelAngleMap
-from encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
-from layout.damp_layout import Layout
-from layout.visualize_layout import log_layout
+from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
+from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
+from damp.layout.damp_layout import Layout
+from damp.layout.visualize_layout import log_layout
 
 
 def _build_encoder() -> Encoder:
@@ -125,7 +125,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 600
+    count = 60
 
 
     for label in range(10):

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import atexit
+import json
 import math
 import random
 from collections import defaultdict
 from typing import Iterable, Mapping, Sequence
 
-from encoding.MnistSobelAngleMap import MnistSobelAngleMap
-from encoding.damp_encoder import Encoder
-from layout.damp_layout import Layout, BitArray as LayoutBitArray
+from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
+from damp.encoding.damp_encoder import Encoder
+from damp.layout.damp_layout import Layout, BitArray as LayoutBitArray
 
 LOG_ENABLED = True
 LOG_EVERY = 50
+LOG_DECODE_DETAILS = False
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,25 @@ class CodeVector:
     bits: int
     ones: int
     length: int
+
+
+@dataclass
+class _RunningStats:
+    count: int = 0
+    total: float = 0.0
+    min: float | None = None
+    max: float | None = None
+
+    def add(self, value: float) -> None:
+        self.count += 1
+        self.total += value
+        if self.min is None or value < self.min:
+            self.min = value
+        if self.max is None or value > self.max:
+            self.max = value
+
+    def mean(self) -> float:
+        return self.total / self.count if self.count else 0.0
 
 
 @dataclass(frozen=True)
@@ -139,9 +161,99 @@ class HierarchyModel:
     embed_l3: EmbedParams
 
 
-def _log(message: str) -> None:
+def _log(group: str, message: str) -> None:
     if LOG_ENABLED:
-        print(message)
+        print(f"[{group}] {message}")
+
+
+_DECODE_STATS: dict[str, object] | None = None
+_DECODE_REGISTERED = False
+
+
+def _get_decode_stats() -> dict[str, object]:
+    global _DECODE_STATS, _DECODE_REGISTERED
+    if _DECODE_STATS is None:
+        _DECODE_STATS = {
+            "total": 0,
+            "correct": 0,
+            "topk_correct": 0,
+            "top_k": None,
+            "none_pred": 0,
+            "top1_stats": _RunningStats(),
+            "label_counts": defaultdict(int),
+            "pred_counts": defaultdict(int),
+            "confusion": defaultdict(lambda: defaultdict(int)),
+        }
+    if not _DECODE_REGISTERED:
+        atexit.register(_log_decode_summary)
+        _DECODE_REGISTERED = True
+    return _DECODE_STATS
+
+
+def _log_decode_summary() -> None:
+    stats = _DECODE_STATS
+    if not stats:
+        return
+    total = int(stats["total"])
+    if total <= 0:
+        return
+    correct = int(stats["correct"])
+    topk_correct = int(stats["topk_correct"])
+    none_pred = int(stats["none_pred"])
+    top_k = stats["top_k"]
+    accuracy = correct / total if total else 0.0
+    topk_accuracy = None
+    if isinstance(top_k, int) and top_k > 0:
+        topk_accuracy = topk_correct / total if total else 0.0
+
+    label_counts = stats["label_counts"]
+    pred_counts = stats["pred_counts"]
+    confusion = stats["confusion"]
+    labels = sorted(label_counts.keys())
+    per_label_accuracy: dict[int, float] = {}
+    confusion_matrix: list[list[int]] = []
+    for label in labels:
+        row = []
+        correct_label = int(confusion[label].get(label, 0))
+        total_label = int(label_counts[label])
+        per_label_accuracy[label] = (correct_label / total_label) if total_label else 0.0
+        for pred_label in labels:
+            row.append(int(confusion[label].get(pred_label, 0)))
+        confusion_matrix.append(row)
+
+    top1_stats = stats["top1_stats"]
+    topk_label = "varied"
+    if isinstance(top_k, int) and top_k > 0:
+        topk_label = str(top_k)
+    topk_part = f"topk={topk_label}"
+    if topk_accuracy is not None:
+        topk_part = f"{topk_part} topk_accuracy={topk_accuracy:.4f}"
+    _log(
+        "decode",
+        f"summary total={total} accuracy={accuracy:.4f} "
+        f"none_pred={none_pred} {topk_part}",
+    )
+    if isinstance(top1_stats, _RunningStats) and top1_stats.count:
+        _log(
+            "decode",
+            "top1_score "
+            f"avg={top1_stats.mean():.4f} "
+            f"min={0.0 if top1_stats.min is None else top1_stats.min:.4f} "
+            f"max={0.0 if top1_stats.max is None else top1_stats.max:.4f}",
+        )
+    _log("decode", f"labels={json.dumps(labels, ensure_ascii=True)}")
+    _log(
+        "decode",
+        f"per_label_accuracy={json.dumps(per_label_accuracy, ensure_ascii=True)}",
+    )
+    _log(
+        "decode",
+        f"pred_counts={json.dumps(dict(pred_counts), ensure_ascii=True)}",
+    )
+    _log(
+        "decode",
+        f"confusion={json.dumps(confusion_matrix, ensure_ascii=True)}",
+    )
 
 
 def _detector_count(hierarchy: DetectorHierarchy) -> int:
@@ -414,13 +526,16 @@ def _build_energy_map(
             if energy > emax:
                 emax = energy
     if emax <= 0.0:
-        _log("[energy] max=0.0 (empty or weak similarities)")
+        _log("detectors", "energy_map max=0.0 (empty or weak similarities)")
         return energies
     for y in range(space.height):
         for x in range(space.width):
             if energies[y][x] > 0.0:
                 energies[y][x] /= emax
-    _log(f"[energy] built radius={radius} lambda={lambda_threshold:.3f} max={emax:.4f}")
+    _log(
+        "detectors",
+        f"energy_map built radius={radius} lambda={lambda_threshold:.3f} max={emax:.4f}",
+    )
     return energies
 
 
@@ -522,7 +637,27 @@ def build_detectors(space: CodeSpace, params: DetectorBuildParams) -> DetectorHi
         or space.eta != params.eta
     )
     _log(
-        "[build_detectors] space="
+        "detectors",
+        "params "
+        f"lambda_levels={list(params.lambda_levels)} "
+        f"activation_radius={params.activation_radius} "
+        f"energy_radius={params.energy_radius} "
+        f"code_len={params.detector_code_length} "
+        f"cluster_eps={params.cluster_eps} "
+        f"cluster_min_points={params.cluster_min_points} "
+        f"energy_threshold_mu={params.energy_threshold_mu} "
+        f"energy_lambda={energy_lambda} "
+        f"max_attempts={params.max_attempts} "
+        f"max_detectors_per_layer={params.max_detectors_per_layer} "
+        f"min_radius={params.min_radius} "
+        f"patience={params.patience} "
+        f"similarity={params.similarity} "
+        f"eta={params.eta} "
+        f"seed={params.seed}"
+    )
+    _log(
+        "detectors",
+        "space "
         f"{space.height}x{space.width} code_len={space.code_length} "
         f"layers={len(params.lambda_levels)}"
     )
@@ -540,7 +675,8 @@ def build_detectors(space: CodeSpace, params: DetectorBuildParams) -> DetectorHi
         space.eta = params.eta
     else:
         _log(
-            "[build_detectors] reuse energy map "
+            "detectors",
+            "reuse energy map "
             f"radius={space.energy_radius} lambda={space.energy_lambda}"
         )
 
@@ -552,12 +688,46 @@ def build_detectors(space: CodeSpace, params: DetectorBuildParams) -> DetectorHi
     ]
     if not coords:
         raise ValueError("space contains no points")
+    space_total = space.height * space.width
+    density = (len(coords) / space_total) if space_total else 0.0
+    _log(
+        "detectors",
+        f"space density={density:.3f} filled={len(coords)}/{space_total}",
+    )
+    if space.energy is not None:
+        energy_min = None
+        energy_max = None
+        energy_sum = 0.0
+        energy_count = 0
+        above_mu = 0
+        for y, x in coords:
+            energy = float(space.energy[y][x])
+            if energy_min is None or energy < energy_min:
+                energy_min = energy
+            if energy_max is None or energy > energy_max:
+                energy_max = energy
+            energy_sum += energy
+            energy_count += 1
+            if energy >= params.energy_threshold_mu:
+                above_mu += 1
+        energy_avg = (energy_sum / energy_count) if energy_count else 0.0
+        above_mu_frac = (above_mu / energy_count) if energy_count else 0.0
+        _log(
+            "detectors",
+            "energy_map stats "
+            f"min={0.0 if energy_min is None else energy_min:.4f} "
+            f"max={0.0 if energy_max is None else energy_max:.4f} "
+            f"avg={energy_avg:.4f} "
+            f"above_mu={above_mu}/{energy_count} "
+            f"above_mu_frac={above_mu_frac:.3f}",
+        )
 
     rng = random.Random(params.seed)
     layers: list[DetectorLayer] = []
     for layer_index, lambda_d in enumerate(params.lambda_levels):
         _log(
-            "[build_detectors] layer "
+            "detectors",
+            "layer "
             f"{layer_index + 1}/{len(params.lambda_levels)} lambda={lambda_d:.3f}"
         )
         detectors: list[Detector] = []
@@ -599,16 +769,43 @@ def build_detectors(space: CodeSpace, params: DetectorBuildParams) -> DetectorHi
             attempts += 1
             if attempts % progress_every == 0:
                 _log(
-                    "[build_detectors] layer "
+                    "detectors",
+                    "layer "
                     f"{layer_index + 1} attempts={attempts} detectors={len(detectors)}"
                 )
         _log(
-            "[build_detectors] layer "
+            "detectors",
+            "layer "
             f"{layer_index + 1} done detectors={len(detectors)} attempts={attempts}"
         )
+        if detectors:
+            radius_stats = _RunningStats()
+            energy_stats = _RunningStats()
+            n_stats = _RunningStats()
+            fill_stats = _RunningStats()
+            for detector in detectors:
+                radius_stats.add(float(detector.radius))
+                energy_stats.add(float(detector.energy))
+                n_stats.add(float(detector.n))
+                fill_stats.add(float(_fill_factor(detector)))
+            _log(
+                "detectors",
+                "layer "
+                f"{layer_index + 1} stats "
+                f"radius_avg={radius_stats.mean():.2f} "
+                f"radius_min={0.0 if radius_stats.min is None else radius_stats.min:.2f} "
+                f"radius_max={0.0 if radius_stats.max is None else radius_stats.max:.2f} "
+                f"energy_avg={energy_stats.mean():.2f} "
+                f"energy_min={0.0 if energy_stats.min is None else energy_stats.min:.2f} "
+                f"energy_max={0.0 if energy_stats.max is None else energy_stats.max:.2f} "
+                f"n_avg={n_stats.mean():.2f} "
+                f"n_min={0.0 if n_stats.min is None else n_stats.min:.0f} "
+                f"n_max={0.0 if n_stats.max is None else n_stats.max:.0f} "
+                f"fill_avg={fill_stats.mean():.2f}",
+            )
         layers.append(DetectorLayer(lambda_d=lambda_d, detectors=detectors))
     hierarchy = DetectorHierarchy(layers=layers, code_length=params.detector_code_length)
-    _log(f"[build_detectors] done total_detectors={_detector_count(hierarchy)}")
+    _log("detectors", f"done total_detectors={_detector_count(hierarchy)}")
     return hierarchy
 
 
@@ -642,11 +839,76 @@ def _color_merge(
     return CodeVector(bits, ones, code_length)
 
 
+def _init_embed_stats(layer_count: int) -> dict[str, object]:
+    return {
+        "samples": 0,
+        "active_total": 0,
+        "active_min": None,
+        "active_max": None,
+        "active_by_layer": [0 for _ in range(layer_count)],
+    }
+
+
+def _update_embed_stats(
+    stats: dict[str, object],
+    active_total: int,
+    active_by_layer: list[int],
+) -> None:
+    stats["samples"] = int(stats["samples"]) + 1
+    stats["active_total"] = int(stats["active_total"]) + active_total
+    active_min = stats["active_min"]
+    active_max = stats["active_max"]
+    if active_min is None or active_total < int(active_min):
+        stats["active_min"] = active_total
+    if active_max is None or active_total > int(active_max):
+        stats["active_max"] = active_total
+    layer_totals = stats["active_by_layer"]
+    for idx, count in enumerate(active_by_layer):
+        layer_totals[idx] += count
+
+
+def _log_embed_activity(
+    level: str,
+    stats: dict[str, object],
+    detectors: DetectorHierarchy,
+) -> None:
+    samples = int(stats["samples"])
+    if samples <= 0:
+        return
+    active_total = int(stats["active_total"])
+    avg_active = active_total / samples if samples else 0.0
+    active_min = stats["active_min"]
+    active_max = stats["active_max"]
+    layer_totals = stats["active_by_layer"]
+    per_layer = []
+    for idx, layer in enumerate(detectors.layers):
+        layer_count = len(layer.detectors)
+        avg_layer = layer_totals[idx] / samples if samples else 0.0
+        frac_layer = (avg_layer / layer_count) if layer_count else 0.0
+        per_layer.append(
+            {
+                "layer": idx + 1,
+                "avg_active": round(avg_layer, 2),
+                "frac": round(frac_layer, 3),
+            }
+        )
+    _log(
+        "embed",
+        f"{level} active_detectors "
+        f"avg={avg_active:.2f} "
+        f"min={0 if active_min is None else active_min} "
+        f"max={0 if active_max is None else active_max} "
+        f"per_layer={json.dumps(per_layer, ensure_ascii=True)}",
+    )
+
+
 def embed_stimulus(
     stimuli: Sequence[object],
     space: CodeSpace,
     detectors: DetectorHierarchy,
     params: EmbedParams,
+    *,
+    stats: dict[str, object] | None = None,
 ) -> CodeVector:
     if not detectors.layers:
         return CodeVector(0, 0, detectors.code_length)
@@ -662,6 +924,7 @@ def embed_stimulus(
         raise ValueError("space energy map is not available")
 
     active_detectors: list[Detector] = []
+    active_by_layer = [0 for _ in range(len(detectors.layers))] if stats is not None else None
     for layer in detectors.layers:
         for detector in layer.detectors:
             if detector.energy <= 0.0:
@@ -688,6 +951,10 @@ def embed_stimulus(
             level = energy_sum / detector.energy
             if level >= params.mu_d:
                 active_detectors.append(detector)
+                if active_by_layer is not None:
+                    active_by_layer[detector.layer_index] += 1
+    if stats is not None and active_by_layer is not None:
+        _update_embed_stats(stats, len(active_detectors), active_by_layer)
     return _color_merge(active_detectors, detectors.code_length, params.sigma, params.merge_order)
 
 
@@ -708,17 +975,33 @@ def build_layout_from_embeddings(
 ) -> Layout:
     codes: dict[float, list[LayoutBitArray]] = {}
     total_embeddings = 0
+    ones_stats = _RunningStats()
+    zero_codes = 0
+    label_counts: dict[int, int] = {}
     for label, entries in embeddings_by_label.items():
         bucket: list[LayoutBitArray] = []
+        label_counts[int(label)] = len(entries)
         for code in entries:
             bucket.append(_codevector_to_layout(code))
+            ones_stats.add(float(code.ones))
+            if code.ones == 0:
+                zero_codes += 1
         codes[float(label)] = bucket
         total_embeddings += len(entries)
-    _log(f"[layout] build labels={len(embeddings_by_label)} total={total_embeddings}")
+    zero_frac = (zero_codes / total_embeddings) if total_embeddings else 0.0
+    _log(
+        "layout",
+        f"build labels={len(embeddings_by_label)} total={total_embeddings} "
+        f"ones_avg={ones_stats.mean():.2f} "
+        f"ones_min={0 if ones_stats.min is None else ones_stats.min:.0f} "
+        f"ones_max={0 if ones_stats.max is None else ones_stats.max:.0f} "
+        f"zero_frac={zero_frac:.3f} "
+        f"per_label_counts={json.dumps(dict(sorted(label_counts.items())), ensure_ascii=True)}",
+    )
     layout = Layout(codes, **config.layout_kwargs)
     for run in config.run_schedule:
         layout.run(**run)
-    _log(f"[layout] done grid={layout.height}x{layout.width}")
+    _log("layout", f"done grid={layout.height}x{layout.width}")
     return layout
 
 
@@ -744,14 +1027,21 @@ def space_from_layout(layout: Layout) -> CodeSpace:
     )
 
 
-def encode_image(image: object, encoder: Encoder, extractor: MnistSobelAngleMap) -> list[CodeVector]:
+def encode_image(
+    image: object,
+    encoder: Encoder,
+    extractor: MnistSobelAngleMap,
+    *,
+    label: int | None = None,
+) -> list[CodeVector]:
     if hasattr(image, "numpy"):
         img = image.numpy()
     else:
         img = image
     if hasattr(img, "squeeze"):
         img = img.squeeze()
-    data = extractor.extract(img, 0)
+    extract_label = 0 if label is None else int(label)
+    data = extractor.extract(img, extract_label)
     values = next(iter(data.values()), [])
     stimuli: list[CodeVector] = []
     for angle, x, y in values:
@@ -764,65 +1054,217 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
     total = None
     if hasattr(train_images, "__len__"):
         total = len(train_images)  # type: ignore[arg-type]
-    _log(f"[train] start samples={total if total is not None else 'unknown'}")
+    _log("levels", f"train start samples={total if total is not None else 'unknown'}")
     d1 = build_detectors(config.v0, config.build_l1)
-    _log(f"[train] D1 detectors={_detector_count(d1)}")
+    _log("levels", f"D1 detectors={_detector_count(d1)}")
+    _log(
+        "embed",
+        "L1 params "
+        f"lambda_activation={config.embed_l1.lambda_activation} "
+        f"mu_e={config.embed_l1.mu_e} "
+        f"mu_d={config.embed_l1.mu_d} "
+        f"sigma={config.embed_l1.sigma} "
+        f"similarity={config.embed_l1.similarity} "
+        f"eta={config.embed_l1.eta} "
+        f"merge_order={config.embed_l1.merge_order}",
+    )
 
     c1_by_label: dict[int, list[CodeVector]] = defaultdict(list)
     c1_ordered: list[tuple[CodeVector, int]] = []
-    ones_sum = 0
+    c1_ones = _RunningStats()
+    c1_zero = 0
+    c1_sigma_hits = 0
+    stimuli_stats = _RunningStats()
+    stimuli_zero = 0
+    stimuli_per_label_count: dict[int, int] = defaultdict(int)
+    stimuli_per_label_sum: dict[int, int] = defaultdict(int)
+    stimuli_per_label_zero: dict[int, int] = defaultdict(int)
+    stimulus_ones = _RunningStats()
+    embed_stats_l1 = _init_embed_stats(len(d1.layers))
     for idx, (image, label) in enumerate(train_images, start=1):
-        stimuli = encode_image(image, config.encoder, config.extractor)
-        c1 = embed_stimulus(stimuli, config.v0, d1, config.embed_l1)
-        c1_by_label[int(label)].append(c1)
-        c1_ordered.append((c1, int(label)))
-        ones_sum += c1.ones
+        label_int = int(label)
+        stimuli = encode_image(image, config.encoder, config.extractor, label=label_int)
+        stimuli_count = len(stimuli)
+        stimuli_stats.add(float(stimuli_count))
+        stimuli_per_label_count[label_int] += 1
+        stimuli_per_label_sum[label_int] += stimuli_count
+        if stimuli_count == 0:
+            stimuli_zero += 1
+            stimuli_per_label_zero[label_int] += 1
+        for stim_code in stimuli:
+            stimulus_ones.add(float(stim_code.ones))
+        c1 = embed_stimulus(stimuli, config.v0, d1, config.embed_l1, stats=embed_stats_l1)
+        c1_by_label[label_int].append(c1)
+        c1_ordered.append((c1, label_int))
+        c1_ones.add(float(c1.ones))
+        if c1.ones == 0:
+            c1_zero += 1
+        if c1.ones >= config.embed_l1.sigma:
+            c1_sigma_hits += 1
         if idx % LOG_EVERY == 0:
             suffix = f"/{total}" if total is not None else ""
-            avg = ones_sum / idx if idx else 0.0
-            _log(f"[train] L1 embeddings {idx}{suffix} avg_ones={avg:.1f}")
+            avg_ones = c1_ones.mean()
+            avg_stimuli = stimuli_stats.mean()
+            _log(
+                "embed",
+                f"L1 embeddings {idx}{suffix} avg_ones={avg_ones:.1f} "
+                f"avg_stimuli={avg_stimuli:.1f}",
+            )
     if c1_ordered:
-        avg = ones_sum / len(c1_ordered)
-        _log(f"[train] L1 done count={len(c1_ordered)} avg_ones={avg:.1f}")
+        avg_ones = c1_ones.mean()
+        avg_stimuli = stimuli_stats.mean()
+        zero_frac = c1_zero / len(c1_ordered)
+        sigma_frac = c1_sigma_hits / len(c1_ordered)
+        _log(
+            "embed",
+            "L1 done "
+            f"count={len(c1_ordered)} avg_ones={avg_ones:.1f} "
+            f"min_ones={0 if c1_ones.min is None else c1_ones.min:.0f} "
+            f"max_ones={0 if c1_ones.max is None else c1_ones.max:.0f} "
+            f"zero_frac={zero_frac:.3f} "
+            f"sigma_frac={sigma_frac:.3f} "
+            f"avg_stimuli={avg_stimuli:.1f} "
+            f"min_stimuli={0 if stimuli_stats.min is None else stimuli_stats.min:.0f} "
+            f"max_stimuli={0 if stimuli_stats.max is None else stimuli_stats.max:.0f}",
+        )
+        stim_zero_frac = stimuli_zero / len(c1_ordered) if c1_ordered else 0.0
+        per_label_avg = {
+            label: (stimuli_per_label_sum[label] / stimuli_per_label_count[label])
+            if stimuli_per_label_count[label]
+            else 0.0
+            for label in sorted(stimuli_per_label_count.keys())
+        }
+        per_label_zero = {
+            label: (stimuli_per_label_zero[label] / stimuli_per_label_count[label])
+            if stimuli_per_label_count[label]
+            else 0.0
+            for label in sorted(stimuli_per_label_count.keys())
+        }
+        _log(
+            "measure",
+            "stimuli_per_image "
+            f"avg={stimuli_stats.mean():.2f} "
+            f"min={0 if stimuli_stats.min is None else stimuli_stats.min:.0f} "
+            f"max={0 if stimuli_stats.max is None else stimuli_stats.max:.0f} "
+            f"zero_frac={stim_zero_frac:.3f} "
+            f"per_label_count={json.dumps(dict(sorted(stimuli_per_label_count.items())), ensure_ascii=True)} "
+            f"per_label_avg={json.dumps(per_label_avg, ensure_ascii=True)} "
+            f"per_label_zero_frac={json.dumps(per_label_zero, ensure_ascii=True)}",
+        )
+        _log(
+            "encode",
+            "stimulus_code_ones "
+            f"avg={stimulus_ones.mean():.2f} "
+            f"min={0 if stimulus_ones.min is None else stimulus_ones.min:.0f} "
+            f"max={0 if stimulus_ones.max is None else stimulus_ones.max:.0f} "
+            f"count={stimulus_ones.count}",
+        )
+        _log_embed_activity("L1", embed_stats_l1, d1)
 
     layout1 = build_layout_from_embeddings(c1_by_label, config.layout_l2)
     v1 = space_from_layout(layout1)
     d2 = build_detectors(v1, config.build_l2)
-    _log(f"[train] D2 detectors={_detector_count(d2)}")
+    _log("levels", f"D2 detectors={_detector_count(d2)}")
+    _log(
+        "embed",
+        "L2 params "
+        f"lambda_activation={config.embed_l2.lambda_activation} "
+        f"mu_e={config.embed_l2.mu_e} "
+        f"mu_d={config.embed_l2.mu_d} "
+        f"sigma={config.embed_l2.sigma} "
+        f"similarity={config.embed_l2.similarity} "
+        f"eta={config.embed_l2.eta} "
+        f"merge_order={config.embed_l2.merge_order}",
+    )
 
     c2_by_label: dict[int, list[CodeVector]] = defaultdict(list)
     c2_ordered: list[tuple[CodeVector, int]] = []
-    ones_sum = 0
+    c2_ones = _RunningStats()
+    c2_zero = 0
+    c2_sigma_hits = 0
+    embed_stats_l2 = _init_embed_stats(len(d2.layers))
     for idx, (c1, label) in enumerate(c1_ordered, start=1):
-        c2 = embed_stimulus([c1], v1, d2, config.embed_l2)
+        c2 = embed_stimulus([c1], v1, d2, config.embed_l2, stats=embed_stats_l2)
         c2_by_label[int(label)].append(c2)
         c2_ordered.append((c2, int(label)))
-        ones_sum += c2.ones
+        c2_ones.add(float(c2.ones))
+        if c2.ones == 0:
+            c2_zero += 1
+        if c2.ones >= config.embed_l2.sigma:
+            c2_sigma_hits += 1
         if idx % LOG_EVERY == 0:
-            avg = ones_sum / idx if idx else 0.0
-            _log(f"[train] L2 embeddings {idx}/{len(c1_ordered)} avg_ones={avg:.1f}")
+            avg = c2_ones.mean()
+            _log("embed", f"L2 embeddings {idx}/{len(c1_ordered)} avg_ones={avg:.1f}")
     if c2_ordered:
-        avg = ones_sum / len(c2_ordered)
-        _log(f"[train] L2 done count={len(c2_ordered)} avg_ones={avg:.1f}")
+        avg = c2_ones.mean()
+        zero_frac = c2_zero / len(c2_ordered)
+        sigma_frac = c2_sigma_hits / len(c2_ordered)
+        _log(
+            "embed",
+            "L2 done "
+            f"count={len(c2_ordered)} avg_ones={avg:.1f} "
+            f"min_ones={0 if c2_ones.min is None else c2_ones.min:.0f} "
+            f"max_ones={0 if c2_ones.max is None else c2_ones.max:.0f} "
+            f"zero_frac={zero_frac:.3f} "
+            f"sigma_frac={sigma_frac:.3f}",
+        )
+        _log_embed_activity("L2", embed_stats_l2, d2)
 
     layout2 = build_layout_from_embeddings(c2_by_label, config.layout_l3)
     v2 = space_from_layout(layout2)
     d3 = build_detectors(v2, config.build_l3)
-    _log(f"[train] D3 detectors={_detector_count(d3)}")
+    _log("levels", f"D3 detectors={_detector_count(d3)}")
+    _log(
+        "embed",
+        "L3 params "
+        f"lambda_activation={config.embed_l3.lambda_activation} "
+        f"mu_e={config.embed_l3.mu_e} "
+        f"mu_d={config.embed_l3.mu_d} "
+        f"sigma={config.embed_l3.sigma} "
+        f"similarity={config.embed_l3.similarity} "
+        f"eta={config.embed_l3.eta} "
+        f"merge_order={config.embed_l3.merge_order}",
+    )
 
     memory: list[MemoryEntry] = []
-    ones_sum = 0
+    c3_ones = _RunningStats()
+    c3_zero = 0
+    c3_sigma_hits = 0
+    embed_stats_l3 = _init_embed_stats(len(d3.layers))
     for idx, (c2, label) in enumerate(c2_ordered, start=1):
-        c3 = embed_stimulus([c2], v2, d3, config.embed_l3)
+        c3 = embed_stimulus([c2], v2, d3, config.embed_l3, stats=embed_stats_l3)
         memory.append(MemoryEntry(code=c3, label=label))
-        ones_sum += c3.ones
+        c3_ones.add(float(c3.ones))
+        if c3.ones == 0:
+            c3_zero += 1
+        if c3.ones >= config.embed_l3.sigma:
+            c3_sigma_hits += 1
         if idx % LOG_EVERY == 0:
-            avg = ones_sum / idx if idx else 0.0
-            _log(f"[train] L3 embeddings {idx}/{len(c2_ordered)} avg_ones={avg:.1f}")
+            avg = c3_ones.mean()
+            _log("embed", f"L3 embeddings {idx}/{len(c2_ordered)} avg_ones={avg:.1f}")
     if memory:
-        avg = ones_sum / len(memory)
-        _log(f"[train] L3 done count={len(memory)} avg_ones={avg:.1f}")
-    _log(f"[train] memory size={len(memory)}")
+        avg = c3_ones.mean()
+        zero_frac = c3_zero / len(memory)
+        sigma_frac = c3_sigma_hits / len(memory)
+        _log(
+            "embed",
+            "L3 done "
+            f"count={len(memory)} avg_ones={avg:.1f} "
+            f"min_ones={0 if c3_ones.min is None else c3_ones.min:.0f} "
+            f"max_ones={0 if c3_ones.max is None else c3_ones.max:.0f} "
+            f"zero_frac={zero_frac:.3f} "
+            f"sigma_frac={sigma_frac:.3f}",
+        )
+        _log_embed_activity("L3", embed_stats_l3, d3)
+    _log("levels", f"memory size={len(memory)}")
+    if memory:
+        mem_label_counts: dict[int, int] = defaultdict(int)
+        for entry in memory:
+            mem_label_counts[int(entry.label)] += 1
+        _log(
+            "levels",
+            f"memory labels={json.dumps(dict(sorted(mem_label_counts.items())), ensure_ascii=True)}",
+        )
 
     return HierarchyModel(
         v0=config.v0,
@@ -867,15 +1309,40 @@ def infer(
     *,
     top_k: int = 5,
     similarity: str = "cosine",
+    label: int | None = None,
 ) -> tuple[int | None, list[tuple[int, float]]]:
     stimuli = encode_image(image, model.encoder, model.extractor)
-    _log(f"[infer] stimuli={len(stimuli)}")
+    if LOG_DECODE_DETAILS:
+        _log("decode", f"stimuli={len(stimuli)}")
     c1 = embed_stimulus(stimuli, model.v0, model.d1, model.embed_l1)
     c2 = embed_stimulus([c1], model.v1, model.d2, model.embed_l2)
     c3 = embed_stimulus([c2], model.v2, model.d3, model.embed_l3)
-    _log(f"[infer] C1 ones={c1.ones} C2 ones={c2.ones} C3 ones={c3.ones}")
+    if LOG_DECODE_DETAILS:
+        _log("decode", f"C1 ones={c1.ones} C2 ones={c2.ones} C3 ones={c3.ones}")
     predicted, top = _decode_memory(c3, model.memory, top_k, similarity)
-    if top:
-        _log(f"[infer] top1 label={top[0][0]} score={top[0][1]:.4f}")
-    _log(f"[infer] predicted={predicted}")
+    if LOG_DECODE_DETAILS and top:
+        _log("decode", f"top1 label={top[0][0]} score={top[0][1]:.4f}")
+    if LOG_DECODE_DETAILS:
+        _log("decode", f"predicted={predicted}")
+    if label is not None:
+        stats = _get_decode_stats()
+        stats["total"] = int(stats["total"]) + 1
+        label_int = int(label)
+        stats["label_counts"][label_int] += 1
+        if predicted is None:
+            stats["none_pred"] = int(stats["none_pred"]) + 1
+        else:
+            pred_int = int(predicted)
+            stats["pred_counts"][pred_int] += 1
+            stats["confusion"][label_int][pred_int] += 1
+            if pred_int == label_int:
+                stats["correct"] = int(stats["correct"]) + 1
+        if top:
+            stats["top1_stats"].add(float(top[0][1]))
+            if any(lbl == label_int for lbl, _score in top):
+                stats["topk_correct"] = int(stats["topk_correct"]) + 1
+        if stats["top_k"] is None:
+            stats["top_k"] = int(top_k)
+        elif isinstance(stats["top_k"], int) and stats["top_k"] != int(top_k):
+            stats["top_k"] = 0
     return predicted, top

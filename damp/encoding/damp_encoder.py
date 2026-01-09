@@ -4,6 +4,13 @@ from dataclasses import dataclass
 import random
 from typing import Iterable, List, Optional, Sequence, Tuple
 
+LOG_ENABLED = True
+
+
+def _log(message: str) -> None:
+    if LOG_ENABLED:
+        print(f"[encode] {message}")
+
 
 @dataclass(frozen=True)
 class Detectors:
@@ -133,6 +140,17 @@ class Encoder:
         self._random_bit = False
         if random_bit:
             self.random_bit = True
+        dim_summaries = []
+        for dim in self.dimensions:
+            status = "closed" if dim.closed else "open"
+            layers = [(layer.count, layer.overlap) for layer in dim.detector_layers]
+            dim_summaries.append(
+                f"{dim.title}:{status} range=({dim.min_value},{dim.max_value}) layers={layers}"
+            )
+        _log(
+            f"encoder init dims={len(self.dimensions)} code_length={self.code_length} "
+            f"random_bit={self._random_bit} dims={dim_summaries}"
+        )
 
     @property
     def random_bit(self) -> bool:

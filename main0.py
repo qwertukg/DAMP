@@ -1,17 +1,17 @@
-from encoding.damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
-from encoding.visualize_encoding import show, wait_for_close
+from damp.encoding.damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
+from damp.encoding.visualize_encoding import show, wait_for_close
 import numpy as np
-from encoding.MnistSobelAngleMap import MnistSobelAngleMap
+from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from collections import defaultdict
 import json
 from pathlib import Path
-from layout.damp_layout import Layout
-from layout.visualize_layout import log_layout
+from damp.layout.damp_layout import Layout
+from damp.layout.visualize_layout import log_layout
 import rerun as rr
 import random
-from damp_hierarchy import (
+from damp.decoding.damp_hierarchy import (
     DetectorBuildParams,
     EmbedParams,
     HierarchyConfig,
@@ -23,7 +23,14 @@ from damp_hierarchy import (
 
 
 def main() -> None:
+
+    # 0. Подготавливаем MNIST и делитель картинок Собеля
+    total_codes = 0
+    codes = defaultdict(list)
+    dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
+    extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
     
+    # 1. Создаем Энкодер и слои первичные детекторы
     encoder = Encoder(
         # Angle
         ClosedDimension("Angle", (0.0, 360.0), [
@@ -51,25 +58,21 @@ def main() -> None:
         ]),
     )
 
-    total_codes = 0
-    codes = defaultdict(list)
-    dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
-    extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+
+    
+
+    # количество картинок
+    count = 100
 
 
-    value = 1
-
-
-    count = 600
-
-
+    # достаем картинки из MNIST
     digits = []
     for img_tensor, label in dataset:
-        if int(label) == value:
-            digits.append((img_tensor, label))
-            if len(digits) == count:
-                break
+        digits.append((img_tensor, label))
+        if len(digits) == count:
+            break
 
+    # кодируем картинки
     for i in range(len(digits)):
         img_tensor, label = digits[i]
         img = img_tensor.squeeze(0).numpy()
@@ -81,11 +84,14 @@ def main() -> None:
 
         for (a, x, y) in digitValues[label]:
             print(f"Encoding: {label} -> \t{a}\t{x}\t{y}")
+
+            # получаем разряженный битовый код
             values, code = encoder.encode(
                 float(a), 
                 float(x), 
                 float(y)
             )
+
             print(f"Encoded to: {values} -> {code}")
             codes[a].append(code)
             total_codes += 1
@@ -95,7 +101,7 @@ def main() -> None:
     print(f"{label}-{count}-{total_codes}")
     
 
-
+    # 2. Раскладка
     rr.init("damp-layout")
     rr.spawn()
     layout = Layout(
@@ -133,14 +139,9 @@ def main() -> None:
         step_offset=step_offset,
     )
 
-    # 
-    cortex = layout.layout_codes(value)
-    cortex_codes, _ = cortex
-    total_cortex_codes = sum(len(values) for values in cortex_codes.values())
-    if total_cortex_codes == 0:
-        raise ValueError("cortex is empty")
-
+    # 3. Детекторы
     v0 = space_from_layout(layout)
+
 
     build_l1 = DetectorBuildParams(
         lambda_levels=[0.5, 0.6, 0.7],
@@ -296,11 +297,27 @@ def main() -> None:
 
     model = train_hierarchy(digits, config)
 
-    n = random.randint(0, count-1)
-    test_image, _ = digits[n]
-    predicted, debug = infer(test_image, model, top_k=3, similarity="cosine")
-    print(f"infer for {value}:", predicted)
-    print("topk:", debug)
+    max_test_digits = 100
+    test_dataset = MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
+    test_digits = []
+    for img_tensor, label in test_dataset:
+        test_digits.append((img_tensor, label))
+        if len(test_digits) == max_test_digits:
+            break
+
+    correct = 0
+    total = len(test_digits)
+    print(f"Total test images: {total}")
+    for i in range(total):
+        test_digit_image, test_label = test_digits[i]
+        predicted, debug = infer(test_digit_image, model, top_k=3, similarity="cosine")
+        if predicted == int(test_label):
+            correct += 1
+            print("CORRECT!!!")
+        print(f"infer for {test_label}[{i}] -> {predicted}")
+    accuracy = (correct / total) if total else 0.0
+    print(f"total accuracy for {test_label}: {accuracy:.4f} ({correct}/{total})")
+
 
     wait_for_close()
 

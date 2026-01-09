@@ -1,14 +1,14 @@
-from encoding.damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
-from encoding.visualize_encoding import show, wait_for_close
+from damp.encoding.damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
+from damp.encoding.visualize_encoding import show, wait_for_close
 import numpy as np
-from encoding.MnistSobelAngleMap import MnistSobelAngleMap
+from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
 from torchvision.datasets import MNIST
 from torchvision import transforms
 from collections import defaultdict
 import json
 from pathlib import Path
-from layout.damp_layout import Layout
-from layout.visualize_layout import log_layout
+from damp.layout.damp_layout import Layout
+from damp.layout.visualize_layout import log_layout
 import rerun as rr
 import random
 

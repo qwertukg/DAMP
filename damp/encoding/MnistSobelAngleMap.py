@@ -5,6 +5,13 @@ from typing import ClassVar, Dict, List, Tuple, Union
 
 import numpy as np
 
+LOG_ENABLED = True
+
+
+def _log(message: str) -> None:
+    if LOG_ENABLED:
+        print(f"[measure] {message}")
+
 
 AngleTriplet = Tuple[float, int, int]      # (angle, X_patch, Y_patch)
 ResultMap = Dict[int, List[AngleTriplet]]  # label -> list of (angle, x, y)
@@ -31,6 +38,13 @@ class MnistSobelAngleMap:
     KY: ClassVar[np.ndarray] = np.array([[ 1,  2,  1],
                                          [ 0,  0,  0],
                                          [-1, -2, -1]], dtype=np.float32)
+
+    def __post_init__(self) -> None:
+        _log(
+            "MnistSobelAngleMap init "
+            f"angle_in_degrees={self.angle_in_degrees} "
+            f"grad_threshold={self.grad_threshold}"
+        )
 
     def extract(self, image: Union[np.ndarray, "np.typing.ArrayLike"], label: int) -> ResultMap:
         img = np.asarray(image, dtype=np.float32)

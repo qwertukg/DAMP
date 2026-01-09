@@ -7,6 +7,13 @@ import random
 from typing import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
+LOG_ENABLED = True
+
+
+def _log(message: str) -> None:
+    if LOG_ENABLED:
+        print(f"[layout] {message}")
+
 
 class BitArray:
     def __init__(self, size: int, fill: int = 0) -> None:
@@ -360,7 +367,7 @@ class _GpuLayoutEngine:
             import numpy as np
             import moderngl
         except Exception as exc:
-            print(f"Layout GPU: import failed ({exc})")
+            _log(f"gpu import failed ({exc})")
             return None
 
         try:
@@ -369,18 +376,19 @@ class _GpuLayoutEngine:
             try:
                 ctx = moderngl.create_standalone_context()
             except Exception as exc:
-                print(f"Layout GPU: context create failed ({exc})")
+                _log(f"gpu context create failed ({exc})")
                 return None
             if getattr(ctx, "version_code", 0) < 410:
-                print(
-                    f"Layout GPU: OpenGL version too low ({getattr(ctx, 'version_code', 0)})"
+                _log(
+                    "gpu OpenGL version too low "
+                    f"({getattr(ctx, 'version_code', 0)})"
                 )
                 return None
 
         try:
             return cls(ctx, np, moderngl, points, similarity)
         except Exception as exc:
-            print(f"Layout GPU: init failed ({exc})")
+            _log(f"gpu init failed ({exc})")
             return None
 
     @property
@@ -647,6 +655,14 @@ class Layout:
 
         self.height = grid_size
         self.width = grid_size
+        _log(
+            "init "
+            f"points={self._point_count} labels={len(self._codes)} "
+            f"grid={self.height}x{self.width} empty_ratio={empty_ratio} "
+            f"similarity={self._similarity} lambda={self._lambda} eta={self._eta} "
+            f"precompute_similarity={precompute_similarity} max_precompute={max_precompute} "
+            f"seed={seed} use_gpu={use_gpu} parallel_workers={parallel_workers}"
+        )
         self.grid: list[list[int | None]] = [
             [None for _ in range(self.width)] for _ in range(self.height)
         ]
@@ -663,9 +679,9 @@ class Layout:
             if self._gpu_engine is None:
                 self._use_gpu = False
         if self._use_gpu and self._gpu_engine is not None:
-            print("Layout GPU: enabled (OpenGL 4.1)")
+            _log("gpu enabled (OpenGL 4.1)")
         else:
-            print("Layout GPU: disabled (using CPU)")
+            _log("gpu disabled (using CPU)")
         self.last_steps = 0
         self._sim_base: list[list[float]] | None = None
         if precompute_similarity and self._point_count <= max_precompute:
@@ -711,6 +727,14 @@ class Layout:
         if energy_patience <= 0:
             raise ValueError("energy_patience must be positive")
 
+        _log(
+            "run start "
+            f"mode={mode} steps={steps} pairs_per_step={pairs_per_step} "
+            f"pair_radius={pair_radius} local_radius={local_radius} "
+            f"min_swap_ratio={min_swap_ratio} energy_radius={energy_radius} "
+            f"energy_check_every={energy_check_every} energy_delta={energy_delta} "
+            f"energy_patience={energy_patience} log_every={log_every}"
+        )
         total_swaps = 0
         min_swaps = 0
         if min_swap_ratio > 0:
@@ -747,6 +771,11 @@ class Layout:
                 break
 
         self.last_steps = steps_executed
+        avg_swaps = (total_swaps / steps_executed) if steps_executed else 0.0
+        _log(
+            "run done "
+            f"steps={steps_executed} total_swaps={total_swaps} avg_swaps={avg_swaps:.2f}"
+        )
         return total_swaps
 
     def set_similarity_params(
@@ -846,19 +875,6 @@ class Layout:
 
     def values(self) -> list[str]:
         return list(self._values)
-
-    def layout_codes(
-        self, class_label: float | int
-    ) -> tuple[Mapping[float, Sequence[BitArray]], float | int]:
-        ordered: dict[float, list[BitArray]] = {}
-        for y in range(self.height):
-            for x in range(self.width):
-                idx = self.grid[y][x]
-                if idx is None:
-                    continue
-                point = self._points[idx]
-                ordered.setdefault(point.label, []).append(point.code)
-        return ordered, class_label
 
     def colors_rgb(self) -> list[tuple[int, int, int]]:
         hues = self._normalized_hues()
@@ -1098,6 +1114,12 @@ class Layout:
 
     def _build_similarity_cache(self) -> None:
         point_count = self._point_count
+        workers = self._similarity_worker_count()
+        _log(
+            "similarity_cache start "
+            f"point_count={point_count} use_gpu={self._use_gpu} workers={workers}"
+        )
+        used_gpu = False
         if self._use_gpu:
             sim_base = self._build_similarity_cache_gpu()
             if sim_base is not None:
@@ -1108,6 +1130,8 @@ class Layout:
                             self._gpu_engine = None
                     except Exception:
                         self._gpu_engine = None
+                used_gpu = True
+                _log("similarity_cache done mode=gpu")
                 return
 
         sim_base: list[list[float]] = [
@@ -1116,7 +1140,6 @@ class Layout:
         for i in range(point_count):
             sim_base[i][i] = 1.0
 
-        workers = self._similarity_worker_count()
         if workers < 2:
             for i in range(point_count):
                 for j in range(i + 1, point_count):
@@ -1143,6 +1166,8 @@ class Layout:
                     self._gpu_engine = None
             except Exception:
                 self._gpu_engine = None
+        if not used_gpu:
+            _log("similarity_cache done mode=cpu")
 
     def _build_similarity_cache_gpu(self) -> list[list[float]] | None:
         if self._gpu_engine is not None:
@@ -1313,7 +1338,7 @@ class Layout:
         total_pairs = self._point_count * (self._point_count - 1) // 2
         if cpu_count < 2 or total_pairs < _PARALLEL_SIM_MIN_PAIRS:
             return 1
-        print(f"CPU Count: {cpu_count}")
+        _log(f"cpu_count={cpu_count}")
         return min(cpu_count, self._point_count)
 
     def _sim_lambda_idx(self, idx_a: int, idx_b: int | None) -> float:
