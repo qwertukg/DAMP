@@ -113,11 +113,14 @@ class Encoder:
         *dimensions: Dimension,
         random_bit: bool = False,
         random_seed: Optional[int] = None,
+        log_every: Optional[int] = None,
     ) -> None:
         if not dimensions:
             raise ValueError("at least one dimension is required")
         self.dimensions = list(dimensions)
         self._rng = random.Random(random_seed)
+        self.log_every = int(log_every) if log_every is not None else 0
+        self._log_state: object | None = None
         self.detectors: List[DetectorWindow] = []
         self._detectors_by_dimension: List[List[DetectorWindow]] = []
         next_index = 0
@@ -175,7 +178,13 @@ class Encoder:
     def randomBit(self, value: bool) -> None:
         self.random_bit = value
 
-    def encode(self, *values: float) -> Tuple[Tuple[float, ...], BitArray]:
+    def encode(
+        self,
+        *values: float,
+        log_image: object | None = None,
+        log_label: int | None = None,
+        log_measurements: Sequence[tuple[float, int, int]] | None = None,
+    ) -> Tuple[Tuple[float, ...], BitArray]:
         if len(values) != len(self.dimensions):
             raise ValueError("number of values must match number of dimensions")
         bit_array = BitArray(self.code_length)
@@ -196,6 +205,22 @@ class Encoder:
             for detector in self._detectors_by_dimension[dim_index]:
                 if detector.is_active(v):
                     bit_array.set(self._bit_map[detector.detector_index], 1)
+        if self.log_every > 0 and log_image is not None:
+            from damp.encoding import visualize_encoding as _viz
+
+            if self._log_state is None:
+                self._log_state = _viz.LogState()
+            label_value = int(log_label) if log_label is not None else None
+            _viz.log_encoding(
+                self,
+                normalized_values,
+                bit_array,
+                log_image,
+                label_value,
+                log_every=self.log_every,
+                state=self._log_state,
+                measurements=log_measurements,
+            )
         return tuple(normalized_values), bit_array
 
     def _build_layer_detectors(

@@ -24,14 +24,21 @@ from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, Open
 from damp.layout.damp_layout import Layout
 from damp.layout.visualize_layout import log_layout
 
-TRAIN_COUNT = 60000
-V0_TRAIN_COUNT: int | None = 800
-TEST_COUNT = 200
-V0_CACHE_PATH = Path("data/mnist_v0.json")
-LOG_LAYOUT_EVERY_LONG = 1
-LOG_LAYOUT_EVERY_SHORT = 1
-LOG_LAYOUT_EVERY_HIER_LONG = 1
-LOG_LAYOUT_EVERY_HIER_SHORT = 1
+TARGET_LABEL: int | None = 0
+TRAIN_COUNT: int | None = 700
+V0_TRAIN_COUNT: int | None = 700
+TEST_COUNT: int | None = 200
+NEGATIVE_TEST_COUNT: int | None = 0
+DECODE_MIN_VOTE: float | None = None
+V0_CACHE_PATH = (
+    Path("data/mnist_v0.json")
+    if TARGET_LABEL is None
+    else Path(f"data/mnist_v0_digit_{TARGET_LABEL}.json")
+)
+LOG_LAYOUT_EVERY_LONG = 100
+LOG_LAYOUT_EVERY_SHORT = 10
+LOG_LAYOUT_EVERY_HIER_LONG = 10
+LOG_LAYOUT_EVERY_HIER_SHORT = 10
 TOP_K = 7
 PER_LABEL_TOP_K = 7
 DECODE_SIMILARITY = "cosine"
@@ -40,13 +47,28 @@ LABEL_COUNT = 10
 PATCH_SIZE = 4
 PATCH_CENTER = PATCH_SIZE / 2.0
 HIERARCHY_LEVELS = 1
+LOG_ENCODING_EVERY=10
 
-
-def take_samples(dataset: MNIST, count: int) -> list[tuple[object, int]]:
+def take_samples(
+    dataset: MNIST,
+    count: int | None,
+    *,
+    label: int | None = None,
+    exclude_label: int | None = None,
+) -> list[tuple[object, int]]:
+    if label is not None and exclude_label is not None:
+        raise ValueError("label and exclude_label are mutually exclusive")
+    if count == 0:
+        return []
     samples: list[tuple[object, int]] = []
-    for img_tensor, label in dataset:
-        samples.append((img_tensor, int(label)))
-        if len(samples) == count:
+    for img_tensor, raw_label in dataset:
+        label_int = int(raw_label)
+        if label is not None and label_int != label:
+            continue
+        if exclude_label is not None and label_int == exclude_label:
+            continue
+        samples.append((img_tensor, label_int))
+        if count is not None and len(samples) == count:
             break
     return samples
 
@@ -139,6 +161,7 @@ def _log_dataset_stats(train_digits: list[tuple[object, int]], test_digits: list
             train_samples=len(train_digits),
             test_samples=len(test_digits),
             top_k=TOP_K,
+            target_label=-1 if TARGET_LABEL is None else TARGET_LABEL,
         ),
     )
     train_counts = _label_counts(train_digits)
@@ -199,7 +222,8 @@ def _infer_by_label_topk(
     top_k: int,
     per_label_k: int,
     similarity: str,
-) -> tuple[int | None, list[tuple[int, float]]]:
+    min_vote: float | None = None,
+) -> tuple[int | None, list[tuple[int, float]], float]:
     inputs = encode_image(image, model.encoder, model.extractor)
     code = embed_inputs(inputs, model.spaces[0], model.detectors[0], model.embed[0])
     for level_index in range(1, len(model.detectors)):
@@ -233,7 +257,10 @@ def _infer_by_label_topk(
         top_scores = scores[:take]
         votes[label] = sum(top_scores) / len(top_scores)
     predicted = max(votes.items(), key=lambda item: item[1])[0] if votes else None
-    return predicted, top
+    best_vote = votes.get(predicted, 0.0) if predicted is not None else 0.0
+    if min_vote is not None and predicted is not None and best_vote < min_vote:
+        predicted = None
+    return predicted, top, best_vote
 
 
 def main() -> None:
@@ -248,14 +275,24 @@ def main() -> None:
     test_dataset = MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(
         angle_in_degrees=True,  # возвращать угол в градусах, влияет на шкалу значений угла
-        grad_threshold=0.015,  # порог модуля градиента, влияет на отсеивание шумовых патчей
+        grad_threshold=0.03,  # порог модуля градиента, влияет на отсеивание шумовых патчей
     )
-    train_digits = take_samples(train_dataset, TRAIN_COUNT)
-    if V0_TRAIN_COUNT is None:
-        v0_train_digits = train_digits
+    if TARGET_LABEL is None:
+        train_digits = take_samples(train_dataset, TRAIN_COUNT)
+        if V0_TRAIN_COUNT is None:
+            v0_train_digits = train_digits
+        else:
+            v0_train_digits = take_samples(train_dataset, V0_TRAIN_COUNT)
+        test_digits = take_samples(test_dataset, TEST_COUNT)
     else:
-        v0_train_digits = take_samples(train_dataset, V0_TRAIN_COUNT)
-    test_digits = take_samples(test_dataset, TEST_COUNT)
+        train_digits = take_samples(train_dataset, TRAIN_COUNT, label=TARGET_LABEL)
+        if V0_TRAIN_COUNT is None:
+            v0_train_digits = train_digits
+        else:
+            v0_train_digits = take_samples(train_dataset, V0_TRAIN_COUNT, label=TARGET_LABEL)
+        test_pos = take_samples(test_dataset, TEST_COUNT, label=TARGET_LABEL)
+        test_neg = take_samples(test_dataset, NEGATIVE_TEST_COUNT, exclude_label=TARGET_LABEL)
+        test_digits = test_pos + test_neg
     v0_cached = load_v0_cache(V0_CACHE_PATH)
 
     rr.init("mnist-hierarchy-test")
@@ -311,6 +348,7 @@ def main() -> None:
                 Detectors(1, 0.4),
             ],
         ),  # позиционное измерение Y, влияет на кодирование расположения
+        log_every=LOG_ENCODING_EVERY,
     )
     codes = defaultdict(list)
     if v0_cached is None:
@@ -326,6 +364,9 @@ def main() -> None:
                     float(angle),  # угол градиента, влияет на активацию угловых детекторов
                     float(x),  # координата патча по X, влияет на позиционные детекторы
                     float(y),  # координата патча по Y, влияет на позиционные детекторы
+                    log_image=img,
+                    log_label=label,
+                    log_measurements=values,
                 )
                 codes[float(angle)].append(code)
 
@@ -597,17 +638,20 @@ def main() -> None:
     none_pred = 0
     confusion = [[0 for _ in range(LABEL_COUNT)] for _ in range(LABEL_COUNT)]
     top1_scores: list[float] = []
+    min_vote = DECODE_MIN_VOTE if TARGET_LABEL is not None else None
+    tp = fp = tn = fn = 0
     for idx, (img_tensor, label) in enumerate(test_digits, start=1):
         label_idx = int(label)
         img = img_tensor.squeeze(0).numpy()
         measurements = extractor.extract(img, label_idx).get(label_idx, [])
-        predicted, top = _infer_by_label_topk(
+        predicted, top, best_vote = _infer_by_label_topk(
             img_tensor,  # изображение для распознавания, источник стимула
             model,  # обученная иерархия детекторов и память
             memory_by_label,  # память, сгруппированная по меткам
             top_k=TOP_K,  # размер списка top-k, влияет на ранжирование и статистику
             per_label_k=PER_LABEL_TOP_K,  # число лучших совпадений на метку
             similarity=DECODE_SIMILARITY,  # метрика сравнения кодов, влияет на выбор класса
+            min_vote=min_vote,
         )
         label_counts[label_idx] += 1
         pred_is_none = predicted is None
@@ -628,6 +672,17 @@ def main() -> None:
         top1_label = top_labels[0] if top_labels else -1
         top1_score = top_scores[0] if top_scores else 0.0
         top1_scores.append(top1_score)
+        if TARGET_LABEL is not None:
+            true_is_target = label_idx == TARGET_LABEL
+            pred_is_target = predicted == TARGET_LABEL
+            if true_is_target and pred_is_target:
+                tp += 1
+            elif true_is_target and not pred_is_target:
+                fn += 1
+            elif (not true_is_target) and pred_is_target:
+                fp += 1
+            else:
+                tn += 1
 
         rr.set_time("sample", sequence=idx)
         rr.log("test/image", rr.Image(img))
@@ -640,6 +695,7 @@ def main() -> None:
                 correct=is_correct,
                 top1_label=top1_label,
                 top1_score=top1_score,
+                best_vote=best_vote,
                 measurements=len(measurements),
                 topk_labels=top_labels,
                 topk_scores=top_scores,
@@ -687,6 +743,30 @@ def main() -> None:
                 min=min(top1_scores),
                 max=max(top1_scores),
             ),
+        )
+    if TARGET_LABEL is not None:
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+        target_accuracy = (tp + tn) / total if total else 0.0
+        rr.log("metrics/target/precision", rr.Scalars(precision))
+        rr.log("metrics/target/recall", rr.Scalars(recall))
+        rr.log("metrics/target/f1", rr.Scalars(f1))
+        rr.log("metrics/target/accuracy", rr.Scalars(target_accuracy))
+        rr.log("metrics/target/tp", rr.Scalars(float(tp)))
+        rr.log("metrics/target/fp", rr.Scalars(float(fp)))
+        rr.log("metrics/target/tn", rr.Scalars(float(tn)))
+        rr.log("metrics/target/fn", rr.Scalars(float(fn)))
+        rr.log("metrics/target/label", rr.Scalars(float(TARGET_LABEL)))
+        rr.log(
+            "metrics/target/min_vote",
+            rr.Scalars(-1.0 if min_vote is None else float(min_vote)),
+        )
+        print(
+            "target_metrics: "
+            f"precision={precision:.4f} recall={recall:.4f} "
+            f"f1={f1:.4f} accuracy={target_accuracy:.4f} "
+            f"tp={tp} fp={fp} tn={tn} fn={fn}"
         )
     print(f"accuracy: {accuracy:.4f} ({correct}/{total})")
 
