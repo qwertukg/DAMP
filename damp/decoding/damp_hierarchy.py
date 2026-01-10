@@ -328,14 +328,14 @@ def _sim_lambda(
 
 
 def _activation_map(
-    stimuli: Sequence[CodeVector],
+    inputs: Sequence[CodeVector],
     space: CodeSpace,
     lambda_threshold: float,
     similarity: str,
     eta: float | None,
 ) -> list[list[float]]:
     activation = [[0.0 for _ in range(space.width)] for _ in range(space.height)]
-    if not stimuli:
+    if not inputs:
         return activation
     for y in range(space.height):
         row = space.grid[y]
@@ -345,8 +345,8 @@ def _activation_map(
             if code is None:
                 continue
             best = 0.0
-            for stim in stimuli:
-                sim = _sim_lambda(stim, code, lambda_threshold, similarity, eta)
+            for input_code in inputs:
+                sim = _sim_lambda(input_code, code, lambda_threshold, similarity, eta)
                 if sim > best:
                     best = sim
             out_row[x] = best
@@ -902,8 +902,8 @@ def _log_embed_activity(
     )
 
 
-def embed_stimulus(
-    stimuli: Sequence[object],
+def embed_inputs(
+    inputs: Sequence[object],
     space: CodeSpace,
     detectors: DetectorHierarchy,
     params: EmbedParams,
@@ -912,9 +912,9 @@ def embed_stimulus(
 ) -> CodeVector:
     if not detectors.layers:
         return CodeVector(0, 0, detectors.code_length)
-    stimuli_codes = [_code_from_any(code, space.code_length) for code in stimuli]
+    input_codes = [_code_from_any(code, space.code_length) for code in inputs]
     activation = _activation_map(
-        stimuli_codes,
+        input_codes,
         space,
         params.lambda_activation,
         params.similarity,
@@ -1043,11 +1043,11 @@ def encode_image(
     extract_label = 0 if label is None else int(label)
     data = extractor.extract(img, extract_label)
     values = next(iter(data.values()), [])
-    stimuli: list[CodeVector] = []
+    inputs: list[CodeVector] = []
     for angle, x, y in values:
         _, code = encoder.encode(float(angle), float(x), float(y))
-        stimuli.append(_code_from_any(code, encoder.code_length))
-    return stimuli
+        inputs.append(_code_from_any(code, encoder.code_length))
+    return inputs
 
 
 def _log_embed_params(level: str, params: EmbedParams) -> None:
@@ -1086,26 +1086,26 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
     c_ones = _RunningStats()
     c_zero = 0
     c_sigma_hits = 0
-    stimuli_stats = _RunningStats()
-    stimuli_zero = 0
-    stimuli_per_label_count: dict[int, int] = defaultdict(int)
-    stimuli_per_label_sum: dict[int, int] = defaultdict(int)
-    stimuli_per_label_zero: dict[int, int] = defaultdict(int)
-    stimulus_ones = _RunningStats()
+    input_stats = _RunningStats()
+    input_zero = 0
+    input_per_label_count: dict[int, int] = defaultdict(int)
+    input_per_label_sum: dict[int, int] = defaultdict(int)
+    input_per_label_zero: dict[int, int] = defaultdict(int)
+    input_ones = _RunningStats()
     embed_stats_l1 = _init_embed_stats(len(d1.layers))
     for idx, (image, label) in enumerate(train_images, start=1):
         label_int = int(label)
-        stimuli = encode_image(image, config.encoder, config.extractor, label=label_int)
-        stimuli_count = len(stimuli)
-        stimuli_stats.add(float(stimuli_count))
-        stimuli_per_label_count[label_int] += 1
-        stimuli_per_label_sum[label_int] += stimuli_count
-        if stimuli_count == 0:
-            stimuli_zero += 1
-            stimuli_per_label_zero[label_int] += 1
-        for stim_code in stimuli:
-            stimulus_ones.add(float(stim_code.ones))
-        c1 = embed_stimulus(stimuli, spaces[0], d1, config.embed[0], stats=embed_stats_l1)
+        inputs = encode_image(image, config.encoder, config.extractor, label=label_int)
+        input_count = len(inputs)
+        input_stats.add(float(input_count))
+        input_per_label_count[label_int] += 1
+        input_per_label_sum[label_int] += input_count
+        if input_count == 0:
+            input_zero += 1
+            input_per_label_zero[label_int] += 1
+        for input_code in inputs:
+            input_ones.add(float(input_code.ones))
+        c1 = embed_inputs(inputs, spaces[0], d1, config.embed[0], stats=embed_stats_l1)
         c_by_label[label_int].append(c1)
         c_ordered.append((c1, label_int))
         c_ones.add(float(c1.ones))
@@ -1116,15 +1116,15 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
         if idx % LOG_EVERY == 0:
             suffix = f"/{total}" if total is not None else ""
             avg_ones = c_ones.mean()
-            avg_stimuli = stimuli_stats.mean()
+            avg_inputs = input_stats.mean()
             _log(
                 "embed",
                 f"L1 embeddings {idx}{suffix} avg_ones={avg_ones:.1f} "
-                f"avg_stimuli={avg_stimuli:.1f}",
+                f"avg_inputs={avg_inputs:.1f}",
             )
     if c_ordered:
         avg_ones = c_ones.mean()
-        avg_stimuli = stimuli_stats.mean()
+        avg_inputs = input_stats.mean()
         zero_frac = c_zero / len(c_ordered)
         sigma_frac = c_sigma_hits / len(c_ordered)
         _log(
@@ -1135,41 +1135,41 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
             f"max_ones={0 if c_ones.max is None else c_ones.max:.0f} "
             f"zero_frac={zero_frac:.3f} "
             f"sigma_frac={sigma_frac:.3f} "
-            f"avg_stimuli={avg_stimuli:.1f} "
-            f"min_stimuli={0 if stimuli_stats.min is None else stimuli_stats.min:.0f} "
-            f"max_stimuli={0 if stimuli_stats.max is None else stimuli_stats.max:.0f}",
+            f"avg_inputs={avg_inputs:.1f} "
+            f"min_inputs={0 if input_stats.min is None else input_stats.min:.0f} "
+            f"max_inputs={0 if input_stats.max is None else input_stats.max:.0f}",
         )
-        stim_zero_frac = stimuli_zero / len(c_ordered) if c_ordered else 0.0
+        input_zero_frac = input_zero / len(c_ordered) if c_ordered else 0.0
         per_label_avg = {
-            label: (stimuli_per_label_sum[label] / stimuli_per_label_count[label])
-            if stimuli_per_label_count[label]
+            label: (input_per_label_sum[label] / input_per_label_count[label])
+            if input_per_label_count[label]
             else 0.0
-            for label in sorted(stimuli_per_label_count.keys())
+            for label in sorted(input_per_label_count.keys())
         }
         per_label_zero = {
-            label: (stimuli_per_label_zero[label] / stimuli_per_label_count[label])
-            if stimuli_per_label_count[label]
+            label: (input_per_label_zero[label] / input_per_label_count[label])
+            if input_per_label_count[label]
             else 0.0
-            for label in sorted(stimuli_per_label_count.keys())
+            for label in sorted(input_per_label_count.keys())
         }
         _log(
             "measure",
-            "stimuli_per_image "
-            f"avg={stimuli_stats.mean():.2f} "
-            f"min={0 if stimuli_stats.min is None else stimuli_stats.min:.0f} "
-            f"max={0 if stimuli_stats.max is None else stimuli_stats.max:.0f} "
-            f"zero_frac={stim_zero_frac:.3f} "
-            f"per_label_count={json.dumps(dict(sorted(stimuli_per_label_count.items())), ensure_ascii=True)} "
+            "inputs_per_image "
+            f"avg={input_stats.mean():.2f} "
+            f"min={0 if input_stats.min is None else input_stats.min:.0f} "
+            f"max={0 if input_stats.max is None else input_stats.max:.0f} "
+            f"zero_frac={input_zero_frac:.3f} "
+            f"per_label_count={json.dumps(dict(sorted(input_per_label_count.items())), ensure_ascii=True)} "
             f"per_label_avg={json.dumps(per_label_avg, ensure_ascii=True)} "
             f"per_label_zero_frac={json.dumps(per_label_zero, ensure_ascii=True)}",
         )
         _log(
             "encode",
-            "stimulus_code_ones "
-            f"avg={stimulus_ones.mean():.2f} "
-            f"min={0 if stimulus_ones.min is None else stimulus_ones.min:.0f} "
-            f"max={0 if stimulus_ones.max is None else stimulus_ones.max:.0f} "
-            f"count={stimulus_ones.count}",
+            "input_code_ones "
+            f"avg={input_ones.mean():.2f} "
+            f"min={0 if input_ones.min is None else input_ones.min:.0f} "
+            f"max={0 if input_ones.max is None else input_ones.max:.0f} "
+            f"count={input_ones.count}",
         )
         _log_embed_activity("L1", embed_stats_l1, d1)
 
@@ -1191,7 +1191,7 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
         next_sigma_hits = 0
         embed_stats = _init_embed_stats(len(detectors_current.layers))
         for idx, (prev_code, label) in enumerate(c_ordered, start=1):
-            next_code = embed_stimulus(
+            next_code = embed_inputs(
                 [prev_code],
                 space,
                 detectors_current,
@@ -1281,13 +1281,13 @@ def infer(
     similarity: str = "cosine",
     label: int | None = None,
 ) -> tuple[int | None, list[tuple[int, float]]]:
-    stimuli = encode_image(image, model.encoder, model.extractor)
+    inputs = encode_image(image, model.encoder, model.extractor)
     if LOG_DECODE_DETAILS:
-        _log("decode", f"stimuli={len(stimuli)}")
-    code = embed_stimulus(stimuli, model.spaces[0], model.detectors[0], model.embed[0])
+        _log("decode", f"inputs={len(inputs)}")
+    code = embed_inputs(inputs, model.spaces[0], model.detectors[0], model.embed[0])
     codes = [code]
     for level_index in range(1, len(model.detectors)):
-        code = embed_stimulus(
+        code = embed_inputs(
             [code],
             model.spaces[level_index],
             model.detectors[level_index],

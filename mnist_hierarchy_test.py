@@ -14,7 +14,8 @@ from damp.decoding.damp_hierarchy import (
     EmbedParams,
     HierarchyConfig,
     LayoutConfig,
-    infer,
+    embed_inputs,
+    encode_image,
     space_from_layout,
     train_hierarchy,
 )
@@ -23,14 +24,17 @@ from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, Open
 from damp.layout.damp_layout import Layout
 from damp.layout.visualize_layout import log_layout
 
-TRAIN_COUNT = 4000
-TEST_COUNT = 100
+TRAIN_COUNT = 5000
+V0_TRAIN_COUNT: int | None = 800
+TEST_COUNT = 200
 V0_CACHE_PATH = Path("data/mnist_v0.json")
 LOG_LAYOUT_EVERY_LONG = 1
 LOG_LAYOUT_EVERY_SHORT = 1
 LOG_LAYOUT_EVERY_HIER_LONG = 1
 LOG_LAYOUT_EVERY_HIER_SHORT = 1
-TOP_K = 3
+TOP_K = 7
+PER_LABEL_TOP_K = 7
+DECODE_SIMILARITY = "cosine"
 LABEL_COUNT = 10
 PATCH_SIZE = 4
 PATCH_CENTER = PATCH_SIZE / 2.0
@@ -164,6 +168,73 @@ def _log_model_stats(model: object) -> None:
     rr.log("model/memory", rr.AnyValues(size=len(memory)))
 
 
+def _similarity(a: CodeVector, b: CodeVector, mode: str) -> float:
+    if a.ones == 0 or b.ones == 0:
+        return 0.0
+    common = (a.bits & b.bits).bit_count()
+    if common == 0:
+        return 0.0
+    if mode == "cosine":
+        denom = (a.ones * b.ones) ** 0.5
+        return 0.0 if denom == 0 else common / denom
+    union = a.ones + b.ones - common
+    return 0.0 if union == 0 else common / union
+
+
+def _group_memory_by_label(memory: list[object]) -> dict[int, list[CodeVector]]:
+    grouped: dict[int, list[CodeVector]] = defaultdict(list)
+    for entry in memory:
+        label = int(getattr(entry, "label"))
+        code = getattr(entry, "code")
+        grouped[label].append(code)
+    return grouped
+
+
+def _infer_by_label_topk(
+    image: object,
+    model: object,
+    memory_by_label: dict[int, list[CodeVector]],
+    *,
+    top_k: int,
+    per_label_k: int,
+    similarity: str,
+) -> tuple[int | None, list[tuple[int, float]]]:
+    inputs = encode_image(image, model.encoder, model.extractor)
+    code = embed_inputs(inputs, model.spaces[0], model.detectors[0], model.embed[0])
+    for level_index in range(1, len(model.detectors)):
+        code = embed_inputs(
+            [code],
+            model.spaces[level_index],
+            model.detectors[level_index],
+            model.embed[level_index],
+        )
+
+    scored: list[tuple[int, float]] = []
+    per_label_scores: dict[int, list[float]] = {}
+    for label, codes in memory_by_label.items():
+        label_scores: list[float] = []
+        for mem_code in codes:
+            score = _similarity(code, mem_code, similarity)
+            label_scores.append(score)
+            scored.append((label, score))
+        per_label_scores[label] = label_scores
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+    top = scored[: max(1, top_k)]
+
+    votes: dict[int, float] = {}
+    for label, scores in per_label_scores.items():
+        if not scores:
+            votes[label] = 0.0
+            continue
+        scores.sort(reverse=True)
+        take = min(per_label_k, len(scores)) if per_label_k > 0 else len(scores)
+        top_scores = scores[:take]
+        votes[label] = sum(top_scores) / len(top_scores)
+    predicted = max(votes.items(), key=lambda item: item[1])[0] if votes else None
+    return predicted, top
+
+
 def main() -> None:
 
 
@@ -176,9 +247,13 @@ def main() -> None:
     test_dataset = MNIST(root="./data", train=False, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(
         angle_in_degrees=True,  # возвращать угол в градусах, влияет на шкалу значений угла
-        grad_threshold=0.03,  # порог модуля градиента, влияет на отсеивание шумовых патчей
+        grad_threshold=0.015,  # порог модуля градиента, влияет на отсеивание шумовых патчей
     )
     train_digits = take_samples(train_dataset, TRAIN_COUNT)
+    if V0_TRAIN_COUNT is None:
+        v0_train_digits = train_digits
+    else:
+        v0_train_digits = take_samples(train_dataset, V0_TRAIN_COUNT)
     test_digits = take_samples(test_dataset, TEST_COUNT)
     v0_cached = load_v0_cache(V0_CACHE_PATH)
 
@@ -238,7 +313,7 @@ def main() -> None:
     )
     codes = defaultdict(list)
     if v0_cached is None:
-        for img_tensor, label in train_digits:
+        for img_tensor, label in v0_train_digits:
             img = img_tensor.squeeze(0).numpy()
             measurements = extractor.extract(
                 img,  # изображение 28x28, источник градиентов для извлечения углов
@@ -318,17 +393,17 @@ def main() -> None:
             0.72,  # порог похожести слоя, делает детекторы более избирательными
             0.82,  # дополнительный коротковолновый слой для детализации
         ],
-        activation_radius=7,  # радиус локальной активации, влияет на размер кластеров
-        energy_radius=7,  # радиус energy map, влияет на оценку энергии вокруг точки
-        detector_code_length=512,  # длина кода детекторов, влияет на размерность битового вектора
-        cluster_eps=2.5,  # радиус DBSCAN, влияет на объединение точек в кластеры
-        cluster_min_points=3,  # минимум точек в кластере, влияет на отсев шума
-        energy_threshold_mu=0.1,  # порог энергии, ниже -> больше точек участвует
+        activation_radius=6,  # радиус локальной активации, влияет на размер кластеров
+        energy_radius=6,  # радиус energy map, влияет на оценку энергии вокруг точки
+        detector_code_length=768,  # длина кода детекторов, влияет на размерность битового вектора
+        cluster_eps=2.3,  # радиус DBSCAN, влияет на объединение точек в кластеры
+        cluster_min_points=2,  # минимум точек в кластере, влияет на отсев шума
+        energy_threshold_mu=0.06,  # порог энергии, ниже -> больше точек участвует
         energy_lambda=0.6,  # порог сходства для energy map, влияет на карту энергий
-        max_attempts=1200,  # максимум попыток подбора детекторов в слое
-        max_detectors_per_layer=150,  # лимит числа детекторов в слое
+        max_attempts=800,  # максимум попыток подбора детекторов в слое
+        max_detectors_per_layer=180,  # лимит числа детекторов в слое
         min_radius=1.0,  # минимальный радиус детектора, ограничивает область покрытия
-        patience=260,  # сколько неудачных попыток терпеть до остановки слоя
+        patience=200,  # сколько неудачных попыток терпеть до остановки слоя
         similarity="cosine",  # метрика сравнения кодов, влияет на вычисление сходства
         eta=None,  # отключает сигмоидальное сглаживание порога похожести
         seed=0,  # сид генератора, влияет на воспроизводимость выбора центров
@@ -375,10 +450,10 @@ def main() -> None:
 
 
     embed_l1 = EmbedParams(
-        lambda_activation=0.7,  # порог сходства в активации, выше -> меньше активных точек
-        mu_e=0.1,  # порог энергии точки, влияет на отбор активаций по energy map
-        mu_d=0.7,  # порог уровня детектора, выше -> более строгий отбор
-        sigma=96,  # максимум активных бит в коде, снижает обрезание насыщенных кодов
+        lambda_activation=0.68,  # порог сходства в активации, выше -> меньше активных точек
+        mu_e=0.07,  # порог энергии точки, влияет на отбор активаций по energy map
+        mu_d=0.62,  # порог уровня детектора, выше -> более строгий отбор
+        sigma=110,  # максимум активных бит в коде, снижает обрезание насыщенных кодов
         similarity="cosine",  # метрика сравнения кодов, влияет на активацию
         eta=None,  # отключает сигмоидальное сглаживание порога сходства
         merge_order="high",  # порядок слияния по lambda, влияет на выбор при коллизиях
@@ -505,6 +580,7 @@ def main() -> None:
         config,  # конфигурация иерархии, влияет на все этапы обучения
     )
     _log_model_stats(model)
+    memory_by_label = _group_memory_by_label(model.memory)
 
 
 # ==============================================
@@ -523,12 +599,13 @@ def main() -> None:
         label_idx = int(label)
         img = img_tensor.squeeze(0).numpy()
         measurements = extractor.extract(img, label_idx).get(label_idx, [])
-        predicted, top = infer(
+        predicted, top = _infer_by_label_topk(
             img_tensor,  # изображение для распознавания, источник стимула
             model,  # обученная иерархия детекторов и память
+            memory_by_label,  # память, сгруппированная по меткам
             top_k=TOP_K,  # размер списка top-k, влияет на ранжирование и статистику
-            similarity="cosine",  # метрика сравнения кодов, влияет на выбор класса
-            label=label_idx,  # истинная метка для логирования/статистики
+            per_label_k=PER_LABEL_TOP_K,  # число лучших совпадений на метку
+            similarity=DECODE_SIMILARITY,  # метрика сравнения кодов, влияет на выбор класса
         )
         label_counts[label_idx] += 1
         pred_is_none = predicted is None
