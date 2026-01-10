@@ -135,30 +135,30 @@ class HierarchyConfig:
     encoder: Encoder
     extractor: MnistSobelAngleMap
     v0: CodeSpace
-    build_l1: DetectorBuildParams
-    build_l2: DetectorBuildParams
-    build_l3: DetectorBuildParams
-    embed_l1: EmbedParams
-    embed_l2: EmbedParams
-    embed_l3: EmbedParams
-    layout_l2: LayoutConfig
-    layout_l3: LayoutConfig
+    build: Sequence[DetectorBuildParams]
+    embed: Sequence[EmbedParams]
+    layout: Sequence[LayoutConfig]
+
+    def __post_init__(self) -> None:
+        self.build = tuple(self.build)
+        self.embed = tuple(self.embed)
+        self.layout = tuple(self.layout)
+        if not self.build:
+            raise ValueError("build levels must be non-empty")
+        if len(self.embed) != len(self.build):
+            raise ValueError("embed levels must match build levels")
+        if len(self.layout) != len(self.build) - 1:
+            raise ValueError("layout levels must be one less than build levels")
 
 
 @dataclass
 class HierarchyModel:
-    v0: CodeSpace
-    v1: CodeSpace
-    v2: CodeSpace
-    d1: DetectorHierarchy
-    d2: DetectorHierarchy
-    d3: DetectorHierarchy
+    spaces: Sequence[CodeSpace]
+    detectors: Sequence[DetectorHierarchy]
     memory: list[MemoryEntry]
     encoder: Encoder
     extractor: MnistSobelAngleMap
-    embed_l1: EmbedParams
-    embed_l2: EmbedParams
-    embed_l3: EmbedParams
+    embed: Sequence[EmbedParams]
 
 
 def _log(group: str, message: str) -> None:
@@ -1050,30 +1050,42 @@ def encode_image(
     return stimuli
 
 
+def _log_embed_params(level: str, params: EmbedParams) -> None:
+    _log(
+        "embed",
+        f"{level} params "
+        f"lambda_activation={params.lambda_activation} "
+        f"mu_e={params.mu_e} "
+        f"mu_d={params.mu_d} "
+        f"sigma={params.sigma} "
+        f"similarity={params.similarity} "
+        f"eta={params.eta} "
+        f"merge_order={params.merge_order}",
+    )
+
+
 def train_hierarchy(train_images: Iterable[tuple[object, int]], config: HierarchyConfig) -> HierarchyModel:
     total = None
     if hasattr(train_images, "__len__"):
         total = len(train_images)  # type: ignore[arg-type]
-    _log("levels", f"train start samples={total if total is not None else 'unknown'}")
-    d1 = build_detectors(config.v0, config.build_l1)
-    _log("levels", f"D1 detectors={_detector_count(d1)}")
+    level_count = len(config.build)
     _log(
-        "embed",
-        "L1 params "
-        f"lambda_activation={config.embed_l1.lambda_activation} "
-        f"mu_e={config.embed_l1.mu_e} "
-        f"mu_d={config.embed_l1.mu_d} "
-        f"sigma={config.embed_l1.sigma} "
-        f"similarity={config.embed_l1.similarity} "
-        f"eta={config.embed_l1.eta} "
-        f"merge_order={config.embed_l1.merge_order}",
+        "levels",
+        f"train start samples={total if total is not None else 'unknown'} levels={level_count}",
     )
+    spaces: list[CodeSpace] = [config.v0]
+    detectors: list[DetectorHierarchy] = []
 
-    c1_by_label: dict[int, list[CodeVector]] = defaultdict(list)
-    c1_ordered: list[tuple[CodeVector, int]] = []
-    c1_ones = _RunningStats()
-    c1_zero = 0
-    c1_sigma_hits = 0
+    d1 = build_detectors(spaces[0], config.build[0])
+    detectors.append(d1)
+    _log("levels", f"D1 detectors={_detector_count(d1)}")
+    _log_embed_params("L1", config.embed[0])
+
+    c_by_label: dict[int, list[CodeVector]] = defaultdict(list)
+    c_ordered: list[tuple[CodeVector, int]] = []
+    c_ones = _RunningStats()
+    c_zero = 0
+    c_sigma_hits = 0
     stimuli_stats = _RunningStats()
     stimuli_zero = 0
     stimuli_per_label_count: dict[int, int] = defaultdict(int)
@@ -1093,41 +1105,41 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
             stimuli_per_label_zero[label_int] += 1
         for stim_code in stimuli:
             stimulus_ones.add(float(stim_code.ones))
-        c1 = embed_stimulus(stimuli, config.v0, d1, config.embed_l1, stats=embed_stats_l1)
-        c1_by_label[label_int].append(c1)
-        c1_ordered.append((c1, label_int))
-        c1_ones.add(float(c1.ones))
+        c1 = embed_stimulus(stimuli, spaces[0], d1, config.embed[0], stats=embed_stats_l1)
+        c_by_label[label_int].append(c1)
+        c_ordered.append((c1, label_int))
+        c_ones.add(float(c1.ones))
         if c1.ones == 0:
-            c1_zero += 1
-        if c1.ones >= config.embed_l1.sigma:
-            c1_sigma_hits += 1
+            c_zero += 1
+        if c1.ones >= config.embed[0].sigma:
+            c_sigma_hits += 1
         if idx % LOG_EVERY == 0:
             suffix = f"/{total}" if total is not None else ""
-            avg_ones = c1_ones.mean()
+            avg_ones = c_ones.mean()
             avg_stimuli = stimuli_stats.mean()
             _log(
                 "embed",
                 f"L1 embeddings {idx}{suffix} avg_ones={avg_ones:.1f} "
                 f"avg_stimuli={avg_stimuli:.1f}",
             )
-    if c1_ordered:
-        avg_ones = c1_ones.mean()
+    if c_ordered:
+        avg_ones = c_ones.mean()
         avg_stimuli = stimuli_stats.mean()
-        zero_frac = c1_zero / len(c1_ordered)
-        sigma_frac = c1_sigma_hits / len(c1_ordered)
+        zero_frac = c_zero / len(c_ordered)
+        sigma_frac = c_sigma_hits / len(c_ordered)
         _log(
             "embed",
             "L1 done "
-            f"count={len(c1_ordered)} avg_ones={avg_ones:.1f} "
-            f"min_ones={0 if c1_ones.min is None else c1_ones.min:.0f} "
-            f"max_ones={0 if c1_ones.max is None else c1_ones.max:.0f} "
+            f"count={len(c_ordered)} avg_ones={avg_ones:.1f} "
+            f"min_ones={0 if c_ones.min is None else c_ones.min:.0f} "
+            f"max_ones={0 if c_ones.max is None else c_ones.max:.0f} "
             f"zero_frac={zero_frac:.3f} "
             f"sigma_frac={sigma_frac:.3f} "
             f"avg_stimuli={avg_stimuli:.1f} "
             f"min_stimuli={0 if stimuli_stats.min is None else stimuli_stats.min:.0f} "
             f"max_stimuli={0 if stimuli_stats.max is None else stimuli_stats.max:.0f}",
         )
-        stim_zero_frac = stimuli_zero / len(c1_ordered) if c1_ordered else 0.0
+        stim_zero_frac = stimuli_zero / len(c_ordered) if c_ordered else 0.0
         per_label_avg = {
             label: (stimuli_per_label_sum[label] / stimuli_per_label_count[label])
             if stimuli_per_label_count[label]
@@ -1161,101 +1173,65 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
         )
         _log_embed_activity("L1", embed_stats_l1, d1)
 
-    layout1 = build_layout_from_embeddings(c1_by_label, config.layout_l2)
-    v1 = space_from_layout(layout1)
-    d2 = build_detectors(v1, config.build_l2)
-    _log("levels", f"D2 detectors={_detector_count(d2)}")
-    _log(
-        "embed",
-        "L2 params "
-        f"lambda_activation={config.embed_l2.lambda_activation} "
-        f"mu_e={config.embed_l2.mu_e} "
-        f"mu_d={config.embed_l2.mu_d} "
-        f"sigma={config.embed_l2.sigma} "
-        f"similarity={config.embed_l2.similarity} "
-        f"eta={config.embed_l2.eta} "
-        f"merge_order={config.embed_l2.merge_order}",
-    )
+    for level_index in range(1, level_count):
+        layout = build_layout_from_embeddings(c_by_label, config.layout[level_index - 1])
+        space = space_from_layout(layout)
+        spaces.append(space)
+        detectors_current = build_detectors(space, config.build[level_index])
+        detectors.append(detectors_current)
+        level_num = level_index + 1
+        level_label = f"L{level_num}"
+        _log("levels", f"D{level_num} detectors={_detector_count(detectors_current)}")
+        _log_embed_params(level_label, config.embed[level_index])
 
-    c2_by_label: dict[int, list[CodeVector]] = defaultdict(list)
-    c2_ordered: list[tuple[CodeVector, int]] = []
-    c2_ones = _RunningStats()
-    c2_zero = 0
-    c2_sigma_hits = 0
-    embed_stats_l2 = _init_embed_stats(len(d2.layers))
-    for idx, (c1, label) in enumerate(c1_ordered, start=1):
-        c2 = embed_stimulus([c1], v1, d2, config.embed_l2, stats=embed_stats_l2)
-        c2_by_label[int(label)].append(c2)
-        c2_ordered.append((c2, int(label)))
-        c2_ones.add(float(c2.ones))
-        if c2.ones == 0:
-            c2_zero += 1
-        if c2.ones >= config.embed_l2.sigma:
-            c2_sigma_hits += 1
-        if idx % LOG_EVERY == 0:
-            avg = c2_ones.mean()
-            _log("embed", f"L2 embeddings {idx}/{len(c1_ordered)} avg_ones={avg:.1f}")
-    if c2_ordered:
-        avg = c2_ones.mean()
-        zero_frac = c2_zero / len(c2_ordered)
-        sigma_frac = c2_sigma_hits / len(c2_ordered)
-        _log(
-            "embed",
-            "L2 done "
-            f"count={len(c2_ordered)} avg_ones={avg:.1f} "
-            f"min_ones={0 if c2_ones.min is None else c2_ones.min:.0f} "
-            f"max_ones={0 if c2_ones.max is None else c2_ones.max:.0f} "
-            f"zero_frac={zero_frac:.3f} "
-            f"sigma_frac={sigma_frac:.3f}",
-        )
-        _log_embed_activity("L2", embed_stats_l2, d2)
-
-    layout2 = build_layout_from_embeddings(c2_by_label, config.layout_l3)
-    v2 = space_from_layout(layout2)
-    d3 = build_detectors(v2, config.build_l3)
-    _log("levels", f"D3 detectors={_detector_count(d3)}")
-    _log(
-        "embed",
-        "L3 params "
-        f"lambda_activation={config.embed_l3.lambda_activation} "
-        f"mu_e={config.embed_l3.mu_e} "
-        f"mu_d={config.embed_l3.mu_d} "
-        f"sigma={config.embed_l3.sigma} "
-        f"similarity={config.embed_l3.similarity} "
-        f"eta={config.embed_l3.eta} "
-        f"merge_order={config.embed_l3.merge_order}",
-    )
+        next_by_label: dict[int, list[CodeVector]] = defaultdict(list)
+        next_ordered: list[tuple[CodeVector, int]] = []
+        next_ones = _RunningStats()
+        next_zero = 0
+        next_sigma_hits = 0
+        embed_stats = _init_embed_stats(len(detectors_current.layers))
+        for idx, (prev_code, label) in enumerate(c_ordered, start=1):
+            next_code = embed_stimulus(
+                [prev_code],
+                space,
+                detectors_current,
+                config.embed[level_index],
+                stats=embed_stats,
+            )
+            label_int = int(label)
+            next_by_label[label_int].append(next_code)
+            next_ordered.append((next_code, label_int))
+            next_ones.add(float(next_code.ones))
+            if next_code.ones == 0:
+                next_zero += 1
+            if next_code.ones >= config.embed[level_index].sigma:
+                next_sigma_hits += 1
+            if idx % LOG_EVERY == 0:
+                avg = next_ones.mean()
+                _log(
+                    "embed",
+                    f"{level_label} embeddings {idx}/{len(c_ordered)} avg_ones={avg:.1f}",
+                )
+        if next_ordered:
+            avg = next_ones.mean()
+            zero_frac = next_zero / len(next_ordered)
+            sigma_frac = next_sigma_hits / len(next_ordered)
+            _log(
+                "embed",
+                f"{level_label} done "
+                f"count={len(next_ordered)} avg_ones={avg:.1f} "
+                f"min_ones={0 if next_ones.min is None else next_ones.min:.0f} "
+                f"max_ones={0 if next_ones.max is None else next_ones.max:.0f} "
+                f"zero_frac={zero_frac:.3f} "
+                f"sigma_frac={sigma_frac:.3f}",
+            )
+            _log_embed_activity(level_label, embed_stats, detectors_current)
+        c_by_label = next_by_label
+        c_ordered = next_ordered
 
     memory: list[MemoryEntry] = []
-    c3_ones = _RunningStats()
-    c3_zero = 0
-    c3_sigma_hits = 0
-    embed_stats_l3 = _init_embed_stats(len(d3.layers))
-    for idx, (c2, label) in enumerate(c2_ordered, start=1):
-        c3 = embed_stimulus([c2], v2, d3, config.embed_l3, stats=embed_stats_l3)
-        memory.append(MemoryEntry(code=c3, label=label))
-        c3_ones.add(float(c3.ones))
-        if c3.ones == 0:
-            c3_zero += 1
-        if c3.ones >= config.embed_l3.sigma:
-            c3_sigma_hits += 1
-        if idx % LOG_EVERY == 0:
-            avg = c3_ones.mean()
-            _log("embed", f"L3 embeddings {idx}/{len(c2_ordered)} avg_ones={avg:.1f}")
-    if memory:
-        avg = c3_ones.mean()
-        zero_frac = c3_zero / len(memory)
-        sigma_frac = c3_sigma_hits / len(memory)
-        _log(
-            "embed",
-            "L3 done "
-            f"count={len(memory)} avg_ones={avg:.1f} "
-            f"min_ones={0 if c3_ones.min is None else c3_ones.min:.0f} "
-            f"max_ones={0 if c3_ones.max is None else c3_ones.max:.0f} "
-            f"zero_frac={zero_frac:.3f} "
-            f"sigma_frac={sigma_frac:.3f}",
-        )
-        _log_embed_activity("L3", embed_stats_l3, d3)
+    for code, label in c_ordered:
+        memory.append(MemoryEntry(code=code, label=label))
     _log("levels", f"memory size={len(memory)}")
     if memory:
         mem_label_counts: dict[int, int] = defaultdict(int)
@@ -1267,18 +1243,12 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
         )
 
     return HierarchyModel(
-        v0=config.v0,
-        v1=v1,
-        v2=v2,
-        d1=d1,
-        d2=d2,
-        d3=d3,
+        spaces=spaces,
+        detectors=detectors,
         memory=memory,
         encoder=config.encoder,
         extractor=config.extractor,
-        embed_l1=config.embed_l1,
-        embed_l2=config.embed_l2,
-        embed_l3=config.embed_l3,
+        embed=config.embed,
     )
 
 
@@ -1314,12 +1284,20 @@ def infer(
     stimuli = encode_image(image, model.encoder, model.extractor)
     if LOG_DECODE_DETAILS:
         _log("decode", f"stimuli={len(stimuli)}")
-    c1 = embed_stimulus(stimuli, model.v0, model.d1, model.embed_l1)
-    c2 = embed_stimulus([c1], model.v1, model.d2, model.embed_l2)
-    c3 = embed_stimulus([c2], model.v2, model.d3, model.embed_l3)
+    code = embed_stimulus(stimuli, model.spaces[0], model.detectors[0], model.embed[0])
+    codes = [code]
+    for level_index in range(1, len(model.detectors)):
+        code = embed_stimulus(
+            [code],
+            model.spaces[level_index],
+            model.detectors[level_index],
+            model.embed[level_index],
+        )
+        codes.append(code)
     if LOG_DECODE_DETAILS:
-        _log("decode", f"C1 ones={c1.ones} C2 ones={c2.ones} C3 ones={c3.ones}")
-    predicted, top = _decode_memory(c3, model.memory, top_k, similarity)
+        ones = [c.ones for c in codes]
+        _log("decode", f"codes_ones={ones}")
+    predicted, top = _decode_memory(code, model.memory, top_k, similarity)
     if LOG_DECODE_DETAILS and top:
         _log("decode", f"top1 label={top[0][0]} score={top[0][1]:.4f}")
     if LOG_DECODE_DETAILS:
