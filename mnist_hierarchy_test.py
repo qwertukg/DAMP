@@ -24,7 +24,7 @@ from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, Open
 from damp.layout.damp_layout import Layout
 from damp.layout.visualize_layout import log_layout
 
-TRAIN_COUNT = 90000
+TRAIN_COUNT = 60000
 V0_TRAIN_COUNT: int | None = 800
 TEST_COUNT = 200
 V0_CACHE_PATH = Path("data/mnist_v0.json")
