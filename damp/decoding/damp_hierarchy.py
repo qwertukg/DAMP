@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import atexit
 import json
 import math
 import random
+import os
 from collections import defaultdict
 from typing import Iterable, Mapping, Sequence
+
+import numpy as np
 
 from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import Encoder
@@ -15,6 +18,50 @@ from damp.layout.damp_layout import Layout, BitArray as LayoutBitArray
 LOG_ENABLED = True
 LOG_EVERY = 50
 LOG_DECODE_DETAILS = False
+EMBED_BACKEND = os.environ.get("DAMP_EMBED_BACKEND", "auto").lower()
+_TORCH_STATE: dict[str, object] = {"checked": False, "torch": None, "device": None}
+
+
+def set_embed_backend(backend: str) -> None:
+    global EMBED_BACKEND
+    EMBED_BACKEND = str(backend).strip().lower()
+
+
+def _get_torch_state() -> tuple[object | None, object | None]:
+    state = _TORCH_STATE
+    if state["checked"]:
+        return state["torch"], state["device"]
+    try:
+        import torch  # type: ignore[import-not-found]
+    except Exception:
+        state["checked"] = True
+        return None, None
+    device = None
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    state["checked"] = True
+    state["torch"] = torch
+    state["device"] = device
+    return torch, device
+
+
+def _resolve_embed_backend() -> str:
+    backend = EMBED_BACKEND
+    if backend not in {"auto", "python", "numpy", "torch"}:
+        backend = "auto"
+    if backend == "auto":
+        torch_mod, device = _get_torch_state()
+        if torch_mod is not None and device is not None:
+            return "torch"
+        return "numpy"
+    if backend == "torch":
+        torch_mod, device = _get_torch_state()
+        if torch_mod is None or device is None:
+            return "numpy"
+        return "torch"
+    return backend
 
 
 @dataclass(frozen=True)
@@ -86,6 +133,7 @@ class CodeSpace:
     energy_lambda: float | None = None
     similarity: str = "cosine"
     eta: float | None = None
+    _cache: dict[object, object] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -138,11 +186,15 @@ class HierarchyConfig:
     build: Sequence[DetectorBuildParams]
     embed: Sequence[EmbedParams]
     layout: Sequence[LayoutConfig]
+    embed_backend: str = "auto"
 
     def __post_init__(self) -> None:
         self.build = tuple(self.build)
         self.embed = tuple(self.embed)
         self.layout = tuple(self.layout)
+        self.embed_backend = str(self.embed_backend).strip().lower()
+        if self.embed_backend not in {"auto", "python", "numpy", "torch"}:
+            self.embed_backend = "auto"
         if not self.build:
             raise ValueError("build levels must be non-empty")
         if len(self.embed) != len(self.build):
@@ -325,6 +377,231 @@ def _sim_lambda(
     if eta is None:
         return sim if sim >= lambda_threshold else 0.0
     return sim * (1.0 / (1.0 + math.exp(-eta * (sim - lambda_threshold))))
+
+
+def _segments_for_length(length: int) -> int:
+    return (int(length) + 63) // 64
+
+
+def _pack_bits_to_uint64(bits: int, segments: int) -> np.ndarray:
+    out = np.zeros(segments, dtype=np.uint64)
+    value = int(bits)
+    mask = (1 << 64) - 1
+    for idx in range(segments):
+        out[idx] = value & mask
+        value >>= 64
+    return out
+
+
+def _pack_codes_numpy(codes: Sequence[CodeVector], segments: int) -> tuple[np.ndarray, np.ndarray]:
+    packed = np.zeros((len(codes), segments), dtype=np.uint64)
+    ones = np.zeros(len(codes), dtype=np.float32)
+    for idx, code in enumerate(codes):
+        packed[idx] = _pack_bits_to_uint64(code.bits, segments)
+        ones[idx] = float(code.ones)
+    return packed, ones
+
+
+def _get_space_numpy_cache(space: CodeSpace) -> dict[str, object]:
+    cache = space._cache.get("numpy")
+    if isinstance(cache, dict):
+        return cache
+    height = space.height
+    width = space.width
+    segments = _segments_for_length(space.code_length)
+    packed = np.zeros((height * width, segments), dtype=np.uint64)
+    ones = np.zeros(height * width, dtype=np.float32)
+    mask = np.zeros(height * width, dtype=bool)
+    for y in range(height):
+        row = space.grid[y]
+        for x in range(width):
+            code = row[x]
+            if code is None:
+                continue
+            idx = y * width + x
+            mask[idx] = True
+            ones[idx] = float(code.ones)
+            packed[idx] = _pack_bits_to_uint64(code.bits, segments)
+    cache = {"packed": packed, "ones": ones, "mask": mask, "segments": segments}
+    space._cache["numpy"] = cache
+    return cache
+
+
+def _packed_to_bit_matrix(packed: np.ndarray, length: int) -> np.ndarray:
+    bytes_view = packed.view(np.uint8)
+    bits = np.unpackbits(bytes_view, axis=1, bitorder="little")
+    return bits[:, :length]
+
+
+def _get_space_torch_cache(space: CodeSpace, torch_mod: object, device: object) -> dict[str, object]:
+    cache_key = ("torch", str(device))
+    cache = space._cache.get(cache_key)
+    if isinstance(cache, dict):
+        return cache
+    np_cache = _get_space_numpy_cache(space)
+    packed = np_cache["packed"]
+    if not isinstance(packed, np.ndarray):
+        raise ValueError("space cache missing packed codes")
+    bits = _packed_to_bit_matrix(packed, space.code_length).astype(np.float32)
+    space_bits = torch_mod.from_numpy(bits).to(device=device)  # type: ignore[attr-defined]
+    space_ones = torch_mod.from_numpy(np_cache["ones"]).to(device=device)  # type: ignore[attr-defined]
+    cache = {"bits": space_bits, "ones": space_ones, "device": device}
+    space._cache[cache_key] = cache
+    return cache
+
+
+def _activation_map_numpy(
+    inputs: Sequence[CodeVector],
+    space: CodeSpace,
+    lambda_threshold: float,
+    similarity: str,
+    eta: float | None,
+) -> np.ndarray:
+    height = space.height
+    width = space.width
+    if not hasattr(np, "bitwise_count"):
+        return np.array(
+            _activation_map(inputs, space, lambda_threshold, similarity, eta),
+            dtype=np.float32,
+        )
+    if not inputs:
+        return np.zeros((height, width), dtype=np.float32)
+    cache = _get_space_numpy_cache(space)
+    packed = cache["packed"]
+    ones = cache["ones"]
+    mask = cache["mask"]
+    segments = int(cache["segments"])
+    if not isinstance(packed, np.ndarray) or not isinstance(ones, np.ndarray):
+        raise ValueError("space cache invalid")
+
+    inputs_packed, inputs_ones = _pack_codes_numpy(inputs, segments)
+    if inputs_packed.size == 0:
+        return np.zeros((height, width), dtype=np.float32)
+
+    point_count = packed.shape[0]
+    common = np.zeros((inputs_packed.shape[0], point_count), dtype=np.uint16)
+    for seg in range(segments):
+        left = inputs_packed[:, seg][:, None]
+        right = packed[:, seg][None, :]
+        common += np.bitwise_count(np.bitwise_and(left, right))
+    common_f = common.astype(np.float32)
+
+    if similarity == "cosine":
+        denom = np.sqrt(inputs_ones[:, None] * ones[None, :])
+        sim = np.divide(common_f, denom, out=np.zeros_like(common_f), where=denom > 0.0)
+    else:
+        union = inputs_ones[:, None] + ones[None, :] - common_f
+        sim = np.divide(common_f, union, out=np.zeros_like(common_f), where=union > 0.0)
+
+    if eta is None:
+        sim = np.where(sim >= lambda_threshold, sim, 0.0)
+    else:
+        sim = sim * (1.0 / (1.0 + np.exp(-eta * (sim - lambda_threshold))))
+
+    activation = sim.max(axis=0)
+    if isinstance(mask, np.ndarray):
+        activation = np.where(mask, activation, 0.0)
+    return activation.reshape((height, width))
+
+
+def _activation_map_torch(
+    inputs: Sequence[CodeVector],
+    space: CodeSpace,
+    lambda_threshold: float,
+    similarity: str,
+    eta: float | None,
+) -> np.ndarray:
+    torch_mod, device = _get_torch_state()
+    if torch_mod is None or device is None:
+        return _activation_map_numpy(inputs, space, lambda_threshold, similarity, eta)
+    height = space.height
+    width = space.width
+    if not inputs:
+        return np.zeros((height, width), dtype=np.float32)
+
+    cache = _get_space_torch_cache(space, torch_mod, device)
+    space_bits = cache["bits"]
+    space_ones = cache["ones"]
+    inputs_packed, inputs_ones = _pack_codes_numpy(inputs, _segments_for_length(space.code_length))
+    inputs_bits = _packed_to_bit_matrix(inputs_packed, space.code_length).astype(np.float32)
+    inputs_bits_t = torch_mod.from_numpy(inputs_bits).to(device=device)  # type: ignore[attr-defined]
+    inputs_ones_t = torch_mod.from_numpy(inputs_ones).to(device=device)  # type: ignore[attr-defined]
+
+    common = inputs_bits_t @ space_bits.T
+    if similarity == "cosine":
+        denom = torch_mod.sqrt(inputs_ones_t[:, None] * space_ones[None, :])  # type: ignore[attr-defined]
+        sim = torch_mod.where(denom > 0.0, common / denom, torch_mod.zeros_like(common))  # type: ignore[attr-defined]
+    else:
+        union = inputs_ones_t[:, None] + space_ones[None, :] - common
+        sim = torch_mod.where(union > 0.0, common / union, torch_mod.zeros_like(common))  # type: ignore[attr-defined]
+
+    if eta is None:
+        sim = torch_mod.where(sim >= lambda_threshold, sim, torch_mod.zeros_like(sim))  # type: ignore[attr-defined]
+    else:
+        sim = sim * (1.0 / (1.0 + torch_mod.exp(-eta * (sim - lambda_threshold))))  # type: ignore[attr-defined]
+    activation = sim.max(dim=0).values
+    return activation.detach().cpu().numpy().reshape((height, width))
+
+
+def _activation_map_fast(
+    inputs: Sequence[CodeVector],
+    space: CodeSpace,
+    lambda_threshold: float,
+    similarity: str,
+    eta: float | None,
+) -> np.ndarray | list[list[float]]:
+    backend = _resolve_embed_backend()
+    if backend == "torch":
+        return _activation_map_torch(inputs, space, lambda_threshold, similarity, eta)
+    if backend == "numpy":
+        return _activation_map_numpy(inputs, space, lambda_threshold, similarity, eta)
+    return _activation_map(inputs, space, lambda_threshold, similarity, eta)
+
+
+def _get_detector_activation_cache(
+    space: CodeSpace,
+    detectors: DetectorHierarchy,
+    mu_e: float,
+) -> list[tuple[Detector, np.ndarray, np.ndarray]]:
+    key = ("detector_cache", id(detectors), float(mu_e))
+    cached = space._cache.get(key)
+    if isinstance(cached, list):
+        return cached
+    if space.energy is None:
+        raise ValueError("space energy map is not available")
+    width = space.width
+    cache: list[tuple[Detector, np.ndarray, np.ndarray]] = []
+    for layer in detectors.layers:
+        for detector in layer.detectors:
+            if detector.energy <= 0.0:
+                cache.append(
+                    (detector, np.array([], dtype=np.int32), np.array([], dtype=np.float32))
+                )
+                continue
+            r_int = int(math.ceil(detector.radius))
+            y_min = max(0, int(math.floor(detector.center_y)) - r_int)
+            y_max = min(space.height - 1, int(math.floor(detector.center_y)) + r_int)
+            x_min = max(0, int(math.floor(detector.center_x)) - r_int)
+            x_max = min(space.width - 1, int(math.floor(detector.center_x)) + r_int)
+            radius_sq = detector.radius * detector.radius
+            indices: list[int] = []
+            energies: list[float] = []
+            for y in range(y_min, y_max + 1):
+                for x in range(x_min, x_max + 1):
+                    dy = y - detector.center_y
+                    dx = x - detector.center_x
+                    if dy * dy + dx * dx > radius_sq:
+                        continue
+                    energy = space.energy[y][x]
+                    if energy < mu_e:
+                        continue
+                    indices.append(y * width + x)
+                    energies.append(float(energy))
+            cache.append(
+                (detector, np.array(indices, dtype=np.int32), np.array(energies, dtype=np.float32))
+            )
+    space._cache[key] = cache
+    return cache
 
 
 def _activation_map(
@@ -913,7 +1190,7 @@ def embed_inputs(
     if not detectors.layers:
         return CodeVector(0, 0, detectors.code_length)
     input_codes = [_code_from_any(code, space.code_length) for code in inputs]
-    activation = _activation_map(
+    activation = _activation_map_fast(
         input_codes,
         space,
         params.lambda_activation,
@@ -925,34 +1202,22 @@ def embed_inputs(
 
     active_detectors: list[Detector] = []
     active_by_layer = [0 for _ in range(len(detectors.layers))] if stats is not None else None
-    for layer in detectors.layers:
-        for detector in layer.detectors:
-            if detector.energy <= 0.0:
-                continue
-            r_int = int(math.ceil(detector.radius))
-            y_min = max(0, int(math.floor(detector.center_y)) - r_int)
-            y_max = min(space.height - 1, int(math.floor(detector.center_y)) + r_int)
-            x_min = max(0, int(math.floor(detector.center_x)) - r_int)
-            x_max = min(space.width - 1, int(math.floor(detector.center_x)) + r_int)
-            radius_sq = detector.radius * detector.radius
-            energy_sum = 0.0
-            for y in range(y_min, y_max + 1):
-                for x in range(x_min, x_max + 1):
-                    dy = y - detector.center_y
-                    dx = x - detector.center_x
-                    if dy * dy + dx * dx > radius_sq:
-                        continue
-                    if space.energy[y][x] < params.mu_e:
-                        continue
-                    a = activation[y][x]
-                    if a <= 0.0:
-                        continue
-                    energy_sum += a * space.energy[y][x]
-            level = energy_sum / detector.energy
-            if level >= params.mu_d:
-                active_detectors.append(detector)
-                if active_by_layer is not None:
-                    active_by_layer[detector.layer_index] += 1
+    if isinstance(activation, np.ndarray):
+        activation_flat = activation.reshape(-1)
+    else:
+        activation_flat = np.array(activation, dtype=np.float32).reshape(-1)
+    cache = _get_detector_activation_cache(space, detectors, params.mu_e)
+    for detector, indices, energies in cache:
+        if detector.energy <= 0.0:
+            continue
+        if indices.size == 0:
+            continue
+        energy_sum = float((activation_flat[indices] * energies).sum())
+        level = energy_sum / detector.energy
+        if level >= params.mu_d:
+            active_detectors.append(detector)
+            if active_by_layer is not None:
+                active_by_layer[detector.layer_index] += 1
     if stats is not None and active_by_layer is not None:
         _update_embed_stats(stats, len(active_detectors), active_by_layer)
     return _color_merge(active_detectors, detectors.code_length, params.sigma, params.merge_order)
@@ -1069,10 +1334,17 @@ def train_hierarchy(train_images: Iterable[tuple[object, int]], config: Hierarch
     if hasattr(train_images, "__len__"):
         total = len(train_images)  # type: ignore[arg-type]
     level_count = len(config.build)
+    set_embed_backend(config.embed_backend)
+    backend = _resolve_embed_backend()
     _log(
         "levels",
         f"train start samples={total if total is not None else 'unknown'} levels={level_count}",
     )
+    if backend == "torch":
+        _torch, device = _get_torch_state()
+        _log("embed", f"backend=torch device={device}")
+    else:
+        _log("embed", f"backend={backend}")
     spaces: list[CodeSpace] = [config.v0]
     detectors: list[DetectorHierarchy] = []
 

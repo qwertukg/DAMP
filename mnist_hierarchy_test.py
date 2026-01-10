@@ -24,7 +24,7 @@ from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, Open
 from damp.layout.damp_layout import Layout
 from damp.layout.visualize_layout import log_layout
 
-TRAIN_COUNT = 5000
+TRAIN_COUNT = 90000
 V0_TRAIN_COUNT: int | None = 800
 TEST_COUNT = 200
 V0_CACHE_PATH = Path("data/mnist_v0.json")
@@ -35,6 +35,7 @@ LOG_LAYOUT_EVERY_HIER_SHORT = 1
 TOP_K = 7
 PER_LABEL_TOP_K = 7
 DECODE_SIMILARITY = "cosine"
+EMBED_BACKEND = "auto"
 LABEL_COUNT = 10
 PATCH_SIZE = 4
 PATCH_CENTER = PATCH_SIZE / 2.0
@@ -574,6 +575,7 @@ def main() -> None:
         build=build,  # параметры построения детекторов по уровням
         embed=embed,  # параметры эмбеддинга по уровням
         layout=layout,  # параметры раскладки между уровнями
+        embed_backend=EMBED_BACKEND,  # backend для ускорения эмбеддинга (auto/numpy/torch/python)
     )
     model = train_hierarchy(
         train_digits,  # обучающие изображения и метки, определяют память модели
