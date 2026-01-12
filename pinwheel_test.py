@@ -1,20 +1,12 @@
-from damp.encoding.damp_encoder import Encoder, ClosedDimension, OpenedDimension, Detectors
-from damp.encoding.visualize_encoding import show, wait_for_close
-import numpy as np
-from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
-from torchvision.datasets import MNIST
-from torchvision import transforms
 from collections import defaultdict
-import json
-from pathlib import Path
-from damp.layout.damp_layout import Layout
-from damp.layout.visualize_layout import log_layout
-import rerun as rr
 import random
+
+from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
+from damp.encoding.visualize_encoding import wait_for_close
+from damp.layout.damp_layout import Layout
 
 
 def main() -> None:
-    
     encoder = Encoder(
         ClosedDimension("Angle", (0.0, 360.0), [
             Detectors(360,  0.7),
@@ -31,13 +23,9 @@ def main() -> None:
 
     for a in range(360):
         values, code = encoder.encode(float(a))
-        print(f"Encoded to: {values} -> {code}")
         codes[a].append(code)
         total_codes += 1
-        #show(encoder, values, code, None, int(a))
     
-    print(f"{total_codes} codes saved to codes.json")
-
     for angle_codes in codes.values():
         random.shuffle(angle_codes)
 
@@ -49,9 +37,6 @@ def main() -> None:
         eta=0.0, # 1.0 - выворачивает пинвил в криветку мебиуса (0 - норм)
         seed=0,
     )
-    rr.init("damp-layout")
-    rr.spawn()
-    log_layout(layout, step=0)
     step_offset = 1
     layout.run(
         steps=22000,

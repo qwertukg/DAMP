@@ -5,12 +5,8 @@ from typing import ClassVar, Dict, List, Tuple, Union
 
 import numpy as np
 
-LOG_ENABLED = True
-
-
-def _log(message: str) -> None:
-    if LOG_ENABLED:
-        print(f"[measure] {message}")
+from damp.article_refs import CYCLIC_COORDS
+from damp.logging import log_event
 
 
 AngleTriplet = Tuple[float, int, int]      # (angle, X_patch, Y_patch)
@@ -40,10 +36,13 @@ class MnistSobelAngleMap:
                                          [-1, -2, -1]], dtype=np.float32)
 
     def __post_init__(self) -> None:
-        _log(
-            "MnistSobelAngleMap init "
-            f"angle_in_degrees={self.angle_in_degrees} "
-            f"grad_threshold={self.grad_threshold}"
+        log_event(
+            "sobel_map.init",
+            section=CYCLIC_COORDS,
+            data={
+                "angle_in_degrees": self.angle_in_degrees,
+                "grad_threshold": self.grad_threshold,
+            },
         )
 
     def extract(self, image: Union[np.ndarray, "np.typing.ArrayLike"], label: int) -> ResultMap:
@@ -53,8 +52,10 @@ class MnistSobelAngleMap:
             raise ValueError(f"Ожидаю MNIST 28x28, получил {img.shape}")
 
         # нормализуем, если пришло 0..255
+        normalized = False
         if img.max() > 1.5:
             img = img / 255.0
+            normalized = True
 
         out: List[AngleTriplet] = []
 
@@ -76,6 +77,16 @@ class MnistSobelAngleMap:
 
                 out.append((angle, bx, by))
 
+        log_event(
+            "sobel_map.extract",
+            section=CYCLIC_COORDS,
+            data={
+                "label": int(label),
+                "normalized": normalized,
+                "patches_total": 49,
+                "patches_kept": len(out),
+            },
+        )
         return {int(label): out}
 
     @classmethod

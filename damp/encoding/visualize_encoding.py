@@ -8,6 +8,9 @@ from typing import DefaultDict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 import numpy as np
 import rerun as rr
 
+from damp.article_refs import CYCLIC_COORDS, MULTI_DIM_CODES, SPARSE_BIT_VECTORS
+from damp.logging import init_rerun, log_event
+
 if TYPE_CHECKING:
     from damp.encoding.damp_encoder import DetectorWindow, Encoder
 
@@ -121,9 +124,7 @@ def _ensure_encoder_state(encoder: "Encoder") -> EncoderState:
 
 
 def _ensure_rerun(app_id: str = "damp-encoding") -> None:
-    if not rr.is_enabled():
-        rr.init(app_id)
-        rr.spawn()
+    init_rerun(app_id=app_id)
 
 
 def _set_time_sequence(name: str, sequence: int) -> None:
@@ -355,6 +356,24 @@ def log_encoding(
         return
 
     _set_time_sequence("sample", sequence)
+    log_event(
+        "encoding.visualize.input",
+        section=MULTI_DIM_CODES,
+        data={"values": values, "label": label, "sequence": sequence},
+    )
+    log_event(
+        "encoding.visualize.normalized",
+        section=CYCLIC_COORDS,
+        data={"values": normalized_values},
+    )
+    log_event(
+        "encoding.visualize.code",
+        section=SPARSE_BIT_VECTORS,
+        data={
+            "code_length": encoder.code_length,
+            "active_bits": sum(int(bit) for bit in codes),
+        },
+    )
 
     encoder_state = _ensure_encoder_state(encoder)
     active_by_index = [False] * len(encoder.detectors)

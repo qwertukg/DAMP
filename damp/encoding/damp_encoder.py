@@ -2,14 +2,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import random
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-LOG_ENABLED = True
-
-
-def _log(message: str) -> None:
-    if LOG_ENABLED:
-        print(f"[encode] {message}")
+from damp.article_refs import (
+    CYCLIC_COORDS,
+    ENCODING_SYSTEM,
+    GEOMETRIC_METHOD,
+    MULTI_DIM_CODES,
+    ONE_DIM_CODES,
+    SPARSE_BIT_VECTORS,
+    WIDE_DETECTORS,
+)
+from damp.encoding.bitarray import BitArray
+from damp.logging import log_event
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,11 @@ class Detectors:
             raise ValueError("detector count must be positive")
         if not (0.0 <= self.overlap <= 1.0):
             raise ValueError("overlap must be in [0.0, 1.0]")
+        log_event(
+            "detectors.init",
+            section=WIDE_DETECTORS,
+            data={"count": self.count, "overlap": self.overlap},
+        )
 
 
 class Dimension:
@@ -44,6 +54,25 @@ class Dimension:
         self.detector_layers = list(detector_layers)
         self.closed = bool(closed)
         self.period = self.max_value - self.min_value
+        layers = [(layer.count, layer.overlap) for layer in self.detector_layers]
+        log_event(
+            "dimension.init",
+            section=ONE_DIM_CODES,
+            data={
+                "title": self.title,
+                "min_value": self.min_value,
+                "max_value": self.max_value,
+                "closed": self.closed,
+                "period": self.period,
+                "layers": layers,
+            },
+        )
+        if self.closed:
+            log_event(
+                "dimension.closed",
+                section=CYCLIC_COORDS,
+                data={"title": self.title, "period": self.period},
+            )
 
 
 class ClosedDimension(Dimension):
@@ -75,36 +104,6 @@ class DetectorWindow:
             diff = abs(value - self.center) % self.period
             return min(diff, self.period - diff) <= self.half_width
         return (self.center - self.half_width) <= value <= (self.center + self.half_width)
-
-
-class BitArray:
-    def __init__(self, length: int, fill: int = 0) -> None:
-        if length <= 0:
-            raise ValueError("bit array length must be positive")
-        if fill not in (0, 1):
-            raise ValueError("fill must be 0 or 1")
-        self._data = bytearray([fill] * length)
-
-    def set(self, index: int, value: int = 1) -> None:
-        self._data[index] = 1 if value else 0
-
-    def __len__(self) -> int:
-        return len(self._data)
-
-    def __getitem__(self, index: int) -> int:
-        return self._data[index]
-
-    def __iter__(self):
-        return iter(self._data)
-
-    def count(self) -> int:
-        return sum(self._data)
-
-    def to01(self) -> str:
-        return "".join("1" if bit else "0" for bit in self._data)
-
-    def __repr__(self) -> str:
-        return f"BitArray(len={len(self._data)}, ones={self.count()})"
 
 
 class Encoder:
@@ -150,9 +149,26 @@ class Encoder:
             dim_summaries.append(
                 f"{dim.title}:{status} range=({dim.min_value},{dim.max_value}) layers={layers}"
             )
-        _log(
-            f"encoder init dims={len(self.dimensions)} code_length={self.code_length} "
-            f"random_bit={self._random_bit} dims={dim_summaries}"
+        log_event(
+            "encoder.init",
+            section=ENCODING_SYSTEM,
+            data={
+                "dimensions": len(self.dimensions),
+                "random_bit": self._random_bit,
+                "random_seed": random_seed,
+                "log_every": self.log_every,
+                "dims": dim_summaries,
+            },
+        )
+        log_event(
+            "encoder.code_length",
+            section=SPARSE_BIT_VECTORS,
+            data={"code_length": self.code_length},
+        )
+        log_event(
+            "encoder.detectors",
+            section=WIDE_DETECTORS,
+            data={"detectors": len(self.detectors)},
         )
 
     @property
@@ -169,6 +185,11 @@ class Encoder:
             self._bit_map = [self._rng.randrange(self.code_length) for _ in range(self.code_length)]
         else:
             self._bit_map = list(range(self.code_length))
+        log_event(
+            "encoder.random_bit",
+            section=ENCODING_SYSTEM,
+            data={"random_bit": self._random_bit},
+        )
 
     @property
     def randomBit(self) -> bool:
@@ -187,6 +208,11 @@ class Encoder:
     ) -> Tuple[Tuple[float, ...], BitArray]:
         if len(values) != len(self.dimensions):
             raise ValueError("number of values must match number of dimensions")
+        log_event(
+            "encoder.encode.input",
+            section=MULTI_DIM_CODES,
+            data={"values": values},
+        )
         bit_array = BitArray(self.code_length)
         normalized_values: List[float] = []
         for dim_index, (value, dim) in enumerate(zip(values, self.dimensions)):
@@ -205,6 +231,20 @@ class Encoder:
             for detector in self._detectors_by_dimension[dim_index]:
                 if detector.is_active(v):
                     bit_array.set(self._bit_map[detector.detector_index], 1)
+        log_event(
+            "encoder.encode.normalized",
+            section=CYCLIC_COORDS,
+            data={"values": normalized_values},
+        )
+        log_event(
+            "encoder.encode.code",
+            section=SPARSE_BIT_VECTORS,
+            data={
+                "code_length": self.code_length,
+                "active_bits": bit_array.count(),
+                "code": bit_array,
+            },
+        )
         if self.log_every > 0 and log_image is not None:
             from damp.encoding import visualize_encoding as _viz
 
@@ -253,6 +293,25 @@ class Encoder:
                 step = width * (1.0 - overlap)
             centers = [dim.min_value + width / 2.0 + i * step for i in range(count)]
         half_width = width / 2.0
+        center_min = centers[0] if centers else None
+        center_max = centers[-1] if centers else None
+        log_event(
+            "encoder.layer",
+            section=GEOMETRIC_METHOD,
+            data={
+                "dimension": dim.title,
+                "dimension_index": dim_index,
+                "layer_index": layer_index,
+                "count": count,
+                "overlap": overlap,
+                "width": width,
+                "step": step,
+                "half_width": half_width,
+                "center_min": center_min,
+                "center_max": center_max,
+                "closed": dim.closed,
+            },
+        )
         windows = []
         for offset, center in enumerate(centers):
             windows.append(

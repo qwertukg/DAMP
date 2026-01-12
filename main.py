@@ -1,15 +1,13 @@
 from collections import defaultdict
-from damp.encoding.visualize_encoding import show, wait_for_close
 
-import rerun as rr
 from PIL import Image
 from torchvision import transforms
 from torchvision.datasets import MNIST
 
-from damp.encoding.MnistSobelAngleMap import MnistSobelAngleMap
+from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
+from damp.encoding.visualize_encoding import wait_for_close
 from damp.layout.damp_layout import Layout
-from damp.layout.visualize_layout import log_layout
 
 
 def _build_encoder() -> Encoder:
@@ -88,7 +86,6 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         eta=0.0,
         seed=0,
     )
-    log_layout(layout, step=0)
     step_offset = 1
     layout.run(
         steps=22000,
@@ -118,27 +115,20 @@ def _run_layout(codes: dict[float, list]) -> Layout:
 
 
 def main() -> None:
-    rr.init("damp-layout")
-    rr.spawn()
-
     encoder = _build_encoder()
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
     count = 60
+    label = 8
 
+    codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
 
-    for label in range(10):
-        codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
-        if not codes:
-            print(f"{label}-{count}-0")
-            continue
-        print(f"{label}-{count}-{total_codes}")
-        layout = _run_layout(codes)
-        image = layout.render_image()
-        rr.log("layout/image", rr.Image(image))
-        filename = f"{label}-{count}-{total_codes}.png"
-        Image.fromarray(image).save(filename)
+    layout = _run_layout(codes)
+
+    image = layout.render_image()
+    filename = f"data/{label}-{count}-{total_codes}.png"
+    Image.fromarray(image).save(filename)
 
     wait_for_close()
 
