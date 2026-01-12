@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import colorsys
 import random
 from typing import List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from damp.article_refs import (
     CYCLIC_COORDS,
@@ -14,7 +17,7 @@ from damp.article_refs import (
     WIDE_DETECTORS,
 )
 from damp.encoding.bitarray import BitArray
-from damp.logging import log_event
+from damp.logging import LOGGER
 
 
 @dataclass(frozen=True)
@@ -27,7 +30,7 @@ class Detectors:
             raise ValueError("detector count must be positive")
         if not (0.0 <= self.overlap <= 1.0):
             raise ValueError("overlap must be in [0.0, 1.0]")
-        log_event(
+        LOGGER.event(
             "detectors.init",
             section=WIDE_DETECTORS,
             data={"count": self.count, "overlap": self.overlap},
@@ -55,7 +58,7 @@ class Dimension:
         self.closed = bool(closed)
         self.period = self.max_value - self.min_value
         layers = [(layer.count, layer.overlap) for layer in self.detector_layers]
-        log_event(
+        LOGGER.event(
             "dimension.init",
             section=ONE_DIM_CODES,
             data={
@@ -68,7 +71,7 @@ class Dimension:
             },
         )
         if self.closed:
-            log_event(
+            LOGGER.event(
                 "dimension.closed",
                 section=CYCLIC_COORDS,
                 data={"title": self.title, "period": self.period},
@@ -119,7 +122,7 @@ class Encoder:
         self.dimensions = list(dimensions)
         self._rng = random.Random(random_seed)
         self.log_every = int(log_every) if log_every is not None else 0
-        self._log_state: object | None = None
+        self._log_counter = 0
         self.detectors: List[DetectorWindow] = []
         self._detectors_by_dimension: List[List[DetectorWindow]] = []
         next_index = 0
@@ -149,7 +152,7 @@ class Encoder:
             dim_summaries.append(
                 f"{dim.title}:{status} range=({dim.min_value},{dim.max_value}) layers={layers}"
             )
-        log_event(
+        LOGGER.event(
             "encoder.init",
             section=ENCODING_SYSTEM,
             data={
@@ -160,12 +163,12 @@ class Encoder:
                 "dims": dim_summaries,
             },
         )
-        log_event(
+        LOGGER.event(
             "encoder.code_length",
             section=SPARSE_BIT_VECTORS,
             data={"code_length": self.code_length},
         )
-        log_event(
+        LOGGER.event(
             "encoder.detectors",
             section=WIDE_DETECTORS,
             data={"detectors": len(self.detectors)},
@@ -185,7 +188,7 @@ class Encoder:
             self._bit_map = [self._rng.randrange(self.code_length) for _ in range(self.code_length)]
         else:
             self._bit_map = list(range(self.code_length))
-        log_event(
+        LOGGER.event(
             "encoder.random_bit",
             section=ENCODING_SYSTEM,
             data={"random_bit": self._random_bit},
@@ -208,7 +211,7 @@ class Encoder:
     ) -> Tuple[Tuple[float, ...], BitArray]:
         if len(values) != len(self.dimensions):
             raise ValueError("number of values must match number of dimensions")
-        log_event(
+        LOGGER.event(
             "encoder.encode.input",
             section=MULTI_DIM_CODES,
             data={"values": values},
@@ -231,36 +234,69 @@ class Encoder:
             for detector in self._detectors_by_dimension[dim_index]:
                 if detector.is_active(v):
                     bit_array.set(self._bit_map[detector.detector_index], 1)
-        log_event(
+        LOGGER.event(
             "encoder.encode.normalized",
             section=CYCLIC_COORDS,
             data={"values": normalized_values},
         )
-        log_event(
+        self._log_counter += 1
+        visuals = []
+        patch_meta: dict[str, float | int | str] = {}
+        if self.log_every > 0 and self._log_counter % self.log_every == 0:
+            visuals.append(
+                LOGGER.visual_bar_chart(
+                    "encoding/code_bits",
+                    list(bit_array),
+                )
+            )
+            image_array = None
+            image_path = "encoding/image"
+            if log_label is not None:
+                image_path = f"label_{int(log_label)}/image"
+            if log_image is not None:
+                image_array = np.asarray(log_image)
+                visuals.append(
+                    LOGGER.visual_image(
+                        image_path,
+                        image_array,
+                    )
+                )
+            if log_measurements:
+                positions, colors, patch_meta, grid = self._patch_points(
+                    log_measurements,
+                    image_array.shape if image_array is not None else None,
+                    grid_override=self._infer_patch_grid(),
+                )
+                visuals.append(
+                    LOGGER.visual_points2d(
+                        image_path,
+                        positions,
+                        colors=colors,
+                        radii=grid["radius"],
+                    )
+                )
+                if grid["mins"]:
+                    visuals.append(
+                        LOGGER.visual_boxes2d(
+                            image_path,
+                            grid["mins"],
+                            grid["sizes"],
+                            colors=grid["colors"],
+                        )
+                    )
+        LOGGER.event(
             "encoder.encode.code",
             section=SPARSE_BIT_VECTORS,
             data={
                 "code_length": self.code_length,
                 "active_bits": bit_array.count(),
                 "code": bit_array,
+                "label": int(log_label) if log_label is not None else None,
+                "measurements": len(log_measurements) if log_measurements else 0,
+                **patch_meta,
             },
+            visuals=visuals if visuals else None,
         )
-        if self.log_every > 0 and log_image is not None:
-            from damp.encoding import visualize_encoding as _viz
-
-            if self._log_state is None:
-                self._log_state = _viz.LogState()
-            label_value = int(log_label) if log_label is not None else None
-            _viz.log_encoding(
-                self,
-                normalized_values,
-                bit_array,
-                log_image,
-                label_value,
-                log_every=self.log_every,
-                state=self._log_state,
-                measurements=log_measurements,
-            )
         return tuple(normalized_values), bit_array
 
     def _build_layer_detectors(
@@ -295,7 +331,7 @@ class Encoder:
         half_width = width / 2.0
         center_min = centers[0] if centers else None
         center_max = centers[-1] if centers else None
-        log_event(
+        LOGGER.event(
             "encoder.layer",
             section=GEOMETRIC_METHOD,
             data={
@@ -328,3 +364,102 @@ class Encoder:
                 )
             )
         return windows
+
+    @staticmethod
+    def _angle_to_rgb(angle_deg: float) -> tuple[int, int, int]:
+        hue = (angle_deg % 360.0) / 360.0
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+        return int(r * 255), int(g * 255), int(b * 255)
+
+    def _patch_points(
+        self,
+        measurements: Sequence[tuple[float, int, int]],
+        image_shape: Sequence[int] | None,
+        *,
+        grid_override: tuple[int, int] | None = None,
+    ) -> tuple[
+        list[tuple[float, float]],
+        list[tuple[int, int, int]],
+        dict[str, float | int | str],
+        dict[str, object],
+    ]:
+        if grid_override:
+            grid_x, grid_y = grid_override
+        else:
+            max_x = max(int(x) for _, x, _ in measurements)
+            max_y = max(int(y) for _, _, y in measurements)
+            grid_x = max_x + 1
+            grid_y = max_y + 1
+        step_x: float | None = None
+        step_y: float | None = None
+        offset_x = 0.0
+        offset_y = 0.0
+        patch_edge: float | None = None
+        positions: list[tuple[float, float]] = []
+        if image_shape and len(image_shape) >= 2 and grid_x > 0 and grid_y > 0:
+            height = float(image_shape[0])
+            width = float(image_shape[1])
+            if height > 0 and width > 0:
+                step_x = width / grid_x
+                step_y = height / grid_y
+        if step_x is not None and step_y is not None:
+            patch_edge = min(step_x, step_y)
+            offset_x = max(0.0, (step_x - patch_edge) * grid_x / 2.0)
+            offset_y = max(0.0, (step_y - patch_edge) * grid_y / 2.0)
+            for _, x, y in measurements:
+                positions.append(
+                    (
+                        offset_x + (float(x) + 0.5) * patch_edge,
+                        offset_y + (float(y) + 0.5) * patch_edge,
+                    )
+                )
+        else:
+            patch_edge = 1.0
+            for _, x, y in measurements:
+                positions.append((float(x) + 0.5, float(y) + 0.5))
+        colors = [self._angle_to_rgb(angle) for angle, _, _ in measurements]
+        grid_mins: list[tuple[float, float]] = []
+        grid_sizes: list[tuple[float, float]] = []
+        grid_colors: list[tuple[int, int, int, int]] = []
+        if patch_edge is not None:
+            for y in range(grid_y):
+                for x in range(grid_x):
+                    grid_mins.append(
+                        (
+                            offset_x + x * patch_edge,
+                            offset_y + y * patch_edge,
+                        )
+                    )
+                    grid_sizes.append((patch_edge, patch_edge))
+                    grid_colors.append((255, 255, 255, 60))
+        meta: dict[str, float | int | str] = {
+            "patch_grid_x": grid_x,
+            "patch_grid_y": grid_y,
+            "patch_edge": patch_edge if patch_edge is not None else "None",
+            "patch_offset_x": offset_x,
+            "patch_offset_y": offset_y,
+        }
+        grid = {
+            "mins": grid_mins,
+            "sizes": grid_sizes,
+            "colors": grid_colors,
+            "radius": patch_edge / 2.0 if patch_edge is not None else 0.5,
+        }
+        return positions, colors, meta, grid
+
+    def _infer_patch_grid(self) -> tuple[int, int] | None:
+        x_dim = None
+        y_dim = None
+        for dim in self.dimensions:
+            title = getattr(dim, "title", "")
+            if str(title).lower() == "x":
+                x_dim = dim
+            elif str(title).lower() == "y":
+                y_dim = dim
+        if x_dim is None or y_dim is None:
+            return None
+        grid_x = int(round(x_dim.max_value)) - int(round(x_dim.min_value)) + 1
+        grid_y = int(round(y_dim.max_value)) - int(round(y_dim.min_value)) + 1
+        if grid_x <= 0 or grid_y <= 0:
+            return None
+        return grid_x, grid_y

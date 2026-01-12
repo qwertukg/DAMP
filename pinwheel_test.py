@@ -2,7 +2,6 @@ from collections import defaultdict
 import random
 
 from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
-from damp.encoding.visualize_encoding import wait_for_close
 from damp.layout.damp_layout import Layout
 
 
@@ -62,10 +61,6 @@ def main() -> None:
         log_every=1,
         step_offset=step_offset,
     )
-
-    wait_for_close()
-
-
 
 if __name__ == "__main__":
     main()

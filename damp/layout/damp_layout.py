@@ -23,7 +23,7 @@ from damp.article_refs import (
     SPARSE_BIT_VECTORS,
 )
 from damp.encoding.bitarray import BitArray
-from damp.logging import log_event
+from damp.logging import LOGGER
 
 
 @dataclass(frozen=True)
@@ -352,7 +352,7 @@ class _GpuLayoutEngine:
             import numpy as np
             import moderngl
         except Exception as exc:
-            log_event(
+            LOGGER.event(
                 "layout.gpu.import_failed",
                 section=GPU_IMPLEMENTATION,
                 data={"error": str(exc)},
@@ -365,14 +365,14 @@ class _GpuLayoutEngine:
             try:
                 ctx = moderngl.create_standalone_context()
             except Exception as exc:
-                log_event(
+                LOGGER.event(
                     "layout.gpu.context_failed",
                     section=GPU_IMPLEMENTATION,
                     data={"error": str(exc)},
                 )
                 return None
             if getattr(ctx, "version_code", 0) < 410:
-                log_event(
+                LOGGER.event(
                     "layout.gpu.version_too_low",
                     section=GPU_IMPLEMENTATION,
                     data={"version_code": getattr(ctx, "version_code", 0)},
@@ -382,7 +382,7 @@ class _GpuLayoutEngine:
         try:
             return cls(ctx, np, moderngl, points, similarity)
         except Exception as exc:
-            log_event(
+            LOGGER.event(
                 "layout.gpu.init_failed",
                 section=GPU_IMPLEMENTATION,
                 data={"error": str(exc)},
@@ -653,7 +653,7 @@ class Layout:
 
         self.height = grid_size
         self.width = grid_size
-        log_event(
+        LOGGER.event(
             "layout.init",
             section=LAYOUT_ALGORITHM,
             data={
@@ -662,7 +662,7 @@ class Layout:
                 "seed": seed,
             },
         )
-        log_event(
+        LOGGER.event(
             "layout.grid",
             section=LAYOUT_COMPACTNESS,
             data={
@@ -670,39 +670,39 @@ class Layout:
                 "empty_ratio": empty_ratio,
             },
         )
-        log_event(
+        LOGGER.event(
             "layout.similarity",
             section=SIMILARITY_MEASURES,
             data={"similarity": self._similarity},
         )
-        log_event(
+        LOGGER.event(
             "layout.thresholds",
             section=ENERGIES,
             data={"lambda_threshold": self._lambda, "eta": self._eta},
         )
-        log_event(
+        LOGGER.event(
             "layout.precompute",
             section=OPTIM_SIM_MATRIX,
             data={"precompute_similarity": precompute_similarity},
         )
-        log_event(
+        LOGGER.event(
             "layout.precompute_limit",
             section=OPTIM_SUBSET,
             data={"max_precompute": max_precompute},
         )
-        log_event(
+        LOGGER.event(
             "layout.parallel",
             section=PARALLEL_PROCESSING,
             data={"parallel_workers": parallel_workers},
         )
-        log_event(
+        LOGGER.event(
             "layout.gpu.config",
             section=GPU_IMPLEMENTATION,
             data={"use_gpu": use_gpu},
         )
         if self._points:
             ones_values = [point.ones for point in self._points]
-            log_event(
+            LOGGER.event(
                 "layout.codes",
                 section=SPARSE_BIT_VECTORS,
                 data={
@@ -713,7 +713,7 @@ class Layout:
                 },
             )
         else:
-            log_event(
+            LOGGER.event(
                 "layout.codes",
                 section=SPARSE_BIT_VECTORS,
                 data={
@@ -732,7 +732,7 @@ class Layout:
         self._place_points()
 
         self._distance_eps = 1e-6
-        log_event(
+        LOGGER.event(
             "layout.distance_eps",
             section=ENERGIES,
             data={"distance_eps": self._distance_eps},
@@ -744,13 +744,13 @@ class Layout:
             if self._gpu_engine is None:
                 self._use_gpu = False
         if self._use_gpu and self._gpu_engine is not None:
-            log_event(
+            LOGGER.event(
                 "layout.gpu.enabled",
                 section=GPU_IMPLEMENTATION,
                 data={"status": "OpenGL 4.1"},
             )
         else:
-            log_event(
+            LOGGER.event(
                 "layout.gpu.disabled",
                 section=GPU_IMPLEMENTATION,
                 data={"status": "cpu"},
@@ -800,7 +800,7 @@ class Layout:
         if energy_patience <= 0:
             raise ValueError("energy_patience must be positive")
 
-        log_event(
+        LOGGER.event(
             "layout.run.selection",
             section=PAIR_SELECTION,
             data={
@@ -808,7 +808,7 @@ class Layout:
                 "pair_radius": pair_radius,
             },
         )
-        log_event(
+        LOGGER.event(
             "layout.run.mode",
             section=ENERGY_LONG if mode == "long" else ENERGY_SHORT,
             data={
@@ -816,7 +816,7 @@ class Layout:
                 "local_radius": local_radius,
             },
         )
-        log_event(
+        LOGGER.event(
             "layout.run.settings",
             section=LAYOUT_ALGORITHM,
             data={
@@ -826,7 +826,7 @@ class Layout:
                 "step_offset": step_offset,
             },
         )
-        log_event(
+        LOGGER.event(
             "layout.run.energy_stop",
             section=QUALITY_ASSESS,
             data={
@@ -854,9 +854,7 @@ class Layout:
             total_swaps += swaps
             steps_executed = step + 1
             if log_every is not None and step % log_every == 0:
-                from .visualize_layout import log_layout
-
-                log_layout(self, path=log_path, step=step + step_offset)
+                self._log_layout_state(path=log_path, step=step + step_offset)
             if energy_radius is not None and mode == "long":
                 if step % energy_check_every == 0:
                     energy = self.average_local_energy(energy_radius)
@@ -873,7 +871,7 @@ class Layout:
 
         self.last_steps = steps_executed
         avg_swaps = (total_swaps / steps_executed) if steps_executed else 0.0
-        log_event(
+        LOGGER.event(
             "layout.run.done",
             section=LAYOUT_ALGORITHM,
             data={
@@ -883,6 +881,30 @@ class Layout:
             },
         )
         return total_swaps
+
+    def _log_layout_state(self, path: str, step: int) -> None:
+        positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+        colors = self.colors_rgb()
+        visuals = [
+            LOGGER.visual_points2d(
+                f"{path}/points",
+                positions,
+                colors=colors,
+                radii=1.0,
+            )
+        ]
+        image = self.render_image(log=False)
+        visuals.append(LOGGER.visual_image(f"{path}/image", image))
+        LOGGER.event(
+            "layout.visual",
+            section=LAYOUT_ALGORITHM,
+            data={
+                "step": step,
+                "points": self._point_count,
+                "grid_size": self.width,
+            },
+            visuals=visuals,
+        )
 
     def set_similarity_params(
         self,
@@ -896,7 +918,7 @@ class Layout:
             self._lambda = lambda_threshold
         if eta is not _UNSET:
             self._eta = eta
-        log_event(
+        LOGGER.event(
             "layout.similarity_params",
             section=ENERGIES,
             data={"lambda_threshold": self._lambda, "eta": self._eta},
@@ -991,13 +1013,20 @@ class Layout:
         hues = self._normalized_hues()
         return [self._hue_to_rgb(hue) for hue in hues]
 
-    def render_image(self) -> "numpy.ndarray":
+    def render_image(self, *, log: bool = True) -> "numpy.ndarray":
         import numpy as np
 
         image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         hues = self._normalized_hues()
         for idx, (y, x) in enumerate(self._positions):
             image[y, x] = self._hue_to_rgb(hues[idx])
+        if log:
+            LOGGER.event(
+                "layout.render_image",
+                section=LAYOUT_ALGORITHM,
+                data={"height": self.height, "width": self.width},
+                visuals=[LOGGER.visual_image("layout/render_image", image)],
+            )
         return image
 
     def average_local_energy(self, radius: int) -> float:
@@ -1021,7 +1050,7 @@ class Layout:
                 self._gpu_engine = None
                 energy = None
             if energy is not None:
-                log_event(
+                LOGGER.event(
                     "layout.energy.average",
                     section=QUALITY_ASSESS,
                     data={"radius": radius, "energy": energy, "mode": "gpu"},
@@ -1057,7 +1086,7 @@ class Layout:
         if emax <= 0.0:
             return 0.0
         avg_energy = sum(e / emax for e in energies) / len(energies)
-        log_event(
+        LOGGER.event(
             "layout.energy.average",
             section=QUALITY_ASSESS,
             data={"radius": radius, "energy": avg_energy, "mode": "cpu"},
@@ -1237,22 +1266,22 @@ class Layout:
     def _build_similarity_cache(self) -> None:
         point_count = self._point_count
         workers = self._similarity_worker_count()
-        log_event(
+        LOGGER.event(
             "layout.sim_cache.start",
             section=OPTIM_SIM_MATRIX,
             data={"point_count": point_count},
         )
-        log_event(
+        LOGGER.event(
             "layout.sim_cache.similarity",
             section=SIMILARITY_MEASURES,
             data={"similarity": self._similarity},
         )
-        log_event(
+        LOGGER.event(
             "layout.sim_cache.parallel",
             section=PARALLEL_PROCESSING,
             data={"workers": workers},
         )
-        log_event(
+        LOGGER.event(
             "layout.sim_cache.gpu",
             section=GPU_IMPLEMENTATION,
             data={"use_gpu": self._use_gpu},
@@ -1269,7 +1298,7 @@ class Layout:
                     except Exception:
                         self._gpu_engine = None
                 used_gpu = True
-                log_event(
+                LOGGER.event(
                     "layout.sim_cache.done",
                     section=GPU_IMPLEMENTATION,
                     data={"mode": "gpu"},
@@ -1309,7 +1338,7 @@ class Layout:
             except Exception:
                 self._gpu_engine = None
         if not used_gpu:
-            log_event(
+            LOGGER.event(
                 "layout.sim_cache.done",
                 section=OPTIM_SIM_MATRIX,
                 data={"mode": "cpu"},
@@ -1484,7 +1513,7 @@ class Layout:
         total_pairs = self._point_count * (self._point_count - 1) // 2
         if cpu_count < 2 or total_pairs < _PARALLEL_SIM_MIN_PAIRS:
             return 1
-        log_event(
+        LOGGER.event(
             "layout.parallel.cpu_count",
             section=PARALLEL_PROCESSING,
             data={"cpu_count": cpu_count},

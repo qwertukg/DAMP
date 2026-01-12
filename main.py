@@ -6,7 +6,6 @@ from torchvision.datasets import MNIST
 
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
-from damp.encoding.visualize_encoding import wait_for_close
 from damp.layout.damp_layout import Layout
 
 
@@ -48,6 +47,7 @@ def _build_encoder() -> Encoder:
                 Detectors(1, 0.4),
             ],
         ),
+        log_every=1,
     )
 
 
@@ -70,10 +70,23 @@ def _collect_codes(
             break
         img = img_tensor.squeeze(0).numpy()
         digit_values = extractor.extract(img, digit)
-        for (a, x, y) in digit_values[digit]:
-            _, code = encoder.encode(float(a), float(x), float(y))
+        measurements = digit_values[int(digit)]
+        first = True
+        for (a, x, y) in measurements:
+            log_image = img if first else None
+            log_label = int(digit) if first else None
+            log_measurements = measurements if first else None
+            _, code = encoder.encode(
+                float(a),
+                float(x),
+                float(y),
+                log_image=log_image,
+                log_label=log_label,
+                log_measurements=log_measurements,
+            )
             codes[a].append(code)
             total_codes += 1
+            first = False
     return codes, total_codes
 
 
@@ -120,7 +133,7 @@ def main() -> None:
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
     count = 60
-    label = 8
+    label = 1
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
 
@@ -129,9 +142,6 @@ def main() -> None:
     image = layout.render_image()
     filename = f"data/{label}-{count}-{total_codes}.png"
     Image.fromarray(image).save(filename)
-
-    wait_for_close()
-
 
 if __name__ == "__main__":
     main()
