@@ -241,12 +241,14 @@ class Encoder:
         )
         self._log_counter += 1
         code_visuals = []
+        code_bits: list[int] | None = None
         patch_meta: dict[str, float | int | str] = {}
         if self.log_every > 0 and self._log_counter % self.log_every == 0:
+            code_bits = list(bit_array)
             code_visuals.append(
                 LOGGER.visual_bar_chart(
                     "encoding/code_bits",
-                    list(bit_array),
+                    code_bits,
                 )
             )
         if log_image is not None or log_measurements:
@@ -261,6 +263,14 @@ class Encoder:
                     LOGGER.visual_image(
                         image_path,
                         image_array,
+                    )
+                )
+                if code_bits is None:
+                    code_bits = list(bit_array)
+                image_visuals.append(
+                    LOGGER.visual_bar_chart(
+                        f"{image_path}/code_bits",
+                        code_bits,
                     )
                 )
             if log_measurements:
