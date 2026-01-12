@@ -8,6 +8,7 @@ import random
 from typing import Iterable, Mapping, Sequence
 
 from damp.article_refs import (
+    ENERGY_CALC,
     ENERGIES,
     ENERGY_LONG,
     ENERGY_SHORT,
@@ -19,6 +20,7 @@ from damp.article_refs import (
     PAIR_SELECTION,
     PARALLEL_PROCESSING,
     QUALITY_ASSESS,
+    SIMILARITY_DEFINITION,
     SIMILARITY_MEASURES,
     SPARSE_BIT_VECTORS,
 )
@@ -995,6 +997,27 @@ class Layout:
                 return self._apply_swaps(swaps)
             self._gpu_engine = None
 
+        if mode == "long":
+            pair_data: list[tuple[int, int, int, int, int | None, int | None]] = []
+            swap_coords = []
+            for y1, x1, y2, x2 in pairs:
+                idx_a = self.grid[y1][x1]
+                idx_b = self.grid[y2][x2]
+                if idx_a is None and idx_b is None:
+                    continue
+                pair_data.append((y1, x1, y2, x2, idx_a, idx_b))
+                swap_coords.append((y1, x1, y2, x2))
+            if pair_data:
+                energies = self._calculate_far_energies(pair_data)
+            else:
+                energies = []
+            for (y1, x1, y2, x2), (energy_c, energy_s) in zip(
+                swap_coords, energies
+            ):
+                if energy_s < energy_c:
+                    swaps.append((y1, x1, y2, x2))
+            return self._apply_swaps(swaps)
+
         for y1, x1, y2, x2 in pairs:
             if self._should_swap(y1, x1, y2, x2, mode=mode, local_radius=local_radius):
                 swaps.append((y1, x1, y2, x2))
@@ -1172,29 +1195,203 @@ class Layout:
         idx_b: int | None,
         pos_b: tuple[int, int],
     ) -> tuple[float, float]:
-        pos_a_y, pos_a_x = pos_a
-        pos_b_y, pos_b_x = pos_b
-        pos_y = self._pos_y
-        pos_x = self._pos_x
-        sim_lambda = self._sim_lambda_idx
-        energy_c = 0.0
-        energy_s = 0.0
-        for idx in range(self._point_count):
-            if idx == idx_a or idx == idx_b:
-                continue
-            s1 = sim_lambda(idx, idx_a)
-            s2 = sim_lambda(idx, idx_b) if idx_b is not None else 0.0
-            if s1 == 0.0 and s2 == 0.0:
-                continue
-            dy1 = pos_a_y - pos_y[idx]
-            dx1 = pos_a_x - pos_x[idx]
-            dy2 = pos_b_y - pos_y[idx]
-            dx2 = pos_b_x - pos_x[idx]
-            d1 = dy1 * dy1 + dx1 * dx1
-            d2 = dy2 * dy2 + dx2 * dx2
-            energy_c += s1 * d1 + s2 * d2
-            energy_s += s2 * d1 + s1 * d2
-        return energy_c, energy_s
+        energies = self._calculate_far_energies(
+            [(pos_a[0], pos_a[1], pos_b[0], pos_b[1], idx_a, idx_b)]
+        )
+        if not energies:
+            return 0.0, 0.0
+        return energies[0]
+
+    def _calculate_far_energies(
+        self,
+        pairs: Sequence[tuple[int, int, int, int, int | None, int | None]],
+    ) -> list[tuple[float, float]]:
+        batch_size = len(pairs)
+        if batch_size == 0:
+            LOGGER.event(
+                "layout.energy.long.empty",
+                section=ENERGY_LONG,
+                data={
+                    "pairs": 0,
+                    "points": self._point_count,
+                    "space_size": (self.height, self.width),
+                },
+            )
+            return []
+
+        cutoff = self._lambda if self._eta is None else 0.0
+        LOGGER.event(
+            "layout.energy.long.similarity",
+            section=SIMILARITY_MEASURES,
+            data={
+                "similarity": self._similarity,
+                "pairs": batch_size,
+                "points": self._point_count,
+            },
+        )
+        LOGGER.event(
+            "layout.energy.long.sim_lambda",
+            section=SIMILARITY_DEFINITION,
+            data={
+                "lambda_threshold": self._lambda,
+                "eta": self._eta,
+                "cutoff": cutoff,
+            },
+        )
+        LOGGER.event(
+            "layout.energy.long.threshold",
+            section=ENERGIES,
+            data={
+                "lambda_threshold": self._lambda,
+                "eta": self._eta,
+                "cutoff": cutoff,
+            },
+        )
+        LOGGER.event(
+            "layout.energy.pair.ignore_self",
+            section=ENERGY_CALC,
+            data={"skip_pair_points": True},
+        )
+
+        pair_points: list[
+            tuple[int, int, int, int, LayoutPoint | None, LayoutPoint | None, int | None, int | None]
+        ] = []
+        for y1, x1, y2, x2, idx_a, idx_b in pairs:
+            point_a = self._points[idx_a] if idx_a is not None else None
+            point_b = self._points[idx_b] if idx_b is not None else None
+            pair_points.append((y1, x1, y2, x2, point_a, point_b, idx_a, idx_b))
+
+        def similarity(a: LayoutPoint | None, b: LayoutPoint | None) -> float:
+            if a is None or b is None:
+                return 0.0
+            sim = _similarity_base_points(a, b, self._similarity)
+            if sim <= 0.0:
+                return 0.0
+            if self._eta is None:
+                return sim
+            return sim * (1.0 / (1.0 + math.exp(-self._eta * (sim - self._lambda))))
+
+        energies: list[list[float]] = [[0.0, 0.0] for _ in range(batch_size)]
+        sim1_sum = [0.0] * batch_size
+        sim2_sum = [0.0] * batch_size
+        sim1_min = [float("inf")] * batch_size
+        sim1_max = [0.0] * batch_size
+        sim2_min = [float("inf")] * batch_size
+        sim2_max = [0.0] * batch_size
+        d1_min = [float("inf")] * batch_size
+        d1_max = [0.0] * batch_size
+        d2_min = [float("inf")] * batch_size
+        d2_max = [0.0] * batch_size
+        contrib_counts = [0] * batch_size
+        empty_cells = 0
+
+        for y in range(self.height):
+            row = self.grid[y]
+            for x in range(self.width):
+                idx = row[x]
+                if idx is None:
+                    empty_cells += 1
+                    continue
+                current_point = self._points[idx]
+                for pair_idx, (y1, x1, y2, x2, point_a, point_b, _, _) in enumerate(
+                    pair_points
+                ):
+                    if (y == y1 and x == x1) or (y == y2 and x == x2):
+                        continue
+                    s1 = similarity(point_a, current_point)
+                    s2 = similarity(point_b, current_point)
+                    if s1 < cutoff:
+                        s1 = 0.0
+                    if s2 < cutoff:
+                        s2 = 0.0
+                    if s1 == 0.0 and s2 == 0.0:
+                        continue
+                    dy1 = y1 - y
+                    dx1 = x1 - x
+                    dy2 = y2 - y
+                    dx2 = x2 - x
+                    d1 = dy1 * dy1 + dx1 * dx1
+                    d2 = dy2 * dy2 + dx2 * dx2
+                    energies[pair_idx][0] += s1 * d1 + s2 * d2
+                    energies[pair_idx][1] += s2 * d1 + s1 * d2
+                    sim1_sum[pair_idx] += s1
+                    sim2_sum[pair_idx] += s2
+                    if s1 < sim1_min[pair_idx]:
+                        sim1_min[pair_idx] = s1
+                    if s1 > sim1_max[pair_idx]:
+                        sim1_max[pair_idx] = s1
+                    if s2 < sim2_min[pair_idx]:
+                        sim2_min[pair_idx] = s2
+                    if s2 > sim2_max[pair_idx]:
+                        sim2_max[pair_idx] = s2
+                    if d1 < d1_min[pair_idx]:
+                        d1_min[pair_idx] = d1
+                    if d1 > d1_max[pair_idx]:
+                        d1_max[pair_idx] = d1
+                    if d2 < d2_min[pair_idx]:
+                        d2_min[pair_idx] = d2
+                    if d2 > d2_max[pair_idx]:
+                        d2_max[pair_idx] = d2
+                    contrib_counts[pair_idx] += 1
+
+        LOGGER.event(
+            "layout.energy.long.space",
+            section=ENERGY_LONG,
+            data={
+                "space_size": (self.height, self.width),
+                "points": self._point_count,
+                "empty_cells": empty_cells,
+            },
+        )
+
+        results: list[tuple[float, float]] = []
+        for pair_idx, (y1, x1, y2, x2, point_a, point_b, idx_a, idx_b) in enumerate(
+            pair_points
+        ):
+            energy_c, energy_s = energies[pair_idx]
+            count = contrib_counts[pair_idx]
+            sim1_min_val = 0.0 if count == 0 else sim1_min[pair_idx]
+            sim1_max_val = 0.0 if count == 0 else sim1_max[pair_idx]
+            sim2_min_val = 0.0 if count == 0 else sim2_min[pair_idx]
+            sim2_max_val = 0.0 if count == 0 else sim2_max[pair_idx]
+            d1_min_val = 0.0 if count == 0 else d1_min[pair_idx]
+            d1_max_val = 0.0 if count == 0 else d1_max[pair_idx]
+            d2_min_val = 0.0 if count == 0 else d2_min[pair_idx]
+            d2_max_val = 0.0 if count == 0 else d2_max[pair_idx]
+            ones_a = 0 if point_a is None else point_a.ones
+            ones_b = 0 if point_b is None else point_b.ones
+            LOGGER.event(
+                "layout.energy.long.pair",
+                section=ENERGY_LONG,
+                data={
+                    "pair_index": pair_idx,
+                    "y1": y1,
+                    "x1": x1,
+                    "y2": y2,
+                    "x2": x2,
+                    "idx_a": -1 if idx_a is None else idx_a,
+                    "idx_b": -1 if idx_b is None else idx_b,
+                    "ones_a": ones_a,
+                    "ones_b": ones_b,
+                    "phi_c": energy_c,
+                    "phi_s": energy_s,
+                    "s1_sum": sim1_sum[pair_idx],
+                    "s2_sum": sim2_sum[pair_idx],
+                    "s1_min": sim1_min_val,
+                    "s1_max": sim1_max_val,
+                    "s2_min": sim2_min_val,
+                    "s2_max": sim2_max_val,
+                    "d1_min": d1_min_val,
+                    "d1_max": d1_max_val,
+                    "d2_min": d2_min_val,
+                    "d2_max": d2_max_val,
+                    "contrib_points": count,
+                    "points_total": self._point_count,
+                },
+            )
+            results.append((energy_c, energy_s))
+
+        return results
 
     def _pair_energy_short(
         self,
