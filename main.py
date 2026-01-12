@@ -8,7 +8,7 @@ from damp.logging import LOGGER
 LOG_INTERVAL_DEFAULT = 1
 LOG_INTERVAL_INIT = 1
 LOG_INTERVAL_SOBEL_IMAGE = 25
-LOG_INTERVAL_SOBEL_PATCH = 200
+LOG_INTERVAL_SOBEL_PATCH = 2000
 LOG_INTERVAL_ENCODER_ENCODE = 100
 LOG_INTERVAL_ENCODER_IMAGE = 10
 LOG_INTERVAL_LAYOUT_ENERGY = 200
@@ -129,7 +129,7 @@ def _build_encoder() -> Encoder:
 
 def _collect_codes(
     dataset,
-    label: int,
+    label: int | None,
     count: int,
     encoder: Encoder,
     extractor: MnistSobelAngleMap,
@@ -139,7 +139,7 @@ def _collect_codes(
     found = 0
 
     for img_tensor, digit in dataset:
-        if int(digit) != label:
+        if label is not None and int(digit) != label:
             continue
         found += 1
         if found > count:
@@ -213,7 +213,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 100
+    count = 600
     label = 8
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)

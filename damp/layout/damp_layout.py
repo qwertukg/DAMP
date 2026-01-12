@@ -889,14 +889,18 @@ class Layout:
         colors = self.colors_rgb()
         visuals = [
             LOGGER.visual_points2d(
+                f"{path}/image",
+                positions,
+                colors=colors,
+                radii=0.5,
+            ),
+            LOGGER.visual_points2d(
                 f"{path}/points",
                 positions,
                 colors=colors,
-                radii=1.0,
-            )
+                radii=0.5,
+            ),
         ]
-        image = self.render_image(log=False)
-        visuals.append(LOGGER.visual_image(f"{path}/image", image))
         LOGGER.event(
             "layout.visual",
             section=LAYOUT_ALGORITHM,
@@ -1040,15 +1044,23 @@ class Layout:
         import numpy as np
 
         image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        hues = self._normalized_hues()
+        colors = self.colors_rgb()
         for idx, (y, x) in enumerate(self._positions):
-            image[y, x] = self._hue_to_rgb(hues[idx])
+            image[y, x] = colors[idx]
         if log:
+            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
             LOGGER.event(
                 "layout.render_image",
                 section=LAYOUT_ALGORITHM,
                 data={"height": self.height, "width": self.width},
-                visuals=[LOGGER.visual_image("layout/render_image", image)],
+                visuals=[
+                    LOGGER.visual_points2d(
+                        "layout/render_image",
+                        positions,
+                        colors=colors,
+                        radii=0.5,
+                    ),
+                ],
             )
         return image
 

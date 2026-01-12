@@ -57,6 +57,9 @@ class DampLogger:
             rr.spawn()
             self._spawned = True
 
+    def _console_log(self, message: str) -> None:
+        print(message)
+
     @staticmethod
     def _format_value(value: Any, *, max_items: int = 8, max_chars: int = 200) -> str:
         if value is None:
@@ -147,12 +150,13 @@ class DampLogger:
         else:
             message = event
         message = f"{message} [{section}]"
-        print(message)
+        self._console_log(message)
         self._ensure_rerun()
         base_path = path or self._base_path
         rr.log(base_path, rr.TextLog(message))
         if data:
-            rr.log(f"{base_path}/{event}", rr.AnyValues(**self._coerce_anyvalues(data)))
+            anyvalues_path = f"{base_path}/{event}"
+            rr.log(anyvalues_path, rr.AnyValues(**self._coerce_anyvalues(data)))
         if visuals:
             for visual in visuals:
                 rr.log(visual.path, visual.payload)
