@@ -240,22 +240,24 @@ class Encoder:
             data={"values": normalized_values},
         )
         self._log_counter += 1
-        visuals = []
+        code_visuals = []
         patch_meta: dict[str, float | int | str] = {}
         if self.log_every > 0 and self._log_counter % self.log_every == 0:
-            visuals.append(
+            code_visuals.append(
                 LOGGER.visual_bar_chart(
                     "encoding/code_bits",
                     list(bit_array),
                 )
             )
+        if log_image is not None or log_measurements:
+            image_visuals = []
             image_array = None
             image_path = "encoding/image"
             if log_label is not None:
                 image_path = f"label_{int(log_label)}/image"
             if log_image is not None:
                 image_array = np.asarray(log_image)
-                visuals.append(
+                image_visuals.append(
                     LOGGER.visual_image(
                         image_path,
                         image_array,
@@ -267,7 +269,7 @@ class Encoder:
                     image_array.shape if image_array is not None else None,
                     grid_override=self._infer_patch_grid(),
                 )
-                visuals.append(
+                image_visuals.append(
                     LOGGER.visual_points2d(
                         image_path,
                         positions,
@@ -276,7 +278,7 @@ class Encoder:
                     )
                 )
                 if grid["mins"]:
-                    visuals.append(
+                    image_visuals.append(
                         LOGGER.visual_boxes2d(
                             image_path,
                             grid["mins"],
@@ -284,6 +286,17 @@ class Encoder:
                             colors=grid["colors"],
                         )
                     )
+            if image_visuals:
+                LOGGER.event(
+                    "encoder.encode.image",
+                    section=MULTI_DIM_CODES,
+                    data={
+                        "label": int(log_label) if log_label is not None else None,
+                        "measurements": len(log_measurements) if log_measurements else 0,
+                        **patch_meta,
+                    },
+                    visuals=image_visuals,
+                )
         LOGGER.event(
             "encoder.encode.code",
             section=SPARSE_BIT_VECTORS,
@@ -295,7 +308,7 @@ class Encoder:
                 "measurements": len(log_measurements) if log_measurements else 0,
                 **patch_meta,
             },
-            visuals=visuals if visuals else None,
+            visuals=code_visuals if code_visuals else None,
         )
         return tuple(normalized_values), bit_array
 

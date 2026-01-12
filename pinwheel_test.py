@@ -1,20 +1,28 @@
 from collections import defaultdict
 import random
 
+from main import (
+    ENCODER_LOG_EVERY,
+    LAYOUT_LOG_EVERY_LONG,
+    LAYOUT_LOG_EVERY_SHORT,
+    configure_logging,
+)
 from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
 from damp.layout.damp_layout import Layout
 
 
 def main() -> None:
+    configure_logging()
     encoder = Encoder(
         ClosedDimension("Angle", (0.0, 360.0), [
-            Detectors(360,  0.7),
-            Detectors(180,  0.7),
+            #Detectors(360,  0.7),
+            #Detectors(180,  0.7),
             Detectors(90,   0.7),
             Detectors(45,   0.7),
             Detectors(30,   0.7),
             Detectors(10,   0.7),
         ]),
+        log_every=ENCODER_LOG_EVERY,
     )
 
     total_codes = 0
@@ -43,7 +51,7 @@ def main() -> None:
         pair_radius=layout.width // 2,
         mode="long",
         min_swap_ratio=0.001,
-        log_every=1,
+        log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
         #energy_radius=7,
         #energy_check_every=5,
@@ -58,7 +66,7 @@ def main() -> None:
         mode="short",
         local_radius=7,
         min_swap_ratio=0.001,
-        log_every=1,
+        log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
     )
 

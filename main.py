@@ -1,12 +1,88 @@
 from collections import defaultdict
 
-from PIL import Image
-from torchvision import transforms
-from torchvision.datasets import MNIST
-
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
 from damp.layout.damp_layout import Layout
+from damp.logging import LOGGER
+
+LOG_INTERVAL_DEFAULT = 1
+LOG_INTERVAL_INIT = 1
+LOG_INTERVAL_SOBEL_IMAGE = 25
+LOG_INTERVAL_SOBEL_PATCH = 200
+LOG_INTERVAL_ENCODER_ENCODE = 100
+LOG_INTERVAL_ENCODER_IMAGE = 10
+LOG_INTERVAL_LAYOUT_ENERGY = 200
+LOG_INTERVAL_LAYOUT_PAIR = 100000
+LOG_INTERVAL_LAYOUT_AVG_ENERGY = 20
+LOG_INTERVAL_LAYOUT_VISUAL = 1
+
+ENCODER_LOG_EVERY = 50
+LAYOUT_LOG_EVERY_LONG = 200
+LAYOUT_LOG_EVERY_SHORT = 50
+LAYOUT_ENERGY_CHECK_EVERY = 5
+
+LOG_INTERVALS = {
+    "detectors.init": LOG_INTERVAL_INIT,
+    "dimension.closed": LOG_INTERVAL_INIT,
+    "dimension.init": LOG_INTERVAL_INIT,
+    "encoder.code_length": LOG_INTERVAL_INIT,
+    "encoder.detectors": LOG_INTERVAL_INIT,
+    "encoder.encode.code": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.encode.image": LOG_INTERVAL_ENCODER_IMAGE,
+    "encoder.encode.input": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.encode.normalized": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.init": LOG_INTERVAL_INIT,
+    "encoder.layer": LOG_INTERVAL_INIT,
+    "encoder.random_bit": LOG_INTERVAL_INIT,
+    "layout.codes": LOG_INTERVAL_INIT,
+    "layout.distance_eps": LOG_INTERVAL_INIT,
+    "layout.energy.average": LOG_INTERVAL_LAYOUT_AVG_ENERGY,
+    "layout.energy.long.empty": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.long.pair": LOG_INTERVAL_LAYOUT_PAIR,
+    "layout.energy.long.sim_lambda": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.long.similarity": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.long.space": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.long.threshold": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.gpu.config": LOG_INTERVAL_INIT,
+    "layout.gpu.context_failed": LOG_INTERVAL_INIT,
+    "layout.gpu.disabled": LOG_INTERVAL_INIT,
+    "layout.gpu.enabled": LOG_INTERVAL_INIT,
+    "layout.gpu.import_failed": LOG_INTERVAL_INIT,
+    "layout.gpu.init_failed": LOG_INTERVAL_INIT,
+    "layout.gpu.version_too_low": LOG_INTERVAL_INIT,
+    "layout.grid": LOG_INTERVAL_INIT,
+    "layout.init": LOG_INTERVAL_INIT,
+    "layout.parallel": LOG_INTERVAL_INIT,
+    "layout.parallel.cpu_count": LOG_INTERVAL_INIT,
+    "layout.precompute": LOG_INTERVAL_INIT,
+    "layout.precompute_limit": LOG_INTERVAL_INIT,
+    "layout.render_image": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.run.done": LOG_INTERVAL_INIT,
+    "layout.run.energy_stop": LOG_INTERVAL_INIT,
+    "layout.run.mode": LOG_INTERVAL_INIT,
+    "layout.run.selection": LOG_INTERVAL_INIT,
+    "layout.run.settings": LOG_INTERVAL_INIT,
+    "layout.sim_cache.done": LOG_INTERVAL_INIT,
+    "layout.sim_cache.gpu": LOG_INTERVAL_INIT,
+    "layout.sim_cache.parallel": LOG_INTERVAL_INIT,
+    "layout.sim_cache.similarity": LOG_INTERVAL_INIT,
+    "layout.sim_cache.start": LOG_INTERVAL_INIT,
+    "layout.similarity": LOG_INTERVAL_INIT,
+    "layout.similarity_params": LOG_INTERVAL_INIT,
+    "layout.thresholds": LOG_INTERVAL_INIT,
+    "layout.visual": LOG_INTERVAL_LAYOUT_VISUAL,
+    "sobel_map.extract": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.init": LOG_INTERVAL_INIT,
+    "sobel_map.patch.angle": LOG_INTERVAL_SOBEL_PATCH,
+    "sobel_map.patch.metrics": LOG_INTERVAL_SOBEL_PATCH,
+    "sobel_map.patch_coords": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.patch_grid": LOG_INTERVAL_SOBEL_IMAGE,
+}
+
+
+def configure_logging() -> None:
+    LOGGER.configure_intervals(LOG_INTERVALS, default_interval=LOG_INTERVAL_DEFAULT)
 
 
 def _build_encoder() -> Encoder:
@@ -16,13 +92,13 @@ def _build_encoder() -> Encoder:
             "Angle",
             (0.0, 360.0),
             [
-                Detectors(360, 0.4),
-                Detectors(180, 0.4),
+                #Detectors(360, 0.4),
+                #Detectors(180, 0.4),
                 Detectors(90, 0.4),
                 Detectors(45, 0.4),
                 Detectors(30, 0.4),
                 Detectors(10, 0.4),
-                Detectors(5, 0.4),
+                #Detectors(5, 0.4),
             ],
         ),
         # X
@@ -47,12 +123,12 @@ def _build_encoder() -> Encoder:
                 Detectors(1, 0.4),
             ],
         ),
-        log_every=1,
+        log_every=ENCODER_LOG_EVERY,
     )
 
 
 def _collect_codes(
-    dataset: MNIST,
+    dataset,
     label: int,
     count: int,
     encoder: Encoder,
@@ -106,10 +182,10 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         pair_radius=layout.width // 2,
         mode="long",
         min_swap_ratio=0.001,
-        log_every=1,
+        log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
         energy_radius=7,
-        energy_check_every=5,
+        energy_check_every=LAYOUT_ENERGY_CHECK_EVERY,
         energy_delta=5e-4,
         energy_patience=4,
     )
@@ -121,19 +197,24 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         mode="short",
         local_radius=7,
         min_swap_ratio=0.001,
-        log_every=1,
+        log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
     )
     return layout
 
 
 def main() -> None:
+    from PIL import Image
+    from torchvision import transforms
+    from torchvision.datasets import MNIST
+
+    configure_logging()
     encoder = _build_encoder()
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 600
-    label = 1
+    count = 100
+    label = 8
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
 
@@ -142,6 +223,7 @@ def main() -> None:
     image = layout.render_image()
     filename = f"data/{label}-{count}-{total_codes}.png"
     Image.fromarray(image).save(filename)
+
 
 if __name__ == "__main__":
     main()

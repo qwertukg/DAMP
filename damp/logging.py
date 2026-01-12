@@ -14,12 +14,38 @@ class LogVisual:
     payload: object
 
 
+class LogIntervalPolicy:
+    def __init__(self, intervals: Mapping[str, int], *, default_interval: int = 1) -> None:
+        self._intervals: dict[str, int] = {}
+        for event, value in intervals.items():
+            interval = int(value)
+            if interval <= 0:
+                raise ValueError("interval must be positive")
+            self._intervals[str(event)] = interval
+        self._default_interval = int(default_interval)
+        if self._default_interval <= 0:
+            raise ValueError("default_interval must be positive")
+        self._counters: dict[str, int] = {}
+
+    def should_log(self, event: str) -> bool:
+        interval = self._intervals.get(event, self._default_interval)
+        if interval <= 1:
+            return True
+        count = self._counters.get(event, 0)
+        self._counters[event] = count + 1
+        return count % interval == 0
+
+    def reset(self) -> None:
+        self._counters.clear()
+
+
 class DampLogger:
     def __init__(self, app_id: str = "damp", base_path: str = LOG_PATH, *, spawn: bool = True) -> None:
         self._app_id = app_id
         self._base_path = base_path
         self._spawn = spawn
         self._spawned = False
+        self._interval_policy: LogIntervalPolicy | None = None
 
     def _ensure_rerun(self) -> None:
         if rr.is_enabled():
@@ -94,6 +120,14 @@ class DampLogger:
     def _coerce_anyvalues(self, data: Mapping[str, Any]) -> Mapping[str, Any]:
         return {key: self._coerce_rr_value(value) for key, value in data.items()}
 
+    def configure_intervals(self, intervals: Mapping[str, int], *, default_interval: int = 1) -> None:
+        self._interval_policy = LogIntervalPolicy(intervals, default_interval=default_interval)
+
+    def should_log(self, event: str) -> bool:
+        if self._interval_policy is None:
+            return True
+        return self._interval_policy.should_log(event)
+
     def event(
         self,
         event: str,
@@ -105,6 +139,8 @@ class DampLogger:
     ) -> None:
         if not section:
             raise ValueError("section must be provided")
+        if not self.should_log(event):
+            return
         if data:
             details = " ".join(f"{k}={self._format_value(v)}" for k, v in data.items())
             message = f"{event} {details}"
