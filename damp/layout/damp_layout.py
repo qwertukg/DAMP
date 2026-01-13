@@ -887,19 +887,16 @@ class Layout:
     def _log_layout_state(self, path: str, step: int) -> None:
         positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
         colors = self.colors_rgb()
+        image = self._build_image(colors)
         visuals = [
+    
             LOGGER.visual_points2d(
                 f"{path}/image",
                 positions,
                 colors=colors,
                 radii=0.5,
             ),
-            LOGGER.visual_points2d(
-                f"{path}/points",
-                positions,
-                colors=colors,
-                radii=0.5,
-            ),
+
         ]
         LOGGER.event(
             "layout.visual",
@@ -1041,12 +1038,8 @@ class Layout:
         return [self._hue_to_rgb(hue) for hue in hues]
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
-        import numpy as np
-
-        image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         colors = self.colors_rgb()
-        for idx, (y, x) in enumerate(self._positions):
-            image[y, x] = colors[idx]
+        image = self._build_image(colors)
         if log:
             positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
             LOGGER.event(
@@ -1054,6 +1047,10 @@ class Layout:
                 section=LAYOUT_ALGORITHM,
                 data={"height": self.height, "width": self.width},
                 visuals=[
+                    LOGGER.visual_image(
+                        "layout/render_image",
+                        image,
+                    ),
                     LOGGER.visual_points2d(
                         "layout/render_image",
                         positions,
@@ -1062,6 +1059,20 @@ class Layout:
                     ),
                 ],
             )
+        return image
+
+    def _build_image(
+        self,
+        colors: Sequence[tuple[int, int, int]] | None = None,
+    ) -> "numpy.ndarray":
+        import numpy as np
+
+        if colors is None:
+            colors = self.colors_rgb()
+        image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        for idx, (y, x) in enumerate(self._positions):
+            if 0 <= y < self.height and 0 <= x < self.width:
+                image[y, x] = colors[idx]
         return image
 
     def average_local_energy(self, radius: int) -> float:

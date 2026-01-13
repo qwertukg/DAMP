@@ -213,16 +213,16 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 600
+    count = 1000
     label = 8
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
 
     layout = _run_layout(codes)
 
-    image = layout.render_image()
-    filename = f"data/{label}-{count}-{total_codes}.png"
-    Image.fromarray(image).save(filename)
+    # image = layout.render_image()
+    # filename = f"data/{label}-{count}-{total_codes}.png"
+    # Image.fromarray(image).save(filename)
 
 
 if __name__ == "__main__":

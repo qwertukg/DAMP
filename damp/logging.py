@@ -121,7 +121,12 @@ class DampLogger:
         return DampLogger._format_value(value)
 
     def _coerce_anyvalues(self, data: Mapping[str, Any]) -> Mapping[str, Any]:
-        return {key: self._coerce_rr_value(value) for key, value in data.items()}
+        coerced: dict[str, Any] = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            coerced[key] = self._coerce_rr_value(value)
+        return coerced
 
     def configure_intervals(self, intervals: Mapping[str, int], *, default_interval: int = 1) -> None:
         self._interval_policy = LogIntervalPolicy(intervals, default_interval=default_interval)
@@ -156,7 +161,9 @@ class DampLogger:
         rr.log(base_path, rr.TextLog(message))
         if data:
             anyvalues_path = f"{base_path}/{event}"
-            rr.log(anyvalues_path, rr.AnyValues(**self._coerce_anyvalues(data)))
+            anyvalues = self._coerce_anyvalues(data)
+            if anyvalues:
+                rr.log(anyvalues_path, rr.AnyValues(**anyvalues))
         if visuals:
             for visual in visuals:
                 rr.log(visual.path, visual.payload)
