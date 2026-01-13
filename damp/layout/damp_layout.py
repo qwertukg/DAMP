@@ -889,14 +889,16 @@ class Layout:
         colors = self.colors_rgb()
         image = self._build_image(colors)
         visuals = [
-    
+            LOGGER.visual_image(
+                f"{path}/image",
+                image,
+            ),
             LOGGER.visual_points2d(
                 f"{path}/image",
                 positions,
                 colors=colors,
                 radii=0.5,
             ),
-
         ]
         LOGGER.event(
             "layout.visual",
