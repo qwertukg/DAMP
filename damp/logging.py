@@ -144,10 +144,14 @@ class DampLogger:
         data: Mapping[str, Any] | None = None,
         path: str | None = None,
         visuals: Sequence[LogVisual] | None = None,
+        force: bool | None = None,
     ) -> None:
         if not section:
             raise ValueError("section must be provided")
-        if not self.should_log(event):
+        if force is None:
+            if not self.should_log(event):
+                return
+        elif force is False:
             return
         if data:
             details = " ".join(f"{k}={self._format_value(v)}" for k, v in data.items())

@@ -11,25 +11,29 @@ LOG_INTERVAL_SOBEL_IMAGE = 25
 LOG_INTERVAL_SOBEL_PATCH = 2000
 LOG_INTERVAL_ENCODER_ENCODE = 100
 LOG_INTERVAL_ENCODER_IMAGE = 10
-LOG_INTERVAL_LAYOUT_ENERGY = 200
-LOG_INTERVAL_LAYOUT_PAIR = 100000
-LOG_INTERVAL_LAYOUT_AVG_ENERGY = 20
+LOG_INTERVAL_LAYOUT_ENERGY = 1000
+LOG_INTERVAL_LAYOUT_PAIR = 250000
+LOG_INTERVAL_LAYOUT_AVG_ENERGY = 200
 LOG_INTERVAL_LAYOUT_VISUAL = 1
-LOG_INTERVAL_LAYOUT_ADAPTIVE = 50
+LOG_INTERVAL_LAYOUT_ADAPTIVE = 200
+LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
 
 LAYOUT_USE_GPU = True
 
 ENCODER_LOG_EVERY = 50
-LAYOUT_LOG_EVERY_LONG = 10
-LAYOUT_LOG_EVERY_SHORT = 10
+LAYOUT_LOG_EVERY_LONG = 500
+LAYOUT_LOG_EVERY_SHORT = 500
+LAYOUT_LOG_VISUALS = True
 LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.5
 LAYOUT_ADAPTIVE_RADIUS_MIN = 1
 LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
 LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
-LAYOUT_ENERGY_STABILITY_WINDOW = 50
-LAYOUT_ENERGY_STABILITY_DELTA = 0.0001
-LAYOUT_ENERGY_STABILITY_EVERY = 50
-LAYOUT_ENERGY_STABILITY_MAX_POINTS = 512
+LAYOUT_ENERGY_STABILITY_WINDOW = 20
+LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
+LAYOUT_ENERGY_STABILITY_EVERY = 200
+LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
+LAYOUT_MIN_SWAP_RATIO = 0.0005
+LAYOUT_MIN_SWAP_WINDOW = 50
 
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
@@ -82,6 +86,9 @@ LOG_INTERVALS = {
     "layout.run.mode": LOG_INTERVAL_INIT,
     "layout.run.selection": LOG_INTERVAL_INIT,
     "layout.run.settings": LOG_INTERVAL_INIT,
+    "layout.run.swap_monitor": LOG_INTERVAL_INIT,
+    "layout.run.swap_ratio": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
+    "layout.run.swap_stability.stop": LOG_INTERVAL_INIT,
     "layout.sim_cache.done": LOG_INTERVAL_INIT,
     "layout.sim_cache.gpu": LOG_INTERVAL_INIT,
     "layout.sim_cache.parallel": LOG_INTERVAL_INIT,
@@ -211,7 +218,8 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         pairs_per_step=16000,
         pair_radius=adaptive_long.start_radius,
         mode="long",
-        min_swap_ratio=0.0,
+        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
         energy_radius=None,
@@ -219,6 +227,7 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
         energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
         energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+        log_visuals=LAYOUT_LOG_VISUALS,
         adaptive_params=adaptive_long,
     )
     step_offset += layout.last_steps
@@ -238,7 +247,8 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         pair_radius=adaptive_short.start_radius,
         mode="short",
         local_radius=adaptive_short.start_radius,
-        min_swap_ratio=0.0,
+        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
         adaptive_params=adaptive_short,
@@ -246,6 +256,7 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
         energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
         energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+        log_visuals=LAYOUT_LOG_VISUALS,
     )
     return layout
 
@@ -260,7 +271,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 6000
+    count = 600
     label = None
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)

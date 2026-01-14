@@ -9,10 +9,13 @@ from main import (
     LAYOUT_ADAPTIVE_SWAP_TRIGGER,
     LAYOUT_LOG_EVERY_LONG,
     LAYOUT_LOG_EVERY_SHORT,
+    LAYOUT_LOG_VISUALS,
     LAYOUT_ENERGY_STABILITY_DELTA,
     LAYOUT_ENERGY_STABILITY_WINDOW,
     LAYOUT_ENERGY_STABILITY_EVERY,
     LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+    LAYOUT_MIN_SWAP_RATIO,
+    LAYOUT_MIN_SWAP_WINDOW,
     configure_logging,
 )
 from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
@@ -69,7 +72,8 @@ def main() -> None:
         pairs_per_step=1200,
         pair_radius=adaptive_long.start_radius,
         mode="long",
-        min_swap_ratio=0.0,
+        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
         adaptive_params=adaptive_long,
@@ -78,6 +82,7 @@ def main() -> None:
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
         energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
         energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+        log_visuals=LAYOUT_LOG_VISUALS,
     )
     step_offset += layout.last_steps
     short_radius_start = max(
@@ -96,7 +101,8 @@ def main() -> None:
         pair_radius=adaptive_short.start_radius,
         mode="short",
         local_radius=adaptive_short.start_radius,
-        min_swap_ratio=0.0,
+        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
         adaptive_params=adaptive_short,
@@ -104,6 +110,7 @@ def main() -> None:
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
         energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
         energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+        log_visuals=LAYOUT_LOG_VISUALS,
     )
 
 if __name__ == "__main__":

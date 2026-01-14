@@ -18,6 +18,7 @@ from damp.article_refs import (
     LAYOUT_COMPACTNESS,
     LAYOUT_PARAMETERS,
     OPTIM_ENERGY,
+    OPTIM_PAIR_SELECTION,
     OPTIM_SIM_MATRIX,
     OPTIM_SUBSET,
     PAIR_SELECTION,
@@ -1006,6 +1007,27 @@ class _EnergyStabilityMonitor:
         return max_delta < self.threshold, diff, max_delta
 
 
+@dataclass
+class _SwapStallMonitor:
+    min_ratio: float
+    window: int
+    history: deque[float] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.history = deque(maxlen=self.window)
+
+    def update(self, swaps: int, pairs_per_step: int) -> tuple[bool, float, float]:
+        if pairs_per_step <= 0:
+            ratio = 0.0
+        else:
+            ratio = swaps / pairs_per_step
+        self.history.append(ratio)
+        average = sum(self.history) / len(self.history)
+        if len(self.history) < self.history.maxlen:
+            return False, ratio, average
+        return average <= self.min_ratio, ratio, average
+
+
 class Layout:
     """Discrete layout of code vectors on a 2D grid using the DAMP algorithm."""
 
@@ -1220,8 +1242,10 @@ class Layout:
         mode: str = "long",
         local_radius: int | None = None,
         min_swap_ratio: float = 0.01,
+        min_swap_window: int | None = None,
         log_every: int | None = None,
         log_path: str = "layout",
+        log_visuals: bool = True,
         step_offset: int = 0,
         energy_radius: int | None = None,
         energy_stability_window: int | None = None,
@@ -1242,6 +1266,8 @@ class Layout:
             raise ValueError("local_radius must be positive when set")
         if not 0 <= min_swap_ratio <= 1:
             raise ValueError("min_swap_ratio must be in [0, 1]")
+        if min_swap_window is not None and min_swap_window <= 0:
+            raise ValueError("min_swap_window must be positive when set")
         if step_offset < 0:
             raise ValueError("step_offset must be >= 0")
         if energy_radius is not None and energy_radius <= 0:
@@ -1298,7 +1324,9 @@ class Layout:
             data={
                 "steps": steps,
                 "min_swap_ratio": min_swap_ratio,
+                "min_swap_window": min_swap_window,
                 "log_every": log_every,
+                "log_visuals": log_visuals,
                 "step_offset": step_offset,
             },
         )
@@ -1323,6 +1351,18 @@ class Layout:
                     "delta": energy_stability_delta,
                     "every": energy_stability_every,
                     "max_points": energy_stability_max_points,
+                },
+            )
+        swap_monitor: _SwapStallMonitor | None = None
+        if min_swap_window and min_swap_ratio > 0:
+            swap_monitor = _SwapStallMonitor(min_swap_ratio, min_swap_window)
+            LOGGER.event(
+                "layout.run.swap_monitor",
+                section=OPTIM_PAIR_SELECTION,
+                data={
+                    "min_swap_ratio": min_swap_ratio,
+                    "window": min_swap_window,
+                    "pairs_per_step": pairs_per_step,
                 },
             )
         adaptive_state: _AdaptiveLayoutState | None = None
@@ -1356,8 +1396,39 @@ class Layout:
             )
             total_swaps += swaps
             steps_executed = step + 1
+            if swap_monitor is not None:
+                should_stop_swaps, swap_ratio, avg_ratio = swap_monitor.update(
+                    swaps, pairs_per_step
+                )
+                LOGGER.event(
+                    "layout.run.swap_ratio",
+                    section=OPTIM_PAIR_SELECTION,
+                    data={
+                        "step": step + step_offset,
+                        "swap_ratio": swap_ratio,
+                        "avg_ratio": avg_ratio,
+                        "window": swap_monitor.window,
+                        "min_swap_ratio": swap_monitor.min_ratio,
+                    },
+                )
+                if should_stop_swaps:
+                    LOGGER.event(
+                        "layout.run.swap_stability.stop",
+                        section=OPTIM_PAIR_SELECTION,
+                        data={
+                            "step": step + step_offset,
+                            "window": swap_monitor.window,
+                            "min_swap_ratio": swap_monitor.min_ratio,
+                            "avg_ratio": avg_ratio,
+                            "swap_ratio": swap_ratio,
+                            "total_swaps": total_swaps,
+                        },
+                    )
+                    break
             if log_every is not None and step % log_every == 0:
-                self._log_layout_state(path=log_path, step=step + step_offset)
+                self._log_layout_state(
+                    path=log_path, step=step + step_offset, log_visuals=log_visuals
+                )
             energy_for_stability: float | None = None
             should_eval_energy = (
                 energy_monitor is not None
@@ -1429,10 +1500,12 @@ class Layout:
         )
         return total_swaps
 
-    def _log_layout_state(self, path: str, step: int) -> None:
-        visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT
+    def _log_layout_state(self, path: str, step: int, *, log_visuals: bool) -> None:
+        if not LOGGER.should_log("layout.visual"):
+            return
+        visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT or not log_visuals
         visuals: list = []
-        if not visuals_skipped:
+        if log_visuals and not visuals_skipped:
             positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
             colors = self.colors_rgb()
             image = self._build_image(colors)
@@ -1455,10 +1528,12 @@ class Layout:
             energy_value = self._last_energy_value
             energy_radius = None
             energy_source = "cached"
-        elif self._point_count <= _VISUAL_ENERGY_POINT_LIMIT:
+        elif log_visuals and self._point_count <= _VISUAL_ENERGY_POINT_LIMIT:
             energy_radius = max(1, min(self.height, self.width) // 2)
             energy_value = self.average_local_energy(energy_radius)
             energy_source = "visual"
+        elif not log_visuals:
+            energy_source = "disabled"
         energy_step = self._last_energy_step if energy_source == "cached" else step
         energy_diff = None
         if (
@@ -1481,9 +1556,11 @@ class Layout:
                 "energy_diff": energy_diff,
                 "energy_radius": energy_radius,
                 "energy_source": energy_source,
+                "visuals_enabled": log_visuals,
                 "visuals_skipped": visuals_skipped,
             },
             visuals=visuals,
+            force=True,
         )
 
     def set_similarity_params(
@@ -2004,6 +2081,9 @@ class Layout:
                 gpu_results: list[tuple[float, float]] = []
                 for pair_idx, (y1, x1, y2, x2, idx_a, idx_b) in enumerate(pairs):
                     energy_c, energy_s = tensor_batch.energies[pair_idx]
+                    gpu_results.append((float(energy_c), float(energy_s)))
+                    if not LOGGER.should_log("layout.energy.long.pair"):
+                        continue
                     ones_a = 0 if idx_a is None else self._points[idx_a].ones
                     ones_b = 0 if idx_b is None else self._points[idx_b].ones
                     LOGGER.event(
@@ -2035,8 +2115,8 @@ class Layout:
                             "points_total": self._point_count,
                             "eval_points": len(eval_indices),
                         },
+                        force=True,
                     )
-                    gpu_results.append((float(energy_c), float(energy_s)))
                 return gpu_results
 
         eval_idx_arr = np.asarray(eval_indices, dtype=np.int32)
@@ -2077,66 +2157,68 @@ class Layout:
             energy_c = float(np.sum(s1 * dist1 + s2 * dist2))
             energy_s = float(np.sum(s2 * dist1 + s1 * dist2))
 
-            contrib_mask = (s1 > 0.0) | (s2 > 0.0)
-            count = int(np.count_nonzero(contrib_mask))
-            if count:
-                s1_m = s1[contrib_mask]
-                s2_m = s2[contrib_mask]
-                d1_m = dist1[contrib_mask]
-                d2_m = dist2[contrib_mask]
-                sim1_min_val = float(s1_m.min())
-                sim1_max_val = float(s1_m.max())
-                sim2_min_val = float(s2_m.min())
-                sim2_max_val = float(s2_m.max())
-                d1_min_val = float(d1_m.min())
-                d1_max_val = float(d1_m.max())
-                d2_min_val = float(d2_m.min())
-                d2_max_val = float(d2_m.max())
-                sim1_sum_val = float(s1_m.sum())
-                sim2_sum_val = float(s2_m.sum())
-            else:
-                sim1_min_val = 0.0
-                sim1_max_val = 0.0
-                sim2_min_val = 0.0
-                sim2_max_val = 0.0
-                d1_min_val = 0.0
-                d1_max_val = 0.0
-                d2_min_val = 0.0
-                d2_max_val = 0.0
-                sim1_sum_val = 0.0
-                sim2_sum_val = 0.0
-
-            LOGGER.event(
-                "layout.energy.long.pair",
-                section=ENERGY_LONG,
-                data={
-                    "pair_index": pair_idx,
-                    "y1": y1,
-                    "x1": x1,
-                    "y2": y2,
-                    "x2": x2,
-                    "idx_a": -1 if idx_a is None else idx_a,
-                    "idx_b": -1 if idx_b is None else idx_b,
-                    "ones_a": ones_a,
-                    "ones_b": ones_b,
-                    "phi_c": energy_c,
-                    "phi_s": energy_s,
-                    "s1_sum": sim1_sum_val,
-                    "s2_sum": sim2_sum_val,
-                    "s1_min": sim1_min_val,
-                    "s1_max": sim1_max_val,
-                    "s2_min": sim2_min_val,
-                    "s2_max": sim2_max_val,
-                    "d1_min": d1_min_val,
-                    "d1_max": d1_max_val,
-                    "d2_min": d2_min_val,
-                    "d2_max": d2_max_val,
-                    "contrib_points": count,
-                    "points_total": self._point_count,
-                    "eval_points": len(eval_indices),
-                },
-            )
             results.append((energy_c, energy_s))
+            if LOGGER.should_log("layout.energy.long.pair"):
+                contrib_mask = (s1 > 0.0) | (s2 > 0.0)
+                count = int(np.count_nonzero(contrib_mask))
+                if count:
+                    s1_m = s1[contrib_mask]
+                    s2_m = s2[contrib_mask]
+                    d1_m = dist1[contrib_mask]
+                    d2_m = dist2[contrib_mask]
+                    sim1_min_val = float(s1_m.min())
+                    sim1_max_val = float(s1_m.max())
+                    sim2_min_val = float(s2_m.min())
+                    sim2_max_val = float(s2_m.max())
+                    d1_min_val = float(d1_m.min())
+                    d1_max_val = float(d1_m.max())
+                    d2_min_val = float(d2_m.min())
+                    d2_max_val = float(d2_m.max())
+                    sim1_sum_val = float(s1_m.sum())
+                    sim2_sum_val = float(s2_m.sum())
+                else:
+                    sim1_min_val = 0.0
+                    sim1_max_val = 0.0
+                    sim2_min_val = 0.0
+                    sim2_max_val = 0.0
+                    d1_min_val = 0.0
+                    d1_max_val = 0.0
+                    d2_min_val = 0.0
+                    d2_max_val = 0.0
+                    sim1_sum_val = 0.0
+                    sim2_sum_val = 0.0
+
+                LOGGER.event(
+                    "layout.energy.long.pair",
+                    section=ENERGY_LONG,
+                    data={
+                        "pair_index": pair_idx,
+                        "y1": y1,
+                        "x1": x1,
+                        "y2": y2,
+                        "x2": x2,
+                        "idx_a": -1 if idx_a is None else idx_a,
+                        "idx_b": -1 if idx_b is None else idx_b,
+                        "ones_a": ones_a,
+                        "ones_b": ones_b,
+                        "phi_c": energy_c,
+                        "phi_s": energy_s,
+                        "s1_sum": sim1_sum_val,
+                        "s2_sum": sim2_sum_val,
+                        "s1_min": sim1_min_val,
+                        "s1_max": sim1_max_val,
+                        "s2_min": sim2_min_val,
+                        "s2_max": sim2_max_val,
+                        "d1_min": d1_min_val,
+                        "d1_max": d1_max_val,
+                        "d2_min": d2_min_val,
+                        "d2_max": d2_max_val,
+                        "contrib_points": count,
+                        "points_total": self._point_count,
+                        "eval_points": len(eval_indices),
+                    },
+                    force=True,
+                )
 
         return results
 
