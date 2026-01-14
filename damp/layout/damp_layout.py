@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 from dataclasses import dataclass, field
 from collections import deque
+import json
 import math
 import os
 import random
@@ -21,6 +22,7 @@ from damp.article_refs import (
     OPTIM_PAIR_SELECTION,
     OPTIM_SIM_MATRIX,
     OPTIM_SUBSET,
+    LAID_OUT_STRUCTURE,
     PAIR_SELECTION,
     PARALLEL_PROCESSING,
     QUALITY_ASSESS,
@@ -1692,6 +1694,56 @@ class Layout:
 
     def values(self) -> list[str]:
         return list(self._values)
+
+    def save_json(self, path: str) -> None:
+        if not path:
+            raise ValueError("path must be provided")
+        points_payload: list[dict[str, Any]] = []
+        for idx, (y, x) in enumerate(self._positions):
+            point = self._points[idx]
+            points_payload.append(
+                {
+                    "index": idx,
+                    "y": y,
+                    "x": x,
+                    "label": self._labels[idx],
+                    "value": self._values[idx],
+                    "hue": point.hue,
+                    "ones": point.ones,
+                }
+            )
+        payload = {
+            "width": self.width,
+            "height": self.height,
+            "points": self._point_count,
+            "similarity": self._similarity,
+            "lambda_threshold": self._lambda,
+            "eta": self._eta,
+            "layout": points_payload,
+        }
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=True, indent=2)
+        except Exception as exc:
+            LOGGER.event(
+                "layout.export.json.error",
+                section=LAID_OUT_STRUCTURE,
+                data={"path": path, "error": str(exc)},
+            )
+            raise
+        LOGGER.event(
+            "layout.export.json",
+            section=LAID_OUT_STRUCTURE,
+            data={
+                "path": path,
+                "points": self._point_count,
+                "width": self.width,
+                "height": self.height,
+            },
+        )
 
     def colors_rgb(self) -> list[tuple[int, int, int]]:
         hues = self._normalized_hues()

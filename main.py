@@ -17,6 +17,7 @@ LOG_INTERVAL_LAYOUT_AVG_ENERGY = 200
 LOG_INTERVAL_LAYOUT_VISUAL = 1
 LOG_INTERVAL_LAYOUT_ADAPTIVE = 200
 LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
+LOG_INTERVAL_LAYOUT_EXPORT = 1
 
 LAYOUT_USE_GPU = True
 
@@ -98,6 +99,8 @@ LOG_INTERVALS = {
     "layout.similarity_params": LOG_INTERVAL_INIT,
     "layout.thresholds": LOG_INTERVAL_INIT,
     "layout.visual": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.export.json": LOG_INTERVAL_LAYOUT_EXPORT,
+    "layout.export.json.error": LOG_INTERVAL_LAYOUT_EXPORT,
     "sobel_map.extract": LOG_INTERVAL_SOBEL_IMAGE,
     "sobel_map.init": LOG_INTERVAL_INIT,
     "sobel_map.patch.angle": LOG_INTERVAL_SOBEL_PATCH,
@@ -271,7 +274,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 600
+    count = 6000
     label = None
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
@@ -281,6 +284,8 @@ def main() -> None:
     image = layout.render_image()
     filename = f"data/{count}-{total_codes}.png"
     Image.fromarray(image).save(filename)
+
+    layout.save_json("data/layout.json")
 
 
 if __name__ == "__main__":
