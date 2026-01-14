@@ -17,9 +17,9 @@ LOG_INTERVAL_LAYOUT_AVG_ENERGY = 20
 LOG_INTERVAL_LAYOUT_VISUAL = 1
 
 ENCODER_LOG_EVERY = 50
-LAYOUT_LOG_EVERY_LONG = 200
+LAYOUT_LOG_EVERY_LONG = 1
 LAYOUT_LOG_EVERY_SHORT = 50
-LAYOUT_ENERGY_CHECK_EVERY = 5
+LAYOUT_ENERGY_CHECK_EVERY = 100
 
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
@@ -174,11 +174,12 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         lambda_threshold=0.06,
         eta=0.0,
         seed=0,
+        use_gpu=False,
     )
     step_offset = 1
     layout.run(
         steps=22000,
-        pairs_per_step=1200,
+        pairs_per_step=16000,
         pair_radius=layout.width // 2,
         mode="long",
         min_swap_ratio=0.001,
@@ -213,7 +214,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 800
+    count = 600000
     label = 8
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)

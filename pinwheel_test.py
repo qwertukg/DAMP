@@ -43,6 +43,7 @@ def main() -> None:
         lambda_threshold=0.00, # 0.06
         eta=0.0, # 1.0 - выворачивает пинвил в криветку мебиуса (0 - норм)
         seed=0,
+        use_gpu=False,
     )
     step_offset = 1
     layout.run(

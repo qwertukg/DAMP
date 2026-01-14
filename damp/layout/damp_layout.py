@@ -15,6 +15,7 @@ from damp.article_refs import (
     GPU_IMPLEMENTATION,
     LAYOUT_ALGORITHM,
     LAYOUT_COMPACTNESS,
+    OPTIM_ENERGY,
     OPTIM_SIM_MATRIX,
     OPTIM_SUBSET,
     PAIR_SELECTION,
@@ -605,6 +606,8 @@ class Layout:
         seed: int = 0,
         parallel_workers: int | None = None,
         use_gpu: bool = True,
+        long_subset_size: int | None = 512,
+        long_subset_refresh: int = 50,
     ) -> None:
         if not codes:
             raise ValueError("codes must be non-empty")
@@ -644,6 +647,17 @@ class Layout:
         self._rng = random.Random(seed)
         self._parallel_workers = parallel_workers
         self._use_gpu = use_gpu
+        self._long_subset_size = (
+            None if long_subset_size is None else int(long_subset_size)
+        )
+        if self._long_subset_size is not None and self._long_subset_size <= 0:
+            raise ValueError("long_subset_size must be positive when set")
+        self._long_subset_refresh = max(1, int(long_subset_refresh))
+        self._long_subset_indices: list[int] = []
+        self._long_subset_last_step: int = 0
+        self._long_step_counter: int = 0
+        self._subset_similarity_cache: dict[int, "numpy.ndarray"] = {}
+        self._code_matrix, self._ones_array = self._build_code_matrix()
 
         if grid_size is None:
             target = len(self._points) * (1.0 + empty_ratio)
@@ -691,6 +705,15 @@ class Layout:
             "layout.precompute_limit",
             section=OPTIM_SUBSET,
             data={"max_precompute": max_precompute},
+        )
+        LOGGER.event(
+            "layout.energy.subset.config",
+            section=OPTIM_SUBSET,
+            data={
+                "long_subset_size": -1 if self._long_subset_size is None else self._long_subset_size,
+                "long_subset_refresh": self._long_subset_refresh,
+                "points": self._point_count,
+            },
         )
         LOGGER.event(
             "layout.parallel",
@@ -1067,7 +1090,15 @@ class Layout:
         self,
         colors: Sequence[tuple[int, int, int]] | None = None,
     ) -> "numpy.ndarray":
-        import numpy as np
+        try:
+            import numpy as np
+        except Exception as exc:
+            LOGGER.event(
+                "layout.energy.long.numpy_unavailable",
+                section=OPTIM_ENERGY,
+                data={"error": str(exc)},
+            )
+            return []
 
         if colors is None:
             colors = self.colors_rgb()
@@ -1116,18 +1147,26 @@ class Layout:
             cy = pos_y[idx]
             cx = pos_x[idx]
             energy = 0.0
-            for j in range(self._point_count):
-                if j == idx:
-                    continue
-                dy = cy - pos_y[j]
-                dx = cx - pos_x[j]
-                dist_sq = dy * dy + dx * dx
-                if dist_sq > radius_sq:
-                    continue
-                sim = sim_lambda(idx, j)
-                if sim <= 0.0:
-                    continue
-                energy += sim / (dist_sq + self._distance_eps)
+            y_min = max(0, cy - radius)
+            y_max = min(self.height - 1, cy + radius)
+            x_min = max(0, cx - radius)
+            x_max = min(self.width - 1, cx + radius)
+            for y in range(y_min, y_max + 1):
+                dy = cy - y
+                dy_sq = dy * dy
+                row = self.grid[y]
+                for x in range(x_min, x_max + 1):
+                    dx = cx - x
+                    dist_sq = dy_sq + dx * dx
+                    if dist_sq > radius_sq:
+                        continue
+                    other_idx = row[x]
+                    if other_idx is None or other_idx == idx:
+                        continue
+                    sim = sim_lambda(idx, other_idx)
+                    if sim <= 0.0:
+                        continue
+                    energy += sim / (dist_sq + self._distance_eps)
             energies.append(energy)
 
         emax = max(energies)
@@ -1221,7 +1260,8 @@ class Layout:
         pos_b: tuple[int, int],
     ) -> tuple[float, float]:
         energies = self._calculate_far_energies(
-            [(pos_a[0], pos_a[1], pos_b[0], pos_b[1], idx_a, idx_b)]
+            [(pos_a[0], pos_a[1], pos_b[0], pos_b[1], idx_a, idx_b)],
+            advance_step=False,
         )
         if not energies:
             return 0.0, 0.0
@@ -1230,7 +1270,11 @@ class Layout:
     def _calculate_far_energies(
         self,
         pairs: Sequence[tuple[int, int, int, int, int | None, int | None]],
+        *,
+        advance_step: bool = True,
     ) -> list[tuple[float, float]]:
+        import numpy as np
+
         batch_size = len(pairs)
         if batch_size == 0:
             LOGGER.event(
@@ -1242,6 +1286,13 @@ class Layout:
                     "space_size": (self.height, self.width),
                 },
             )
+            return []
+
+        if advance_step:
+            self._long_step_counter += 1
+        step_no = self._long_step_counter if advance_step else self._long_step_counter
+        eval_indices = self._ensure_long_subset(step_no)
+        if not eval_indices:
             return []
 
         cutoff = self._lambda if self._eta is None else 0.0
@@ -1277,88 +1328,7 @@ class Layout:
             section=ENERGY_CALC,
             data={"skip_pair_points": True},
         )
-
-        pair_points: list[
-            tuple[int, int, int, int, LayoutPoint | None, LayoutPoint | None, int | None, int | None]
-        ] = []
-        for y1, x1, y2, x2, idx_a, idx_b in pairs:
-            point_a = self._points[idx_a] if idx_a is not None else None
-            point_b = self._points[idx_b] if idx_b is not None else None
-            pair_points.append((y1, x1, y2, x2, point_a, point_b, idx_a, idx_b))
-
-        def similarity(a: LayoutPoint | None, b: LayoutPoint | None) -> float:
-            if a is None or b is None:
-                return 0.0
-            sim = _similarity_base_points(a, b, self._similarity)
-            if sim <= 0.0:
-                return 0.0
-            if self._eta is None:
-                return sim
-            return sim * (1.0 / (1.0 + math.exp(-self._eta * (sim - self._lambda))))
-
-        energies: list[list[float]] = [[0.0, 0.0] for _ in range(batch_size)]
-        sim1_sum = [0.0] * batch_size
-        sim2_sum = [0.0] * batch_size
-        sim1_min = [float("inf")] * batch_size
-        sim1_max = [0.0] * batch_size
-        sim2_min = [float("inf")] * batch_size
-        sim2_max = [0.0] * batch_size
-        d1_min = [float("inf")] * batch_size
-        d1_max = [0.0] * batch_size
-        d2_min = [float("inf")] * batch_size
-        d2_max = [0.0] * batch_size
-        contrib_counts = [0] * batch_size
-        empty_cells = 0
-
-        for y in range(self.height):
-            row = self.grid[y]
-            for x in range(self.width):
-                idx = row[x]
-                if idx is None:
-                    empty_cells += 1
-                    continue
-                current_point = self._points[idx]
-                for pair_idx, (y1, x1, y2, x2, point_a, point_b, _, _) in enumerate(
-                    pair_points
-                ):
-                    if (y == y1 and x == x1) or (y == y2 and x == x2):
-                        continue
-                    s1 = similarity(point_a, current_point)
-                    s2 = similarity(point_b, current_point)
-                    if s1 < cutoff:
-                        s1 = 0.0
-                    if s2 < cutoff:
-                        s2 = 0.0
-                    if s1 == 0.0 and s2 == 0.0:
-                        continue
-                    dy1 = y1 - y
-                    dx1 = x1 - x
-                    dy2 = y2 - y
-                    dx2 = x2 - x
-                    d1 = dy1 * dy1 + dx1 * dx1
-                    d2 = dy2 * dy2 + dx2 * dx2
-                    energies[pair_idx][0] += s1 * d1 + s2 * d2
-                    energies[pair_idx][1] += s2 * d1 + s1 * d2
-                    sim1_sum[pair_idx] += s1
-                    sim2_sum[pair_idx] += s2
-                    if s1 < sim1_min[pair_idx]:
-                        sim1_min[pair_idx] = s1
-                    if s1 > sim1_max[pair_idx]:
-                        sim1_max[pair_idx] = s1
-                    if s2 < sim2_min[pair_idx]:
-                        sim2_min[pair_idx] = s2
-                    if s2 > sim2_max[pair_idx]:
-                        sim2_max[pair_idx] = s2
-                    if d1 < d1_min[pair_idx]:
-                        d1_min[pair_idx] = d1
-                    if d1 > d1_max[pair_idx]:
-                        d1_max[pair_idx] = d1
-                    if d2 < d2_min[pair_idx]:
-                        d2_min[pair_idx] = d2
-                    if d2 > d2_max[pair_idx]:
-                        d2_max[pair_idx] = d2
-                    contrib_counts[pair_idx] += 1
-
+        empty_cells = (self.height * self.width) - self._point_count
         LOGGER.event(
             "layout.energy.long.space",
             section=ENERGY_LONG,
@@ -1366,25 +1336,97 @@ class Layout:
                 "space_size": (self.height, self.width),
                 "points": self._point_count,
                 "empty_cells": empty_cells,
+                "eval_points": len(eval_indices),
             },
         )
 
+        eval_idx_arr = np.asarray(eval_indices, dtype=np.int32)
+        eval_y = np.take(self._pos_y, eval_idx_arr).astype(np.float64)
+        eval_x = np.take(self._pos_x, eval_idx_arr).astype(np.float64)
+
+        unique_indices = sorted(
+            {
+                idx
+                for (_, _, _, _, idx_a, idx_b) in pairs
+                for idx in (idx_a, idx_b)
+                if idx is not None
+            }
+        )
+        if not unique_indices:
+            return [(0.0, 0.0) for _ in pairs]
+
+        missing = [idx for idx in unique_indices if idx not in self._subset_similarity_cache]
+        if missing:
+            missing_matrix = self._apply_lambda_array(
+                self._similarity_block(missing, eval_indices)
+            ).astype(np.float32, copy=False)
+            for row, idx in enumerate(missing):
+                self._subset_similarity_cache[idx] = missing_matrix[row]
+        sim_lookup = self._subset_similarity_cache
+        zero_vec = np.zeros(len(eval_indices), dtype=np.float32)
+
         results: list[tuple[float, float]] = []
-        for pair_idx, (y1, x1, y2, x2, point_a, point_b, idx_a, idx_b) in enumerate(
-            pair_points
-        ):
-            energy_c, energy_s = energies[pair_idx]
-            count = contrib_counts[pair_idx]
-            sim1_min_val = 0.0 if count == 0 else sim1_min[pair_idx]
-            sim1_max_val = 0.0 if count == 0 else sim1_max[pair_idx]
-            sim2_min_val = 0.0 if count == 0 else sim2_min[pair_idx]
-            sim2_max_val = 0.0 if count == 0 else sim2_max[pair_idx]
-            d1_min_val = 0.0 if count == 0 else d1_min[pair_idx]
-            d1_max_val = 0.0 if count == 0 else d1_max[pair_idx]
-            d2_min_val = 0.0 if count == 0 else d2_min[pair_idx]
-            d2_max_val = 0.0 if count == 0 else d2_max[pair_idx]
-            ones_a = 0 if point_a is None else point_a.ones
-            ones_b = 0 if point_b is None else point_b.ones
+        for pair_idx, (y1, x1, y2, x2, idx_a, idx_b) in enumerate(pairs):
+            s1 = zero_vec
+            s2 = zero_vec
+            ones_a = 0
+            ones_b = 0
+            if idx_a is not None:
+                s1 = sim_lookup.get(idx_a, zero_vec)
+                ones_a = self._points[idx_a].ones
+            if idx_b is not None:
+                s2 = sim_lookup.get(idx_b, zero_vec)
+                ones_b = self._points[idx_b].ones
+            if idx_a is not None or idx_b is not None:
+                mask = np.zeros_like(eval_idx_arr, dtype=bool)
+                if idx_a is not None:
+                    mask |= eval_idx_arr == idx_a
+                if idx_b is not None:
+                    mask |= eval_idx_arr == idx_b
+                if mask.any():
+                    if idx_a is not None:
+                        s1 = np.where(mask, 0.0, s1)
+                    if idx_b is not None:
+                        s2 = np.where(mask, 0.0, s2)
+
+            dy1 = y1 - eval_y
+            dx1 = x1 - eval_x
+            dy2 = y2 - eval_y
+            dx2 = x2 - eval_x
+            dist1 = dy1 * dy1 + dx1 * dx1
+            dist2 = dy2 * dy2 + dx2 * dx2
+            energy_c = float(np.sum(s1 * dist1 + s2 * dist2))
+            energy_s = float(np.sum(s2 * dist1 + s1 * dist2))
+
+            contrib_mask = (s1 > 0.0) | (s2 > 0.0)
+            count = int(np.count_nonzero(contrib_mask))
+            if count:
+                s1_m = s1[contrib_mask]
+                s2_m = s2[contrib_mask]
+                d1_m = dist1[contrib_mask]
+                d2_m = dist2[contrib_mask]
+                sim1_min_val = float(s1_m.min())
+                sim1_max_val = float(s1_m.max())
+                sim2_min_val = float(s2_m.min())
+                sim2_max_val = float(s2_m.max())
+                d1_min_val = float(d1_m.min())
+                d1_max_val = float(d1_m.max())
+                d2_min_val = float(d2_m.min())
+                d2_max_val = float(d2_m.max())
+                sim1_sum_val = float(s1_m.sum())
+                sim2_sum_val = float(s2_m.sum())
+            else:
+                sim1_min_val = 0.0
+                sim1_max_val = 0.0
+                sim2_min_val = 0.0
+                sim2_max_val = 0.0
+                d1_min_val = 0.0
+                d1_max_val = 0.0
+                d2_min_val = 0.0
+                d2_max_val = 0.0
+                sim1_sum_val = 0.0
+                sim2_sum_val = 0.0
+
             LOGGER.event(
                 "layout.energy.long.pair",
                 section=ENERGY_LONG,
@@ -1400,8 +1442,8 @@ class Layout:
                     "ones_b": ones_b,
                     "phi_c": energy_c,
                     "phi_s": energy_s,
-                    "s1_sum": sim1_sum[pair_idx],
-                    "s2_sum": sim2_sum[pair_idx],
+                    "s1_sum": sim1_sum_val,
+                    "s2_sum": sim2_sum_val,
                     "s1_min": sim1_min_val,
                     "s1_max": sim1_max_val,
                     "s2_min": sim2_min_val,
@@ -1412,6 +1454,7 @@ class Layout:
                     "d2_max": d2_max_val,
                     "contrib_points": count,
                     "points_total": self._point_count,
+                    "eval_points": len(eval_indices),
                 },
             )
             results.append((energy_c, energy_s))
@@ -1431,34 +1474,40 @@ class Layout:
         cx = (pos_a[1] + pos_b[1]) / 2.0
         radius_sq = radius * radius
 
-        pos_y = self._pos_y
-        pos_x = self._pos_x
         sim_lambda = self._sim_lambda_idx
         energy_c = 0.0
         energy_s = 0.0
-        for idx in range(self._point_count):
-            if idx == idx_a or idx == idx_b:
-                continue
-            dyc = pos_y[idx] - cy
-            dxc = pos_x[idx] - cx
-            if dyc * dyc + dxc * dxc > radius_sq:
-                continue
-            s1 = sim_lambda(idx, idx_a)
-            s2 = sim_lambda(idx, idx_b) if idx_b is not None else 0.0
-            if s1 == 0.0 and s2 == 0.0:
-                continue
-            dy1 = pos_a[0] - pos_y[idx]
-            dx1 = pos_a[1] - pos_x[idx]
-            dy2 = pos_b[0] - pos_y[idx]
-            dx2 = pos_b[1] - pos_x[idx]
-            d1 = dy1 * dy1 + dx1 * dx1
-            d2 = dy2 * dy2 + dx2 * dx2
-            energy_c += s1 / (d1 + self._distance_eps) + s2 / (
-                d2 + self._distance_eps
-            )
-            energy_s += s2 / (d1 + self._distance_eps) + s1 / (
-                d2 + self._distance_eps
-            )
+        y_min = max(0, int(math.floor(cy - radius)))
+        y_max = min(self.height - 1, int(math.ceil(cy + radius)))
+        x_min = max(0, int(math.floor(cx - radius)))
+        x_max = min(self.width - 1, int(math.ceil(cx + radius)))
+        for y in range(y_min, y_max + 1):
+            dyc = y - cy
+            dyc_sq = dyc * dyc
+            row = self.grid[y]
+            for x in range(x_min, x_max + 1):
+                idx = row[x]
+                if idx is None or idx == idx_a or idx == idx_b:
+                    continue
+                dxc = x - cx
+                if dyc_sq + dxc * dxc > radius_sq:
+                    continue
+                s1 = sim_lambda(idx, idx_a)
+                s2 = sim_lambda(idx, idx_b) if idx_b is not None else 0.0
+                if s1 == 0.0 and s2 == 0.0:
+                    continue
+                dy1 = pos_a[0] - y
+                dx1 = pos_a[1] - x
+                dy2 = pos_b[0] - y
+                dx2 = pos_b[1] - x
+                d1 = dy1 * dy1 + dx1 * dx1
+                d2 = dy2 * dy2 + dx2 * dx2
+                energy_c += s1 / (d1 + self._distance_eps) + s2 / (
+                    d2 + self._distance_eps
+                )
+                energy_s += s2 / (d1 + self._distance_eps) + s1 / (
+                    d2 + self._distance_eps
+                )
         return energy_c, energy_s
 
     def _apply_swaps(self, swaps: Iterable[tuple[int, int, int, int]]) -> int:
@@ -1726,6 +1775,34 @@ class Layout:
         self._gpu_positions_dirty = False
         return True
 
+    def _build_code_matrix(self) -> tuple["numpy.ndarray | None", "numpy.ndarray | None"]:
+        try:
+            import numpy as np
+        except Exception as exc:
+            LOGGER.event(
+                "layout.sim_matrix.numpy_unavailable",
+                section=OPTIM_ENERGY,
+                data={"error": str(exc)},
+            )
+            return None, None
+        if self._point_count == 0:
+            return None, None
+        code_len = len(self._points[0].code)
+        matrix = np.zeros((self._point_count, code_len), dtype=np.uint8)
+        ones = np.zeros(self._point_count, dtype=np.float32)
+        for idx, point in enumerate(self._points):
+            matrix[idx] = np.frombuffer(point.code._bits, dtype=np.uint8, count=code_len)
+            ones[idx] = float(point.ones)
+        LOGGER.event(
+            "layout.sim_matrix.ready",
+            section=OPTIM_ENERGY,
+            data={
+                "points": self._point_count,
+                "code_len": code_len,
+            },
+        )
+        return matrix, ones
+
     def _similarity_worker_count(self) -> int:
         if self._parallel_workers is not None:
             if self._parallel_workers <= 1:
@@ -1742,13 +1819,106 @@ class Layout:
         )
         return min(cpu_count, self._point_count)
 
+    def _ensure_long_subset(self, step: int | None) -> list[int]:
+        if self._point_count == 0:
+            self._long_subset_indices = []
+            return self._long_subset_indices
+        if self._long_subset_size is None or self._point_count <= self._long_subset_size:
+            if len(self._long_subset_indices) != self._point_count:
+                self._long_subset_indices = list(range(self._point_count))
+                self._subset_similarity_cache.clear()
+                LOGGER.event(
+                    "layout.energy.subset.full",
+                    section=OPTIM_SUBSET,
+                    data={
+                        "points": self._point_count,
+                        "selected": len(self._long_subset_indices),
+                    },
+                )
+            return self._long_subset_indices
+
+        need_refresh = not self._long_subset_indices
+        if step is not None:
+            need_refresh = need_refresh or (step - self._long_subset_last_step) >= self._long_subset_refresh
+        if need_refresh:
+            self._long_subset_indices = self._rng.sample(
+                range(self._point_count), self._long_subset_size
+            )
+            self._long_subset_last_step = 0 if step is None else step
+            self._subset_similarity_cache.clear()
+            LOGGER.event(
+                "layout.energy.subset.refresh",
+                section=OPTIM_SUBSET,
+                data={
+                    "points": self._point_count,
+                    "selected": len(self._long_subset_indices),
+                    "step": self._long_subset_last_step,
+                },
+            )
+        return self._long_subset_indices
+
+    def _apply_lambda_array(self, sim: "numpy.ndarray") -> "numpy.ndarray":
+        import numpy as np
+
+        if sim.size == 0:
+            return sim
+        if self._eta is None:
+            if self._lambda <= 0.0:
+                return np.where(sim > 0.0, sim, 0.0)
+            return np.where(sim >= self._lambda, sim, 0.0)
+        scaled = 1.0 / (1.0 + np.exp(-self._eta * (sim - self._lambda)))
+        return sim * scaled
+
+    def _similarity_value(self, idx_a: int, idx_b: int) -> float:
+        if idx_a == idx_b:
+            return 1.0
+        if self._sim_base is not None:
+            return self._sim_base[idx_a][idx_b]
+        if self._code_matrix is not None and self._ones_array is not None:
+            vec_a = self._code_matrix[idx_a]
+            vec_b = self._code_matrix[idx_b]
+            common = float(vec_a @ vec_b)
+            ones_a = float(self._ones_array[idx_a])
+            ones_b = float(self._ones_array[idx_b])
+            if ones_a <= 0.0 or ones_b <= 0.0:
+                return 0.0
+            if self._similarity == "cosine":
+                denom = math.sqrt(ones_a * ones_b)
+                return 0.0 if denom == 0 else common / denom
+            union = ones_a + ones_b - common
+            return 0.0 if union == 0.0 else common / union
+        return self._similarity_base(self._points[idx_a], self._points[idx_b])
+
+    def _similarity_block(
+        self, row_indices: Sequence[int], col_indices: Sequence[int]
+    ) -> "numpy.ndarray":
+        import numpy as np
+
+        if not row_indices or not col_indices:
+            return np.zeros((len(row_indices), len(col_indices)), dtype=np.float32)
+        if self._code_matrix is None or self._ones_array is None:
+            block = np.zeros((len(row_indices), len(col_indices)), dtype=np.float32)
+            for i, ridx in enumerate(row_indices):
+                for j, cidx in enumerate(col_indices):
+                    block[i, j] = self._similarity_value(ridx, cidx)
+            return block
+        rows = self._code_matrix[list(row_indices)].astype(np.float32, copy=False)
+        cols = self._code_matrix[list(col_indices)].astype(np.float32, copy=False).T
+        common = rows @ cols
+        ones_rows = self._ones_array[list(row_indices)].astype(np.float32, copy=False)
+        ones_cols = self._ones_array[list(col_indices)].astype(np.float32, copy=False)
+        if self._similarity == "cosine":
+            denom = np.sqrt(np.outer(ones_rows, ones_cols))
+            sim = np.divide(common, denom, out=np.zeros_like(common, dtype=np.float32), where=denom != 0)
+        else:
+            union = ones_rows[:, None] + ones_cols[None, :] - common
+            sim = np.divide(common, union, out=np.zeros_like(common, dtype=np.float32), where=union != 0)
+        return sim.astype(np.float32)
+
     def _sim_lambda_idx(self, idx_a: int, idx_b: int | None) -> float:
         if idx_b is None:
             return 0.0
-        if self._sim_base is not None:
-            sim = self._sim_base[idx_a][idx_b]
-        else:
-            sim = self._similarity_base(self._points[idx_a], self._points[idx_b])
+        sim = self._similarity_value(idx_a, idx_b)
         if sim <= 0.0:
             return 0.0
         if self._eta is None:
