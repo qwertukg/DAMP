@@ -214,8 +214,8 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 600000
-    label = 8
+    count = 6000
+    label = None
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
 
