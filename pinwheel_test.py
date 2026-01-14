@@ -3,12 +3,18 @@ import random
 
 from main import (
     ENCODER_LOG_EVERY,
+    LAYOUT_ADAPTIVE_LAMBDA_STEP,
+    LAYOUT_ADAPTIVE_RADIUS_MIN,
+    LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+    LAYOUT_ADAPTIVE_SWAP_TRIGGER,
     LAYOUT_LOG_EVERY_LONG,
     LAYOUT_LOG_EVERY_SHORT,
+    LAYOUT_ENERGY_STABILITY_DELTA,
+    LAYOUT_ENERGY_STABILITY_WINDOW,
     configure_logging,
 )
 from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
-from damp.layout.damp_layout import Layout
+from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout
 
 
 def main() -> None:
@@ -43,32 +49,55 @@ def main() -> None:
         lambda_threshold=0.00, # 0.06
         eta=0.0, # 1.0 - выворачивает пинвил в криветку мебиуса (0 - норм)
         seed=0,
-        use_gpu=False,
+        use_gpu=True,
     )
     step_offset = 1
+    long_radius_start = max(
+        LAYOUT_ADAPTIVE_RADIUS_MIN,
+        int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
+    )
+    adaptive_long = AdaptiveLayoutConfig(
+        start_radius=long_radius_start,
+        end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
+        swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
+        lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+    )
     layout.run(
         steps=22000,
         pairs_per_step=1200,
-        pair_radius=layout.width // 2,
+        pair_radius=adaptive_long.start_radius,
         mode="long",
-        min_swap_ratio=0.001,
+        min_swap_ratio=0.0,
         log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
-        #energy_radius=7,
-        #energy_check_every=5,
-        #energy_delta=5e-4,
-        #energy_patience=4,
+        adaptive_params=adaptive_long,
+        energy_radius=None,
+        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
     )
     step_offset += layout.last_steps
+    short_radius_start = max(
+        LAYOUT_ADAPTIVE_RADIUS_MIN,
+        int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
+    )
+    adaptive_short = AdaptiveLayoutConfig(
+        start_radius=short_radius_start,
+        end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
+        swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
+        lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+    )
     layout.run(
         steps=900,
         pairs_per_step=500,
-        pair_radius=7,
+        pair_radius=adaptive_short.start_radius,
         mode="short",
-        local_radius=7,
-        min_swap_ratio=0.001,
+        local_radius=adaptive_short.start_radius,
+        min_swap_ratio=0.0,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
+        adaptive_params=adaptive_short,
+        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
     )
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from collections import defaultdict
 
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
-from damp.layout.damp_layout import Layout
+from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout
 from damp.logging import LOGGER
 
 LOG_INTERVAL_DEFAULT = 1
@@ -15,11 +15,19 @@ LOG_INTERVAL_LAYOUT_ENERGY = 200
 LOG_INTERVAL_LAYOUT_PAIR = 100000
 LOG_INTERVAL_LAYOUT_AVG_ENERGY = 20
 LOG_INTERVAL_LAYOUT_VISUAL = 1
+LOG_INTERVAL_LAYOUT_ADAPTIVE = 50
+
+LAYOUT_USE_GPU = True
 
 ENCODER_LOG_EVERY = 50
-LAYOUT_LOG_EVERY_LONG = 1
-LAYOUT_LOG_EVERY_SHORT = 50
-LAYOUT_ENERGY_CHECK_EVERY = 100
+LAYOUT_LOG_EVERY_LONG = 10
+LAYOUT_LOG_EVERY_SHORT = 10
+LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.5
+LAYOUT_ADAPTIVE_RADIUS_MIN = 1
+LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
+LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
+LAYOUT_ENERGY_STABILITY_WINDOW = 50
+LAYOUT_ENERGY_STABILITY_DELTA = 0.0001
 
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
@@ -43,6 +51,7 @@ LOG_INTERVALS = {
     "layout.energy.long.similarity": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.space": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.threshold": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.long.tensor": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
@@ -50,6 +59,9 @@ LOG_INTERVALS = {
     "layout.gpu.enabled": LOG_INTERVAL_INIT,
     "layout.gpu.import_failed": LOG_INTERVAL_INIT,
     "layout.gpu.init_failed": LOG_INTERVAL_INIT,
+    "layout.gpu.tensor.disabled": LOG_INTERVAL_INIT,
+    "layout.gpu.tensor.enabled": LOG_INTERVAL_INIT,
+    "layout.gpu.tensor.unavailable": LOG_INTERVAL_INIT,
     "layout.gpu.version_too_low": LOG_INTERVAL_INIT,
     "layout.grid": LOG_INTERVAL_INIT,
     "layout.init": LOG_INTERVAL_INIT,
@@ -58,8 +70,13 @@ LOG_INTERVALS = {
     "layout.precompute": LOG_INTERVAL_INIT,
     "layout.precompute_limit": LOG_INTERVAL_INIT,
     "layout.render_image": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.adaptive.config": LOG_INTERVAL_INIT,
+    "layout.adaptive.radius": LOG_INTERVAL_LAYOUT_ADAPTIVE,
+    "layout.adaptive.lambda": LOG_INTERVAL_INIT,
     "layout.run.done": LOG_INTERVAL_INIT,
-    "layout.run.energy_stop": LOG_INTERVAL_INIT,
+    "layout.run.energy_monitor": LOG_INTERVAL_INIT,
+    "layout.run.energy_stability": LOG_INTERVAL_INIT,
+    "layout.run.energy_stability.stop": LOG_INTERVAL_INIT,
     "layout.run.mode": LOG_INTERVAL_INIT,
     "layout.run.selection": LOG_INTERVAL_INIT,
     "layout.run.settings": LOG_INTERVAL_INIT,
@@ -169,37 +186,60 @@ def _collect_codes(
 def _run_layout(codes: dict[float, list]) -> Layout:
     layout = Layout(
         codes,
-        empty_ratio=0.5,
+        empty_ratio=0.15,
         similarity="cosine",
         lambda_threshold=0.06,
         eta=0.0,
         seed=0,
-        use_gpu=False,
+        use_gpu=LAYOUT_USE_GPU,
     )
     step_offset = 1
+    long_radius_start = max(
+        LAYOUT_ADAPTIVE_RADIUS_MIN,
+        int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
+    )
+    adaptive_long = AdaptiveLayoutConfig(
+        start_radius=long_radius_start,
+        end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
+        swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
+        lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+    )
     layout.run(
         steps=22000,
         pairs_per_step=16000,
-        pair_radius=layout.width // 2,
+        pair_radius=adaptive_long.start_radius,
         mode="long",
-        min_swap_ratio=0.001,
+        min_swap_ratio=0.0,
         log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
-        energy_radius=7,
-        energy_check_every=LAYOUT_ENERGY_CHECK_EVERY,
-        energy_delta=5e-4,
-        energy_patience=4,
+        energy_radius=None,
+        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+        adaptive_params=adaptive_long,
     )
     step_offset += layout.last_steps
+    short_radius_start = max(
+        LAYOUT_ADAPTIVE_RADIUS_MIN,
+        int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
+    )
+    adaptive_short = AdaptiveLayoutConfig(
+        start_radius=short_radius_start,
+        end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
+        swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
+        lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+    )
     layout.run(
         steps=900,
-        pairs_per_step=500,
-        pair_radius=7,
+        pairs_per_step=16000,
+        pair_radius=adaptive_short.start_radius,
         mode="short",
-        local_radius=7,
-        min_swap_ratio=0.001,
+        local_radius=adaptive_short.start_radius,
+        min_swap_ratio=0.0,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
+        adaptive_params=adaptive_short,
+        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
     )
     return layout
 
@@ -214,16 +254,16 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 6000
+    count = 600
     label = None
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
 
     layout = _run_layout(codes)
 
-    # image = layout.render_image()
-    # filename = f"data/{label}-{count}-{total_codes}.png"
-    # Image.fromarray(image).save(filename)
+    image = layout.render_image()
+    filename = f"data/{count}-{total_codes}.png"
+    Image.fromarray(image).save(filename)
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from collections import deque
 import math
 import os
 import random
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from damp.article_refs import (
     ENERGY_CALC,
@@ -15,6 +16,7 @@ from damp.article_refs import (
     GPU_IMPLEMENTATION,
     LAYOUT_ALGORITHM,
     LAYOUT_COMPACTNESS,
+    LAYOUT_PARAMETERS,
     OPTIM_ENERGY,
     OPTIM_SIM_MATRIX,
     OPTIM_SUBSET,
@@ -36,11 +38,22 @@ class LayoutPoint:
     hue: float
     ones: int
 
+
+@dataclass(frozen=True)
+class AdaptiveLayoutConfig:
+    start_radius: int
+    end_radius: int = 1
+    swap_ratio_trigger: float = 0.01
+    lambda_step: float | None = None
+
 _UNSET = object()
 HUE = 360.0
 _PARALLEL_SIM_MIN_PAIRS = 50_000
 _SIM_POINTS: Sequence[LayoutPoint] | None = None
 _SIM_MODE: str | None = None
+_VISUAL_ENERGY_POINT_LIMIT = 5000
+_VISUAL_POINT_LIMIT = 200000
+_AUTO_ENERGY_RADIUS_MAX = 15
 
 
 def _init_similarity_worker(points: Sequence[LayoutPoint], similarity: str) -> None:
@@ -589,6 +602,410 @@ class _GpuLayoutEngine:
             return 0.0
         return float((energies / emax).mean())
 
+
+@dataclass(frozen=True)
+class _TensorEnergyBatch:
+    energies: list[tuple[float, float]]
+    contrib_points: list[int]
+    s1_min: list[float]
+    s1_max: list[float]
+    s2_min: list[float]
+    s2_max: list[float]
+    s1_sum: list[float]
+    s2_sum: list[float]
+    d1_min: list[float]
+    d1_max: list[float]
+    d2_min: list[float]
+    d2_max: list[float]
+
+
+class _TensorLayoutEngine:
+    def __init__(
+        self,
+        *,
+        torch_mod: "Any",
+        device: "Any",
+        code_matrix: "numpy.ndarray",
+        ones: "numpy.ndarray",
+        similarity: str,
+    ) -> None:
+        self._torch = torch_mod
+        self._device = device
+        self._similarity = similarity
+        self._codes = self._torch.as_tensor(code_matrix, dtype=self._torch.float32, device=device)
+        self._ones = self._torch.as_tensor(ones, dtype=self._torch.float32, device=device)
+        self._subset_indices: tuple[int, ...] | None = None
+        self._subset_tensor: "Any" | None = None
+        self._zero_row: "Any" | None = None
+        self._sim_cache: dict[int, "Any"] = {}
+        self._lambda: float | None = None
+        self._eta: float | None = None
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        code_matrix: "numpy.ndarray | None",
+        ones: "numpy.ndarray | None",
+        similarity: str,
+    ) -> "_TensorLayoutEngine | None":
+        try:
+            import torch
+        except Exception as exc:
+            LOGGER.event(
+                "layout.gpu.tensor.unavailable",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc)},
+            )
+            return None
+        if code_matrix is None or ones is None:
+            LOGGER.event(
+                "layout.gpu.tensor.unavailable",
+                section=GPU_IMPLEMENTATION,
+                data={"error": "code matrix missing"},
+            )
+            return None
+        device: "torch.device | None" = None
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        if device is None:
+            LOGGER.event(
+                "layout.gpu.tensor.unavailable",
+                section=GPU_IMPLEMENTATION,
+                data={"error": "no gpu backend"},
+            )
+            return None
+        try:
+            engine = cls(
+                torch_mod=torch,
+                device=device,
+                code_matrix=code_matrix,
+                ones=ones,
+                similarity=similarity,
+            )
+        except Exception as exc:
+            LOGGER.event(
+                "layout.gpu.tensor.unavailable",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc)},
+            )
+            return None
+        LOGGER.event(
+            "layout.gpu.tensor.enabled",
+            section=GPU_IMPLEMENTATION,
+            data={"device": str(device), "similarity": similarity},
+        )
+        return engine
+
+    def reset_subset(self) -> None:
+        self._subset_indices = None
+        self._subset_tensor = None
+        self._zero_row = None
+        self._sim_cache.clear()
+
+    @property
+    def device(self) -> str:
+        return str(self._device)
+
+    def _apply_lambda_tensor(
+        self, sim: "Any", lambda_threshold: float, eta: float | None
+    ) -> "Any":
+        if sim.numel() == 0:
+            return sim
+        if eta is None:
+            if lambda_threshold <= 0.0:
+                return self._torch.where(sim > 0.0, sim, self._torch.zeros_like(sim))
+            return self._torch.where(sim >= lambda_threshold, sim, self._torch.zeros_like(sim))
+        scaled = 1.0 / (1.0 + self._torch.exp(-eta * (sim - lambda_threshold)))
+        return sim * scaled
+
+    def ensure_subset(
+        self, subset_indices: Sequence[int], lambda_threshold: float, eta: float | None
+    ) -> bool:
+        subset_key = tuple(subset_indices)
+        if not subset_key:
+            return False
+        if (
+            self._subset_indices != subset_key
+            or self._lambda != lambda_threshold
+            or self._eta != eta
+        ):
+            self._subset_indices = subset_key
+            self._subset_tensor = self._torch.as_tensor(
+                subset_indices, dtype=self._torch.long, device=self._device
+            )
+            self._zero_row = self._torch.zeros(
+                (len(subset_indices),), dtype=self._torch.float32, device=self._device
+            )
+            self._sim_cache.clear()
+            self._lambda = lambda_threshold
+            self._eta = eta
+        return True
+
+    def _similarity_block_tensor(
+        self, row_indices: Sequence[int]
+    ) -> "Any":
+        if self._subset_tensor is None:
+            raise RuntimeError("subset is not prepared")
+        rows = self._codes[self._torch.as_tensor(row_indices, device=self._device)]
+        cols = self._codes[self._subset_tensor].T
+        common = rows @ cols
+        ones_rows = self._ones[self._torch.as_tensor(row_indices, device=self._device)]
+        ones_cols = self._ones[self._subset_tensor]
+        if self._similarity == "cosine":
+            denom = self._torch.sqrt(self._torch.outer(ones_rows, ones_cols))
+            safe = self._torch.where(denom != 0, denom, self._torch.ones_like(denom))
+            sim = self._torch.where(denom != 0, common / safe, self._torch.zeros_like(common))
+        else:
+            union = ones_rows[:, None] + ones_cols[None, :] - common
+            safe = self._torch.where(union != 0, union, self._torch.ones_like(union))
+            sim = self._torch.where(union != 0, common / safe, self._torch.zeros_like(common))
+        sim = self._apply_lambda_tensor(sim, self._lambda or 0.0, self._eta)
+        return sim
+
+    def similarity_block(
+        self,
+        row_indices: Sequence[int],
+        subset_indices: Sequence[int],
+        lambda_threshold: float,
+        eta: float | None,
+    ) -> "numpy.ndarray | None":
+        if not self.ensure_subset(subset_indices, lambda_threshold, eta):
+            return None
+        with self._torch.no_grad():
+            sim = self._similarity_block_tensor(row_indices)
+            for idx, row in zip(row_indices, sim):
+                self._sim_cache[idx] = row
+            return sim.cpu().numpy().astype("float32", copy=False)
+
+    def _get_sim_row(
+        self, idx: int | None, sim_lookup: Mapping[int, "numpy.ndarray"]
+    ) -> "Any":
+        if idx is None:
+            assert self._zero_row is not None
+            return self._zero_row
+        cached = self._sim_cache.get(idx)
+        if cached is not None:
+            return cached
+        values = sim_lookup.get(idx)
+        if values is None:
+            assert self._zero_row is not None
+            return self._zero_row
+        row = self._torch.as_tensor(values, dtype=self._torch.float32, device=self._device)
+        self._sim_cache[idx] = row
+        return row
+
+    def register_cache_row(self, idx: int, values: Sequence[float]) -> None:
+        if self._subset_tensor is None:
+            return
+        row = self._torch.as_tensor(values, dtype=self._torch.float32, device=self._device)
+        self._sim_cache[idx] = row
+
+    def pair_energies(
+        self,
+        pairs: Sequence[tuple[int, int, int, int, int | None, int | None]],
+        eval_indices: Sequence[int],
+        pos_y: Sequence[int],
+        pos_x: Sequence[int],
+        sim_lookup: Mapping[int, "numpy.ndarray"],
+        distance_eps: float,
+    ) -> _TensorEnergyBatch | None:
+        if self._subset_tensor is None or not pairs:
+            return None
+        if not self.ensure_subset(eval_indices, self._lambda or 0.0, self._eta):
+            return None
+        _ = distance_eps
+        torch = self._torch
+        device = self._device
+        subset = self._subset_tensor
+        zero_row = self._zero_row
+        if zero_row is None:
+            return None
+
+        with torch.no_grad():
+            eval_y = torch.as_tensor(
+                [pos_y[idx] for idx in eval_indices],
+                dtype=torch.float32,
+                device=device,
+            )
+            eval_x = torch.as_tensor(
+                [pos_x[idx] for idx in eval_indices],
+                dtype=torch.float32,
+                device=device,
+            )
+
+            idx_a_tensor = torch.as_tensor(
+                [idx_a if idx_a is not None else -1 for _, _, _, _, idx_a, _ in pairs],
+                dtype=torch.long,
+                device=device,
+            )
+            idx_b_tensor = torch.as_tensor(
+                [idx_b if idx_b is not None else -1 for _, _, _, _, _, idx_b in pairs],
+                dtype=torch.long,
+                device=device,
+            )
+
+            s1_rows = [
+                self._get_sim_row(idx_a, sim_lookup)
+                for (_, _, _, _, idx_a, _) in pairs
+            ]
+            s2_rows = [
+                self._get_sim_row(idx_b, sim_lookup)
+                for (_, _, _, _, _, idx_b) in pairs
+            ]
+            s1 = torch.stack(s1_rows, dim=0)
+            s2 = torch.stack(s2_rows, dim=0)
+
+            mask_a = subset[None, :] == idx_a_tensor[:, None]
+            mask_b = subset[None, :] == idx_b_tensor[:, None]
+            mask_self = mask_a | mask_b
+            s1 = torch.where(mask_self, torch.zeros_like(s1), s1)
+            s2 = torch.where(mask_self, torch.zeros_like(s2), s2)
+
+            pair_y1 = torch.as_tensor(
+                [y1 for (y1, _, _, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_x1 = torch.as_tensor(
+                [x1 for (_, x1, _, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_y2 = torch.as_tensor(
+                [y2 for (_, _, y2, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_x2 = torch.as_tensor(
+                [x2 for (_, _, _, x2, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+
+            dy1 = pair_y1[:, None] - eval_y[None, :]
+            dx1 = pair_x1[:, None] - eval_x[None, :]
+            dy2 = pair_y2[:, None] - eval_y[None, :]
+            dx2 = pair_x2[:, None] - eval_x[None, :]
+            dist1 = dy1 * dy1 + dx1 * dx1
+            dist2 = dy2 * dy2 + dx2 * dx2
+
+            energy_c = torch.sum(s1 * dist1 + s2 * dist2, dim=1)
+            energy_s = torch.sum(s2 * dist1 + s1 * dist2, dim=1)
+
+            contrib_mask = (s1 > 0.0) | (s2 > 0.0)
+            contrib_counts = torch.sum(contrib_mask, dim=1)
+
+            def _masked_min(values: "Any") -> "Any":
+                inf = torch.finfo(values.dtype).max
+                masked = torch.where(contrib_mask, values, torch.full_like(values, inf))
+                mins = torch.min(masked, dim=1).values
+                return torch.where(contrib_counts > 0, mins, torch.zeros_like(mins))
+
+            def _masked_max(values: "Any") -> "Any":
+                ninf = torch.tensor(-torch.finfo(values.dtype).max, device=device, dtype=values.dtype)
+                masked = torch.where(contrib_mask, values, ninf)
+                maxs = torch.max(masked, dim=1).values
+                return torch.where(contrib_counts > 0, maxs, torch.zeros_like(maxs))
+
+            s1_sum = torch.sum(torch.where(contrib_mask, s1, torch.zeros_like(s1)), dim=1)
+            s2_sum = torch.sum(torch.where(contrib_mask, s2, torch.zeros_like(s2)), dim=1)
+            s1_min = _masked_min(s1)
+            s1_max = _masked_max(s1)
+            s2_min = _masked_min(s2)
+            s2_max = _masked_max(s2)
+            d1_min = _masked_min(dist1)
+            d1_max = _masked_max(dist1)
+            d2_min = _masked_min(dist2)
+            d2_max = _masked_max(dist2)
+
+            energies = list(
+                zip(
+                    energy_c.detach().cpu().tolist(),
+                    energy_s.detach().cpu().tolist(),
+                )
+            )
+            return _TensorEnergyBatch(
+                energies=energies,
+                contrib_points=[int(v) for v in contrib_counts.detach().cpu().tolist()],
+                s1_min=[float(v) for v in s1_min.detach().cpu().tolist()],
+                s1_max=[float(v) for v in s1_max.detach().cpu().tolist()],
+                s2_min=[float(v) for v in s2_min.detach().cpu().tolist()],
+                s2_max=[float(v) for v in s2_max.detach().cpu().tolist()],
+                s1_sum=[float(v) for v in s1_sum.detach().cpu().tolist()],
+                s2_sum=[float(v) for v in s2_sum.detach().cpu().tolist()],
+                d1_min=[float(v) for v in d1_min.detach().cpu().tolist()],
+                d1_max=[float(v) for v in d1_max.detach().cpu().tolist()],
+                d2_min=[float(v) for v in d2_min.detach().cpu().tolist()],
+                d2_max=[float(v) for v in d2_max.detach().cpu().tolist()],
+            )
+
+
+class _AdaptiveLayoutState:
+    def __init__(self, config: AdaptiveLayoutConfig, total_steps: int) -> None:
+        self._config = config
+        self._total_steps = max(1, total_steps)
+        self._initial_swaps: int | None = None
+        self._radius_cap = max(config.start_radius, config.end_radius)
+        self._trigger_count = 0
+
+    def _base_radius_for_step(self, step: int) -> int:
+        if self._total_steps <= 1:
+            return self._config.end_radius
+        progress = step / max(1, self._total_steps - 1)
+        decayed = self._config.start_radius - (
+            (self._config.start_radius - self._config.end_radius) * progress
+        )
+        return max(self._config.end_radius, int(round(decayed)))
+
+    def radius_for_step(self, step: int) -> int:
+        radius = self._base_radius_for_step(step)
+        return min(radius, self._radius_cap)
+
+    def update_after_step(
+        self, *, step: int, swaps: int, current_lambda: float
+    ) -> tuple[float | None, float]:
+        if self._initial_swaps is None:
+            self._initial_swaps = max(1, swaps)
+        swap_ratio = 0.0 if self._initial_swaps == 0 else swaps / self._initial_swaps
+        new_lambda: float | None = None
+        if swap_ratio <= self._config.swap_ratio_trigger:
+            self._trigger_count += 1
+            self._initial_swaps = max(1, swaps)
+            base_radius = self._base_radius_for_step(step)
+            reduced_cap = max(self._config.end_radius, int(base_radius * 0.5))
+            if reduced_cap < self._radius_cap:
+                self._radius_cap = reduced_cap
+            if self._config.lambda_step is not None:
+                new_lambda = min(1.0, current_lambda + self._config.lambda_step)
+        return new_lambda, swap_ratio
+
+
+@dataclass
+class _EnergyStabilityMonitor:
+    window: int
+    threshold: float
+    history: deque[float] = field(init=False)
+    last_energy: float | None = None
+
+    def __post_init__(self) -> None:
+        self.history = deque(maxlen=self.window)
+
+    def update(self, energy: float) -> tuple[bool, float | None, float]:
+        diff = None
+        if self.last_energy is not None:
+            diff = abs(energy - self.last_energy)
+            self.history.append(diff)
+        self.last_energy = energy
+        if len(self.history) < self.history.maxlen:
+            max_delta = max(self.history) if self.history else 0.0
+            return False, diff, max_delta
+        max_delta = max(self.history) if self.history else 0.0
+        return max_delta < self.threshold, diff, max_delta
+
+
 class Layout:
     """Discrete layout of code vectors on a 2D grid using the DAMP algorithm."""
 
@@ -762,17 +1179,26 @@ class Layout:
             section=ENERGIES,
             data={"distance_eps": self._distance_eps},
         )
+        self._last_visual_energy: float | None = None
+        self._last_visual_energy_step: int | None = None
+        self._last_energy_value: float | None = None
+        self._last_energy_step: int | None = None
         self._gpu_engine: _GpuLayoutEngine | None = None
+        self._tensor_engine: _TensorLayoutEngine | None = None
         self._gpu_positions_dirty = True
         if self._use_gpu:
             self._gpu_engine = _GpuLayoutEngine.create(self._points, self._similarity)
-            if self._gpu_engine is None:
-                self._use_gpu = False
-        if self._use_gpu and self._gpu_engine is not None:
+            self._tensor_engine = _TensorLayoutEngine.create(
+                code_matrix=self._code_matrix,
+                ones=self._ones_array,
+                similarity=self._similarity,
+            )
+        if self._use_gpu and (self._gpu_engine is not None or self._tensor_engine is not None):
+            status = "OpenGL 4.1" if self._gpu_engine is not None else f"tensor:{self._tensor_engine.device}"
             LOGGER.event(
                 "layout.gpu.enabled",
                 section=GPU_IMPLEMENTATION,
-                data={"status": "OpenGL 4.1"},
+                data={"status": status},
             )
         else:
             LOGGER.event(
@@ -798,9 +1224,9 @@ class Layout:
         log_path: str = "layout",
         step_offset: int = 0,
         energy_radius: int | None = None,
-        energy_check_every: int = 10,
-        energy_delta: float = 1e-3,
-        energy_patience: int = 3,
+        energy_stability_window: int | None = None,
+        energy_stability_delta: float = 1e-3,
+        adaptive_params: AdaptiveLayoutConfig | None = None,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
@@ -818,12 +1244,31 @@ class Layout:
             raise ValueError("step_offset must be >= 0")
         if energy_radius is not None and energy_radius <= 0:
             raise ValueError("energy_radius must be positive when set")
-        if energy_check_every <= 0:
-            raise ValueError("energy_check_every must be positive")
-        if energy_delta < 0:
-            raise ValueError("energy_delta must be >= 0")
-        if energy_patience <= 0:
-            raise ValueError("energy_patience must be positive")
+        if energy_stability_window is not None and energy_stability_window <= 0:
+            raise ValueError("energy_stability_window must be positive when set")
+        if energy_stability_delta < 0:
+            raise ValueError("energy_stability_delta must be >= 0")
+        if adaptive_params is not None:
+            if adaptive_params.start_radius <= 0:
+                raise ValueError("adaptive start_radius must be positive")
+            if adaptive_params.end_radius <= 0:
+                raise ValueError("adaptive end_radius must be positive")
+            if adaptive_params.start_radius < adaptive_params.end_radius:
+                raise ValueError("adaptive start_radius must be >= end_radius")
+            if not 0 <= adaptive_params.swap_ratio_trigger <= 1:
+                raise ValueError("adaptive swap_ratio_trigger must be in [0, 1]")
+
+        effective_energy_radius = energy_radius
+        if effective_energy_radius is None:
+            auto_radius = max(
+                1, min(min(self.height, self.width) // 2, _AUTO_ENERGY_RADIUS_MAX)
+            )
+            effective_energy_radius = auto_radius
+            LOGGER.event(
+                "layout.energy.auto_radius",
+                section=QUALITY_ASSESS,
+                data={"energy_radius": effective_energy_radius},
+            )
 
         LOGGER.event(
             "layout.run.selection",
@@ -852,27 +1297,52 @@ class Layout:
             },
         )
         LOGGER.event(
-            "layout.run.energy_stop",
+            "layout.run.energy_monitor",
             section=QUALITY_ASSESS,
             data={
-                "energy_radius": energy_radius,
-                "energy_check_every": energy_check_every,
-                "energy_delta": energy_delta,
-                "energy_patience": energy_patience,
+                "energy_radius": effective_energy_radius,
             },
         )
+        energy_monitor: _EnergyStabilityMonitor | None = None
+        if energy_stability_window is not None:
+            energy_monitor = _EnergyStabilityMonitor(
+                window=energy_stability_window,
+                threshold=energy_stability_delta,
+            )
+            LOGGER.event(
+                "layout.run.energy_stability",
+                section=QUALITY_ASSESS,
+                data={
+                    "window": energy_stability_window,
+                    "delta": energy_stability_delta,
+                },
+            )
+        adaptive_state: _AdaptiveLayoutState | None = None
+        if adaptive_params is not None:
+            adaptive_state = _AdaptiveLayoutState(adaptive_params, steps)
+            LOGGER.event(
+                "layout.adaptive.config",
+                section=LAYOUT_PARAMETERS,
+                data={
+                    "start_radius": adaptive_params.start_radius,
+                    "end_radius": adaptive_params.end_radius,
+                    "swap_ratio_trigger": adaptive_params.swap_ratio_trigger,
+                    "lambda_step": adaptive_params.lambda_step,
+                    "steps": steps,
+                },
+            )
         total_swaps = 0
-        min_swaps = 0
-        if min_swap_ratio > 0:
-            min_swaps = max(1, int(pairs_per_step * min_swap_ratio))
         steps_executed = 0
-        prev_energy: float | None = None
-        stable_checks = 0
 
         for step in range(steps):
+            effective_pair_radius = (
+                adaptive_state.radius_for_step(step)
+                if adaptive_state is not None
+                else pair_radius
+            )
             swaps = self.step(
                 pairs_per_step=pairs_per_step,
-                pair_radius=pair_radius,
+                pair_radius=effective_pair_radius,
                 mode=mode,
                 local_radius=local_radius,
             )
@@ -880,19 +1350,55 @@ class Layout:
             steps_executed = step + 1
             if log_every is not None and step % log_every == 0:
                 self._log_layout_state(path=log_path, step=step + step_offset)
-            if energy_radius is not None and mode == "long":
-                if step % energy_check_every == 0:
-                    energy = self.average_local_energy(energy_radius)
-                    if prev_energy is not None:
-                        if abs(energy - prev_energy) <= energy_delta:
-                            stable_checks += 1
-                        else:
-                            stable_checks = 0
-                        if stable_checks >= energy_patience:
-                            break
-                    prev_energy = energy
-            if min_swaps and swaps < min_swaps:
-                break
+            energy_for_stability: float | None = None
+            if effective_energy_radius is not None:
+                energy = self.average_local_energy(effective_energy_radius)
+                energy_for_stability = energy
+                self._last_energy_value = energy
+                self._last_energy_step = step + step_offset
+            if adaptive_state is not None:
+                new_lambda, swap_ratio = adaptive_state.update_after_step(
+                    step=step, swaps=swaps, current_lambda=self._lambda
+                )
+                LOGGER.event(
+                    "layout.adaptive.radius",
+                    section=LAYOUT_PARAMETERS,
+                    data={
+                        "step": step + step_offset,
+                        "pair_radius": effective_pair_radius,
+                        "swap_ratio": swap_ratio,
+                        "lambda_threshold": self._lambda,
+                    },
+                )
+                if new_lambda is not None and new_lambda != self._lambda:
+                    self._lambda = new_lambda
+                    LOGGER.event(
+                        "layout.adaptive.lambda",
+                        section=LAYOUT_PARAMETERS,
+                        data={
+                            "step": step + step_offset,
+                            "lambda_threshold": self._lambda,
+                            "swap_ratio": swap_ratio,
+                        },
+                    )
+            if energy_monitor is not None and energy_for_stability is not None:
+                should_stop, energy_diff, max_delta = energy_monitor.update(
+                    energy_for_stability
+                )
+                if should_stop:
+                    LOGGER.event(
+                        "layout.run.energy_stability.stop",
+                        section=QUALITY_ASSESS,
+                        data={
+                            "step": step + step_offset,
+                            "window": energy_monitor.window,
+                            "delta": energy_monitor.threshold,
+                            "max_delta": max_delta,
+                            "last_energy_diff": energy_diff,
+                            "total_swaps": total_swaps,
+                        },
+                    )
+                    break
 
         self.last_steps = steps_executed
         avg_swaps = (total_swaps / steps_executed) if steps_executed else 0.0
@@ -908,21 +1414,46 @@ class Layout:
         return total_swaps
 
     def _log_layout_state(self, path: str, step: int) -> None:
-        positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
-        colors = self.colors_rgb()
-        image = self._build_image(colors)
-        visuals = [
-            LOGGER.visual_image(
-                f"{path}/image",
-                image,
-            ),
-            LOGGER.visual_points2d(
-                f"{path}/image",
-                positions,
-                colors=colors,
-                radii=0.5,
-            ),
-        ]
+        visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT
+        visuals: list = []
+        if not visuals_skipped:
+            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+            colors = self.colors_rgb()
+            image = self._build_image(colors)
+            visuals = [
+                LOGGER.visual_image(
+                    f"{path}/image",
+                    image,
+                ),
+                LOGGER.visual_points2d(
+                    f"{path}/image",
+                    positions,
+                    colors=colors,
+                    radii=0.5,
+                ),
+            ]
+        energy_radius: int | None = None
+        energy_value: float | None = None
+        energy_source: str | None = None
+        if self._last_energy_value is not None:
+            energy_value = self._last_energy_value
+            energy_radius = None
+            energy_source = "cached"
+        elif self._point_count <= _VISUAL_ENERGY_POINT_LIMIT:
+            energy_radius = max(1, min(self.height, self.width) // 2)
+            energy_value = self.average_local_energy(energy_radius)
+            energy_source = "visual"
+        energy_step = self._last_energy_step if energy_source == "cached" else step
+        energy_diff = None
+        if (
+            energy_value is not None
+            and self._last_visual_energy is not None
+            and energy_step != self._last_visual_energy_step
+        ):
+            energy_diff = energy_value - self._last_visual_energy
+        if energy_value is not None:
+            self._last_visual_energy = energy_value
+            self._last_visual_energy_step = energy_step
         LOGGER.event(
             "layout.visual",
             section=LAYOUT_ALGORITHM,
@@ -930,6 +1461,11 @@ class Layout:
                 "step": step,
                 "points": self._point_count,
                 "grid_size": self.width,
+                "energy": energy_value,
+                "energy_diff": energy_diff,
+                "energy_radius": energy_radius,
+                "energy_source": energy_source,
+                "visuals_skipped": visuals_skipped,
             },
             visuals=visuals,
         )
@@ -960,7 +1496,7 @@ class Layout:
         mode: str,
         local_radius: int | None,
     ) -> int:
-        swaps: list[tuple[int, int, int, int]] = []
+        swaps_with_delta: list[tuple[tuple[int, int, int, int], float]] = []
         pairs = [self._sample_pair(pair_radius) for _ in range(pairs_per_step)]
 
         if (
@@ -1015,12 +1551,14 @@ class Layout:
                     swap_coords, energies
                 ):
                     if mode == "long":
+                        delta = energy_c - energy_s
                         if energy_s < energy_c:
-                            swaps.append((y1, x1, y2, x2))
+                            swaps_with_delta.append(((y1, x1, y2, x2), delta))
                     else:
+                        delta = energy_s - energy_c
                         if energy_s > energy_c:
-                            swaps.append((y1, x1, y2, x2))
-                return self._apply_swaps(swaps)
+                            swaps_with_delta.append(((y1, x1, y2, x2), delta))
+                return self._apply_tracked_swaps(swaps_with_delta)
             self._gpu_engine = None
 
         if mode == "long":
@@ -1040,14 +1578,18 @@ class Layout:
             for (y1, x1, y2, x2), (energy_c, energy_s) in zip(
                 swap_coords, energies
             ):
+                delta = energy_c - energy_s
                 if energy_s < energy_c:
-                    swaps.append((y1, x1, y2, x2))
-            return self._apply_swaps(swaps)
+                    swaps_with_delta.append(((y1, x1, y2, x2), delta))
+            return self._apply_tracked_swaps(swaps_with_delta)
 
         for y1, x1, y2, x2 in pairs:
-            if self._should_swap(y1, x1, y2, x2, mode=mode, local_radius=local_radius):
-                swaps.append((y1, x1, y2, x2))
-        return self._apply_swaps(swaps)
+            should_swap, delta = self._should_swap(
+                y1, x1, y2, x2, mode=mode, local_radius=local_radius
+            )
+            if should_swap:
+                swaps_with_delta.append(((y1, x1, y2, x2), delta))
+        return self._apply_tracked_swaps(swaps_with_delta)
 
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
@@ -1227,12 +1769,12 @@ class Layout:
         *,
         mode: str,
         local_radius: int | None,
-    ) -> bool:
+    ) -> tuple[bool, float]:
         idx_a = self.grid[y1][x1]
         idx_b = self.grid[y2][x2]
 
         if idx_a is None and idx_b is None:
-            return False
+            return False, 0.0
         if idx_a is None:
             idx_a, idx_b = idx_b, idx_a
             y1, x1, y2, x2 = y2, x2, y1, x1
@@ -1241,7 +1783,7 @@ class Layout:
             energy_c, energy_s = self._pair_energy_long(
                 idx_a, (y1, x1), idx_b, (y2, x2)
             )
-            return energy_s < energy_c
+            return energy_s < energy_c, energy_c - energy_s
 
         radius = local_radius
         if radius is None:
@@ -1250,7 +1792,7 @@ class Layout:
         energy_c, energy_s = self._pair_energy_short(
             idx_a, (y1, x1), idx_b, (y2, x2), radius=radius
         )
-        return energy_s > energy_c
+        return energy_s > energy_c, energy_s - energy_c
 
     def _pair_energy_long(
         self,
@@ -1340,9 +1882,22 @@ class Layout:
             },
         )
 
-        eval_idx_arr = np.asarray(eval_indices, dtype=np.int32)
-        eval_y = np.take(self._pos_y, eval_idx_arr).astype(np.float64)
-        eval_x = np.take(self._pos_x, eval_idx_arr).astype(np.float64)
+        tensor_batch: _TensorEnergyBatch | None = None
+        tensor_ready = False
+        tensor_engine = self._tensor_engine if self._use_gpu else None
+        if tensor_engine is not None:
+            try:
+                tensor_ready = tensor_engine.ensure_subset(
+                    eval_indices, self._lambda, self._eta
+                )
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.gpu.tensor.disabled",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc)},
+                )
+                tensor_engine = None
+                self._tensor_engine = None
 
         unique_indices = sorted(
             {
@@ -1357,12 +1912,101 @@ class Layout:
 
         missing = [idx for idx in unique_indices if idx not in self._subset_similarity_cache]
         if missing:
-            missing_matrix = self._apply_lambda_array(
-                self._similarity_block(missing, eval_indices)
-            ).astype(np.float32, copy=False)
+            missing_matrix: "np.ndarray | None" = None
+            if tensor_ready and tensor_engine is not None:
+                try:
+                    missing_matrix = tensor_engine.similarity_block(
+                        missing, eval_indices, self._lambda, self._eta
+                    )
+                except Exception as exc:
+                    LOGGER.event(
+                        "layout.gpu.tensor.disabled",
+                        section=GPU_IMPLEMENTATION,
+                        data={"error": str(exc)},
+                    )
+                    tensor_ready = False
+                    tensor_engine = None
+                    self._tensor_engine = None
+            if missing_matrix is None:
+                missing_matrix = self._apply_lambda_array(
+                    self._similarity_block(missing, eval_indices)
+                ).astype(np.float32, copy=False)
             for row, idx in enumerate(missing):
                 self._subset_similarity_cache[idx] = missing_matrix[row]
+                if tensor_ready and tensor_engine is not None:
+                    tensor_engine.register_cache_row(idx, missing_matrix[row])
         sim_lookup = self._subset_similarity_cache
+
+        if tensor_ready and tensor_engine is not None:
+            try:
+                tensor_batch = tensor_engine.pair_energies(
+                    pairs,
+                    eval_indices,
+                    self._pos_y,
+                    self._pos_x,
+                    sim_lookup,
+                    self._distance_eps,
+                )
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.gpu.tensor.disabled",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc)},
+                )
+                tensor_batch = None
+                tensor_engine = None
+                self._tensor_engine = None
+            if tensor_batch is not None:
+                LOGGER.event(
+                    "layout.energy.long.tensor",
+                    section=GPU_IMPLEMENTATION,
+                    data={
+                        "pairs": batch_size,
+                        "points": self._point_count,
+                        "eval_points": len(eval_indices),
+                    },
+                )
+                gpu_results: list[tuple[float, float]] = []
+                for pair_idx, (y1, x1, y2, x2, idx_a, idx_b) in enumerate(pairs):
+                    energy_c, energy_s = tensor_batch.energies[pair_idx]
+                    ones_a = 0 if idx_a is None else self._points[idx_a].ones
+                    ones_b = 0 if idx_b is None else self._points[idx_b].ones
+                    LOGGER.event(
+                        "layout.energy.long.pair",
+                        section=ENERGY_LONG,
+                        data={
+                            "pair_index": pair_idx,
+                            "y1": y1,
+                            "x1": x1,
+                            "y2": y2,
+                            "x2": x2,
+                            "idx_a": -1 if idx_a is None else idx_a,
+                            "idx_b": -1 if idx_b is None else idx_b,
+                            "ones_a": ones_a,
+                            "ones_b": ones_b,
+                            "phi_c": float(energy_c),
+                            "phi_s": float(energy_s),
+                            "s1_sum": tensor_batch.s1_sum[pair_idx],
+                            "s2_sum": tensor_batch.s2_sum[pair_idx],
+                            "s1_min": tensor_batch.s1_min[pair_idx],
+                            "s1_max": tensor_batch.s1_max[pair_idx],
+                            "s2_min": tensor_batch.s2_min[pair_idx],
+                            "s2_max": tensor_batch.s2_max[pair_idx],
+                            "d1_min": tensor_batch.d1_min[pair_idx],
+                            "d1_max": tensor_batch.d1_max[pair_idx],
+                            "d2_min": tensor_batch.d2_min[pair_idx],
+                            "d2_max": tensor_batch.d2_max[pair_idx],
+                            "contrib_points": tensor_batch.contrib_points[pair_idx],
+                            "points_total": self._point_count,
+                            "eval_points": len(eval_indices),
+                        },
+                    )
+                    gpu_results.append((float(energy_c), float(energy_s)))
+                return gpu_results
+
+        eval_idx_arr = np.asarray(eval_indices, dtype=np.int32)
+        eval_y = np.take(self._pos_y, eval_idx_arr).astype(np.float64)
+        eval_x = np.take(self._pos_x, eval_idx_arr).astype(np.float64)
         zero_vec = np.zeros(len(eval_indices), dtype=np.float32)
 
         results: list[tuple[float, float]] = []
@@ -1509,6 +2153,20 @@ class Layout:
                     d2 + self._distance_eps
                 )
         return energy_c, energy_s
+
+    def _apply_tracked_swaps(
+        self, swaps_with_delta: Sequence[tuple[tuple[int, int, int, int], float]]
+    ) -> int:
+        used: set[tuple[int, int]] = set()
+        swaps: list[tuple[int, int, int, int]] = []
+        for (y1, x1, y2, x2), delta in swaps_with_delta:
+            if (y1, x1) in used or (y2, x2) in used:
+                continue
+            swaps.append((y1, x1, y2, x2))
+            used.add((y1, x1))
+            used.add((y2, x2))
+        applied = self._apply_swaps(swaps)
+        return applied
 
     def _apply_swaps(self, swaps: Iterable[tuple[int, int, int, int]]) -> int:
         used: set[tuple[int, int]] = set()
@@ -1822,11 +2480,15 @@ class Layout:
     def _ensure_long_subset(self, step: int | None) -> list[int]:
         if self._point_count == 0:
             self._long_subset_indices = []
+            if self._tensor_engine is not None:
+                self._tensor_engine.reset_subset()
             return self._long_subset_indices
+        subset_changed = False
         if self._long_subset_size is None or self._point_count <= self._long_subset_size:
             if len(self._long_subset_indices) != self._point_count:
                 self._long_subset_indices = list(range(self._point_count))
                 self._subset_similarity_cache.clear()
+                subset_changed = True
                 LOGGER.event(
                     "layout.energy.subset.full",
                     section=OPTIM_SUBSET,
@@ -1846,6 +2508,7 @@ class Layout:
             )
             self._long_subset_last_step = 0 if step is None else step
             self._subset_similarity_cache.clear()
+            subset_changed = True
             LOGGER.event(
                 "layout.energy.subset.refresh",
                 section=OPTIM_SUBSET,
@@ -1855,6 +2518,8 @@ class Layout:
                     "step": self._long_subset_last_step,
                 },
             )
+        if subset_changed and self._tensor_engine is not None:
+            self._tensor_engine.reset_subset()
         return self._long_subset_indices
 
     def _apply_lambda_array(self, sim: "numpy.ndarray") -> "numpy.ndarray":
