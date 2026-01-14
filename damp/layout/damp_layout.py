@@ -1226,6 +1226,8 @@ class Layout:
         energy_radius: int | None = None,
         energy_stability_window: int | None = None,
         energy_stability_delta: float = 1e-3,
+        energy_stability_every: int = 1,
+        energy_stability_max_points: int | None = None,
         adaptive_params: AdaptiveLayoutConfig | None = None,
     ) -> int:
         if steps <= 0:
@@ -1248,6 +1250,10 @@ class Layout:
             raise ValueError("energy_stability_window must be positive when set")
         if energy_stability_delta < 0:
             raise ValueError("energy_stability_delta must be >= 0")
+        if energy_stability_every <= 0:
+            raise ValueError("energy_stability_every must be positive")
+        if energy_stability_max_points is not None and energy_stability_max_points <= 0:
+            raise ValueError("energy_stability_max_points must be positive when set")
         if adaptive_params is not None:
             if adaptive_params.start_radius <= 0:
                 raise ValueError("adaptive start_radius must be positive")
@@ -1315,6 +1321,8 @@ class Layout:
                 data={
                     "window": energy_stability_window,
                     "delta": energy_stability_delta,
+                    "every": energy_stability_every,
+                    "max_points": energy_stability_max_points,
                 },
             )
         adaptive_state: _AdaptiveLayoutState | None = None
@@ -1351,8 +1359,15 @@ class Layout:
             if log_every is not None and step % log_every == 0:
                 self._log_layout_state(path=log_path, step=step + step_offset)
             energy_for_stability: float | None = None
-            if effective_energy_radius is not None:
-                energy = self.average_local_energy(effective_energy_radius)
+            should_eval_energy = (
+                energy_monitor is not None
+                and step % energy_stability_every == 0
+            )
+            if effective_energy_radius is not None and should_eval_energy:
+                energy = self.average_local_energy(
+                    effective_energy_radius,
+                    max_points=energy_stability_max_points,
+                )
                 energy_for_stability = energy
                 self._last_energy_value = energy
                 self._last_energy_step = step + step_offset
@@ -1393,6 +1408,7 @@ class Layout:
                             "step": step + step_offset,
                             "window": energy_monitor.window,
                             "delta": energy_monitor.threshold,
+                            "every": energy_stability_every,
                             "max_delta": max_delta,
                             "last_energy_diff": energy_diff,
                             "total_swaps": total_swaps,
@@ -1650,42 +1666,55 @@ class Layout:
                 image[y, x] = colors[idx]
         return image
 
-    def average_local_energy(self, radius: int) -> float:
+    def average_local_energy(
+        self,
+        radius: int,
+        *,
+        max_points: int | None = None,
+    ) -> float:
         if radius <= 0:
             raise ValueError("radius must be positive")
         if self._point_count == 0:
             return 0.0
-        if (
-            self._gpu_engine is not None
-            and self._ensure_gpu_similarity()
-            and self._ensure_gpu_positions()
-        ):
-            try:
-                energy = self._gpu_engine.average_local_energy(
-                    radius,
-                    lambda_threshold=self._lambda,
-                    eta=self._eta,
-                    distance_eps=self._distance_eps,
-                )
-            except Exception:
+        use_subset = (
+            max_points is not None and max_points > 0 and max_points < self._point_count
+        )
+        if not use_subset:
+            if (
+                self._gpu_engine is not None
+                and self._ensure_gpu_similarity()
+                and self._ensure_gpu_positions()
+            ):
+                try:
+                    energy = self._gpu_engine.average_local_energy(
+                        radius,
+                        lambda_threshold=self._lambda,
+                        eta=self._eta,
+                        distance_eps=self._distance_eps,
+                    )
+                except Exception:
+                    self._gpu_engine = None
+                    energy = None
+                if energy is not None:
+                    LOGGER.event(
+                        "layout.energy.average",
+                        section=QUALITY_ASSESS,
+                        data={"radius": radius, "energy": energy, "mode": "gpu"},
+                    )
+                    return energy
                 self._gpu_engine = None
-                energy = None
-            if energy is not None:
-                LOGGER.event(
-                    "layout.energy.average",
-                    section=QUALITY_ASSESS,
-                    data={"radius": radius, "energy": energy, "mode": "gpu"},
-                )
-                return energy
-            self._gpu_engine = None
 
         radius_sq = radius * radius
         energies: list[float] = []
         pos_y = self._pos_y
         pos_x = self._pos_x
         sim_lambda = self._sim_lambda_idx
+        if use_subset:
+            indices = self._rng.sample(range(self._point_count), max_points)  # type: ignore[arg-type]
+        else:
+            indices = range(self._point_count)
 
-        for idx in range(self._point_count):
+        for idx in indices:
             cy = pos_y[idx]
             cx = pos_x[idx]
             energy = 0.0
@@ -1718,7 +1747,13 @@ class Layout:
         LOGGER.event(
             "layout.energy.average",
             section=QUALITY_ASSESS,
-            data={"radius": radius, "energy": avg_energy, "mode": "cpu"},
+            data={
+                "radius": radius,
+                "energy": avg_energy,
+                "mode": "cpu_sample" if use_subset else "cpu",
+                "sample_size": len(energies),
+                "points": self._point_count,
+            },
         )
         return avg_energy
 

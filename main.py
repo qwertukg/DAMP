@@ -28,6 +28,8 @@ LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
 LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
 LAYOUT_ENERGY_STABILITY_WINDOW = 50
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0001
+LAYOUT_ENERGY_STABILITY_EVERY = 50
+LAYOUT_ENERGY_STABILITY_MAX_POINTS = 512
 
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
@@ -215,6 +217,8 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         energy_radius=None,
         energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
         adaptive_params=adaptive_long,
     )
     step_offset += layout.last_steps
@@ -240,6 +244,8 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         adaptive_params=adaptive_short,
         energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
     )
     return layout
 
@@ -254,7 +260,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 600
+    count = 6000
     label = None
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)

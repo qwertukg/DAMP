@@ -11,6 +11,8 @@ from main import (
     LAYOUT_LOG_EVERY_SHORT,
     LAYOUT_ENERGY_STABILITY_DELTA,
     LAYOUT_ENERGY_STABILITY_WINDOW,
+    LAYOUT_ENERGY_STABILITY_EVERY,
+    LAYOUT_ENERGY_STABILITY_MAX_POINTS,
     configure_logging,
 )
 from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
@@ -74,6 +76,8 @@ def main() -> None:
         energy_radius=None,
         energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
     )
     step_offset += layout.last_steps
     short_radius_start = max(
@@ -98,6 +102,8 @@ def main() -> None:
         adaptive_params=adaptive_short,
         energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
         energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
     )
 
 if __name__ == "__main__":
