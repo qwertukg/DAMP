@@ -57,6 +57,7 @@ _SIM_MODE: str | None = None
 _VISUAL_ENERGY_POINT_LIMIT = 5000
 _VISUAL_POINT_LIMIT = 200000
 _AUTO_ENERGY_RADIUS_MAX = 15
+_LAYOUT_STEP_TIMELINE = "layout/step"
 
 
 def _init_similarity_worker(points: Sequence[LayoutPoint], similarity: str) -> None:
@@ -197,15 +198,15 @@ class _GpuLayoutEngine:
             if (mode == 1) {
                 cy = (pos_a_y + pos_b_y) * 0.5;
                 cx = (pos_a_x + pos_b_x) * 0.5;
+                float dy = pos_a_y - pos_b_y;
+                float dx = pos_a_x - pos_b_x;
+                float dist = sqrt(dy * dy + dx * dx);
+                float base_rad = max(1.0, ceil(dist));
+                float rad = base_rad;
                 if (use_radius_override == 1) {
-                    radius_sq = radius * radius;
-                } else {
-                    float dy = pos_a_y - pos_b_y;
-                    float dx = pos_a_x - pos_b_x;
-                    float dist = sqrt(dy * dy + dx * dx);
-                    float rad = max(1.0, ceil(dist));
-                    radius_sq = rad * rad;
+                    rad = max(rad, radius);
                 }
+                radius_sq = rad * rad;
             }
 
             for (int idx = 0; idx < point_count; idx++) {
@@ -1398,30 +1399,50 @@ class Layout:
             )
             total_swaps += swaps
             steps_executed = step + 1
+            current_step = step + step_offset
             if swap_monitor is not None:
                 should_stop_swaps, swap_ratio, avg_ratio = swap_monitor.update(
                     swaps, pairs_per_step
+                )
+                avg_swaps_window = avg_ratio * pairs_per_step
+                log_swap_ratio = LOGGER.should_log("layout.run.swap_ratio")
+                swap_visuals = (
+                    LOGGER.visual_scalars(
+                        f"{log_path}/swap_ratio",
+                        {
+                            "swap_ratio": swap_ratio,
+                            "avg_ratio": avg_ratio,
+                        },
+                        step=current_step,
+                        timeline=_LAYOUT_STEP_TIMELINE,
+                    )
+                    if log_swap_ratio
+                    else None
                 )
                 LOGGER.event(
                     "layout.run.swap_ratio",
                     section=OPTIM_PAIR_SELECTION,
                     data={
-                        "step": step + step_offset,
+                        "step": current_step,
                         "swap_ratio": swap_ratio,
                         "avg_ratio": avg_ratio,
+                        "avg_swaps": avg_swaps_window,
                         "window": swap_monitor.window,
                         "min_swap_ratio": swap_monitor.min_ratio,
                     },
+                    visuals=swap_visuals,
+                    force=log_swap_ratio,
                 )
                 if should_stop_swaps:
                     LOGGER.event(
                         "layout.run.swap_stability.stop",
                         section=OPTIM_PAIR_SELECTION,
                         data={
-                            "step": step + step_offset,
+                            "step": current_step,
                             "window": swap_monitor.window,
                             "min_swap_ratio": swap_monitor.min_ratio,
                             "avg_ratio": avg_ratio,
+                            "avg_swaps_window": avg_swaps_window,
                             "swap_ratio": swap_ratio,
                             "total_swaps": total_swaps,
                         },
@@ -1949,10 +1970,9 @@ class Layout:
             )
             return energy_s < energy_c, energy_c - energy_s
 
-        radius = local_radius
-        if radius is None:
-            dist_sq = (y1 - y2) ** 2 + (x1 - x2) ** 2
-            radius = max(1, int(math.ceil(math.sqrt(dist_sq))))
+        dist_sq = (y1 - y2) ** 2 + (x1 - x2) ** 2
+        base_radius = max(1, int(math.ceil(math.sqrt(dist_sq))))
+        radius = base_radius if local_radius is None else max(local_radius, base_radius)
         energy_c, energy_s = self._pair_energy_short(
             idx_a, (y1, x1), idx_b, (y2, x2), radius=radius
         )

@@ -12,6 +12,8 @@ LOG_PATH = "damp/log"
 class LogVisual:
     path: str
     payload: object
+    timeline: str | None = None
+    time: int | float | None = None
 
 
 class LogIntervalPolicy:
@@ -170,6 +172,8 @@ class DampLogger:
                 rr.log(anyvalues_path, rr.AnyValues(**anyvalues))
         if visuals:
             for visual in visuals:
+                if visual.timeline is not None and visual.time is not None:
+                    rr.set_time(visual.timeline, sequence=visual.time)
                 rr.log(visual.path, visual.payload)
 
     def visual_image(self, path: str, image) -> LogVisual:
@@ -199,6 +203,28 @@ class DampLogger:
         colors: Sequence[Sequence[int]] | None = None,
     ) -> LogVisual:
         return LogVisual(path=path, payload=rr.Boxes2D(mins=mins, sizes=sizes, colors=colors))
+
+    def visual_scalars(
+        self,
+        path: str,
+        values: Mapping[str, float | int],
+        *,
+        step: int | float | None = None,
+        timeline: str = "step",
+    ) -> list[LogVisual]:
+        visuals: list[LogVisual] = []
+        for name, value in values.items():
+            if value is None:
+                continue
+            visuals.append(
+                LogVisual(
+                    path=f"{path}/{name}",
+                    payload=rr.Scalars(float(value)),
+                    timeline=timeline if step is not None else None,
+                    time=step,
+                )
+            )
+        return visuals
 
 
 LOGGER = DampLogger()

@@ -21,6 +21,10 @@ LOG_INTERVAL_LAYOUT_EXPORT = 1
 
 LAYOUT_USE_GPU = True
 
+LAYOUT_LONG_PAIRS_PER_STEP = 16000
+LAYOUT_SHORT_PAIRS_PER_STEP = 2000
+LAYOUT_SHORT_LOCAL_RADIUS = 5
+
 ENCODER_LOG_EVERY = 50
 LAYOUT_LOG_EVERY_LONG = 500
 LAYOUT_LOG_EVERY_SHORT = 500
@@ -33,7 +37,7 @@ LAYOUT_ENERGY_STABILITY_WINDOW = 20
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
 LAYOUT_ENERGY_STABILITY_EVERY = 200
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
-LAYOUT_MIN_SWAP_RATIO = 0.0005
+LAYOUT_MIN_SWAP_RATIO = 0.007
 LAYOUT_MIN_SWAP_WINDOW = 50
 
 LOG_INTERVALS = {
@@ -218,7 +222,7 @@ def _run_layout(codes: dict[float, list]) -> Layout:
     )
     layout.run(
         steps=22000,
-        pairs_per_step=16000,
+        pairs_per_step=LAYOUT_LONG_PAIRS_PER_STEP,
         pair_radius=adaptive_long.start_radius,
         mode="long",
         min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
@@ -245,21 +249,14 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
     )
     layout.run(
-        steps=900,
-        pairs_per_step=16000,
-        pair_radius=adaptive_short.start_radius,
+        steps=4200,
+        pairs_per_step=100,
+        pair_radius=7,
         mode="short",
-        local_radius=adaptive_short.start_radius,
-        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
-        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
+        local_radius=7,
+        min_swap_ratio=0.001,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
-        adaptive_params=adaptive_short,
-        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
-        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
-        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
-        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
-        log_visuals=LAYOUT_LOG_VISUALS,
     )
     return layout
 
@@ -274,7 +271,7 @@ def main() -> None:
     dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
     extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
 
-    count = 6000
+    count = 1000
     label = None
 
     codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
