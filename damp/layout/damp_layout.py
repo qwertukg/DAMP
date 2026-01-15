@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import concurrent.futures
 from dataclasses import dataclass, field
 from collections import deque
@@ -19,6 +20,7 @@ from damp.article_refs import (
     LAYOUT_COMPACTNESS,
     LAYOUT_PARAMETERS,
     OPTIM_ENERGY,
+    OPTIM_FIRST_POINT,
     OPTIM_PAIR_SELECTION,
     OPTIM_SIM_MATRIX,
     OPTIM_SUBSET,
@@ -48,6 +50,28 @@ class AdaptiveLayoutConfig:
     end_radius: int = 1
     swap_ratio_trigger: float = 0.01
     lambda_step: float | None = None
+
+
+@dataclass(frozen=True)
+class ShortLayoutOptimConfig:
+    energy_radius: int
+    energy_max_points: int | None = None
+    energy_recalc_every: int = 50
+    energy_eps: float = 1e-6
+    use_weighted_first_point: bool = True
+    similarity_cutoff: float | None = None
+    partitions: int = 1
+
+
+@dataclass(frozen=True)
+class _ShortPair:
+    y1: int
+    x1: int
+    y2: int
+    x2: int
+    idx_a: int | None
+    idx_b: int | None
+    radius: float
 
 _UNSET = object()
 HUE = 360.0
@@ -623,6 +647,13 @@ class _TensorEnergyBatch:
     d2_max: list[float]
 
 
+@dataclass(frozen=True)
+class _TensorShortEnergyBatch:
+    energies: list[tuple[float, float]]
+    contrib_points: list[int]
+    subset_size: int
+
+
 class _TensorLayoutEngine:
     def __init__(
         self,
@@ -638,6 +669,7 @@ class _TensorLayoutEngine:
         self._similarity = similarity
         self._codes = self._torch.as_tensor(code_matrix, dtype=self._torch.float32, device=device)
         self._ones = self._torch.as_tensor(ones, dtype=self._torch.float32, device=device)
+        self._point_count = code_matrix.shape[0]
         self._subset_indices: tuple[int, ...] | None = None
         self._subset_tensor: "Any" | None = None
         self._zero_row: "Any" | None = None
@@ -712,6 +744,10 @@ class _TensorLayoutEngine:
     @property
     def device(self) -> str:
         return str(self._device)
+
+    @property
+    def point_count(self) -> int:
+        return self._point_count
 
     def _apply_lambda_tensor(
         self, sim: "Any", lambda_threshold: float, eta: float | None
@@ -946,6 +982,134 @@ class _TensorLayoutEngine:
                 d2_max=[float(v) for v in d2_max.detach().cpu().tolist()],
             )
 
+    def short_pair_energies(
+        self,
+        pairs: Sequence[tuple[int, int, int, int, int | None, int | None, float]],
+        pos_y: Sequence[int],
+        pos_x: Sequence[int],
+        sim_lookup: Mapping[int, "numpy.ndarray"],
+        distance_eps: float,
+    ) -> _TensorShortEnergyBatch | None:
+        if self._subset_tensor is None:
+            return None
+        pair_count = len(pairs)
+        if pair_count == 0:
+            return _TensorShortEnergyBatch(energies=[], contrib_points=[], subset_size=len(self._subset_tensor))
+        subset = self._subset_tensor
+        if subset.numel() == 0:
+            energies = [(0.0, 0.0) for _ in pairs]
+            return _TensorShortEnergyBatch(
+                energies=energies,
+                contrib_points=[0 for _ in pairs],
+                subset_size=0,
+            )
+        torch = self._torch
+        device = self._device
+        with torch.no_grad():
+            subset_indices = subset.tolist()
+            subset_y = torch.as_tensor(
+                [pos_y[idx] for idx in subset_indices],
+                dtype=torch.float32,
+                device=device,
+            )
+            subset_x = torch.as_tensor(
+                [pos_x[idx] for idx in subset_indices],
+                dtype=torch.float32,
+                device=device,
+            )
+            idx_a_tensor = torch.as_tensor(
+                [idx_a if idx_a is not None else -1 for (_, _, _, _, idx_a, _, _) in pairs],
+                dtype=torch.long,
+                device=device,
+            )
+            idx_b_tensor = torch.as_tensor(
+                [idx_b if idx_b is not None else -1 for (_, _, _, _, _, idx_b, _) in pairs],
+                dtype=torch.long,
+                device=device,
+            )
+            center_y = torch.as_tensor(
+                [((y1 + y2) / 2.0) for (y1, _, y2, _, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            center_x = torch.as_tensor(
+                [((x1 + x2) / 2.0) for (_, x1, _, x2, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            radius = torch.as_tensor(
+                [radius for (_, _, _, _, _, _, radius) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_y1 = torch.as_tensor(
+                [y1 for (y1, _, _, _, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_x1 = torch.as_tensor(
+                [x1 for (_, x1, _, _, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_y2 = torch.as_tensor(
+                [y2 for (_, _, y2, _, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_x2 = torch.as_tensor(
+                [x2 for (_, _, _, x2, _, _, _) in pairs],
+                dtype=torch.float32,
+                device=device,
+            )
+
+            s1_rows = [
+                self._get_sim_row(idx_a, sim_lookup)
+                for (_, _, _, _, idx_a, _, _) in pairs
+            ]
+            s2_rows = [
+                self._get_sim_row(idx_b, sim_lookup)
+                for (_, _, _, _, _, idx_b, _) in pairs
+            ]
+            s1 = torch.stack(s1_rows, dim=0)
+            s2 = torch.stack(s2_rows, dim=0)
+
+            mask_a = subset[None, :] == idx_a_tensor[:, None]
+            mask_b = subset[None, :] == idx_b_tensor[:, None]
+            mask_self = mask_a | mask_b
+            s1 = torch.where(mask_self, torch.zeros_like(s1), s1)
+            s2 = torch.where(mask_self, torch.zeros_like(s2), s2)
+
+            dyc = center_y[:, None] - subset_y[None, :]
+            dxc = center_x[:, None] - subset_x[None, :]
+            radius_sq = radius[:, None] * radius[:, None]
+            mask_radius = (dyc * dyc + dxc * dxc) <= radius_sq
+
+            dist1 = (pair_y1[:, None] - subset_y[None, :]) ** 2 + (pair_x1[:, None] - subset_x[None, :]) ** 2
+            dist2 = (pair_y2[:, None] - subset_y[None, :]) ** 2 + (pair_x2[:, None] - subset_x[None, :]) ** 2
+            denom1 = dist1 + distance_eps
+            denom2 = dist2 + distance_eps
+
+            s1_masked = torch.where(mask_radius, s1, torch.zeros_like(s1))
+            s2_masked = torch.where(mask_radius, s2, torch.zeros_like(s2))
+
+            energy_c = torch.sum(s1_masked / denom1 + s2_masked / denom2, dim=1)
+            energy_s = torch.sum(s2_masked / denom1 + s1_masked / denom2, dim=1)
+            contrib_mask = mask_radius & ((s1_masked > 0.0) | (s2_masked > 0.0))
+            contrib_counts = torch.sum(contrib_mask, dim=1)
+
+            energies = list(
+                zip(
+                    energy_c.detach().cpu().tolist(),
+                    energy_s.detach().cpu().tolist(),
+                )
+            )
+            return _TensorShortEnergyBatch(
+                energies=energies,
+                contrib_points=[int(v) for v in contrib_counts.detach().cpu().tolist()],
+                subset_size=len(subset_indices),
+            )
+
 
 class _AdaptiveLayoutState:
     def __init__(self, config: AdaptiveLayoutConfig, total_steps: int) -> None:
@@ -1099,6 +1263,8 @@ class Layout:
         self._long_subset_last_step: int = 0
         self._long_step_counter: int = 0
         self._subset_similarity_cache: dict[int, "numpy.ndarray"] = {}
+        self._short_subset_indices: tuple[int, ...] | None = None
+        self._short_similarity_cache: dict[int, "numpy.ndarray"] = {}
         self._code_matrix, self._ones_array = self._build_code_matrix()
 
         if grid_size is None:
@@ -1196,8 +1362,17 @@ class Layout:
         self._positions: list[tuple[int, int]] = [(-1, -1)] * len(self._points)
         self._pos_y = [0] * len(self._points)
         self._pos_x = [0] * len(self._points)
+        self._row_occupied: list[set[int]] = [set() for _ in range(self.height)]
+        self._radius_offsets_cache: dict[int, list[tuple[int, int]]] = {}
+        self._short_energy_weights: list[float] | None = None
+        self._short_energy_last_step: int = -1
+        self._short_energy_radius: int | None = None
+        self._short_energy_eps: float = 1e-6
         self._place_points()
 
+        self._long_swap_radius_sum = 0.0
+        self._long_swap_count = 0
+        self._pair_radius: int | None = None
         self._distance_eps = 1e-6
         LOGGER.event(
             "layout.distance_eps",
@@ -1236,6 +1411,39 @@ class Layout:
         if precompute_similarity and self._point_count <= max_precompute:
             self._build_similarity_cache()
 
+    def _long_average_swap_radius(self) -> float | None:
+        if self._long_swap_count == 0:
+            return None
+        return self._long_swap_radius_sum / self._long_swap_count
+
+    def _resolve_pair_radius(self, pair_radius: int | None, mode: str) -> int | None:
+        resolved_radius = pair_radius
+        if mode == "short" and pair_radius is None:
+            average_radius = self._long_average_swap_radius()
+            if average_radius is None:
+                LOGGER.event(
+                    "layout.pair_radius.short_unset",
+                    section=PAIR_SELECTION,
+                    data={
+                        "pair_radius": "auto",
+                        "long_swaps": self._long_swap_count,
+                    },
+                )
+                self.pair_radius = None
+                return None
+            resolved_radius = max(1, int(round(average_radius)))
+            LOGGER.event(
+                "layout.pair_radius.short_resolved",
+                section=PAIR_SELECTION,
+                data={
+                    "pair_radius": resolved_radius,
+                    "long_swap_average_radius": average_radius,
+                    "long_swaps": self._long_swap_count,
+                },
+            )
+        self.pair_radius = resolved_radius
+        return resolved_radius
+
     def run(
         self,
         *,
@@ -1256,6 +1464,7 @@ class Layout:
         energy_stability_every: int = 1,
         energy_stability_max_points: int | None = None,
         adaptive_params: AdaptiveLayoutConfig | None = None,
+        short_optim: ShortLayoutOptimConfig | None = None,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
@@ -1292,6 +1501,17 @@ class Layout:
                 raise ValueError("adaptive start_radius must be >= end_radius")
             if not 0 <= adaptive_params.swap_ratio_trigger <= 1:
                 raise ValueError("adaptive swap_ratio_trigger must be in [0, 1]")
+        if mode == "short" and short_optim is not None:
+            if short_optim.energy_radius <= 0:
+                raise ValueError("short energy_radius must be positive")
+            if short_optim.energy_recalc_every <= 0:
+                raise ValueError("short energy_recalc_every must be positive")
+            if short_optim.energy_eps <= 0:
+                raise ValueError("short energy_eps must be positive")
+            if short_optim.energy_max_points is not None and short_optim.energy_max_points <= 0:
+                raise ValueError("short energy_max_points must be positive when set")
+            if short_optim.partitions <= 0:
+                raise ValueError("short partitions must be positive")
 
         effective_energy_radius = energy_radius
         if effective_energy_radius is None:
@@ -1305,12 +1525,14 @@ class Layout:
                 data={"energy_radius": effective_energy_radius},
             )
 
+        resolved_pair_radius = self._resolve_pair_radius(pair_radius, mode)
         LOGGER.event(
             "layout.run.selection",
             section=PAIR_SELECTION,
             data={
                 "pairs_per_step": pairs_per_step,
-                "pair_radius": pair_radius,
+                "pair_radius": resolved_pair_radius,
+                "pair_radius_requested": pair_radius,
             },
         )
         LOGGER.event(
@@ -1382,6 +1604,44 @@ class Layout:
                     "steps": steps,
                 },
             )
+        short_config: ShortLayoutOptimConfig | None = short_optim
+        if mode == "short":
+            if short_config is None:
+                base_energy_radius = local_radius if local_radius is not None else 3
+                short_config = ShortLayoutOptimConfig(
+                    energy_radius=base_energy_radius,
+                    energy_max_points=None,
+                    energy_recalc_every=max(1, steps // 20),
+                    energy_eps=1e-6,
+                    use_weighted_first_point=True,
+                    similarity_cutoff=self._lambda,
+                    partitions=1,
+                )
+            elif short_config.similarity_cutoff is None:
+                short_config = ShortLayoutOptimConfig(
+                    energy_radius=short_config.energy_radius,
+                    energy_max_points=short_config.energy_max_points,
+                    energy_recalc_every=short_config.energy_recalc_every,
+                    energy_eps=short_config.energy_eps,
+                    use_weighted_first_point=short_config.use_weighted_first_point,
+                    similarity_cutoff=self._lambda,
+                    partitions=short_config.partitions,
+                )
+            LOGGER.event(
+                "layout.short.optim_config",
+                section=OPTIM_FIRST_POINT,
+                data={
+                    "energy_radius": short_config.energy_radius,
+                    "energy_recalc_every": short_config.energy_recalc_every,
+                    "energy_max_points": -1
+                    if short_config.energy_max_points is None
+                    else short_config.energy_max_points,
+                    "energy_eps": short_config.energy_eps,
+                    "similarity_cutoff": short_config.similarity_cutoff,
+                    "weighted_first": short_config.use_weighted_first_point,
+                    "partitions": short_config.partitions,
+                },
+            )
         total_swaps = 0
         steps_executed = 0
 
@@ -1389,13 +1649,15 @@ class Layout:
             effective_pair_radius = (
                 adaptive_state.radius_for_step(step)
                 if adaptive_state is not None
-                else pair_radius
+                else resolved_pair_radius
             )
             swaps = self.step(
                 pairs_per_step=pairs_per_step,
                 pair_radius=effective_pair_radius,
                 mode=mode,
                 local_radius=local_radius,
+                step_index=step,
+                short_config=short_config,
             )
             total_swaps += swaps
             steps_executed = step + 1
@@ -1604,6 +1866,21 @@ class Layout:
             data={"lambda_threshold": self._lambda, "eta": self._eta},
         )
 
+    @property
+    def pair_radius(self) -> int | None:
+        return self._pair_radius
+
+    @pair_radius.setter
+    def pair_radius(self, value: int | None) -> None:
+        if value is not None and value <= 0:
+            raise ValueError("pair_radius must be positive when set")
+        self._pair_radius = value
+        LOGGER.event(
+            "layout.pair_radius.update",
+            section=PAIR_SELECTION,
+            data={"pair_radius": "auto" if value is None else value},
+        )
+
     def step(
         self,
         *,
@@ -1611,9 +1888,49 @@ class Layout:
         pair_radius: int | None,
         mode: str,
         local_radius: int | None,
+        step_index: int | None = None,
+        short_config: ShortLayoutOptimConfig | None = None,
     ) -> int:
         swaps_with_delta: list[tuple[tuple[int, int, int, int], float]] = []
-        pairs = [self._sample_pair(pair_radius) for _ in range(pairs_per_step)]
+        if mode == "short":
+            similarity_cutoff = (
+                self._lambda
+                if short_config is None or short_config.similarity_cutoff is None
+                else short_config.similarity_cutoff
+            )
+            weighted_first = bool(short_config.use_weighted_first_point) if short_config else False
+            if short_config is not None:
+                self._ensure_short_energy_weights(
+                    step_index=step_index, config=short_config
+                )
+            partitions = 1 if short_config is None else max(1, short_config.partitions)
+            if partitions > 1:
+                pairs = self._sample_pairs_short_partitioned(
+                    pairs_per_step,
+                    pair_radius=pair_radius,
+                    similarity_cutoff=similarity_cutoff,
+                    weighted_first=weighted_first,
+                    step_index=step_index,
+                    partitions=partitions,
+                )
+            else:
+                pairs = self._sample_pairs_short(
+                    pairs_per_step,
+                    pair_radius=pair_radius,
+                    similarity_cutoff=similarity_cutoff,
+                    weighted_first=weighted_first,
+                    step_index=step_index,
+                )
+        else:
+            pairs = [self._sample_pair(pair_radius) for _ in range(pairs_per_step)]
+
+        if mode == "short":
+            tensor_swaps = self._evaluate_pairs_short_tensor(
+                pairs,
+                local_radius=local_radius,
+            )
+            if tensor_swaps is not None:
+                return self._apply_tracked_swaps(tensor_swaps, mode=mode)
 
         if (
             self._gpu_engine is not None
@@ -1674,7 +1991,7 @@ class Layout:
                         delta = energy_s - energy_c
                         if energy_s > energy_c:
                             swaps_with_delta.append(((y1, x1, y2, x2), delta))
-                return self._apply_tracked_swaps(swaps_with_delta)
+                return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
             self._gpu_engine = None
 
         if mode == "long":
@@ -1697,15 +2014,25 @@ class Layout:
                 delta = energy_c - energy_s
                 if energy_s < energy_c:
                     swaps_with_delta.append(((y1, x1, y2, x2), delta))
-            return self._apply_tracked_swaps(swaps_with_delta)
+            return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
 
-        for y1, x1, y2, x2 in pairs:
-            should_swap, delta = self._should_swap(
-                y1, x1, y2, x2, mode=mode, local_radius=local_radius
+        partitions = 1 if short_config is None else max(1, short_config.partitions)
+        if partitions > 1:
+            workers = min(partitions, os.cpu_count() or partitions)
+            swaps_with_delta = self._evaluate_pairs_short_parallel(
+                pairs,
+                local_radius=local_radius,
+                workers=workers,
+                partitions=partitions,
             )
-            if should_swap:
-                swaps_with_delta.append(((y1, x1, y2, x2), delta))
-        return self._apply_tracked_swaps(swaps_with_delta)
+        else:
+            for y1, x1, y2, x2 in pairs:
+                should_swap, delta = self._should_swap(
+                    y1, x1, y2, x2, mode=mode, local_radius=local_radius
+                )
+                if should_swap:
+                    swaps_with_delta.append(((y1, x1, y2, x2), delta))
+        return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
 
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
@@ -1875,13 +2202,17 @@ class Layout:
             for y in range(y_min, y_max + 1):
                 dy = cy - y
                 dy_sq = dy * dy
-                row = self.grid[y]
-                for x in range(x_min, x_max + 1):
+                occupied = self._row_occupied[y]
+                if not occupied:
+                    continue
+                for x in occupied:
+                    if x < x_min or x > x_max:
+                        continue
                     dx = cx - x
                     dist_sq = dy_sq + dx * dx
                     if dist_sq > radius_sq:
                         continue
-                    other_idx = row[x]
+                    other_idx = self.grid[y][x]
                     if other_idx is None or other_idx == idx:
                         continue
                     sim = sim_lambda(idx, other_idx)
@@ -1915,6 +2246,7 @@ class Layout:
             self._positions[idx] = (y, x)
             self._pos_y[idx] = y
             self._pos_x[idx] = x
+            self._row_occupied[y].add(x)
 
     def _sample_pair(self, radius: int | None) -> tuple[int, int, int, int]:
         idx_a = self._rng.randrange(self._point_count)
@@ -1944,6 +2276,576 @@ class Layout:
             x2 = self._rng.randrange(self.width)
             if (y2, x2) != (y1, x1):
                 return y1, x1, y2, x2
+
+    def _sample_nearby_position(
+        self,
+        y1: int,
+        x1: int,
+        radius: int | None,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> tuple[int, int]:
+        y_min_bound = 0 if bounds is None else bounds[0]
+        y_max_bound = (self.height - 1) if bounds is None else bounds[1]
+        x_min_bound = 0 if bounds is None else bounds[2]
+        x_max_bound = (self.width - 1) if bounds is None else bounds[3]
+        if radius is None:
+            while True:
+                y2 = self._rng.randint(y_min_bound, y_max_bound)
+                x2 = self._rng.randint(x_min_bound, x_max_bound)
+                if (y2, x2) != (y1, x1):
+                    return y2, x2
+        radius_sq = radius * radius
+        for _ in range(50):
+            dy = self._rng.randint(-radius, radius)
+            dx = self._rng.randint(-radius, radius)
+            if dy * dy + dx * dx > radius_sq:
+                continue
+            y2 = y1 + dy
+            x2 = x1 + dx
+            if (
+                y_min_bound <= y2 <= y_max_bound
+                and x_min_bound <= x2 <= x_max_bound
+                and (y2, x2) != (y1, x1)
+            ):
+                return y2, x2
+        while True:
+            y2 = self._rng.randint(y_min_bound, y_max_bound)
+            x2 = self._rng.randint(x_min_bound, x_max_bound)
+            if (y2, x2) != (y1, x1):
+                return y2, x2
+
+    def _compute_point_energies(
+        self,
+        radius: int,
+        *,
+        max_points: int | None = None,
+    ) -> list[float]:
+        if radius <= 0:
+            raise ValueError("radius must be positive")
+        if self._point_count == 0:
+            return []
+        radius_sq = radius * radius
+        indices: Sequence[int]
+        if max_points is not None and 0 < max_points < self._point_count:
+            indices = self._rng.sample(range(self._point_count), max_points)  # type: ignore[arg-type]
+        else:
+            indices = range(self._point_count)
+
+        energies = [0.0 for _ in range(self._point_count)]
+        for idx in indices:
+            cy = self._pos_y[idx]
+            cx = self._pos_x[idx]
+            y_min = max(0, cy - radius)
+            y_max = min(self.height - 1, cy + radius)
+            x_min = max(0, cx - radius)
+            x_max = min(self.width - 1, cx + radius)
+            energy = 0.0
+            for y in range(y_min, y_max + 1):
+                occupied = self._row_occupied[y]
+                if not occupied:
+                    continue
+                dy = cy - y
+                dy_sq = dy * dy
+                for x in occupied:
+                    if x < x_min or x > x_max:
+                        continue
+                    dx = cx - x
+                    dist_sq = dy_sq + dx * dx
+                    if dist_sq > radius_sq:
+                        continue
+                    other_idx = self.grid[y][x]
+                    if other_idx is None or other_idx == idx:
+                        continue
+                    sim = self._sim_lambda_idx(idx, other_idx)
+                    if sim <= 0.0:
+                        continue
+                    energy += sim / (dist_sq + self._distance_eps)
+            energies[idx] = energy
+        return energies
+
+    def _ensure_short_energy_weights(
+        self, *, step_index: int | None, config: ShortLayoutOptimConfig
+    ) -> None:
+        if not config.use_weighted_first_point:
+            return
+        if (
+            self._short_energy_weights is not None
+            and self._short_energy_last_step >= 0
+            and step_index is not None
+            and (step_index - self._short_energy_last_step) < config.energy_recalc_every
+            and self._short_energy_radius == config.energy_radius
+            and abs(self._short_energy_eps - config.energy_eps) < 1e-12
+        ):
+            return
+        energies = self._compute_point_energies(
+            config.energy_radius, max_points=config.energy_max_points
+        )
+        self._short_energy_radius = config.energy_radius
+        self._short_energy_eps = config.energy_eps
+        self._short_energy_last_step = 0 if step_index is None else step_index
+        if not energies:
+            self._short_energy_weights = None
+            LOGGER.event(
+                "layout.short.energy_weights.empty",
+                section=OPTIM_FIRST_POINT,
+                data={
+                    "energy_radius": config.energy_radius,
+                    "points": self._point_count,
+                    "step": self._short_energy_last_step,
+                },
+            )
+            return
+        emax = max(energies)
+        if emax <= 0.0:
+            weights = [0.0 for _ in energies]
+        else:
+            weights = [
+                max(0.0, -math.log(max(config.energy_eps, energy / emax)))
+                for energy in energies
+            ]
+        self._short_energy_weights = weights
+        LOGGER.event(
+            "layout.short.energy_weights",
+            section=OPTIM_FIRST_POINT,
+            data={
+                "energy_radius": config.energy_radius,
+                "points": self._point_count,
+                "step": self._short_energy_last_step,
+                "recalc_every": config.energy_recalc_every,
+                "max_points": -1 if config.energy_max_points is None else config.energy_max_points,
+                "weighted": config.use_weighted_first_point,
+            },
+        )
+
+    def _sample_first_point(self, *, weighted: bool) -> int:
+        return self._sample_first_point_from_indices(
+            list(range(self._point_count)), weighted=weighted
+        )
+
+    def _sample_first_point_from_indices(
+        self, indices: Sequence[int], *, weighted: bool
+    ) -> int:
+        if not indices:
+            raise ValueError("candidate indices must be non-empty")
+        if weighted and self._short_energy_weights and sum(
+            self._short_energy_weights[idx] for idx in indices
+        ) > 0:
+            try:
+                weights = [self._short_energy_weights[idx] for idx in indices]
+                return self._rng.choices(population=indices, weights=weights, k=1)[0]
+            except Exception:
+                pass
+        return self._rng.choice(indices)
+
+    def _sample_pairs_short(
+        self,
+        count: int,
+        *,
+        pair_radius: int | None,
+        similarity_cutoff: float | None,
+        weighted_first: bool,
+        step_index: int | None,
+        candidate_indices: Sequence[int] | None = None,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> list[tuple[int, int, int, int]]:
+        pairs: list[tuple[int, int, int, int]] = []
+        rejected_similarity = 0
+        attempts = 0
+        max_attempts = max(count * 5, count)
+        while len(pairs) < count and attempts < max_attempts:
+            if candidate_indices is None:
+                idx_a = self._sample_first_point(weighted=weighted_first)
+            else:
+                if not candidate_indices:
+                    break
+                idx_a = self._sample_first_point_from_indices(
+                    candidate_indices, weighted=weighted_first
+                )
+            y1, x1 = self._positions[idx_a]
+            y2, x2 = self._sample_nearby_position(y1, x1, pair_radius, bounds=bounds)
+            idx_b = self.grid[y2][x2]
+            if idx_b is not None:
+                sim = self._similarity_value(idx_a, idx_b)
+                if similarity_cutoff is not None and sim < similarity_cutoff:
+                    rejected_similarity += 1
+                    attempts += 1
+                    continue
+            pairs.append((y1, x1, y2, x2))
+            attempts += 1
+        while len(pairs) < count:
+            pairs.append(self._sample_pair(pair_radius))
+        LOGGER.event(
+            "layout.short.pair_sampling",
+            section=OPTIM_PAIR_SELECTION,
+            data={
+                "pairs_requested": count,
+                "pairs_generated": len(pairs),
+                "rejected_similarity": rejected_similarity,
+                "attempts": attempts,
+                "pair_radius": "auto" if pair_radius is None else pair_radius,
+                "step": 0 if step_index is None else step_index,
+                "weighted": weighted_first,
+                "similarity_cutoff": similarity_cutoff,
+                "candidate_indices": -1 if candidate_indices is None else len(candidate_indices),
+                "bounds": bounds,
+            },
+        )
+        return pairs
+
+    def _random_segments(self, total: int, parts: int) -> list[tuple[int, int]]:
+        parts = max(1, parts)
+        if parts == 1:
+            return [(0, total - 1)]
+        cuts = sorted(self._rng.sample(range(1, total), min(parts - 1, max(0, total - 1))))
+        segments = []
+        prev = 0
+        for cut in cuts:
+            segments.append((prev, cut - 1))
+            prev = cut
+        segments.append((prev, total - 1))
+        return segments
+
+    def _build_short_tiles(
+        self, partitions: int
+    ) -> tuple[list[list[int]], list[tuple[int, int]], list[tuple[int, int]]]:
+        row_parts = max(1, int(round(math.sqrt(partitions))))
+        col_parts = max(1, math.ceil(partitions / row_parts))
+        segments_y = self._random_segments(self.height, row_parts)
+        segments_x = self._random_segments(self.width, col_parts)
+        y_ends = [end for _, end in segments_y]
+        x_ends = [end for _, end in segments_x]
+        tiles = [[] for _ in range(row_parts * col_parts)]
+
+        for y in range(self.height):
+            occupied = self._row_occupied[y]
+            if not occupied:
+                continue
+            y_idx = bisect.bisect_left(y_ends, y)
+            for x in occupied:
+                x_idx = bisect.bisect_left(x_ends, x)
+                tile_idx = y_idx * col_parts + x_idx
+                idx = self.grid[y][x]
+                if idx is not None:
+                    tiles[tile_idx].append(idx)
+        LOGGER.event(
+            "layout.short.tiles",
+            section=PARALLEL_PROCESSING,
+            data={
+                "partitions": row_parts * col_parts,
+                "row_parts": row_parts,
+                "col_parts": col_parts,
+                "segments_y": segments_y,
+                "segments_x": segments_x,
+                "points": self._point_count,
+            },
+        )
+        return tiles, segments_y, segments_x
+
+    def _sample_pairs_short_partitioned(
+        self,
+        count: int,
+        *,
+        pair_radius: int | None,
+        similarity_cutoff: float | None,
+        weighted_first: bool,
+        step_index: int | None,
+        partitions: int,
+    ) -> list[tuple[int, int, int, int]]:
+        tiles, segments_y, segments_x = self._build_short_tiles(partitions)
+        tile_count = len(tiles)
+        if tile_count == 0:
+            return self._sample_pairs_short(
+                count,
+                pair_radius=pair_radius,
+                similarity_cutoff=similarity_cutoff,
+                weighted_first=weighted_first,
+                step_index=step_index,
+            )
+        order = list(range(tile_count))
+        self._rng.shuffle(order)
+        base = count // tile_count
+        extra = count % tile_count
+        all_pairs: list[tuple[int, int, int, int]] = []
+        for idx, tile_idx in enumerate(order):
+            quota = base + (1 if idx < extra else 0)
+            if quota <= 0:
+                continue
+            candidates = tiles[tile_idx]
+            if not candidates:
+                continue
+            row_parts = len(segments_y)
+            col_parts = len(segments_x)
+            tile_row = tile_idx // col_parts
+            tile_col = tile_idx % col_parts
+            y_start, y_end = segments_y[tile_row]
+            x_start, x_end = segments_x[tile_col]
+            bounds = (y_start, y_end, x_start, x_end)
+            pairs = self._sample_pairs_short(
+                quota,
+                pair_radius=pair_radius,
+                similarity_cutoff=similarity_cutoff,
+                weighted_first=weighted_first,
+                step_index=step_index,
+                candidate_indices=candidates,
+                bounds=bounds,
+            )
+            all_pairs.extend(pairs)
+        remaining = count - len(all_pairs)
+        if remaining > 0:
+            fallback = self._sample_pairs_short(
+                remaining,
+                pair_radius=pair_radius,
+                similarity_cutoff=similarity_cutoff,
+                weighted_first=weighted_first,
+                step_index=step_index,
+            )
+            all_pairs.extend(fallback)
+        LOGGER.event(
+            "layout.short.partition_pairs",
+            section=PARALLEL_PROCESSING,
+            data={
+                "requested": count,
+                "produced": len(all_pairs),
+                "partitions": tile_count,
+                "remaining_fallback": remaining,
+            },
+        )
+        return all_pairs
+
+    def _evaluate_pairs_short_parallel(
+        self,
+        pairs: Sequence[tuple[int, int, int, int]],
+        *,
+        local_radius: int | None,
+        workers: int,
+        partitions: int,
+    ) -> list[tuple[tuple[int, int, int, int], float]]:
+        if not pairs:
+            return []
+        workers = max(1, workers)
+        chunk_size = max(1, len(pairs) // workers)
+
+        def _eval_chunk(chunk: Sequence[tuple[int, int, int, int]]) -> list[tuple[tuple[int, int, int, int], float]]:
+            local_swaps: list[tuple[tuple[int, int, int, int], float]] = []
+            for y1, x1, y2, x2 in chunk:
+                should_swap, delta = self._should_swap(
+                    y1, x1, y2, x2, mode="short", local_radius=local_radius
+                )
+                if should_swap:
+                    local_swaps.append(((y1, x1, y2, x2), delta))
+            return local_swaps
+
+        LOGGER.event(
+            "layout.short.parallel",
+            section=PARALLEL_PROCESSING,
+            data={
+                "pairs": len(pairs),
+                "workers": workers,
+                "partitions": partitions,
+                "chunk_size": chunk_size,
+            },
+        )
+
+        results: list[tuple[tuple[int, int, int, int], float]] = []
+        if workers == 1:
+            return _eval_chunk(pairs)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = []
+            for start in range(0, len(pairs), chunk_size):
+                futures.append(
+                    executor.submit(_eval_chunk, pairs[start : start + chunk_size])
+                )
+            for fut in futures:
+                try:
+                    results.extend(fut.result())
+                except Exception as exc:
+                    LOGGER.event(
+                        "layout.short.parallel.error",
+                        section=PARALLEL_PROCESSING,
+                        data={"error": str(exc)},
+                    )
+        return results
+
+    def _short_pair_radius(self, y1: int, x1: int, y2: int, x2: int, local_radius: int | None) -> int:
+        dist_sq = (y1 - y2) ** 2 + (x1 - x2) ** 2
+        base_radius = max(1, int(math.ceil(math.sqrt(dist_sq))))
+        if local_radius is None:
+            return base_radius
+        return max(local_radius, base_radius)
+
+    def _collect_short_subset(
+        self, pairs: Sequence[_ShortPair]
+    ) -> list[int]:
+        if not pairs:
+            return []
+        subset: set[int] = set()
+        for pair in pairs:
+            cy = (pair.y1 + pair.y2) / 2.0
+            cx = (pair.x1 + pair.x2) / 2.0
+            radius_sq = pair.radius * pair.radius
+            y_min = max(0, int(math.floor(cy - pair.radius)))
+            y_max = min(self.height - 1, int(math.ceil(cy + pair.radius)))
+            x_min = max(0, int(math.floor(cx - pair.radius)))
+            x_max = min(self.width - 1, int(math.ceil(cx + pair.radius)))
+            for y in range(y_min, y_max + 1):
+                occupied = self._row_occupied[y]
+                if not occupied:
+                    continue
+                dyc = y - cy
+                dyc_sq = dyc * dyc
+                for x in occupied:
+                    if x < x_min or x > x_max:
+                        continue
+                    dxc = x - cx
+                    if dyc_sq + dxc * dxc > radius_sq:
+                        continue
+                    idx = self.grid[y][x]
+                    if idx is None or idx == pair.idx_a or idx == pair.idx_b:
+                        continue
+                    subset.add(idx)
+        return sorted(subset)
+
+    def _evaluate_pairs_short_tensor(
+        self,
+        pairs: Sequence[tuple[int, int, int, int]],
+        *,
+        local_radius: int | None,
+    ) -> list[tuple[tuple[int, int, int, int], float]] | None:
+        tensor_engine = self._tensor_engine if self._use_gpu else None
+        if tensor_engine is None:
+            return None
+        prepared: list[_ShortPair] = []
+        for y1, x1, y2, x2 in pairs:
+            idx_a = self.grid[y1][x1]
+            idx_b = self.grid[y2][x2]
+            if idx_a is None and idx_b is None:
+                continue
+            if idx_a is None:
+                idx_a, idx_b = idx_b, idx_a
+                y1, x1, y2, x2 = y2, x2, y1, x1
+            radius = self._short_pair_radius(y1, x1, y2, x2, local_radius)
+            prepared.append(
+                _ShortPair(
+                    y1=y1,
+                    x1=x1,
+                    y2=y2,
+                    x2=x2,
+                    idx_a=idx_a,
+                    idx_b=idx_b,
+                    radius=float(radius),
+                )
+            )
+        if not prepared:
+            return []
+        subset_indices = self._collect_short_subset(prepared)
+        subset_key = tuple(subset_indices)
+        if subset_key != self._short_subset_indices:
+            self._short_subset_indices = subset_key
+            self._short_similarity_cache.clear()
+        if not subset_indices:
+            LOGGER.event(
+                "layout.energy.short.tensor.empty_subset",
+                section=ENERGY_SHORT,
+                data={
+                    "pairs": len(prepared),
+                    "points": self._point_count,
+                },
+            )
+            return []
+        try:
+            if not tensor_engine.ensure_subset(subset_indices, self._lambda, self._eta):
+                return None
+        except Exception as exc:
+            LOGGER.event(
+                "layout.gpu.tensor.short.disabled",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc)},
+            )
+            self._tensor_engine = None
+            return None
+
+        unique_indices = sorted(
+            {
+                idx
+                for pair in prepared
+                for idx in (pair.idx_a, pair.idx_b)
+                if idx is not None
+            }
+        )
+        missing = [idx for idx in unique_indices if idx not in self._short_similarity_cache]
+        if missing:
+            missing_matrix: "numpy.ndarray | None"
+            try:
+                missing_matrix = tensor_engine.similarity_block(
+                    missing, subset_indices, self._lambda, self._eta
+                )
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.gpu.tensor.short.sim_failed",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc)},
+                )
+                missing_matrix = None
+            if missing_matrix is None:
+                missing_matrix = self._apply_lambda_array(
+                    self._similarity_block(missing, subset_indices)
+                )
+            for row, idx in enumerate(missing):
+                self._short_similarity_cache[idx] = missing_matrix[row]
+                try:
+                    tensor_engine.register_cache_row(idx, missing_matrix[row])
+                except Exception:
+                    pass
+
+        pair_payload = [
+            (
+                pair.y1,
+                pair.x1,
+                pair.y2,
+                pair.x2,
+                pair.idx_a,
+                pair.idx_b,
+                pair.radius,
+            )
+            for pair in prepared
+        ]
+
+        try:
+            tensor_batch = tensor_engine.short_pair_energies(
+                pair_payload,
+                self._pos_y,
+                self._pos_x,
+                self._short_similarity_cache,
+                self._distance_eps,
+            )
+        except Exception as exc:
+            LOGGER.event(
+                "layout.gpu.tensor.short.disabled",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc)},
+            )
+            self._tensor_engine = None
+            tensor_batch = None
+
+        if tensor_batch is None:
+            return None
+
+        LOGGER.event(
+            "layout.energy.short.tensor",
+            section=GPU_IMPLEMENTATION,
+            data={
+                "pairs": len(pair_payload),
+                "subset_points": tensor_batch.subset_size,
+                "points": self._point_count,
+                "device": tensor_engine.device,
+            },
+        )
+        swaps_with_delta: list[tuple[tuple[int, int, int, int], float]] = []
+        for (pair, (energy_c, energy_s)) in zip(prepared, tensor_batch.energies):
+            delta = energy_s - energy_c
+            if energy_s > energy_c:
+                swaps_with_delta.append(((pair.y1, pair.x1, pair.y2, pair.x2), delta))
+        return swaps_with_delta
 
     def _should_swap(
         self,
@@ -2318,7 +3220,12 @@ class Layout:
             dyc = y - cy
             dyc_sq = dyc * dyc
             row = self.grid[y]
-            for x in range(x_min, x_max + 1):
+            occupied = self._row_occupied[y]
+            if not occupied:
+                continue
+            for x in occupied:
+                if x < x_min or x > x_max:
+                    continue
                 idx = row[x]
                 if idx is None or idx == idx_a or idx == idx_b:
                     continue
@@ -2344,7 +3251,7 @@ class Layout:
         return energy_c, energy_s
 
     def _apply_tracked_swaps(
-        self, swaps_with_delta: Sequence[tuple[tuple[int, int, int, int], float]]
+        self, swaps_with_delta: Sequence[tuple[tuple[int, int, int, int], float]], *, mode: str
     ) -> int:
         used: set[tuple[int, int]] = set()
         swaps: list[tuple[int, int, int, int]] = []
@@ -2354,10 +3261,10 @@ class Layout:
             swaps.append((y1, x1, y2, x2))
             used.add((y1, x1))
             used.add((y2, x2))
-        applied = self._apply_swaps(swaps)
+        applied = self._apply_swaps(swaps, mode=mode)
         return applied
 
-    def _apply_swaps(self, swaps: Iterable[tuple[int, int, int, int]]) -> int:
+    def _apply_swaps(self, swaps: Iterable[tuple[int, int, int, int]], *, mode: str) -> int:
         used: set[tuple[int, int]] = set()
         applied = 0
         for y1, x1, y2, x2 in swaps:
@@ -2365,21 +3272,36 @@ class Layout:
                 continue
             idx_a = self.grid[y1][x1]
             idx_b = self.grid[y2][x2]
+            if idx_a is not None:
+                self._row_occupied[y1].discard(x1)
+            if idx_b is not None:
+                self._row_occupied[y2].discard(x2)
             self.grid[y1][x1], self.grid[y2][x2] = idx_b, idx_a
             if idx_a is not None:
                 self._positions[idx_a] = (y2, x2)
                 self._pos_y[idx_a] = y2
                 self._pos_x[idx_a] = x2
+                self._row_occupied[y2].add(x2)
             if idx_b is not None:
                 self._positions[idx_b] = (y1, x1)
                 self._pos_y[idx_b] = y1
                 self._pos_x[idx_b] = x1
+                self._row_occupied[y1].add(x1)
             used.add((y1, x1))
             used.add((y2, x2))
             applied += 1
+            if mode == "long":
+                self._register_long_swap_radius(y1, x1, y2, x2)
         if applied:
+            self._short_energy_weights = None
+            self._short_energy_last_step = -1
             self._gpu_positions_dirty = True
         return applied
+
+    def _register_long_swap_radius(self, y1: int, x1: int, y2: int, x2: int) -> None:
+        radius = math.hypot(y1 - y2, x1 - x2)
+        self._long_swap_radius_sum += radius
+        self._long_swap_count += 1
 
     def _build_similarity_cache(self) -> None:
         point_count = self._point_count

@@ -2,7 +2,7 @@ from collections import defaultdict
 
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
-from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout
+from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
 from damp.logging import LOGGER
 
 LOG_INTERVAL_DEFAULT = 1
@@ -21,13 +21,25 @@ LOG_INTERVAL_LAYOUT_EXPORT = 1
 
 LAYOUT_USE_GPU = True
 
-LAYOUT_LONG_PAIRS_PER_STEP = 16000
+LAYOUT_LONG_PAIRS_PER_STEP = 24000
+LAYOUT_LONG_STEPS = 14000
+LAYOUT_LONG_SUBSET_SIZE = 1024
+LAYOUT_LONG_SUBSET_REFRESH = 40
+
 LAYOUT_SHORT_PAIRS_PER_STEP = 2000
-LAYOUT_SHORT_LOCAL_RADIUS = 5
+LAYOUT_SHORT_STEPS = 4000
+LAYOUT_SHORT_LOCAL_RADIUS = 7
+LAYOUT_SHORT_ENERGY_RADIUS = 7
+LAYOUT_SHORT_ENERGY_RECALC_EVERY = 75
+LAYOUT_SHORT_ENERGY_MAX_POINTS = 256
+LAYOUT_SHORT_ENERGY_EPS = 1e-6
+LAYOUT_SHORT_WEIGHTED_FIRST = True
+LAYOUT_SHORT_SIMILARITY_CUTOFF = 0.06
+LAYOUT_SHORT_PARTITIONS = 8
 
 ENCODER_LOG_EVERY = 50
-LAYOUT_LOG_EVERY_LONG = 500
-LAYOUT_LOG_EVERY_SHORT = 500
+LAYOUT_LOG_EVERY_LONG = 100
+LAYOUT_LOG_EVERY_SHORT = 50
 LAYOUT_LOG_VISUALS = True
 LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.5
 LAYOUT_ADAPTIVE_RADIUS_MIN = 1
@@ -37,7 +49,7 @@ LAYOUT_ENERGY_STABILITY_WINDOW = 20
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
 LAYOUT_ENERGY_STABILITY_EVERY = 200
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
-LAYOUT_MIN_SWAP_RATIO = 0.007
+LAYOUT_MIN_SWAP_RATIO = 0.003
 LAYOUT_MIN_SWAP_WINDOW = 50
 
 LOG_INTERVALS = {
@@ -63,6 +75,8 @@ LOG_INTERVALS = {
     "layout.energy.long.space": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.threshold": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.tensor": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.short.tensor": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.short.tensor.empty_subset": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
@@ -73,6 +87,8 @@ LOG_INTERVALS = {
     "layout.gpu.tensor.disabled": LOG_INTERVAL_INIT,
     "layout.gpu.tensor.enabled": LOG_INTERVAL_INIT,
     "layout.gpu.tensor.unavailable": LOG_INTERVAL_INIT,
+    "layout.gpu.tensor.short.disabled": LOG_INTERVAL_INIT,
+    "layout.gpu.tensor.short.sim_failed": LOG_INTERVAL_INIT,
     "layout.gpu.version_too_low": LOG_INTERVAL_INIT,
     "layout.grid": LOG_INTERVAL_INIT,
     "layout.init": LOG_INTERVAL_INIT,
@@ -198,7 +214,7 @@ def _collect_codes(
             first = False
     return codes, total_codes
 
-
+SPR = 32
 def _run_layout(codes: dict[float, list]) -> Layout:
     layout = Layout(
         codes,
@@ -208,6 +224,8 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         eta=0.0,
         seed=0,
         use_gpu=LAYOUT_USE_GPU,
+        long_subset_size=LAYOUT_LONG_SUBSET_SIZE,
+        long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
     )
     step_offset = 1
     long_radius_start = max(
@@ -221,7 +239,7 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
     )
     layout.run(
-        steps=22000,
+        steps=LAYOUT_LONG_STEPS,
         pairs_per_step=LAYOUT_LONG_PAIRS_PER_STEP,
         pair_radius=adaptive_long.start_radius,
         mode="long",
@@ -248,15 +266,27 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
     )
+    short_optim = ShortLayoutOptimConfig(
+        energy_radius=LAYOUT_SHORT_ENERGY_RADIUS,
+        energy_max_points=LAYOUT_SHORT_ENERGY_MAX_POINTS,
+        energy_recalc_every=LAYOUT_SHORT_ENERGY_RECALC_EVERY,
+        energy_eps=LAYOUT_SHORT_ENERGY_EPS,
+        use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
+        similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF,
+        partitions=LAYOUT_SHORT_PARTITIONS,
+    )
     layout.run(
-        steps=4200,
-        pairs_per_step=100,
-        pair_radius=7,
+        steps=LAYOUT_SHORT_STEPS,
+        pairs_per_step=LAYOUT_SHORT_PAIRS_PER_STEP,
+        pair_radius=None,
         mode="short",
-        local_radius=7,
-        min_swap_ratio=0.001,
+        local_radius=LAYOUT_SHORT_LOCAL_RADIUS,
+        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
+        adaptive_params=adaptive_short,
+        short_optim=short_optim,
     )
     return layout
 
@@ -279,7 +309,7 @@ def main() -> None:
     layout = _run_layout(codes)
 
     image = layout.render_image()
-    filename = f"data/{count}-{total_codes}.png"
+    filename = f"data/{count}-{layout.pair_radius}.png"
     Image.fromarray(image).save(filename)
 
     layout.save_json("data/layout.json")
