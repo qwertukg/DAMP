@@ -9,6 +9,7 @@ from main import (
     LAYOUT_ADAPTIVE_SWAP_TRIGGER,
     LAYOUT_LOG_EVERY_LONG,
     LAYOUT_LOG_EVERY_SHORT,
+    LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR,
     LAYOUT_LOG_VISUALS,
     LAYOUT_ENERGY_STABILITY_DELTA,
     LAYOUT_ENERGY_STABILITY_WINDOW,
@@ -16,6 +17,7 @@ from main import (
     LAYOUT_ENERGY_STABILITY_MAX_POINTS,
     LAYOUT_MIN_SWAP_RATIO,
     LAYOUT_MIN_SWAP_WINDOW,
+    LAYOUT_TUNE_SHORT_RADIUS_FACTOR,
     configure_logging,
 )
 from damp.encoding.damp_encoder import Encoder, ClosedDimension, Detectors
@@ -85,9 +87,20 @@ def main() -> None:
         log_visuals=LAYOUT_LOG_VISUALS,
     )
     step_offset += layout.last_steps
+    short_local_radius = max(
+        LAYOUT_ADAPTIVE_RADIUS_MIN,
+        int(layout.width * LAYOUT_TUNE_SHORT_RADIUS_FACTOR),
+    )
+    short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
+    short_radius_base = int(
+        max(
+            1,
+            round(short_local_radius * LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR),
+        )
+    )
     short_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
-        int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
+        min(short_radius_base, short_radius_max),
     )
     adaptive_short = AdaptiveLayoutConfig(
         start_radius=short_radius_start,
@@ -100,7 +113,7 @@ def main() -> None:
         pairs_per_step=500,
         pair_radius=adaptive_short.start_radius,
         mode="short",
-        local_radius=adaptive_short.start_radius,
+        local_radius=short_local_radius,
         min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
         min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,

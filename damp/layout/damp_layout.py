@@ -1383,6 +1383,7 @@ class Layout:
         self._last_visual_energy_step: int | None = None
         self._last_energy_value: float | None = None
         self._last_energy_step: int | None = None
+        self._last_energy_progress: float | None = None
         self._gpu_engine: _GpuLayoutEngine | None = None
         self._tensor_engine: _TensorLayoutEngine | None = None
         self._gpu_positions_dirty = True
@@ -1715,6 +1716,7 @@ class Layout:
                     path=log_path, step=step + step_offset, log_visuals=log_visuals
                 )
             energy_for_stability: float | None = None
+            previous_energy: float | None = None
             should_eval_energy = (
                 energy_monitor is not None
                 and step % energy_stability_every == 0
@@ -1725,8 +1727,44 @@ class Layout:
                     max_points=energy_stability_max_points,
                 )
                 energy_for_stability = energy
+                previous_energy = self._last_energy_progress
                 self._last_energy_value = energy
                 self._last_energy_step = step + step_offset
+                self._last_energy_progress = energy
+            if (
+                mode == "long"
+                and energy_for_stability is not None
+                and effective_energy_radius is not None
+            ):
+                minimization = (
+                    0.0
+                    if previous_energy is None
+                    else previous_energy - energy_for_stability
+                )
+                log_energy_progress = LOGGER.should_log("layout.energy.long.progress")
+                energy_visuals = (
+                    LOGGER.visual_scalars(
+                        f"{log_path}/energy/long",
+                        {"energy_minimization": minimization},
+                        step=current_step,
+                        timeline=_LAYOUT_STEP_TIMELINE,
+                    )
+                    if log_energy_progress
+                    else None
+                )
+                LOGGER.event(
+                    "layout.energy.long.progress",
+                    section=QUALITY_ASSESS,
+                    data={
+                        "step": current_step,
+                        "energy": energy_for_stability,
+                        "energy_prev": previous_energy,
+                        "energy_minimization": minimization,
+                        "radius": effective_energy_radius,
+                    },
+                    visuals=energy_visuals,
+                    force=log_energy_progress,
+                )
             if adaptive_state is not None:
                 new_lambda, swap_ratio = adaptive_state.update_after_step(
                     step=step, swaps=swaps, current_lambda=self._lambda

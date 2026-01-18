@@ -1,5 +1,8 @@
+import math
 from collections import defaultdict
+from dataclasses import dataclass
 
+from damp.article_refs import LAYOUT_PARAMETERS, LAYOUT_SYSTEM
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
@@ -18,7 +21,12 @@ LOG_INTERVAL_LAYOUT_VISUAL = 1
 LOG_INTERVAL_LAYOUT_ADAPTIVE = 200
 LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
 LOG_INTERVAL_LAYOUT_EXPORT = 1
+LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS = 1
 
+LAYOUT_SIMILARITY = "cosine"
+LAYOUT_LAMBDA_THRESHOLD = 0.65
+LAYOUT_ETA = 0
+LAYOUT_EMPTY_RATIO = 0.5
 LAYOUT_USE_GPU = True
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
@@ -26,7 +34,7 @@ LAYOUT_LONG_STEPS = 14000
 LAYOUT_LONG_SUBSET_SIZE = 1024
 LAYOUT_LONG_SUBSET_REFRESH = 40
 
-LAYOUT_SHORT_PAIRS_PER_STEP = 2000
+LAYOUT_SHORT_PAIRS_PER_STEP = 100
 LAYOUT_SHORT_STEPS = 4000
 LAYOUT_SHORT_LOCAL_RADIUS = 7
 LAYOUT_SHORT_ENERGY_RADIUS = 7
@@ -34,17 +42,18 @@ LAYOUT_SHORT_ENERGY_RECALC_EVERY = 75
 LAYOUT_SHORT_ENERGY_MAX_POINTS = 256
 LAYOUT_SHORT_ENERGY_EPS = 1e-6
 LAYOUT_SHORT_WEIGHTED_FIRST = True
-LAYOUT_SHORT_SIMILARITY_CUTOFF = 0.06
+LAYOUT_SHORT_SIMILARITY_CUTOFF = LAYOUT_LAMBDA_THRESHOLD
 LAYOUT_SHORT_PARTITIONS = 8
 
 ENCODER_LOG_EVERY = 50
-LAYOUT_LOG_EVERY_LONG = 100
+LAYOUT_LOG_EVERY_LONG = 150
 LAYOUT_LOG_EVERY_SHORT = 50
 LAYOUT_LOG_VISUALS = True
 LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.5
 LAYOUT_ADAPTIVE_RADIUS_MIN = 1
 LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
 LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
+LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR = 1.0
 LAYOUT_ENERGY_STABILITY_WINDOW = 20
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
 LAYOUT_ENERGY_STABILITY_EVERY = 200
@@ -52,6 +61,27 @@ LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
 LAYOUT_MIN_SWAP_RATIO = 0.003
 LAYOUT_MIN_SWAP_WINDOW = 50
 
+LAYOUT_TUNE_LONG_PAIR_FACTOR = 0.35
+LAYOUT_TUNE_LONG_PAIRS_MIN = 4000
+LAYOUT_TUNE_LONG_PAIRS_MAX = 20000
+LAYOUT_TUNE_LONG_STEPS_DIVISOR = 25
+LAYOUT_TUNE_LONG_STEPS_MIN = 300
+LAYOUT_TUNE_LONG_STEPS_MAX = 1500
+LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER = 8
+LAYOUT_TUNE_LONG_SUBSET_MIN = 512
+LAYOUT_TUNE_LONG_SUBSET_MAX = 2048
+LAYOUT_TUNE_LONG_SUBSET_REFRESH_DIVISOR = 18
+LAYOUT_TUNE_LONG_SUBSET_REFRESH_MIN = 20
+LAYOUT_TUNE_LONG_SUBSET_REFRESH_MAX = 80
+LAYOUT_TUNE_SHORT_PAIR_FACTOR = 0.2
+LAYOUT_TUNE_SHORT_PAIRS_MIN = 1800
+LAYOUT_TUNE_SHORT_PAIRS_MAX = 12000
+LAYOUT_TUNE_SHORT_STEPS_FACTOR = 1.6
+LAYOUT_TUNE_SHORT_STEPS_MIN = 160
+LAYOUT_TUNE_SHORT_STEPS_MAX = 900
+LAYOUT_TUNE_SHORT_RADIUS_FACTOR = 0.05
+LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR = 0.04
+LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR = 30
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
     "dimension.closed": LOG_INTERVAL_INIT,
@@ -78,6 +108,7 @@ LOG_INTERVALS = {
     "layout.energy.short.tensor": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.short.tensor.empty_subset": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.energy.long.progress": LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
     "layout.gpu.disabled": LOG_INTERVAL_INIT,
@@ -134,6 +165,115 @@ def configure_logging() -> None:
     LOGGER.configure_intervals(LOG_INTERVALS, default_interval=LOG_INTERVAL_DEFAULT)
 
 
+@dataclass(frozen=True)
+class TunedLayoutParams:
+    long_pairs_per_step: int
+    long_steps: int
+    long_subset_size: int | None
+    long_subset_refresh: int
+    short_pairs_per_step: int
+    short_steps: int
+    short_local_radius: int
+    short_energy_radius: int
+    short_energy_recalc_every: int
+
+
+class LayoutParameterTuner:
+    def __init__(
+        self,
+        *,
+        empty_ratio: float = LAYOUT_EMPTY_RATIO,
+        start_radius_factor: float = LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+    ) -> None:
+        self._empty_ratio = empty_ratio
+        self._start_radius_factor = start_radius_factor
+
+    def tune(self, total_points: int) -> TunedLayoutParams:
+        if total_points <= 0:
+            raise ValueError("total_points must be positive for tuning")
+        grid_size = int(math.ceil(math.sqrt(total_points * (1.0 + self._empty_ratio))))
+        long_pairs = max(
+            LAYOUT_TUNE_LONG_PAIRS_MIN,
+            min(LAYOUT_TUNE_LONG_PAIRS_MAX, int(total_points * LAYOUT_TUNE_LONG_PAIR_FACTOR)),
+        )
+        long_steps = max(
+            LAYOUT_TUNE_LONG_STEPS_MIN,
+            min(LAYOUT_TUNE_LONG_STEPS_MAX, int(total_points / LAYOUT_TUNE_LONG_STEPS_DIVISOR)),
+        )
+        long_subset_size = min(
+            LAYOUT_TUNE_LONG_SUBSET_MAX,
+            max(LAYOUT_TUNE_LONG_SUBSET_MIN, int(math.sqrt(total_points) * LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER)),
+        )
+        long_subset_refresh = max(
+            LAYOUT_TUNE_LONG_SUBSET_REFRESH_MIN,
+            min(
+                LAYOUT_TUNE_LONG_SUBSET_REFRESH_MAX,
+                long_steps // LAYOUT_TUNE_LONG_SUBSET_REFRESH_DIVISOR,
+            ),
+        )
+        short_pairs = max(
+            LAYOUT_TUNE_SHORT_PAIRS_MIN,
+            min(LAYOUT_TUNE_SHORT_PAIRS_MAX, int(total_points * LAYOUT_TUNE_SHORT_PAIR_FACTOR)),
+        )
+        short_steps = max(
+            LAYOUT_TUNE_SHORT_STEPS_MIN,
+            min(LAYOUT_TUNE_SHORT_STEPS_MAX, int(grid_size * LAYOUT_TUNE_SHORT_STEPS_FACTOR)),
+        )
+        short_local_radius = max(
+            LAYOUT_ADAPTIVE_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_RADIUS_FACTOR)
+        )
+        short_energy_radius = max(
+            LAYOUT_ADAPTIVE_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR)
+        )
+        short_energy_recalc_every = max(LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR, short_steps // 6)
+        LOGGER.event(
+            "layout.tune",
+            section=LAYOUT_PARAMETERS,
+            data={
+                "points": total_points,
+                "grid_size_est": grid_size,
+                "empty_ratio": self._empty_ratio,
+                "start_radius_factor": self._start_radius_factor,
+                "long_pairs_per_step": long_pairs,
+                "long_steps": long_steps,
+                "long_subset_size": long_subset_size,
+                "long_subset_refresh": long_subset_refresh,
+                "short_pairs_per_step": short_pairs,
+                "short_steps": short_steps,
+                "short_local_radius": short_local_radius,
+                "short_energy_radius": short_energy_radius,
+                "short_energy_recalc_every": short_energy_recalc_every,
+                "lambda_threshold": LAYOUT_LAMBDA_THRESHOLD,
+                "eta": "hard" if LAYOUT_ETA is None else LAYOUT_ETA,
+            },
+        )
+        return TunedLayoutParams(
+            long_pairs_per_step=long_pairs,
+            long_steps=long_steps,
+            long_subset_size=long_subset_size,
+            long_subset_refresh=long_subset_refresh,
+            short_pairs_per_step=short_pairs,
+            short_steps=short_steps,
+            short_local_radius=short_local_radius,
+            short_energy_radius=short_energy_radius,
+            short_energy_recalc_every=short_energy_recalc_every,
+        )
+
+
+def _default_layout_params() -> TunedLayoutParams:
+    return TunedLayoutParams(
+        long_pairs_per_step=LAYOUT_LONG_PAIRS_PER_STEP,
+        long_steps=LAYOUT_LONG_STEPS,
+        long_subset_size=LAYOUT_LONG_SUBSET_SIZE,
+        long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
+        short_pairs_per_step=LAYOUT_SHORT_PAIRS_PER_STEP,
+        short_steps=LAYOUT_SHORT_STEPS,
+        short_local_radius=LAYOUT_SHORT_LOCAL_RADIUS,
+        short_energy_radius=LAYOUT_SHORT_ENERGY_RADIUS,
+        short_energy_recalc_every=LAYOUT_SHORT_ENERGY_RECALC_EVERY,
+    )
+
+
 def _build_encoder() -> Encoder:
     return Encoder(
         # Angle
@@ -143,10 +283,10 @@ def _build_encoder() -> Encoder:
             [
                 #Detectors(360, 0.4),
                 #Detectors(180, 0.4),
-                Detectors(90, 0.4),
-                Detectors(45, 0.4),
-                Detectors(30, 0.4),
-                Detectors(10, 0.4),
+                Detectors(90, 0.7),
+                Detectors(45, 0.7),
+                Detectors(30, 0.7),
+                Detectors(10, 0.7),
                 #Detectors(5, 0.4),
             ],
         ),
@@ -155,10 +295,12 @@ def _build_encoder() -> Encoder:
             "X",
             (0, 6),
             [
-                Detectors(7, 0.4),
-                Detectors(4, 0.4),
-                Detectors(2, 0.4),
-                Detectors(1, 0.4),
+                Detectors(7, 0.7),
+                Detectors(6, 0.7),
+                Detectors(5, 0.7),
+                Detectors(4, 0.7),
+                Detectors(3, 0.7),
+                Detectors(2, 0.7),
             ],
         ),
         # Y
@@ -166,10 +308,12 @@ def _build_encoder() -> Encoder:
             "Y",
             (0, 6),
             [
-                Detectors(7, 0.4),
-                Detectors(4, 0.4),
-                Detectors(2, 0.4),
-                Detectors(1, 0.4),
+                Detectors(7, 0.7),
+                Detectors(6, 0.7),
+                Detectors(5, 0.7),
+                Detectors(4, 0.7),
+                Detectors(3, 0.7),
+                Detectors(2, 0.7),
             ],
         ),
         log_every=ENCODER_LOG_EVERY,
@@ -215,17 +359,18 @@ def _collect_codes(
     return codes, total_codes
 
 SPR = 32
-def _run_layout(codes: dict[float, list]) -> Layout:
+def _run_layout(codes: dict[float, list], params: TunedLayoutParams | None = None) -> Layout:
+    run_params = params or _default_layout_params()
     layout = Layout(
         codes,
-        empty_ratio=0.15,
-        similarity="cosine",
-        lambda_threshold=0.06,
-        eta=0.0,
+        empty_ratio=LAYOUT_EMPTY_RATIO,
+        similarity=LAYOUT_SIMILARITY,
+        lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
+        eta=LAYOUT_ETA,
         seed=0,
         use_gpu=LAYOUT_USE_GPU,
-        long_subset_size=LAYOUT_LONG_SUBSET_SIZE,
-        long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
+        long_subset_size=run_params.long_subset_size,
+        long_subset_refresh=run_params.long_subset_refresh,
     )
     step_offset = 1
     long_radius_start = max(
@@ -239,8 +384,8 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
     )
     layout.run(
-        steps=LAYOUT_LONG_STEPS,
-        pairs_per_step=LAYOUT_LONG_PAIRS_PER_STEP,
+        steps=run_params.long_steps,
+        pairs_per_step=run_params.long_pairs_per_step,
         pair_radius=adaptive_long.start_radius,
         mode="long",
         min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
@@ -256,9 +401,16 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         adaptive_params=adaptive_long,
     )
     step_offset += layout.last_steps
+    short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
+    short_radius_base = int(
+        max(
+            1,
+            round(run_params.short_local_radius * LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR),
+        )
+    )
     short_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
-        int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
+        min(short_radius_base, short_radius_max),
     )
     adaptive_short = AdaptiveLayoutConfig(
         start_radius=short_radius_start,
@@ -267,20 +419,20 @@ def _run_layout(codes: dict[float, list]) -> Layout:
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
     )
     short_optim = ShortLayoutOptimConfig(
-        energy_radius=LAYOUT_SHORT_ENERGY_RADIUS,
+        energy_radius=run_params.short_energy_radius,
         energy_max_points=LAYOUT_SHORT_ENERGY_MAX_POINTS,
-        energy_recalc_every=LAYOUT_SHORT_ENERGY_RECALC_EVERY,
+        energy_recalc_every=run_params.short_energy_recalc_every,
         energy_eps=LAYOUT_SHORT_ENERGY_EPS,
         use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
         similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF,
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
     layout.run(
-        steps=LAYOUT_SHORT_STEPS,
-        pairs_per_step=LAYOUT_SHORT_PAIRS_PER_STEP,
-        pair_radius=None,
+        steps=run_params.short_steps,
+        pairs_per_step=run_params.short_pairs_per_step,
+        pair_radius=short_radius_start,
         mode="short",
-        local_radius=LAYOUT_SHORT_LOCAL_RADIUS,
+        local_radius=run_params.short_local_radius,
         min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
         min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
@@ -291,28 +443,70 @@ def _run_layout(codes: dict[float, list]) -> Layout:
     return layout
 
 
+class MnistLayoutRunner:
+    def __init__(self, *, count: int, label: int | None = None) -> None:
+        self.count = count
+        self.label = label
+        configure_logging()
+        self.encoder = _build_encoder()
+        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+
+    def _build_dataset(self):
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        return MNIST(
+            root="./data",
+            train=True,
+            download=True,
+            transform=transforms.ToTensor(),
+        )
+
+    def _tune_layout(self, total_codes: int) -> TunedLayoutParams:
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        return tuner.tune(total_codes)
+
+    def _log_dataset(self, angles: int, total_codes: int) -> None:
+        LOGGER.event(
+            "mnist.codes",
+            section=LAYOUT_SYSTEM,
+            data={
+                "count": self.count,
+                "label": "all" if self.label is None else int(self.label),
+                "angles": angles,
+                "points": total_codes,
+            },
+        )
+
+    def _export_layout(self, layout: Layout) -> None:
+        from PIL import Image
+
+        image = layout.render_image()
+        filename = f"data/{self.count}-{layout.pair_radius}.png"
+        Image.fromarray(image).save(filename)
+        layout.save_json("data/layout.json")
+
+    def run(self) -> None:
+        dataset = self._build_dataset()
+        codes, total_codes = _collect_codes(
+            dataset,
+            self.label,
+            self.count,
+            self.encoder,
+            self.extractor,
+        )
+        self._log_dataset(len(codes), total_codes)
+        tuned_params = self._tune_layout(total_codes)
+        layout = _run_layout(codes, tuned_params)
+        self._export_layout(layout)
+
+
 def main() -> None:
-    from PIL import Image
-    from torchvision import transforms
-    from torchvision.datasets import MNIST
-
-    configure_logging()
-    encoder = _build_encoder()
-    dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
-    extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
-
-    count = 1000
-    label = None
-
-    codes, total_codes = _collect_codes(dataset, label, count, encoder, extractor)
-
-    layout = _run_layout(codes)
-
-    image = layout.render_image()
-    filename = f"data/{count}-{layout.pair_radius}.png"
-    Image.fromarray(image).save(filename)
-
-    layout.save_json("data/layout.json")
+    runner = MnistLayoutRunner(count=6000, label=None)
+    runner.run()
 
 
 if __name__ == "__main__":
