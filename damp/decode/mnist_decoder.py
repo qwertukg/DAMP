@@ -72,29 +72,74 @@ class EmbeddingDatabase:
     def config(self) -> DecoderConfig:
         return self._config
 
-    def predict(self, embedding: BitArray, *, temperature: float | None = None) -> PredictionResult:
+    def predict(
+        self,
+        embedding: BitArray,
+        *,
+        temperature: float | None = None,
+        top_k: int | None = None,
+    ) -> PredictionResult:
         if len(embedding) == 0:
             raise ValueError("embedding must be non-empty")
+
+        temp = temperature if temperature is not None else self._config.temperature
+        if temp <= 0:
+            raise ValueError("temperature must be positive")
+
+        k = int(top_k) if top_k is not None else 50
+        if k <= 0:
+            raise ValueError("top_k must be positive")
+
         query_ones = embedding.count()
-        class_scores: dict[int, float] = {}
-        class_details: list[tuple[int, float, float, int]] = []
-        for label in self._expected_classes:
-            sims: list[float] = []
-            for stored in self._by_class.get(label, []):
-                sims.append(self._similarity_value(embedding, query_ones, stored))
-            if sims:
-                score = sum(sims) / len(sims)
-                best = max(sims)
-            else:
-                score = float("-inf")
-                best = 0.0
-            class_scores[label] = score
-            class_details.append((label, score, best, len(sims)))
-        probs_map = self._to_probabilities(class_scores, temperature=temperature)
-        probabilities = [probs_map.get(label, 0.0) for label in self._expected_classes]
+
+        # Top-K fuzzy search over the full embedding memory (approx. associative recall).
+        import heapq
+
+        heap: list[tuple[float, int]] = []
+        for item in self._embeddings:
+            label = item.label
+            if label not in self._expected_classes:
+                continue
+            sim = self._similarity_value(embedding, query_ones, item.embedding)
+            if sim <= 0.0:
+                continue
+            if len(heap) < k:
+                heapq.heappush(heap, (sim, label))
+            elif sim > heap[0][0]:
+                heapq.heapreplace(heap, (sim, label))
+
+        neighbors = sorted(heap, key=lambda pair: pair[0], reverse=True)
+
+        class_weight: dict[int, float] = {label: 0.0 for label in self._expected_classes}
+        class_best_sim: dict[int, float] = {label: 0.0 for label in self._expected_classes}
+        class_count: dict[int, int] = {label: 0 for label in self._expected_classes}
+
+        for sim, label in neighbors:
+            # Weighting: soft vote with temperature on similarity (higher temp -> smoother).
+            w = math.exp(sim / temp)
+            class_weight[label] += w
+            class_count[label] += 1
+            if sim > class_best_sim[label]:
+                class_best_sim[label] = sim
+
+        total_w = sum(class_weight.values())
+        if total_w <= 0.0:
+            # Degenerate case: no overlap found; fall back to uniform probabilities.
+            uniform = 1.0 / max(len(self._expected_classes), 1)
+            probabilities = [uniform for _ in self._expected_classes]
+        else:
+            probabilities = [class_weight[label] / total_w for label in self._expected_classes]
+
         predicted_label = self._expected_classes[int(np.argmax(probabilities))] if probabilities else -1
         confidence = max(probabilities) if probabilities else 0.0
-        best_scores = sorted(class_details, key=lambda item: item[1], reverse=True)[:3]
+
+        # For debugging, record top classes by total weight (not by mean similarity).
+        details = [
+            (label, class_weight[label], class_best_sim[label], class_count[label])
+            for label in self._expected_classes
+        ]
+        best_scores = sorted(details, key=lambda item: item[1], reverse=True)[:3]
+
         LOGGER.event(
             "decoder.base.predict",
             section=SIMILARITY_DEFINITION,
@@ -102,8 +147,10 @@ class EmbeddingDatabase:
                 "classes": len(self._expected_classes),
                 "best_label": predicted_label,
                 "confidence": confidence,
-                "temperature": temperature if temperature is not None else self._config.temperature,
+                "temperature": temp,
                 "similarity": self._config.similarity,
+                "top_k": k,
+                "neighbors": len(neighbors),
                 "top_scores": best_scores,
                 "low_confidence": confidence < self._config.min_confidence,
             },
