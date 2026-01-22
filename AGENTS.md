@@ -2,6 +2,8 @@
 
 # Изспользуй OOP
 
+# всегда переииспользуй Layout и Encoder
+
 # Всегда строго следуй статье [DAMP_extracted.txt](docs/DAMP_extracted.txt)
 
 ## Все константы пропиши в [main.py](main/py)
@@ -25,9 +27,10 @@
 # В [main.py](main.py) тест на кодирование изображений из MNIST
 
 # Структура проекта:
-- /damp
-- /damp/encoding
-- /damp/layout
+- damp
+- damp/encoding
+- damp/layout
+- damp/activation
 
 
 

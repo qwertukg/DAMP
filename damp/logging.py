@@ -127,6 +127,9 @@ class DampLogger:
         for key, value in data.items():
             if value is None:
                 continue
+            if key == "label":
+                coerced[key] = str(value)
+                continue
             coerced[key] = self._coerce_rr_value(value)
         return coerced
 

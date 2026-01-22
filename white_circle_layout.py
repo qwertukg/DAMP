@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List
-
 import numpy as np
 from PIL import Image
 
@@ -11,6 +8,7 @@ import main as damp_main
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.article_refs import ENCODING_SYSTEM, LAYOUT_PARAMETERS, LAYOUT_SYSTEM, SLIDING_WINDOW
 from damp.layout.damp_layout import Layout
+from damp.layout.payload import LayoutPayloadBuilder
 from damp.logging import LOGGER
 from main import _build_encoder, _run_layout, configure_logging
 
@@ -106,10 +104,15 @@ class SingleImageLayoutRunner:
         )
         return array
 
-    def _encode_image(self, image: np.ndarray) -> Dict[float, List]:
+    def _encode_image(self, image: np.ndarray) -> LayoutPayloadBuilder:
         measurements_map = self.extractor.extract(image, self.label)
         measurements = measurements_map[self.label]
-        codes: dict[float, list] = defaultdict(list)
+        payload = LayoutPayloadBuilder(
+            similarity=None,
+            lambda_threshold=None,
+            eta=None,
+        )
+        total_codes = 0
         for idx, (angle, x, y) in enumerate(measurements):
             log_image = image if idx == 0 else None
             log_measurements = measurements if idx == 0 else None
@@ -121,28 +124,36 @@ class SingleImageLayoutRunner:
                 log_label=self.label,
                 log_measurements=log_measurements,
             )
-            codes[angle].append(code)
+            payload.add_code(label=self.label, hue=float(angle), code=code)
+            total_codes += 1
         LOGGER.event(
             "single_image.codes",
             section=ENCODING_SYSTEM,
             data={
                 "label": self.label,
-                "angles": len(codes),
-                "codes_total": sum(len(bucket) for bucket in codes.values()),
+                "angles": len(payload.codes_by_hue()),
+                "codes_total": total_codes,
             },
         )
-        return codes
+        return payload
 
-    def _layout_codes(self, codes: Dict[float, List]) -> Layout:
+    def _layout_codes(self, payload: LayoutPayloadBuilder) -> Layout:
+        codes = payload.codes_by_hue()
+        total_codes = len(payload.records)
         LOGGER.event(
             "single_image.layout.start",
             section=LAYOUT_SYSTEM,
             data={
-                "codes": sum(len(bucket) for bucket in codes.values()),
+                "codes": total_codes,
                 "angles": len(codes),
             },
         )
-        layout = _run_layout(codes)
+        layout = _run_layout(
+            codes,
+            None,
+            count=total_codes,
+            total_codes=total_codes,
+        )
         LOGGER.event(
             "single_image.layout.done",
             section=LAYOUT_SYSTEM,
@@ -154,9 +165,8 @@ class SingleImageLayoutRunner:
         )
         return layout
 
-    def _export_layout(self, layout: Layout) -> None:
+    def _export_layout(self, layout: Layout, json_path: Path) -> None:
         image_path = self.output_prefix.with_suffix(".png")
-        json_path = self.output_prefix.with_suffix(".json")
         rendered = layout.render_image()
         Image.fromarray(rendered).save(image_path)
         layout.save_json(str(json_path))
@@ -172,9 +182,11 @@ class SingleImageLayoutRunner:
 
     def run(self) -> None:
         image = self._load_image()
-        codes = self._encode_image(image)
-        layout = self._layout_codes(codes)
-        self._export_layout(layout)
+        payload = self._encode_image(image)
+        json_path = self.output_prefix.with_suffix(".json")
+        payload.save_base(str(json_path))
+        layout = self._layout_codes(payload)
+        self._export_layout(layout, json_path)
 
 
 def main() -> None:

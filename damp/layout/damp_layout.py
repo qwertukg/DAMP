@@ -33,13 +33,14 @@ from damp.article_refs import (
     SPARSE_BIT_VECTORS,
 )
 from damp.encoding.bitarray import BitArray
+from damp.layout.payload import LayoutEncodedCode
 from damp.logging import LOGGER
 
 
 @dataclass(frozen=True)
 class LayoutPoint:
     code: BitArray
-    label: float
+    label: str
     hue: float
     ones: int
 
@@ -741,6 +742,33 @@ class _TensorLayoutEngine:
         self._zero_row = None
         self._sim_cache.clear()
 
+    def _is_oom(self, exc: Exception) -> bool:
+        return "out of memory" in str(exc).lower()
+
+    def _is_mps(self) -> bool:
+        return getattr(self._device, "type", str(self._device)).lower() == "mps"
+
+    def release_memory_on_oom(self, exc: Exception, *, stage: str) -> bool:
+        if not self._is_oom(exc):
+            return False
+        if not self._is_mps():
+            return False
+        self.reset_subset()
+        try:
+            self._torch.mps.empty_cache()
+        except Exception:
+            return False
+        LOGGER.event(
+            "layout.gpu.mps.empty_cache",
+            section=GPU_IMPLEMENTATION,
+            data={
+                "device": str(self._device),
+                "stage": stage,
+                "error": str(exc),
+            },
+        )
+        return True
+
     @property
     def device(self) -> str:
         return str(self._device)
@@ -1230,17 +1258,20 @@ class Layout:
 
         self._points = []
         self._codes: dict[float, list[BitArray]] = {}
-        for label, label_codes in codes.items():
-            label_value = float(label)
-            bucket = self._codes.setdefault(label_value, [])
-            for code in label_codes:
-                layout_code, ones = self._coerce_code(code)
+        for hue, label_codes in codes.items():
+            hue_value = float(hue)
+            bucket = self._codes.setdefault(hue_value, [])
+            for code_entry in label_codes:
+                layout_code, ones, label_text = self._coerce_code_entry(
+                    code_entry,
+                    default_label=hue_value,
+                )
                 bucket.append(layout_code)
                 self._points.append(
                     LayoutPoint(
                         code=layout_code,
-                        label=label_value,
-                        hue=label_value,
+                        label=label_text,
+                        hue=hue_value,
                         ones=ones,
                     )
                 )
@@ -1466,6 +1497,7 @@ class Layout:
         energy_stability_max_points: int | None = None,
         adaptive_params: AdaptiveLayoutConfig | None = None,
         short_optim: ShortLayoutOptimConfig | None = None,
+        save_on_stop_path: str | None = None,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
@@ -1710,6 +1742,19 @@ class Layout:
                             "total_swaps": total_swaps,
                         },
                     )
+                    if mode == "long":
+                        self._log_layout_state(
+                            path=log_path,
+                            step=current_step,
+                            log_visuals=log_visuals,
+                            force=True,
+                        )
+                        self._save_on_stop(
+                            path=save_on_stop_path,
+                            reason="swap_ratio",
+                            step=current_step,
+                            mode=mode,
+                        )
                     break
             if log_every is not None and step % log_every == 0:
                 self._log_layout_state(
@@ -1808,6 +1853,19 @@ class Layout:
                             "total_swaps": total_swaps,
                         },
                     )
+                    if mode == "long":
+                        self._log_layout_state(
+                            path=log_path,
+                            step=current_step,
+                            log_visuals=log_visuals,
+                            force=True,
+                        )
+                        self._save_on_stop(
+                            path=save_on_stop_path,
+                            reason="energy_stability",
+                            step=current_step,
+                            mode=mode,
+                        )
                     break
 
         self.last_steps = steps_executed
@@ -1823,8 +1881,44 @@ class Layout:
         )
         return total_swaps
 
-    def _log_layout_state(self, path: str, step: int, *, log_visuals: bool) -> None:
-        if not LOGGER.should_log("layout.visual"):
+    def _save_on_stop(self, *, path: str | None, reason: str, step: int, mode: str) -> None:
+        if mode != "long" or path is None:
+            return
+        try:
+            self.save_json(path)
+            LOGGER.event(
+                "layout.run.save_on_stop",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "path": path,
+                    "reason": reason,
+                    "step": step,
+                    "mode": mode,
+                },
+            )
+        except Exception as exc:
+            LOGGER.event(
+                "layout.run.save_on_stop.error",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "path": path,
+                    "reason": reason,
+                    "step": step,
+                    "mode": mode,
+                    "error": str(exc),
+                },
+            )
+            raise
+
+    def _log_layout_state(
+        self,
+        path: str,
+        step: int,
+        *,
+        log_visuals: bool,
+        force: bool = False,
+    ) -> None:
+        if not force and not LOGGER.should_log("layout.visual"):
             return
         visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT or not log_visuals
         visuals: list = []
@@ -2081,32 +2175,58 @@ class Layout:
     def values(self) -> list[str]:
         return list(self._values)
 
+    def hues(self) -> list[float]:
+        return [point.hue for point in self._points]
+
     def save_json(self, path: str) -> None:
         if not path:
             raise ValueError("path must be provided")
+        base_payload: dict[str, Any] | None = None
+        base_layout: dict[int, Mapping[str, Any]] = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fp:
+                    base_payload = json.load(fp)
+                for item in base_payload.get("layout", []):  # type: ignore[attr-defined]
+                    try:
+                        base_layout[int(item.get("index"))] = item
+                    except Exception:
+                        continue
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.export.json.error",
+                    section=LAID_OUT_STRUCTURE,
+                    data={"path": path, "error": str(exc), "stage": "read"},
+                )
+                base_payload = None
         points_payload: list[dict[str, Any]] = []
         for idx, (y, x) in enumerate(self._positions):
             point = self._points[idx]
+            base_entry = base_layout.get(idx, {})
             points_payload.append(
                 {
                     "index": idx,
                     "y": y,
                     "x": x,
-                    "label": self._labels[idx],
-                    "value": self._values[idx],
-                    "hue": point.hue,
-                    "ones": point.ones,
+                    "label": base_entry.get("label", self._labels[idx]),
+                    "value": base_entry.get("value", self._values[idx]),
+                    "hue": base_entry.get("hue", point.hue),
+                    "ones": base_entry.get("ones", point.ones),
                 }
             )
-        payload = {
-            "width": self.width,
-            "height": self.height,
-            "points": self._point_count,
-            "similarity": self._similarity,
-            "lambda_threshold": self._lambda,
-            "eta": self._eta,
-            "layout": points_payload,
-        }
+        payload = dict(base_payload) if isinstance(base_payload, dict) else {}
+        payload.update(
+            {
+                "width": self.width,
+                "height": self.height,
+                "points": self._point_count,
+                "similarity": self._similarity,
+                "lambda_threshold": self._lambda,
+                "eta": self._eta,
+                "pair_radius": self._pair_radius,
+                "layout": points_payload,
+            }
+        )
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -2772,7 +2892,7 @@ class Layout:
                     idx_b=idx_b,
                     radius=float(radius),
                 )
-            )
+        )
         if not prepared:
             return []
         subset_indices = self._collect_short_subset(prepared)
@@ -2818,12 +2938,36 @@ class Layout:
                     missing, subset_indices, self._lambda, self._eta
                 )
             except Exception as exc:
+                recovered = tensor_engine.release_memory_on_oom(
+                    exc,
+                    stage="short.similarity_block",
+                )
                 LOGGER.event(
                     "layout.gpu.tensor.short.sim_failed",
                     section=GPU_IMPLEMENTATION,
-                    data={"error": str(exc)},
+                    data={
+                        "error": str(exc),
+                        "retry": recovered,
+                    },
                 )
-                missing_matrix = None
+                if recovered:
+                    try:
+                        missing_matrix = tensor_engine.similarity_block(
+                            missing, subset_indices, self._lambda, self._eta
+                        )
+                    except Exception as retry_exc:
+                        LOGGER.event(
+                            "layout.gpu.tensor.short.sim_failed",
+                            section=GPU_IMPLEMENTATION,
+                            data={
+                                "error": str(retry_exc),
+                                "retry": False,
+                                "stage": "retry",
+                            },
+                        )
+                        missing_matrix = None
+                else:
+                    missing_matrix = None
             if missing_matrix is None:
                 missing_matrix = self._apply_lambda_array(
                     self._similarity_block(missing, subset_indices)
@@ -2848,6 +2992,7 @@ class Layout:
             for pair in prepared
         ]
 
+        recovered_from_oom = False
         try:
             tensor_batch = tensor_engine.short_pair_energies(
                 pair_payload,
@@ -2857,15 +3002,46 @@ class Layout:
                 self._distance_eps,
             )
         except Exception as exc:
+            recovered_from_oom = tensor_engine.release_memory_on_oom(
+                exc,
+                stage="short.pair_energies",
+            )
             LOGGER.event(
                 "layout.gpu.tensor.short.disabled",
                 section=GPU_IMPLEMENTATION,
-                data={"error": str(exc)},
+                data={
+                    "error": str(exc),
+                    "retry": recovered_from_oom,
+                },
             )
-            self._tensor_engine = None
-            tensor_batch = None
+            if recovered_from_oom:
+                try:
+                    tensor_batch = tensor_engine.short_pair_energies(
+                        pair_payload,
+                        self._pos_y,
+                        self._pos_x,
+                        self._short_similarity_cache,
+                        self._distance_eps,
+                    )
+                except Exception as retry_exc:
+                    LOGGER.event(
+                        "layout.gpu.tensor.short.disabled",
+                        section=GPU_IMPLEMENTATION,
+                        data={
+                            "error": str(retry_exc),
+                            "retry": False,
+                            "stage": "retry",
+                        },
+                    )
+                    tensor_batch = None
+                    recovered_from_oom = False
+            else:
+                self._tensor_engine = None
+                tensor_batch = None
 
         if tensor_batch is None:
+            if not recovered_from_oom:
+                self._tensor_engine = None
             return None
 
         LOGGER.event(
@@ -3743,10 +3919,13 @@ class Layout:
         return _similarity_base_points(a, b, self._similarity)
 
     @staticmethod
-    def _format_label(value: float) -> str:
-        if abs(value - round(value)) < 1e-6:
-            return str(int(round(value)))
-        return f"{value:.3f}"
+    def _format_label(value: object) -> str:
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if abs(number - round(number)) < 1e-6:
+                return str(int(round(number)))
+            return f"{number:.3f}"
+        return str(value)
 
     def _normalized_hues(self) -> list[float]:
         if not self._points:
@@ -3764,6 +3943,20 @@ class Layout:
                 value = HUE - 1e-9
             normalized.append(value)
         return normalized
+
+    def _coerce_code_entry(
+        self,
+        entry: LayoutEncodedCode | BitArray | Iterable[int],
+        *,
+        default_label: float,
+    ) -> tuple[BitArray, int, str]:
+        if isinstance(entry, LayoutEncodedCode):
+            layout_code, ones = self._coerce_code(entry.code)
+            label_text = self._format_label(entry.label)
+            return layout_code, ones, label_text
+        layout_code, ones = self._coerce_code(entry)
+        label_text = self._format_label(default_label)
+        return layout_code, ones, label_text
 
     @staticmethod
     def _coerce_code(code: BitArray | Iterable[int]) -> tuple[BitArray, int]:
