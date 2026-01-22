@@ -134,7 +134,12 @@ class _PythonActivationBackend(_ActivationBackend):
             denom = math.sqrt(ones_a * ones_b)
             return 0.0 if denom == 0 else common / denom
         union = ones_a + ones_b - common
-        return 0.0 if union == 0 else common / union
+        if union == 0:
+            return 0.0
+        jacc = common / union
+        if self._similarity in ("jaccard2", "j2", "jac2"):
+            return jacc * jacc
+        return jacc
 
     def _apply_threshold(self, similarity: float) -> float:
         if similarity <= 0.0:
@@ -193,6 +198,8 @@ class _NumpyActivationBackend(_ActivationBackend):
                 out=self._np.zeros_like(intersection),
                 where=union > 0,
             )
+            if self._similarity in ("jaccard2", "j2", "jac2"):
+                sim = sim * sim
         sim = self._apply_threshold(sim)
         if sim.size == 0:
             return [0.0 for _ in range(self._codes.shape[0])]
@@ -262,6 +269,8 @@ class _TorchActivationBackend(_ActivationBackend):
             else:
                 union = self._ones[:, None] + stim_ones[None, :] - intersection
                 sim = torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
+                if self._similarity in ("jaccard2", "j2", "jac2"):
+                    sim = sim * sim
             sim = self._apply_threshold(sim)
             if sim.numel() == 0:
                 return [0.0 for _ in range(self._codes.shape[0])]
@@ -710,31 +719,63 @@ class ActivationEngine:
         merged = BitArray(self._code_length)
         if not active_detectors:
             return merged
-        bit_priority: dict[int, float] = {}
+
+        ranked: list[tuple[float, ActivatedDetector]] = []
         for activated in active_detectors:
-            code = activated.detector.output_code
             color = activated.detector.lambda_threshold
-            weight = activated.activation_level * color
-            if weight <= 0.0:
+            priority = activated.activation_level * color
+            if priority > 0.0:
+                ranked.append((priority, activated))
+
+        if not ranked:
+            return merged
+
+        ranked.sort(key=lambda item: item[0], reverse=True)
+
+        bits_count = 0
+        used_detectors = 0
+        skipped_detectors = 0
+
+        for priority, activated in ranked:
+            if bits_count >= self._saturation_limit:
+                skipped_detectors += 1
                 continue
+
+            code = activated.detector.output_code
+
+            # Count how many *new* bits this detector would add.
+            new_bits = 0
             for idx, bit in enumerate(code):
-                if not bit:
-                    continue
-                current = bit_priority.get(idx)
-                if current is None or weight > current:
-                    bit_priority[idx] = weight
-        sorted_bits = sorted(bit_priority.items(), key=lambda item: item[1], reverse=True)
-        for idx, _ in sorted_bits[: self._saturation_limit]:
-            merged.set(idx, 1)
+                if bit and not merged[idx]:
+                    new_bits += 1
+
+            if new_bits == 0:
+                continue
+
+            # To preserve detector structure (as in detector insertion / color merge),
+            # we either insert the detector code as a whole or skip it.
+            if bits_count + new_bits > self._saturation_limit:
+                skipped_detectors += 1
+                continue
+
+            for idx, bit in enumerate(code):
+                if bit and not merged[idx]:
+                    merged.set(idx, 1)
+                    bits_count += 1
+
+            used_detectors += 1
+
         LOGGER.event(
             "activation.color_merge",
             section=COLOR_MERGE,
             data={
-                "candidate_bits": len(bit_priority),
-                "selected_bits": merged.count(),
+                "candidate_detectors": len(ranked),
+                "used_detectors": used_detectors,
+                "skipped_detectors": skipped_detectors,
+                "selected_bits": bits_count,
                 "saturation_limit": self._saturation_limit,
-                "priority_max": 0.0 if not sorted_bits else sorted_bits[0][1],
-                "priority_min": 0.0 if not sorted_bits else sorted_bits[-1][1],
+                "priority_max": ranked[0][0],
+                "priority_min": ranked[-1][0],
             },
         )
         return merged

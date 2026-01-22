@@ -112,7 +112,7 @@ ACTIVATION_SAMPLE_IMAGES = 33
 ACTIVATION_LAMBDA_LEVELS = (0.5, 0.7, 0.85)
 ACTIVATION_USE_GPU = True
 
-DECODER_SIMILARITY = "cosine"
+DECODER_SIMILARITY = "jaccard2"
 DECODER_SOFTMAX_TEMPERATURE = 0.35
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
@@ -1372,6 +1372,9 @@ class MnistDecodeRunner:
                 temperature=DECODER_SOFTMAX_TEMPERATURE,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
+                knn_top_k=200,
+                top_k_per_class=20,
+                min_similarity=0.0,
             ),
         )
         self._decoder = MnistDecoder(
