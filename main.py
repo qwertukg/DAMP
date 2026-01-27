@@ -101,18 +101,23 @@ LAYOUT_MIN_SWAP_WINDOW = 1
 
 ACTIVATION_LAMBDA_THRESHOLD = 0.6
 ACTIVATION_ETA = None
-ACTIVATION_ENERGY_THRESHOLD = 0.0
-ACTIVATION_DETECTOR_THRESHOLD = 0.5
-ACTIVATION_SATURATION_LIMIT = 50
+ACTIVATION_ENERGY_THRESHOLD = 0.12
+ACTIVATION_DETECTOR_THRESHOLD = 0.45
+ACTIVATION_SATURATION_LIMIT = 260
 ACTIVATION_POINT_ENERGY_RADIUS = 3
-ACTIVATION_DETECTOR_RADIUS = 3
-ACTIVATION_MAX_DETECTORS = 128
-ACTIVATION_OUTPUT_BITS = 256
-ACTIVATION_SAMPLE_IMAGES = 33
-ACTIVATION_LAMBDA_LEVELS = (0.5, 0.7, 0.85)
+ACTIVATION_DETECTOR_RADIUS = 6
+ACTIVATION_DETECTOR_RADIUS_MIN = 1
+ACTIVATION_DETECTOR_TARGET_POINTS = 28
+ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR = 0.8
+ACTIVATION_DETECTOR_STEP_DENSITY = 6
+
+ACTIVATION_MAX_DETECTORS = 2048
+ACTIVATION_OUTPUT_BITS = 8192
+ACTIVATION_SAMPLE_IMAGES = 6000
+ACTIVATION_LAMBDA_LEVELS = (0.45, 0.55, 0.65, 0.75, 0.85)
 ACTIVATION_USE_GPU = True
 
-DECODER_SIMILARITY = "cosine"
+DECODER_SIMILARITY = "jaccard2"
 DECODER_SOFTMAX_TEMPERATURE = 0.35
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
@@ -640,6 +645,13 @@ def _build_detectors_from_layout(
     output_bits: int,
     lambda_levels: tuple[float, ...],
 ) -> list[Detector]:
+    """
+    Построение иерархии детекторов "как в статье":
+    - несколько уровней λ (детекторная иерархия);
+    - радиус детектора выбирается адаптивно (приближение fill-factor) по целевому числу точек покрытия;
+    - центры детекторов выбираются из точек с высокой статической энергией и разреживаются (NMS);
+    - выходной код детектора — уникальный бит в своём слое (без коллизий).
+    """
     if radius <= 0:
         raise ValueError("detector radius must be positive")
     if max_detectors <= 0:
@@ -650,37 +662,137 @@ def _build_detectors_from_layout(
         raise ValueError("lambda_levels must be non-empty")
     if len(energies) != len(layout._positions):
         raise ValueError("energies size must match layout points")
+
+    layers = len(lambda_levels)
+    per_layer_limit = max(1, max_detectors // layers)
+    required_bits = per_layer_limit * layers
+    if output_bits < required_bits:
+        raise ValueError(
+            f"output_bits must be >= per_layer_limit*layers ({required_bits}), got {output_bits}"
+        )
+
+    # Предпочитаем точки с высокой статической энергией
     sorted_indices = sorted(range(len(energies)), key=lambda i: energies[i], reverse=True)
+
+    # Быстрая выборка индексов по радиусу через grid/row_occupied (как в _compute_point_energies)
+    row_occupied = layout._row_occupied
+    grid = layout.grid
+    height = layout.height
+    width = layout.width
+    pos_y = layout._pos_y
+    pos_x = layout._pos_x
+
+    def covered_indices_for(center_idx: int, r: int) -> list[int]:
+        cy = pos_y[center_idx]
+        cx = pos_x[center_idx]
+        r_sq = r * r
+        covered: list[int] = []
+        y_min = max(0, cy - r)
+        y_max = min(height - 1, cy + r)
+        x_min = max(0, cx - r)
+        x_max = min(width - 1, cx + r)
+        for y in range(y_min, y_max + 1):
+            dy = cy - y
+            dy_sq = dy * dy
+            occupied = row_occupied[y]
+            if not occupied:
+                continue
+            for x in occupied:
+                if x < x_min or x > x_max:
+                    continue
+                dx = cx - x
+                if dy_sq + dx * dx > r_sq:
+                    continue
+                other_idx = grid[y][x]
+                if other_idx is None:
+                    continue
+                covered.append(other_idx)
+        return covered
+
+    # Адаптивный радиус (приближение подбора fill-factor)
+    r_min = ACTIVATION_DETECTOR_RADIUS_MIN
+    r_max = radius
+    target_points = max(1, ACTIVATION_DETECTOR_TARGET_POINTS)
+
+    def choose_radius(center_idx: int) -> tuple[int, list[int]]:
+        chosen_r = r_max
+        chosen_cov: list[int] = []
+        for r in range(r_min, r_max + 1):
+            cov = covered_indices_for(center_idx, r)
+            if len(cov) >= target_points:
+                return r, cov
+            # запомним лучший (самый большой) на случай, если до цели не дотянули
+            if len(cov) > len(chosen_cov):
+                chosen_cov = cov
+                chosen_r = r
+        return chosen_r, chosen_cov
+
+    # NMS: не даём центрам быть слишком близко (избегаем дубликатов детекторов)
+    min_dist = max(1.0, float(r_max) * float(ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR))
+    min_dist_sq = min_dist * min_dist
+    chosen_centers: list[tuple[float, float]] = []
+
     detectors: list[Detector] = []
-    radius_sq = float(radius * radius)
-    per_layer_limit = max(1, max_detectors // len(lambda_levels))
-    for lambda_value in lambda_levels:
+
+    for layer_idx, lambda_value in enumerate(lambda_levels):
         layer_detectors: list[Detector] = []
-        step = max(1, len(sorted_indices) // per_layer_limit)
+        layer_offset = layer_idx * per_layer_limit
+
+        # Берём кандидатов плотнее, чем "строго per_layer_limit", чтобы NMS не выжигал слой
+        step = max(1, len(sorted_indices) // (per_layer_limit * max(1, int(ACTIVATION_DETECTOR_STEP_DENSITY))))
+
+        local_id = 0
         for idx in sorted_indices[::step]:
             if len(layer_detectors) >= per_layer_limit or len(detectors) >= max_detectors:
                 break
-            center = layout._positions[idx]
-            covered_indices = _points_in_radius(center, layout._positions, radius_sq)
-            if not covered_indices:
+
+            cy = pos_y[idx]
+            cx = pos_x[idx]
+            # NMS check
+            too_close = False
+            for (py, px) in chosen_centers:
+                dy = float(cy) - float(py)
+                dx = float(cx) - float(px)
+                if dy * dy + dx * dx < min_dist_sq:
+                    too_close = True
+                    break
+            if too_close:
                 continue
-            energy_sum = sum(energies[i] for i in covered_indices)
+
+            chosen_r, covered = choose_radius(idx)
+            if not covered:
+                continue
+
+            # В статье далее используется энергия точки (static energy) — мы используем сумму в области как e_d
+            energy_sum = 0.0
+            for i in covered:
+                energy_sum += energies[i]
             if energy_sum <= 0.0:
                 continue
+
+            # Уникальный бит в своём слое (без коллизий)
+            bit_index = layer_offset + local_id
+            if bit_index >= output_bits:
+                break
             output_code = BitArray(output_bits)
-            bit_index = (idx + int(lambda_value * 1000)) % output_bits
             output_code.set(bit_index, 1)
+            local_id += 1
+
+            center = (cy, cx)
             detector = Detector(
                 center=center,
-                radius=float(radius),
+                radius=float(chosen_r),
                 lambda_threshold=lambda_value,
                 energy=energy_sum,
-                points_count=len(covered_indices),
+                points_count=len(covered),
                 output_code=output_code,
                 label=f"λ={lambda_value:.2f}",
             )
+
             layer_detectors.append(detector)
             detectors.append(detector)
+            chosen_centers.append((float(cy), float(cx)))
+
         LOGGER.event(
             "activation.detector.layer",
             section=DETECTOR_CONSTRUCTION,
@@ -689,10 +801,15 @@ def _build_detectors_from_layout(
                 "layer_detectors": len(layer_detectors),
                 "per_layer_limit": per_layer_limit,
                 "total_detectors": len(detectors),
+                "radius_min": r_min,
+                "radius_max": r_max,
+                "target_points": target_points,
             },
         )
+
         if len(detectors) >= max_detectors:
             break
+
     if not detectors:
         raise RuntimeError("не удалось построить ни одного детектора для активации")
     return detectors
@@ -1372,6 +1489,9 @@ class MnistDecodeRunner:
                 temperature=DECODER_SOFTMAX_TEMPERATURE,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
+                knn_top_k=200,
+                top_k_per_class=20,
+                min_similarity=0.0,
             ),
         )
         self._decoder = MnistDecoder(

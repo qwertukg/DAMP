@@ -21,6 +21,9 @@ class DecoderConfig:
     temperature: float
     min_confidence: float
     expected_classes: Sequence[int]
+    knn_top_k: int = 50
+    top_k_per_class: int = 0
+    min_similarity: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -42,17 +45,31 @@ class EmbeddingDatabase:
             raise ValueError("embeddings must be non-empty")
         if config.temperature <= 0:
             raise ValueError("temperature must be positive")
+        if config.knn_top_k <= 0:
+            raise ValueError("knn_top_k must be positive")
+        if config.top_k_per_class < 0:
+            raise ValueError("top_k_per_class must be non-negative")
+        if config.min_similarity < 0:
+            raise ValueError("min_similarity must be non-negative")
+
         self._config = config
         self._embeddings = list(embeddings)
+
         expected = list(config.expected_classes)
         if not expected:
             expected = sorted({item.label for item in embeddings})
         self._expected_classes = expected
-        self._by_class: dict[int, list[BitArray]] = defaultdict(list)
+
+        # Precompute counts once (BitArray.count() can be non-trivial).
+        self._items: list[tuple[int, BitArray, int]] = []
+        self._by_class: dict[int, list[tuple[BitArray, int]]] = defaultdict(list)
         for item in self._embeddings:
             if item.label not in self._expected_classes:
                 continue
-            self._by_class[item.label].append(item.embedding)
+            ones = item.embedding.count()
+            self._items.append((item.label, item.embedding, ones))
+            self._by_class[item.label].append((item.embedding, ones))
+
         LOGGER.event(
             "decoder.base.init",
             section=SIMILARITY_MEASURES,
@@ -61,6 +78,9 @@ class EmbeddingDatabase:
                 "classes": len(self._expected_classes),
                 "similarity": self._config.similarity,
                 "temperature": self._config.temperature,
+                "knn_top_k": self._config.knn_top_k,
+                "top_k_per_class": self._config.top_k_per_class,
+                "min_similarity": self._config.min_similarity,
             },
         )
 
@@ -78,6 +98,7 @@ class EmbeddingDatabase:
         *,
         temperature: float | None = None,
         top_k: int | None = None,
+        top_k_per_class: int | None = None,
     ) -> PredictionResult:
         if len(embedding) == 0:
             raise ValueError("embedding must be non-empty")
@@ -86,37 +107,105 @@ class EmbeddingDatabase:
         if temp <= 0:
             raise ValueError("temperature must be positive")
 
-        k = int(top_k) if top_k is not None else 50
-        if k <= 0:
+        k_total = int(top_k) if top_k is not None else int(self._config.knn_top_k)
+        if k_total <= 0:
             raise ValueError("top_k must be positive")
 
-        query_ones = embedding.count()
+        k_per_class = (
+            int(top_k_per_class)
+            if top_k_per_class is not None
+            else int(self._config.top_k_per_class)
+        )
+        if k_per_class < 0:
+            raise ValueError("top_k_per_class must be non-negative")
 
-        # Top-K fuzzy search over the full embedding memory (approx. associative recall).
+        query_ones = embedding.count()
+        if query_ones <= 0:
+            uniform = 1.0 / max(len(self._expected_classes), 1)
+            return PredictionResult(
+                predicted_class=int(self._expected_classes[0]) if self._expected_classes else -1,
+                probabilities=[uniform for _ in self._expected_classes],
+                confidence=uniform,
+            )
+
+        min_sim = float(self._config.min_similarity)
+
+        # Fuzzy search over the full embedding memory (approx. associative recall).
+        # Two modes:
+        #  - Global top-K (default)
+        #  - Balanced per-class top-K then merge (helps when class counts are skewed)
         import heapq
 
-        heap: list[tuple[float, int]] = []
-        for item in self._embeddings:
-            label = item.label
-            if label not in self._expected_classes:
-                continue
-            sim = self._similarity_value(embedding, query_ones, item.embedding)
-            if sim <= 0.0:
-                continue
-            if len(heap) < k:
-                heapq.heappush(heap, (sim, label))
-            elif sim > heap[0][0]:
-                heapq.heapreplace(heap, (sim, label))
+        neighbors: list[tuple[float, int]] = []
 
-        neighbors = sorted(heap, key=lambda pair: pair[0], reverse=True)
+        if k_per_class > 0:
+            heaps_by_class: dict[int, list[tuple[float, int]]] = {lbl: [] for lbl in self._expected_classes}
+            for label, stored, stored_ones in self._items:
+                sim = self._similarity_value(embedding, query_ones, stored, stored_ones)
+                if sim <= min_sim:
+                    continue
+                h = heaps_by_class[label]
+                if len(h) < k_per_class:
+                    heapq.heappush(h, (sim, label))
+                elif sim > h[0][0]:
+                    heapq.heapreplace(h, (sim, label))
 
+            for h in heaps_by_class.values():
+                neighbors.extend(h)
+
+            # Optional final trim to global top-K to keep vote compute stable.
+            if len(neighbors) > k_total:
+                neighbors = heapq.nlargest(k_total, neighbors, key=lambda pair: pair[0])
+            strategy = "per_class_topk"
+        else:
+            heap: list[tuple[float, int]] = []
+            for label, stored, stored_ones in self._items:
+                sim = self._similarity_value(embedding, query_ones, stored, stored_ones)
+                if sim <= min_sim:
+                    continue
+                if len(heap) < k_total:
+                    heapq.heappush(heap, (sim, label))
+                elif sim > heap[0][0]:
+                    heapq.heapreplace(heap, (sim, label))
+            neighbors = heapq.nlargest(len(heap), heap, key=lambda pair: pair[0])
+            strategy = "global_topk"
+
+        if not neighbors:
+            uniform = 1.0 / max(len(self._expected_classes), 1)
+            probabilities = [uniform for _ in self._expected_classes]
+            predicted_label = self._expected_classes[int(np.argmax(probabilities))] if probabilities else -1
+            confidence = max(probabilities) if probabilities else 0.0
+            LOGGER.event(
+                "decoder.base.predict",
+                section=SIMILARITY_DEFINITION,
+                data={
+                    "classes": len(self._expected_classes),
+                    "best_label": predicted_label,
+                    "confidence": confidence,
+                    "temperature": temp,
+                    "similarity": self._config.similarity,
+                    "top_k": k_total,
+                    "top_k_per_class": k_per_class,
+                    "neighbors": 0,
+                    "strategy": strategy,
+                    "min_similarity": min_sim,
+                    "low_confidence": confidence < self._config.min_confidence,
+                },
+            )
+            return PredictionResult(
+                predicted_class=int(predicted_label),
+                probabilities=probabilities,
+                confidence=confidence,
+            )
+
+        # Stable soft-vote: subtract max sim before exp.
+        max_sim = max(sim for sim, _ in neighbors)
         class_weight: dict[int, float] = {label: 0.0 for label in self._expected_classes}
         class_best_sim: dict[int, float] = {label: 0.0 for label in self._expected_classes}
         class_count: dict[int, int] = {label: 0 for label in self._expected_classes}
 
         for sim, label in neighbors:
-            # Weighting: soft vote with temperature on similarity (higher temp -> smoother).
-            w = math.exp(sim / temp)
+            w = math.exp((sim - max_sim) / temp)
             class_weight[label] += w
             class_count[label] += 1
             if sim > class_best_sim[label]:
@@ -124,7 +213,6 @@ class EmbeddingDatabase:
 
         total_w = sum(class_weight.values())
         if total_w <= 0.0:
-            # Degenerate case: no overlap found; fall back to uniform probabilities.
             uniform = 1.0 / max(len(self._expected_classes), 1)
             probabilities = [uniform for _ in self._expected_classes]
         else:
@@ -133,7 +221,6 @@ class EmbeddingDatabase:
         predicted_label = self._expected_classes[int(np.argmax(probabilities))] if probabilities else -1
         confidence = max(probabilities) if probabilities else 0.0
 
-        # For debugging, record top classes by total weight (not by mean similarity).
         details = [
             (label, class_weight[label], class_best_sim[label], class_count[label])
             for label in self._expected_classes
@@ -149,8 +236,11 @@ class EmbeddingDatabase:
                 "confidence": confidence,
                 "temperature": temp,
                 "similarity": self._config.similarity,
-                "top_k": k,
+                "top_k": k_total,
+                "top_k_per_class": k_per_class,
                 "neighbors": len(neighbors),
+                "strategy": strategy,
+                "min_similarity": min_sim,
                 "top_scores": best_scores,
                 "low_confidence": confidence < self._config.min_confidence,
             },
@@ -161,34 +251,35 @@ class EmbeddingDatabase:
             confidence=confidence,
         )
 
-    def _to_probabilities(self, scores: dict[int, float], *, temperature: float | None) -> dict[int, float]:
-        temp = temperature if temperature is not None else self._config.temperature
-        if temp <= 0:
-            raise ValueError("temperature must be positive")
-        if not scores:
-            return {}
-        scaled = {label: score / temp for label, score in scores.items()}
-        max_scaled = max(scaled.values())
-        exps = {label: math.exp(value - max_scaled) for label, value in scaled.items()}
-        total = sum(exps.values()) or 1.0
-        probs = {label: value / total for label, value in exps.items()}
-        min_conf = self._config.min_confidence
-        if min_conf > 0:
-            probs = {label: max(prob, 0.0) for label, prob in probs.items()}
-        return probs
-
-    def _similarity_value(self, query: BitArray, query_ones: int, stored: BitArray) -> float:
+    def _similarity_value(self, query: BitArray, query_ones: int, stored: BitArray, stored_ones: int) -> float:
         if len(query) != len(stored):
             raise ValueError("embedding sizes must match for similarity")
-        ones_b = stored.count()
-        if query_ones <= 0 or ones_b <= 0:
+        if query_ones <= 0 or stored_ones <= 0:
             return 0.0
+
         common = query.common(stored)
-        if self._config.similarity == "cosine":
-            denom = math.sqrt(query_ones * ones_b)
+        sim_name = (self._config.similarity or "").lower()
+
+        if sim_name in ("cosine", "cos"):
+            denom = math.sqrt(query_ones * stored_ones)
             return 0.0 if denom == 0 else common / denom
-        union = query_ones + ones_b - common
-        return 0.0 if union == 0 else common / union
+
+        if sim_name in ("cosine2", "cos2"):
+            denom = math.sqrt(query_ones * stored_ones)
+            if denom == 0:
+                return 0.0
+            v = common / denom
+            return v * v
+
+        # Default: Jaccard family (recommended for sparse bit codes).
+        union = query_ones + stored_ones - common
+        if union == 0:
+            return 0.0
+        v = common / union
+
+        if sim_name in ("jaccard2", "j2", "jac2"):
+            return v * v
+        return v
 
 
 class MnistDecoder:
