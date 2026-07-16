@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
 from typing import Any, Mapping, Sequence
 
 import rerun as rr
@@ -14,6 +15,7 @@ class LogVisual:
     payload: object
     timeline: str | None = None
     time: int | float | None = None
+    static: bool = False
 
 
 class LogIntervalPolicy:
@@ -46,21 +48,27 @@ class DampLogger:
         self._app_id = app_id
         self._base_path = base_path
         self._spawn = spawn
+        self._initialized = False
         self._spawned = False
+        self._event_sequence = 0
         self._interval_policy: LogIntervalPolicy | None = None
 
     def _ensure_rerun(self) -> None:
-        if rr.is_enabled():
-            if self._spawn:
-                self._spawned = True
-            return
-        rr.init(self._app_id)
-        if self._spawn:
+        if not self._initialized:
+            rr.init(self._app_id)
+            self._initialized = True
+        if self._spawn and not self._spawned and rr.is_enabled():
             rr.spawn()
             self._spawned = True
 
     def _console_log(self, message: str) -> None:
-        print(message)
+        stream = sys.stdout
+        try:
+            print(message, file=stream)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, "encoding", None) or "utf-8"
+            safe_message = message.encode(encoding, errors="backslashreplace").decode(encoding)
+            print(safe_message, file=stream)
 
     @staticmethod
     def _format_value(value: Any, *, max_items: int = 8, max_chars: int = 200) -> str:
@@ -166,6 +174,9 @@ class DampLogger:
         message = f"{message} [{section}]"
         self._console_log(message)
         self._ensure_rerun()
+        self._event_sequence += 1
+        rr.reset_time()
+        rr.set_time("event", sequence=self._event_sequence)
         base_path = path or self._base_path
         rr.log(base_path, rr.TextLog(message))
         if data:
@@ -175,14 +186,18 @@ class DampLogger:
                 rr.log(anyvalues_path, rr.AnyValues(**anyvalues))
         if visuals:
             for visual in visuals:
+                rr.reset_time()
+                if not visual.static:
+                    rr.set_time("event", sequence=self._event_sequence)
                 if visual.timeline is not None and visual.time is not None:
                     rr.set_time(visual.timeline, sequence=visual.time)
-                rr.log(visual.path, visual.payload)
+                rr.log(visual.path, visual.payload, static=visual.static)
+        rr.reset_time()
 
-    def visual_image(self, path: str, image) -> LogVisual:
+    def visual_image(self, path: str, image, *, static: bool = False) -> LogVisual:
         import numpy as np
 
-        return LogVisual(path=path, payload=rr.Image(np.asarray(image)))
+        return LogVisual(path=path, payload=rr.Image(np.asarray(image)), static=static)
 
     def visual_points2d(
         self,
@@ -191,8 +206,13 @@ class DampLogger:
         *,
         colors: Sequence[Sequence[int]] | None = None,
         radii: float | Sequence[float] | None = None,
+        static: bool = False,
     ) -> LogVisual:
-        return LogVisual(path=path, payload=rr.Points2D(positions, colors=colors, radii=radii))
+        return LogVisual(
+            path=path,
+            payload=rr.Points2D(positions, colors=colors, radii=radii),
+            static=static,
+        )
 
     def visual_bar_chart(self, path: str, values: Sequence[int]) -> LogVisual:
         return LogVisual(path=path, payload=rr.BarChart(list(values)))

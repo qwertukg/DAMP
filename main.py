@@ -20,6 +20,7 @@ from damp.article_refs import (
     STIMULUS_DETECTION,
     ENCODING_SYSTEM,
     GPU_IMPLEMENTATION,
+    PARALLEL_PROCESSING,
 )
 from damp.activation import ActivationEngine, Detector
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
@@ -45,19 +46,23 @@ LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
 LOG_INTERVAL_LAYOUT_EXPORT = 1
 LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS = 1
 LOG_INTERVAL_ACTIVATION_INIT = 1
-LOG_INTERVAL_ACTIVATION_MAP = 1
-LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL = 10
-LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE = 1
-LOG_INTERVAL_ACTIVATION_EMBEDDING = 1
-LOG_INTERVAL_ACTIVATION_COLOR_MERGE = 1
-LOG_INTERVAL_ACTIVATION_COVERAGE = 1
+LOG_INTERVAL_ACTIVATION_MAP = 100
+LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL = 10000
+LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE = 10000
+LOG_INTERVAL_ACTIVATION_EMBEDDING = 100
+LOG_INTERVAL_ACTIVATION_COLOR_MERGE = 100
+LOG_INTERVAL_ACTIVATION_COVERAGE = 100
 LOG_INTERVAL_ACTIVATION_ENERGY_MAP = 1
 LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER = 1
-LOG_INTERVAL_ACTIVATION_SAMPLE = 1
-LOG_INTERVAL_ACTIVATION_VISUAL = 1
+LOG_INTERVAL_ACTIVATION_SAMPLE = 100
+LOG_INTERVAL_ACTIVATION_VISUAL = 100
 LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
 
 EMBEDDINGS_JSON_KEY = "embeddings"
+EMBEDDINGS_VERSION_KEY = "embeddings_version"
+EMBEDDINGS_VERSION = 3
+PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
+PIPELINE_CHECKPOINT_VERSION = 2
 
 LAYOUT_SIMILARITY = "cosine"
 LAYOUT_LAMBDA_THRESHOLD = 0.65
@@ -99,23 +104,26 @@ LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
 LAYOUT_MIN_SWAP_RATIO = 0.003
 LAYOUT_MIN_SWAP_WINDOW = 1
 
-ACTIVATION_LAMBDA_THRESHOLD = 0.6
+ACTIVATION_LAMBDA_THRESHOLD = 0.55
 ACTIVATION_ETA = None
 ACTIVATION_ENERGY_THRESHOLD = 0.12
-ACTIVATION_DETECTOR_THRESHOLD = 0.45
-ACTIVATION_SATURATION_LIMIT = 260
+ACTIVATION_DETECTOR_THRESHOLD = 0.5
+ACTIVATION_SATURATION_LIMIT = 50
 ACTIVATION_POINT_ENERGY_RADIUS = 3
 ACTIVATION_DETECTOR_RADIUS = 6
 ACTIVATION_DETECTOR_RADIUS_MIN = 1
 ACTIVATION_DETECTOR_TARGET_POINTS = 28
+ACTIVATION_DETECTOR_MIN_POINTS = 3
 ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR = 0.8
 ACTIVATION_DETECTOR_STEP_DENSITY = 6
 
-ACTIVATION_MAX_DETECTORS = 2048
-ACTIVATION_OUTPUT_BITS = 8192
-ACTIVATION_SAMPLE_IMAGES = 6000
-ACTIVATION_LAMBDA_LEVELS = (0.45, 0.55, 0.65, 0.75, 0.85)
+ACTIVATION_MAX_DETECTORS = 256
+ACTIVATION_OUTPUT_BITS = 256
+ACTIVATION_LAMBDA_LEVELS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.85)
 ACTIVATION_USE_GPU = True
+ACTIVATION_PARALLEL_WORKERS = 4
+ACTIVATION_BATCH_SIZE = 10
+ACTIVATION_CHECKPOINT_EVERY = 10
 
 DECODER_SIMILARITY = "jaccard2"
 DECODER_SOFTMAX_TEMPERATURE = 0.35
@@ -246,12 +254,19 @@ LOG_INTERVALS = {
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
 }
 
-LAYOUT_CACHE_PATTERN = "data/layout-{count}-*.json"
+LAYOUT_CACHE_PATTERNS = ("data/layout-{count}-*.json", "layout-{count}-*.json")
 
 
 def _layout_cache_paths_for_count(count: int) -> list[str]:
-    pattern = LAYOUT_CACHE_PATTERN.format(count=count)
-    return sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+    paths: list[str] = []
+    for pattern_template in LAYOUT_CACHE_PATTERNS:
+        pattern = pattern_template.format(count=count)
+        paths.extend(
+            path
+            for path in glob.glob(pattern)
+            if not path.endswith(PIPELINE_CHECKPOINT_SUFFIX)
+        )
+    return sorted(set(paths), key=os.path.getmtime, reverse=True)
 
 
 def _load_layout_metadata_from_path(path: str) -> tuple[int, int | None, bool] | None:
@@ -347,10 +362,12 @@ class EmbeddingRecord:
 
 
 class EmbeddingStore:
-    def __init__(self, json_key: str) -> None:
+    def __init__(self, json_key: str, *, version_key: str, version: int) -> None:
         if not json_key:
             raise ValueError("json_key must be provided for embedding storage")
         self._json_key = json_key
+        self._version_key = str(version_key)
+        self._version = int(version)
 
     def save(self, path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
         if not path:
@@ -376,6 +393,7 @@ class EmbeddingStore:
                 )
                 payload = {}
         payload[self._json_key] = [record.as_payload() for record in embeddings]
+        payload[self._version_key] = self._version
         with open(path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=True, indent=2)
         LOGGER.event(
@@ -396,6 +414,18 @@ def _load_embeddings_from_file(path: str) -> list["EmbeddingRecord"]:
         raise FileNotFoundError(path)
     with open(path, "r", encoding="utf-8") as fp:
         data = json.load(fp)
+    stored_version = data.get(EMBEDDINGS_VERSION_KEY)
+    if stored_version != EMBEDDINGS_VERSION:
+        LOGGER.event(
+            "activation.embedding.incompatible",
+            section=DETECTOR_HIERARCHY,
+            data={
+                "path": path,
+                "stored_version": stored_version,
+                "expected_version": EMBEDDINGS_VERSION,
+            },
+        )
+        return []
     raw_embeddings = data.get(EMBEDDINGS_JSON_KEY, [])
     embeddings: list[EmbeddingRecord] = []
     for item in raw_embeddings:
@@ -421,6 +451,100 @@ def _load_embeddings_from_file(path: str) -> list["EmbeddingRecord"]:
         },
     )
     return embeddings
+
+
+class PipelineCheckpointStore:
+    """Атомарно сохраняет прогресс этапов и частичные эмбеддинги."""
+
+    def __init__(self, *, suffix: str, version: int) -> None:
+        self._suffix = str(suffix)
+        self._version = int(version)
+
+    def path_for(self, layout_path: str) -> str:
+        return f"{layout_path}{self._suffix}"
+
+    def load(self, layout_path: str) -> dict[str, object]:
+        path = self.path_for(layout_path)
+        if not os.path.exists(path):
+            return self._empty_payload()
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+        except Exception as exc:
+            LOGGER.event(
+                "pipeline.checkpoint.load.error",
+                section=PARALLEL_PROCESSING,
+                data={"path": path, "error": str(exc)},
+            )
+            return self._empty_payload()
+        if payload.get("version") != self._version:
+            LOGGER.event(
+                "pipeline.checkpoint.incompatible",
+                section=PARALLEL_PROCESSING,
+                data={
+                    "path": path,
+                    "stored_version": payload.get("version"),
+                    "expected_version": self._version,
+                },
+            )
+            return self._empty_payload()
+        LOGGER.event(
+            "pipeline.checkpoint.load",
+            section=PARALLEL_PROCESSING,
+            data={
+                "path": path,
+                "completed": len(payload.get("embeddings", [])),
+                "stages": payload.get("stages", {}),
+            },
+        )
+        return payload
+
+    def save(
+        self,
+        layout_path: str,
+        *,
+        stages: dict[str, bool],
+        target_samples: int,
+        embeddings: Sequence[EmbeddingRecord],
+    ) -> None:
+        path = self.path_for(layout_path)
+        payload = {
+            "version": self._version,
+            "target_samples": int(target_samples),
+            "stages": dict(stages),
+            "embeddings": [record.as_payload() for record in embeddings],
+        }
+        temporary_path = f"{path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=True, indent=2)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(temporary_path, path)
+        LOGGER.event(
+            "pipeline.checkpoint.save",
+            section=PARALLEL_PROCESSING,
+            data={
+                "path": path,
+                "completed": len(embeddings),
+                "target": int(target_samples),
+                "stages": stages,
+            },
+        )
+
+    def records(self, payload: dict[str, object]) -> list[EmbeddingRecord]:
+        records: list[EmbeddingRecord] = []
+        for item in payload.get("embeddings", []):
+            if not isinstance(item, dict):
+                continue
+            class_label = item.get("class")
+            embedding = item.get("embedding")
+            if class_label is None or embedding is None:
+                continue
+            records.append(EmbeddingRecord(str(class_label), str(embedding)))
+        return records
+
+    def _empty_payload(self) -> dict[str, object]:
+        return {"version": self._version, "target_samples": 0, "stages": {}, "embeddings": []}
 
 
 def _embedding_records_to_labeled(records: Sequence["EmbeddingRecord"]) -> list[LabeledEmbedding]:
@@ -636,7 +760,7 @@ def _compute_point_energies(layout: Layout, radius: int) -> list[float]:
     return normalized
 
 
-def _build_detectors_from_layout(
+def _build_detectors_from_layout_legacy(
     layout: Layout,
     energies: list[float],
     *,
@@ -730,12 +854,12 @@ def _build_detectors_from_layout(
     # NMS: не даём центрам быть слишком близко (избегаем дубликатов детекторов)
     min_dist = max(1.0, float(r_max) * float(ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR))
     min_dist_sq = min_dist * min_dist
-    chosen_centers: list[tuple[float, float]] = []
-
     detectors: list[Detector] = []
 
     for layer_idx, lambda_value in enumerate(lambda_levels):
         layer_detectors: list[Detector] = []
+        # §6.4.5 запрещает перекрытие только внутри одного слоя D_lambda.
+        chosen_centers: list[tuple[float, float]] = []
         layer_offset = layer_idx * per_layer_limit
 
         # Берём кандидатов плотнее, чем "строго per_layer_limit", чтобы NMS не выжигал слой
@@ -763,11 +887,26 @@ def _build_detectors_from_layout(
             if not covered:
                 continue
 
-            # В статье далее используется энергия точки (static energy) — мы используем сумму в области как e_d
+            # §6.3: e_d = sum(a_ji * e_ji). Активация a_ji вычисляется
+            # кодом центра при пороге lambda данного слоя, а не заменяется единицей.
+            center_code = layout._points[idx].code
+            center_ones = layout._points[idx].ones
             energy_sum = 0.0
+            active_points = 0
             for i in covered:
-                energy_sum += energies[i]
-            if energy_sum <= 0.0:
+                point_energy = energies[i]
+                if point_energy < ACTIVATION_ENERGY_THRESHOLD:
+                    continue
+                point = layout._points[i]
+                denominator = math.sqrt(center_ones * point.ones)
+                if denominator <= 0.0:
+                    continue
+                activation = center_code.common(point.code) / denominator
+                if activation < lambda_value:
+                    continue
+                energy_sum += activation * point_energy
+                active_points += 1
+            if energy_sum <= 0.0 or active_points <= 0:
                 continue
 
             # Уникальный бит в своём слое (без коллизий)
@@ -784,7 +923,7 @@ def _build_detectors_from_layout(
                 radius=float(chosen_r),
                 lambda_threshold=lambda_value,
                 energy=energy_sum,
-                points_count=len(covered),
+                points_count=active_points,
                 output_code=output_code,
                 label=f"λ={lambda_value:.2f}",
             )
@@ -813,6 +952,259 @@ def _build_detectors_from_layout(
     if not detectors:
         raise RuntimeError("не удалось построить ни одного детектора для активации")
     return detectors
+
+
+@dataclass(frozen=True)
+class DetectorCandidate:
+    center: tuple[float, float]
+    radius: float
+    energy: float
+    points_count: int
+    fill_factor: float
+    insertion_density: float
+
+
+class DetectorHierarchyBuilder:
+    """Строит слои D_lambda по формулам §6.3–6.4.5."""
+
+    def __init__(
+        self,
+        *,
+        layout: Layout,
+        energies: Sequence[float],
+        radius: int,
+        radius_min: int,
+        min_points: int,
+        max_detectors: int,
+        output_bits: int,
+        lambda_levels: Sequence[float],
+        energy_threshold: float,
+        candidate_density: int,
+    ) -> None:
+        if radius <= 0 or radius_min <= 0 or radius_min > radius:
+            raise ValueError("invalid detector radius range")
+        if min_points <= 0:
+            raise ValueError("min_points must be positive")
+        if max_detectors <= 0 or output_bits <= 0:
+            raise ValueError("detector and output sizes must be positive")
+        if len(energies) != len(layout._positions):
+            raise ValueError("energies size must match layout points")
+        if not lambda_levels:
+            raise ValueError("lambda_levels must be non-empty")
+        self._layout = layout
+        self._energies = [float(value) for value in energies]
+        self._radius = int(radius)
+        self._radius_min = int(radius_min)
+        self._min_points = int(min_points)
+        self._max_detectors = int(max_detectors)
+        self._output_bits = int(output_bits)
+        self._lambda_levels = tuple(float(value) for value in lambda_levels)
+        self._energy_threshold = float(energy_threshold)
+        self._candidate_density = max(1, int(candidate_density))
+        self._sorted_indices = sorted(
+            range(len(self._energies)),
+            key=lambda index: self._energies[index],
+            reverse=True,
+        )
+
+    def build(self) -> list[Detector]:
+        per_layer_limit = max(1, self._max_detectors // len(self._lambda_levels))
+        if per_layer_limit * len(self._lambda_levels) > self._output_bits:
+            raise ValueError("output_bits is too small for detector hierarchy")
+        detectors: list[Detector] = []
+        for layer_index, lambda_value in enumerate(self._lambda_levels):
+            candidates = self._build_layer(lambda_value, per_layer_limit)
+            layer_offset = layer_index * per_layer_limit
+            for local_index, candidate in enumerate(candidates):
+                output_code = BitArray(self._output_bits)
+                output_code.set(layer_offset + local_index, 1)
+                detectors.append(
+                    Detector(
+                        center=candidate.center,
+                        radius=candidate.radius,
+                        lambda_threshold=lambda_value,
+                        energy=candidate.energy,
+                        points_count=candidate.points_count,
+                        output_code=output_code,
+                        label=f"λ={lambda_value:.2f}",
+                    )
+                )
+            LOGGER.event(
+                "activation.detector.layer",
+                section=DETECTOR_CONSTRUCTION,
+                data={
+                    "lambda": lambda_value,
+                    "layer_detectors": len(candidates),
+                    "per_layer_limit": per_layer_limit,
+                    "fill_min": min((item.fill_factor for item in candidates), default=0.0),
+                    "fill_max": max((item.fill_factor for item in candidates), default=0.0),
+                    "radius_min": min((item.radius for item in candidates), default=0.0),
+                    "radius_max": max((item.radius for item in candidates), default=0.0),
+                },
+            )
+        if not detectors:
+            raise RuntimeError("не удалось построить ни одного детектора для активации")
+        return detectors
+
+    def _build_layer(self, lambda_value: float, limit: int) -> list[DetectorCandidate]:
+        selected: list[DetectorCandidate] = []
+        step = max(1, len(self._sorted_indices) // (limit * self._candidate_density))
+        for center_index in self._sorted_indices[::step]:
+            candidate = self._make_candidate(center_index, lambda_value)
+            if candidate is None:
+                continue
+            overlaps = [
+                existing
+                for existing in selected
+                if self._overlaps(candidate, existing)
+            ]
+            if overlaps:
+                if any(
+                    existing.insertion_density >= candidate.insertion_density
+                    for existing in overlaps
+                ):
+                    continue
+                selected = [item for item in selected if item not in overlaps]
+            selected.append(candidate)
+        selected.sort(key=lambda item: item.insertion_density, reverse=True)
+        return selected[:limit]
+
+    def _make_candidate(
+        self,
+        center_index: int,
+        lambda_value: float,
+    ) -> DetectorCandidate | None:
+        if self._energies[center_index] < self._energy_threshold:
+            return None
+        center_point = self._layout._points[center_index]
+        center_y = self._layout._pos_y[center_index]
+        center_x = self._layout._pos_x[center_index]
+        active: dict[tuple[int, int], tuple[int, float]] = {}
+        for point_index in self._indices_in_radius(center_y, center_x, self._radius):
+            point_energy = self._energies[point_index]
+            if point_energy < self._energy_threshold:
+                continue
+            point = self._layout._points[point_index]
+            denominator = math.sqrt(center_point.ones * point.ones)
+            if denominator <= 0.0:
+                continue
+            activation = center_point.code.common(point.code) / denominator
+            if activation < lambda_value:
+                continue
+            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
+            active[position] = (point_index, activation * point_energy)
+        seed = (center_y, center_x)
+        if seed not in active:
+            return None
+        cluster_positions = self._connected_component(seed, active)
+        if len(cluster_positions) < self._min_points:
+            return None
+        weight_sum = sum(active[position][1] for position in cluster_positions)
+        if weight_sum <= 0.0:
+            return None
+        centroid_y = sum(position[0] * active[position][1] for position in cluster_positions) / weight_sum
+        centroid_x = sum(position[1] * active[position][1] for position in cluster_positions) / weight_sum
+        distances = sorted(
+            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
+            for position in cluster_positions
+        )
+        best_radius = 0.0
+        best_fill = -1.0
+        for distance in distances:
+            candidate_radius = max(float(self._radius_min), distance)
+            if candidate_radius > self._radius:
+                continue
+            points_count = sum(1 for value in distances if value <= candidate_radius)
+            if points_count < self._min_points:
+                continue
+            fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
+            if fill_factor > best_fill:
+                best_fill = fill_factor
+                best_radius = candidate_radius
+        if best_radius <= 0.0:
+            return None
+        included = [
+            position
+            for position in cluster_positions
+            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
+        ]
+        detector_energy = sum(active[position][1] for position in included)
+        points_count = len(included)
+        if detector_energy <= 0.0 or points_count < self._min_points:
+            return None
+        return DetectorCandidate(
+            center=(centroid_y, centroid_x),
+            radius=best_radius,
+            energy=detector_energy,
+            points_count=points_count,
+            fill_factor=best_fill,
+            insertion_density=points_count / best_radius,
+        )
+
+    def _indices_in_radius(self, center_y: int, center_x: int, radius: int) -> list[int]:
+        indices: list[int] = []
+        radius_sq = radius * radius
+        for y in range(max(0, center_y - radius), min(self._layout.height - 1, center_y + radius) + 1):
+            dy_sq = (center_y - y) ** 2
+            for x in self._layout._row_occupied[y]:
+                if x < center_x - radius or x > center_x + radius:
+                    continue
+                if dy_sq + (center_x - x) ** 2 > radius_sq:
+                    continue
+                point_index = self._layout.grid[y][x]
+                if point_index is not None:
+                    indices.append(point_index)
+        return indices
+
+    @staticmethod
+    def _connected_component(
+        seed: tuple[int, int],
+        active: dict[tuple[int, int], tuple[int, float]],
+    ) -> list[tuple[int, int]]:
+        pending = [seed]
+        visited = {seed}
+        while pending:
+            y, x = pending.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    neighbour = (y + dy, x + dx)
+                    if neighbour in active and neighbour not in visited:
+                        visited.add(neighbour)
+                        pending.append(neighbour)
+        return list(visited)
+
+    @staticmethod
+    def _overlaps(left: DetectorCandidate, right: DetectorCandidate) -> bool:
+        distance = math.hypot(
+            left.center[0] - right.center[0],
+            left.center[1] - right.center[1],
+        )
+        return distance <= left.radius or distance <= right.radius
+
+
+def _build_detectors_from_layout(
+    layout: Layout,
+    energies: list[float],
+    *,
+    radius: int,
+    max_detectors: int,
+    output_bits: int,
+    lambda_levels: tuple[float, ...],
+) -> list[Detector]:
+    return DetectorHierarchyBuilder(
+        layout=layout,
+        energies=energies,
+        radius=radius,
+        radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
+        min_points=ACTIVATION_DETECTOR_MIN_POINTS,
+        max_detectors=max_detectors,
+        output_bits=output_bits,
+        lambda_levels=lambda_levels,
+        energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
+        candidate_density=ACTIVATION_DETECTOR_STEP_DENSITY,
+    ).build()
 
 
 def _build_activation_engine(layout: Layout, energies: list[float]) -> ActivationEngine:
@@ -1164,18 +1556,27 @@ class MnistLayoutRunner:
         *,
         count: int,
         label: int | None = None,
-        activation_samples: int = ACTIVATION_SAMPLE_IMAGES,
+        activation_samples: int | None = None,
     ) -> None:
         self.count = count
         self.label = label
-        if activation_samples <= 0:
+        resolved_activation_samples = count if activation_samples is None else int(activation_samples)
+        if resolved_activation_samples <= 0:
             raise ValueError("activation_samples must be positive")
-        self._activation_samples = int(activation_samples)
+        self._activation_samples = resolved_activation_samples
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
         self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
-        self._embedding_store = EmbeddingStore(json_key=EMBEDDINGS_JSON_KEY)
+        self._embedding_store = EmbeddingStore(
+            json_key=EMBEDDINGS_JSON_KEY,
+            version_key=EMBEDDINGS_VERSION_KEY,
+            version=EMBEDDINGS_VERSION,
+        )
+        self._checkpoint_store = PipelineCheckpointStore(
+            suffix=PIPELINE_CHECKPOINT_SUFFIX,
+            version=PIPELINE_CHECKPOINT_VERSION,
+        )
 
     def _layout_cache_paths(self) -> list[str]:
         return _layout_cache_paths_for_count(self.count)
@@ -1295,7 +1696,15 @@ class MnistLayoutRunner:
             },
         )
 
-    def _run_activation(self, layout: Layout, dataset) -> list[EmbeddingRecord]:
+    def _run_activation(
+        self,
+        layout: Layout,
+        dataset,
+        *,
+        layout_path: str,
+        stages: dict[str, bool],
+        initial_embeddings: Sequence[EmbeddingRecord],
+    ) -> list[EmbeddingRecord]:
         energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
         engine = _build_activation_engine(layout, energies)
         samples = _collect_samples(
@@ -1305,26 +1714,53 @@ class MnistLayoutRunner:
             self.extractor,
             label=self.label,
         )
-        embeddings: list[EmbeddingRecord] = []
-        for idx, (label, codes) in enumerate(samples):
-            result = engine.activate(codes)
-            LOGGER.event(
-                "activation.sample",
-                section=STIMULUS_DETECTION,
-                data={
-                    "index": idx,
-                    "sample_label": str(int(label)),
-                    "stimuli": len(codes),
-                    "active_detectors": len(result.active_detectors),
-                    "embedding_bits": result.embedding.count(),
-                },
+        embeddings = list(initial_embeddings[: len(samples)])
+        start_index = len(embeddings)
+        LOGGER.event(
+            "activation.resume",
+            section=PARALLEL_PROCESSING,
+            data={
+                "completed": start_index,
+                "target": len(samples),
+                "workers": ACTIVATION_PARALLEL_WORKERS,
+                "batch_size": ACTIVATION_BATCH_SIZE,
+            },
+        )
+        for batch_start in range(start_index, len(samples), ACTIVATION_BATCH_SIZE):
+            batch = samples[batch_start : batch_start + ACTIVATION_BATCH_SIZE]
+            results = engine.activate_many(
+                [codes for _, codes in batch],
+                max_workers=ACTIVATION_PARALLEL_WORKERS,
             )
-            embeddings.append(
-                EmbeddingRecord(
-                    class_label=str(int(label)),
-                    embedding_bits=result.embedding.to01(),
+            for offset, ((label, codes), result) in enumerate(zip(batch, results)):
+                index = batch_start + offset
+                LOGGER.event(
+                    "activation.sample",
+                    section=STIMULUS_DETECTION,
+                    data={
+                        "index": index,
+                        "sample_label": str(int(label)),
+                        "stimuli": len(codes),
+                        "active_detectors": len(result.active_detectors),
+                        "embedding_bits": result.embedding.count(),
+                    },
                 )
-            )
+                embeddings.append(
+                    EmbeddingRecord(
+                        class_label=str(int(label)),
+                        embedding_bits=result.embedding.to01(),
+                    )
+                )
+            if (
+                len(embeddings) % ACTIVATION_CHECKPOINT_EVERY == 0
+                or len(embeddings) == len(samples)
+            ):
+                self._checkpoint_store.save(
+                    layout_path,
+                    stages=stages,
+                    target_samples=self._activation_samples,
+                    embeddings=embeddings,
+                )
         return embeddings
 
     def _save_embeddings(self, layout_path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
@@ -1366,6 +1802,15 @@ class MnistLayoutRunner:
             expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
             layout_path = _layout_json_path(self.count, expected_pair_radius)
             payload.save_base(layout_path)
+            encoding_checkpoint = self._checkpoint_store.load(layout_path)
+            encoding_stages = dict(encoding_checkpoint.get("stages", {}))
+            encoding_stages["encoding"] = True
+            self._checkpoint_store.save(
+                layout_path,
+                stages=encoding_stages,
+                target_samples=self._activation_samples,
+                embeddings=self._checkpoint_store.records(encoding_checkpoint),
+            )
             layout = _run_layout(
                 codes,
                 tuned_params,
@@ -1373,25 +1818,61 @@ class MnistLayoutRunner:
                 total_codes=total_codes,
             )
             save_json = True
+        checkpoint = self._checkpoint_store.load(layout_path)
+        stages = dict(checkpoint.get("stages", {}))
+        stages["encoding"] = True
+        stages["layout"] = True
+        checkpoint_embeddings = self._checkpoint_store.records(checkpoint)
+        self._checkpoint_store.save(
+            layout_path,
+            stages=stages,
+            target_samples=self._activation_samples,
+            embeddings=checkpoint_embeddings,
+        )
         try:
             cached_embeddings = _load_embeddings_from_file(layout_path)
         except FileNotFoundError:
             cached_embeddings = []
-        if cached_embeddings:
-            embeddings = cached_embeddings
+        resume_embeddings = (
+            checkpoint_embeddings
+            if len(checkpoint_embeddings) >= len(cached_embeddings)
+            else cached_embeddings
+        )
+        if len(resume_embeddings) >= self._activation_samples:
+            embeddings = resume_embeddings[: self._activation_samples]
             LOGGER.event(
                 "activation.embedding.skip",
                 section=DETECTOR_INSERTION,
                 data={
                     "path": layout_path,
-                    "embeddings": len(cached_embeddings),
-                    "reason": "cache_present",
+                    "embeddings": len(embeddings),
+                    "reason": "target_present",
                 },
             )
         else:
-            embeddings = self._run_activation(layout, dataset)
+            embeddings = self._run_activation(
+                layout,
+                dataset,
+                layout_path=layout_path,
+                stages=stages,
+                initial_embeddings=resume_embeddings,
+            )
             self._save_embeddings(layout_path, embeddings)
+        stages["activation"] = True
+        self._checkpoint_store.save(
+            layout_path,
+            stages=stages,
+            target_samples=self._activation_samples,
+            embeddings=embeddings,
+        )
         self._export_layout(layout, tuned_params, layout_path=layout_path, save_json=save_json)
+        stages["export"] = True
+        self._checkpoint_store.save(
+            layout_path,
+            stages=stages,
+            target_samples=self._activation_samples,
+            embeddings=embeddings,
+        )
 
 
 def _load_image_from_path(path: str) -> "np.ndarray":
@@ -1427,7 +1908,11 @@ class MnistDecodeRunner:
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
         self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
-        self._embedding_store = EmbeddingStore(json_key=EMBEDDINGS_JSON_KEY)
+        self._embedding_store = EmbeddingStore(
+            json_key=EMBEDDINGS_JSON_KEY,
+            version_key=EMBEDDINGS_VERSION_KEY,
+            version=EMBEDDINGS_VERSION,
+        )
 
     def _load_layout(self) -> tuple[Layout, str, int]:
         candidates: list[str] = []
@@ -1695,8 +2180,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     layout_parser.add_argument(
         "--activation-samples",
         type=int,
-        default=ACTIVATION_SAMPLE_IMAGES,
-        help="количество изображений для базы эмбеддингов активации",
+        default=None,
+        help="количество эмбеддингов; по умолчанию равно --count",
     )
     predict_parser = subparsers.add_parser("predict", help="декодирование картинки или батча")
     predict_parser.add_argument("--layout-path", type=str, default=None)

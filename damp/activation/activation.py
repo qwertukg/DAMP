@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import concurrent.futures
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -28,7 +29,7 @@ from damp.logging import LOGGER
 
 @dataclass(frozen=True)
 class Detector:
-    center: tuple[int, int]
+    center: tuple[float, float]
     radius: float
     lambda_threshold: float
     energy: float
@@ -50,7 +51,7 @@ class Detector:
             section=DETECTOR_PARAMS,
             data={
                 "center": self.center,
-                "radius": self.radius,
+                "receptive_radius": self.radius,
                 "lambda_threshold": self.lambda_threshold,
                 "energy": self.energy,
                 "points_count": self.points_count,
@@ -354,6 +355,10 @@ class ActivationMap:
         return len(self._codes)
 
     @property
+    def backend_name(self) -> str:
+        return self._backend.name
+
+    @property
     def positions(self) -> list[tuple[int, int]]:
         return self._positions
 
@@ -577,6 +582,41 @@ class ActivationEngine:
             embedding=embedding,
         )
 
+    def activate_many(
+        self,
+        stimuli_batch: Sequence[Sequence[BitArray]],
+        *,
+        max_workers: int,
+    ) -> list[ActivationResult]:
+        """Активирует независимые стимулы параллельно, сохраняя порядок входа."""
+        workers = int(max_workers)
+        if workers <= 0:
+            raise ValueError("max_workers must be positive")
+        batches = list(stimuli_batch)
+        if not batches:
+            return []
+        effective_workers = min(workers, len(batches))
+        LOGGER.event(
+            "activation.parallel.start",
+            section=PARALLEL_PROCESSING,
+            data={
+                "images": len(batches),
+                "workers": effective_workers,
+                "backend": self._activation_map.backend_name,
+            },
+        )
+        if effective_workers == 1:
+            results = [self.activate(stimuli) for stimuli in batches]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                results = list(executor.map(self.activate, batches))
+        LOGGER.event(
+            "activation.parallel.done",
+            section=PARALLEL_PROCESSING,
+            data={"images": len(results), "workers": effective_workers},
+        )
+        return results
+
     def _prepare_energy_map(self, energy_map: Sequence[float] | None) -> list[float]:
         if energy_map is None:
             return [1.0 for _ in range(self._activation_map.point_count)]
@@ -606,7 +646,7 @@ class ActivationEngine:
                 data={
                     "detector": idx,
                     "detector_label": "" if detector.label is None else str(detector.label),
-                    "radius": detector.radius,
+                    "receptive_radius": detector.radius,
                     "covered_points": len(covered),
                 },
             )
@@ -684,7 +724,8 @@ class ActivationEngine:
                         continue
                     energy_sum += act_value * energy
                     points_used += 1
-            activation_level = 0.0 if detector.energy <= 0 else energy_sum / detector.energy
+            raw_activation_level = 0.0 if detector.energy <= 0 else energy_sum / detector.energy
+            activation_level = max(0.0, min(1.0, raw_activation_level))
             LOGGER.event(
                 "activation.detector.level",
                 section=STIMULUS_DETECTION,
@@ -692,6 +733,7 @@ class ActivationEngine:
                     "detector": idx,
                     "detector_label": "" if detector.label is None else str(detector.label),
                     "activation_level": activation_level,
+                    "raw_activation_level": raw_activation_level,
                     "points_used": points_used,
                     "energy_sum": energy_sum,
                 },
@@ -720,8 +762,16 @@ class ActivationEngine:
         if not active_detectors:
             return merged
 
+        # §7.1.12: динамический порог mu_c выбирается так, чтобы |D_mu| ~ sigma.
+        selected_detectors = sorted(
+            active_detectors,
+            key=lambda item: item.activation_level,
+            reverse=True,
+        )[: self._saturation_limit]
+        mu_c = selected_detectors[-1].activation_level if selected_detectors else 0.0
+
         ranked: list[tuple[float, ActivatedDetector]] = []
-        for activated in active_detectors:
+        for activated in selected_detectors:
             color = activated.detector.lambda_threshold
             priority = activated.activation_level * color
             if priority > 0.0:
@@ -770,10 +820,12 @@ class ActivationEngine:
             section=COLOR_MERGE,
             data={
                 "candidate_detectors": len(ranked),
+                "active_detectors": len(active_detectors),
                 "used_detectors": used_detectors,
                 "skipped_detectors": skipped_detectors,
                 "selected_bits": bits_count,
                 "saturation_limit": self._saturation_limit,
+                "mu_c": mu_c,
                 "priority_max": ranked[0][0],
                 "priority_min": ranked[-1][0],
             },

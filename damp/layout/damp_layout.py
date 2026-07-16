@@ -2266,14 +2266,16 @@ class Layout:
                 data={"height": self.height, "width": self.width},
                 visuals=[
                     LOGGER.visual_image(
-                        "layout/render_image",
+                        "layout/final/image",
                         image,
+                        static=True,
                     ),
                     LOGGER.visual_points2d(
-                        "layout/render_image",
+                        "layout/final/points",
                         positions,
                         colors=colors,
                         radii=0.5,
+                        static=True,
                     ),
                 ],
             )
