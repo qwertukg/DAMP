@@ -11,6 +11,7 @@ import random
 from typing import Any, Iterable, Mapping, Sequence
 
 from damp.article_refs import (
+    DYNAMIC_CODE_MODIFICATION,
     ENERGY_CALC,
     ENERGIES,
     ENERGY_LONG,
@@ -43,6 +44,7 @@ class LayoutPoint:
     label: str
     hue: float
     ones: int
+    color: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -1256,25 +1258,7 @@ class Layout:
         if parallel_workers is not None and parallel_workers < 0:
             raise ValueError("parallel_workers must be >= 0")
 
-        self._points = []
-        self._codes: dict[float, list[BitArray]] = {}
-        for hue, label_codes in codes.items():
-            hue_value = float(hue)
-            bucket = self._codes.setdefault(hue_value, [])
-            for code_entry in label_codes:
-                layout_code, ones, label_text = self._coerce_code_entry(
-                    code_entry,
-                    default_label=hue_value,
-                )
-                bucket.append(layout_code)
-                self._points.append(
-                    LayoutPoint(
-                        code=layout_code,
-                        label=label_text,
-                        hue=hue_value,
-                        ones=ones,
-                    )
-                )
+        self._codes, self._points = self._materialize_codes(codes)
         self._labels = [self._format_label(point.label) for point in self._points]
         self._values = [point.code.to01() for point in self._points]
         self._point_count = len(self._points)
@@ -1284,6 +1268,8 @@ class Layout:
         self._rng = random.Random(seed)
         self._parallel_workers = parallel_workers
         self._use_gpu = use_gpu
+        self._precompute_similarity = bool(precompute_similarity)
+        self._max_precompute = int(max_precompute)
         self._long_subset_size = (
             None if long_subset_size is None else int(long_subset_size)
         )
@@ -1442,6 +1428,58 @@ class Layout:
         self._sim_base: list[list[float]] | None = None
         if precompute_similarity and self._point_count <= max_precompute:
             self._build_similarity_cache()
+
+    def replace_codes(self, codes: Mapping[float, Sequence[BitArray]]) -> None:
+        """Change code resolution while preserving the established layout (§5.13.2.4)."""
+        replacement_codes, replacement_points = self._materialize_codes(codes)
+        if len(replacement_points) != self._point_count:
+            raise ValueError("replacement codes must preserve point count")
+        for index, (current, replacement) in enumerate(zip(self._points, replacement_points)):
+            if current.hue != replacement.hue or current.label != replacement.label:
+                raise ValueError(
+                    f"replacement codes must preserve point identity at index {index}"
+                )
+
+        old_code_length = len(self._points[0].code)
+        self._codes = replacement_codes
+        self._points = replacement_points
+        self._labels = [self._format_label(point.label) for point in self._points]
+        self._values = [point.code.to01() for point in self._points]
+        self._code_matrix, self._ones_array = self._build_code_matrix()
+        self._sim_base = None
+        self._subset_similarity_cache.clear()
+        self._short_similarity_cache.clear()
+        self._long_subset_indices = []
+        self._short_subset_indices = None
+        self._short_energy_weights = None
+        self._short_energy_last_step = -1
+        self._last_visual_energy = None
+        self._last_visual_energy_step = None
+        self._last_energy_value = None
+        self._last_energy_step = None
+        self._last_energy_progress = None
+        self._gpu_engine = None
+        self._tensor_engine = None
+        self._gpu_positions_dirty = True
+        if self._use_gpu:
+            self._gpu_engine = _GpuLayoutEngine.create(self._points, self._similarity)
+            self._tensor_engine = _TensorLayoutEngine.create(
+                code_matrix=self._code_matrix,
+                ones=self._ones_array,
+                similarity=self._similarity,
+            )
+        if self._precompute_similarity and self._point_count <= self._max_precompute:
+            self._build_similarity_cache()
+        LOGGER.event(
+            "layout.codes.dynamic_replace",
+            section=DYNAMIC_CODE_MODIFICATION,
+            data={
+                "points": self._point_count,
+                "old_code_length": old_code_length,
+                "new_code_length": len(self._points[0].code),
+                "positions_preserved": True,
+            },
+        )
 
     def _long_average_swap_radius(self) -> float | None:
         if self._long_swap_count == 0:
@@ -2182,16 +2220,10 @@ class Layout:
         if not path:
             raise ValueError("path must be provided")
         base_payload: dict[str, Any] | None = None
-        base_layout: dict[int, Mapping[str, Any]] = {}
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fp:
                     base_payload = json.load(fp)
-                for item in base_payload.get("layout", []):  # type: ignore[attr-defined]
-                    try:
-                        base_layout[int(item.get("index"))] = item
-                    except Exception:
-                        continue
             except Exception as exc:
                 LOGGER.event(
                     "layout.export.json.error",
@@ -2202,16 +2234,16 @@ class Layout:
         points_payload: list[dict[str, Any]] = []
         for idx, (y, x) in enumerate(self._positions):
             point = self._points[idx]
-            base_entry = base_layout.get(idx, {})
             points_payload.append(
                 {
                     "index": idx,
                     "y": y,
                     "x": x,
-                    "label": base_entry.get("label", self._labels[idx]),
-                    "value": base_entry.get("value", self._values[idx]),
-                    "hue": base_entry.get("hue", point.hue),
-                    "ones": base_entry.get("ones", point.ones),
+                    "label": self._labels[idx],
+                    "value": self._values[idx],
+                    "hue": point.hue,
+                    "ones": point.ones,
+                    "color": list(point.color) if point.color is not None else None,
                 }
             )
         payload = dict(base_payload) if isinstance(base_payload, dict) else {}
@@ -2253,7 +2285,10 @@ class Layout:
 
     def colors_rgb(self) -> list[tuple[int, int, int]]:
         hues = self._normalized_hues()
-        return [self._hue_to_rgb(hue) for hue in hues]
+        return [
+            point.color if point.color is not None else self._hue_to_rgb(hue)
+            for point, hue in zip(self._points, hues)
+        ]
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
         colors = self.colors_rgb()
@@ -3951,14 +3986,40 @@ class Layout:
         entry: LayoutEncodedCode | BitArray | Iterable[int],
         *,
         default_label: float,
-    ) -> tuple[BitArray, int, str]:
+    ) -> tuple[BitArray, int, str, tuple[int, int, int] | None]:
         if isinstance(entry, LayoutEncodedCode):
             layout_code, ones = self._coerce_code(entry.code)
             label_text = self._format_label(entry.label)
-            return layout_code, ones, label_text
+            return layout_code, ones, label_text, entry.color
         layout_code, ones = self._coerce_code(entry)
         label_text = self._format_label(default_label)
-        return layout_code, ones, label_text
+        return layout_code, ones, label_text, None
+
+    def _materialize_codes(
+        self,
+        codes: Mapping[float, Sequence[BitArray]],
+    ) -> tuple[dict[float, list[BitArray]], list[LayoutPoint]]:
+        materialized: dict[float, list[BitArray]] = {}
+        points: list[LayoutPoint] = []
+        for hue, label_codes in codes.items():
+            hue_value = float(hue)
+            bucket = materialized.setdefault(hue_value, [])
+            for code_entry in label_codes:
+                layout_code, ones, label_text, color = self._coerce_code_entry(
+                    code_entry,
+                    default_label=hue_value,
+                )
+                bucket.append(layout_code)
+                points.append(
+                    LayoutPoint(
+                        code=layout_code,
+                        label=label_text,
+                        hue=hue_value,
+                        ones=ones,
+                        color=color,
+                    )
+                )
+        return materialized, points
 
     @staticmethod
     def _coerce_code(code: BitArray | Iterable[int]) -> tuple[BitArray, int]:

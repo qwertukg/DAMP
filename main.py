@@ -104,6 +104,46 @@ LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
 LAYOUT_MIN_SWAP_RATIO = 0.003
 LAYOUT_MIN_SWAP_WINDOW = 1
 
+PINWHEEL_ANGLE_MIN = 0.0
+PINWHEEL_ANGLE_MAX = 180.0
+PINWHEEL_ANGLE_COUNT = 360
+PINWHEEL_POSITION_MIN = 0.0
+PINWHEEL_POSITION_MAX = 1.0
+PINWHEEL_SINGULARITY_COORDINATES = (0.25, 0.50, 0.75)
+PINWHEEL_RING_RADIUS = 0.125
+PINWHEEL_SMOOTH_DELTA = 15.0
+PINWHEEL_PSEUDO_COLOR_MIN_HUE = 0.0
+PINWHEEL_PSEUDO_COLOR_MAX_HUE = 360.0
+PINWHEEL_LONG_JOINT_LAYERS = (
+    ((3, 3), (0.80, 0.80)),
+    ((6, 6), (0.80, 0.80)),
+    ((12, 12), (0.75, 0.75)),
+)
+PINWHEEL_SHORT_JOINT_LAYERS = (
+    ((12, 12), (0.75, 0.75)),
+    ((24, 24), (0.70, 0.70)),
+    ((48, 48), (0.60, 0.60)),
+)
+PINWHEEL_LONG_ANGLE_LAYERS = ((12, 0.50),)
+PINWHEEL_SHORT_ANGLE_LAYERS = ((360, 0.50),)
+PINWHEEL_EMPTY_RATIO = 0.0
+PINWHEEL_SIMILARITY = "cosine"
+PINWHEEL_LAMBDA_THRESHOLD = 0.0
+PINWHEEL_ADAPTIVE_LAMBDA_STEP = None
+PINWHEEL_ETA = 0.0
+PINWHEEL_SEED = 0
+PINWHEEL_LONG_STEPS = 1000
+PINWHEEL_LONG_PAIRS_PER_STEP = 2400
+PINWHEEL_SHORT_STEPS = 600
+PINWHEEL_SHORT_PAIRS_PER_STEP = 1200
+PINWHEEL_SHORT_LOCAL_RADIUS_FACTOR = 0.06
+PINWHEEL_SHORT_PARTITIONS = 1
+PINWHEEL_MIN_SWAP_RATIO = 0.001
+PINWHEEL_MIN_SWAP_WINDOW = 50
+PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
+PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
+PINWHEEL_LONG_LAYOUT_PATH = "pinwheel_test.long.checkpoint.json"
+
 ACTIVATION_LAMBDA_THRESHOLD = 0.55
 ACTIVATION_ETA = None
 ACTIVATION_ENERGY_THRESHOLD = 0.12
@@ -167,6 +207,13 @@ LOG_INTERVALS = {
     "encoder.init": LOG_INTERVAL_INIT,
     "encoder.layer": LOG_INTERVAL_INIT,
     "encoder.random_bit": LOG_INTERVAL_INIT,
+    "encoder.joint.code": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.joint.detectors": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.joint.input": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.joint.normalized": LOG_INTERVAL_ENCODER_ENCODE,
+    "pinwheel.surface.orientation": LOG_INTERVAL_ENCODER_ENCODE,
+    "pinwheel.encoder.code_union": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.code.color": LOG_INTERVAL_ENCODER_ENCODE,
     "layout.codes": LOG_INTERVAL_INIT,
     "layout.distance_eps": LOG_INTERVAL_INIT,
     "layout.energy.average": LOG_INTERVAL_LAYOUT_AVG_ENERGY,
@@ -1283,6 +1330,12 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
             LayoutEncodedCode(
                 code=bit_array,
                 label=str(item.get("label", "")),
+                color=(
+                    tuple(int(channel) for channel in item["color"])
+                    if isinstance(item.get("color"), list)
+                    and len(item["color"]) == 3
+                    else None
+                ),
             )
         )
     layout = Layout(

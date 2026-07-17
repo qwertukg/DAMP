@@ -8,6 +8,7 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from damp.article_refs import (
+    CHROMODYNAMICS,
     CYCLIC_COORDS,
     ENCODING_SYSTEM,
     GEOMETRIC_METHOD,
@@ -486,3 +487,42 @@ class Encoder:
         if grid_x <= 0 or grid_y <= 0:
             return None
         return grid_x, grid_y
+    @staticmethod
+    def color_from_code(
+        code: BitArray,
+        *,
+        min_hue: float,
+        max_hue: float,
+    ) -> tuple[int, int, int]:
+        """Pseudo-colour sum of active bits ordered red to violet (§5.14)."""
+        if max_hue < min_hue:
+            raise ValueError("max_hue must be >= min_hue")
+        active = [index for index, bit in enumerate(code) if bit]
+        if not active:
+            return (0, 0, 0)
+        denominator = max(1, len(code) - 1)
+        red = green = blue = 0.0
+        for index in active:
+            hue_degrees = min_hue + (max_hue - min_hue) * index / denominator
+            r, g, b = colorsys.hsv_to_rgb((hue_degrees % 360.0) / 360.0, 1.0, 1.0)
+            red += r
+            green += g
+            blue += b
+        scale = 255.0 / max(red, green, blue)
+        color = (
+            int(round(red * scale)),
+            int(round(green * scale)),
+            int(round(blue * scale)),
+        )
+        LOGGER.event(
+            "encoder.code.color",
+            section=CHROMODYNAMICS,
+            data={
+                "code_length": len(code),
+                "active_bits": len(active),
+                "min_hue": min_hue,
+                "max_hue": max_hue,
+                "color": color,
+            },
+        )
+        return color
