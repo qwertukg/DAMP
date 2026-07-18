@@ -51,6 +51,8 @@ class EmbeddingDatabase:
             raise ValueError("top_k_per_class must be non-negative")
         if config.min_similarity < 0:
             raise ValueError("min_similarity must be non-negative")
+        if config.similarity.lower() not in ("cosine", "cos", "jaccard", "j2"):
+            raise ValueError("similarity must be cosine or binary Jaccard/J2")
 
         self._config = config
         self._embeddings = list(embeddings)
@@ -264,22 +266,11 @@ class EmbeddingDatabase:
             denom = math.sqrt(query_ones * stored_ones)
             return 0.0 if denom == 0 else common / denom
 
-        if sim_name in ("cosine2", "cos2"):
-            denom = math.sqrt(query_ones * stored_ones)
-            if denom == 0:
-                return 0.0
-            v = common / denom
-            return v * v
-
-        # Default: Jaccard family (recommended for sparse bit codes).
+        # Для бинарных векторов формула J2 из §2.2.4.2 совпадает с Jaccard.
         union = query_ones + stored_ones - common
         if union == 0:
             return 0.0
-        v = common / union
-
-        if sim_name in ("jaccard2", "j2", "jac2"):
-            return v * v
-        return v
+        return common / union
 
 
 class MnistDecoder:

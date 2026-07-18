@@ -15,7 +15,6 @@ from damp.logging import LOGGER
 class LayoutEncodedCode:
     code: BitArray
     label: str
-    color: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)

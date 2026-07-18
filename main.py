@@ -22,9 +22,15 @@ from damp.article_refs import (
     GPU_IMPLEMENTATION,
     PARALLEL_PROCESSING,
 )
-from damp.activation import ActivationEngine, Detector
+from damp.activation import ActivationEngine, Detector, DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
-from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
+from damp.encoding.damp_encoder import (
+    ClosedDimension,
+    Detectors,
+    Encoder,
+    EncoderCodeColorizer,
+    OpenedDimension,
+)
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
 from damp.encoding.bitarray import BitArray
@@ -54,21 +60,30 @@ LOG_INTERVAL_ACTIVATION_COLOR_MERGE = 100
 LOG_INTERVAL_ACTIVATION_COVERAGE = 100
 LOG_INTERVAL_ACTIVATION_ENERGY_MAP = 1
 LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER = 1
+LOG_INTERVAL_ACTIVATION_DETECTOR_CLUSTER = 100
+LOG_INTERVAL_ACTIVATION_DETECTOR_CENTER = 100
 LOG_INTERVAL_ACTIVATION_SAMPLE = 100
 LOG_INTERVAL_ACTIVATION_VISUAL = 100
 LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 3
+EMBEDDINGS_VERSION = 4
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 2
+PIPELINE_CHECKPOINT_VERSION = 3
+LAYOUT_CACHE_TAG = "article-damp"
 
 LAYOUT_SIMILARITY = "cosine"
 LAYOUT_LAMBDA_THRESHOLD = 0.65
-LAYOUT_ETA = 0
+LAYOUT_ETA = 10.0
 LAYOUT_EMPTY_RATIO = 0.5
 LAYOUT_USE_GPU = True
+LAYOUT_PSEUDO_COLOR_MIN_HUE = 0.0
+LAYOUT_PSEUDO_COLOR_MAX_HUE = 300.0
+LAYOUT_COLORIZER = EncoderCodeColorizer(
+    min_hue=LAYOUT_PSEUDO_COLOR_MIN_HUE,
+    max_hue=LAYOUT_PSEUDO_COLOR_MAX_HUE,
+)
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
@@ -89,6 +104,9 @@ LAYOUT_SHORT_PARTITIONS = 8
 MPS_HIGH_WATERMARK_RATIO = 0.0
 
 ENCODER_LOG_EVERY = 50
+ENCODER_RANDOM_SEED = 0
+MNIST_ANGLE_IN_DEGREES = True
+MNIST_GRAD_THRESHOLD = 0.05
 LAYOUT_LOG_EVERY_LONG = 150
 LAYOUT_LOG_EVERY_SHORT = 50
 LAYOUT_LOG_VISUALS = True
@@ -99,7 +117,7 @@ LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
 LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR = 1.0
 LAYOUT_ENERGY_STABILITY_WINDOW = 20
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
-LAYOUT_ENERGY_STABILITY_EVERY = 200
+LAYOUT_ENERGY_STABILITY_EVERY = 25
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
 LAYOUT_MIN_SWAP_RATIO = 0.003
 LAYOUT_MIN_SWAP_WINDOW = 1
@@ -109,53 +127,56 @@ PINWHEEL_ANGLE_MAX = 180.0
 PINWHEEL_ANGLE_COUNT = 360
 PINWHEEL_POSITION_MIN = 0.0
 PINWHEEL_POSITION_MAX = 1.0
-PINWHEEL_SINGULARITY_COORDINATES = (0.25, 0.50, 0.75)
+PINWHEEL_POSITION_COORDINATES = (0.25, 0.50, 0.75)
+PINWHEEL_COUNT = len(PINWHEEL_POSITION_COORDINATES) ** 2
+PINWHEEL_PHASE_STEP = 90.0
 PINWHEEL_RING_RADIUS = 0.125
-PINWHEEL_SMOOTH_DELTA = 15.0
-PINWHEEL_PSEUDO_COLOR_MIN_HUE = 0.0
-PINWHEEL_PSEUDO_COLOR_MAX_HUE = 360.0
-PINWHEEL_LONG_JOINT_LAYERS = (
+PINWHEEL_LONG_SPATIAL_JOINT_LAYERS = (
     ((3, 3), (0.80, 0.80)),
     ((6, 6), (0.80, 0.80)),
     ((12, 12), (0.75, 0.75)),
 )
-PINWHEEL_SHORT_JOINT_LAYERS = (
+PINWHEEL_SHORT_SPATIAL_JOINT_LAYERS = (
     ((12, 12), (0.75, 0.75)),
     ((24, 24), (0.70, 0.70)),
     ((48, 48), (0.60, 0.60)),
 )
 PINWHEEL_LONG_ANGLE_LAYERS = ((12, 0.50),)
 PINWHEEL_SHORT_ANGLE_LAYERS = ((360, 0.50),)
-PINWHEEL_EMPTY_RATIO = 0.0
+PINWHEEL_COLOR_MIN_HUE = 0.0
+PINWHEEL_COLOR_MAX_HUE = 360.0
+PINWHEEL_SMOOTH_DELTA = 15.0
+PINWHEEL_MIN_UNIQUE_COLORS = 300
+PINWHEEL_EMPTY_RATIO = 0.20
 PINWHEEL_SIMILARITY = "cosine"
 PINWHEEL_LAMBDA_THRESHOLD = 0.0
 PINWHEEL_ADAPTIVE_LAMBDA_STEP = None
 PINWHEEL_ETA = 0.0
-PINWHEEL_SEED = 0
+PINWHEEL_SEED = 2
 PINWHEEL_LONG_STEPS = 1000
 PINWHEEL_LONG_PAIRS_PER_STEP = 2400
 PINWHEEL_SHORT_STEPS = 600
 PINWHEEL_SHORT_PAIRS_PER_STEP = 1200
 PINWHEEL_SHORT_LOCAL_RADIUS_FACTOR = 0.06
 PINWHEEL_SHORT_PARTITIONS = 1
-PINWHEEL_MIN_SWAP_RATIO = 0.001
-PINWHEEL_MIN_SWAP_WINDOW = 50
+PINWHEEL_MIN_SWAP_RATIO = 0.003
+PINWHEEL_MIN_SWAP_WINDOW = 150
 PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
 PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
 PINWHEEL_LONG_LAYOUT_PATH = "pinwheel_test.long.checkpoint.json"
+PINWHEEL_RESUME_LONG_CHECKPOINT = True
 
 ACTIVATION_LAMBDA_THRESHOLD = 0.55
-ACTIVATION_ETA = None
+ACTIVATION_ETA = 10.0
 ACTIVATION_ENERGY_THRESHOLD = 0.12
 ACTIVATION_DETECTOR_THRESHOLD = 0.5
 ACTIVATION_SATURATION_LIMIT = 50
 ACTIVATION_POINT_ENERGY_RADIUS = 3
 ACTIVATION_DETECTOR_RADIUS = 6
 ACTIVATION_DETECTOR_RADIUS_MIN = 1
-ACTIVATION_DETECTOR_TARGET_POINTS = 28
 ACTIVATION_DETECTOR_MIN_POINTS = 3
-ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR = 0.8
-ACTIVATION_DETECTOR_STEP_DENSITY = 6
+ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 1000
+ACTIVATION_DETECTOR_SEED = 0
 
 ACTIVATION_MAX_DETECTORS = 256
 ACTIVATION_OUTPUT_BITS = 256
@@ -165,7 +186,7 @@ ACTIVATION_PARALLEL_WORKERS = 4
 ACTIVATION_BATCH_SIZE = 10
 ACTIVATION_CHECKPOINT_EVERY = 10
 
-DECODER_SIMILARITY = "jaccard2"
+DECODER_SIMILARITY = "jaccard"
 DECODER_SOFTMAX_TEMPERATURE = 0.35
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
@@ -213,7 +234,10 @@ LOG_INTERVALS = {
     "encoder.joint.normalized": LOG_INTERVAL_ENCODER_ENCODE,
     "pinwheel.surface.orientation": LOG_INTERVAL_ENCODER_ENCODE,
     "pinwheel.encoder.code_union": LOG_INTERVAL_ENCODER_ENCODE,
+    "pinwheel.encoder.code": LOG_INTERVAL_ENCODER_ENCODE,
+    "pinwheel.topology.angle": LOG_INTERVAL_ENCODER_ENCODE,
     "encoder.code.color": LOG_INTERVAL_ENCODER_ENCODE,
+    "encoder.code.color_component": LOG_INTERVAL_ENCODER_ENCODE,
     "layout.codes": LOG_INTERVAL_INIT,
     "layout.distance_eps": LOG_INTERVAL_INIT,
     "layout.energy.average": LOG_INTERVAL_LAYOUT_AVG_ENERGY,
@@ -291,6 +315,9 @@ LOG_INTERVALS = {
     "activation.detector.active": LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE,
     "activation.detector.init": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.detector.layer": LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER,
+    "activation.detector.builder.init": LOG_INTERVAL_INIT,
+    "activation.detector.cluster": LOG_INTERVAL_ACTIVATION_DETECTOR_CLUSTER,
+    "activation.detector.center": LOG_INTERVAL_ACTIVATION_DETECTOR_CENTER,
     "activation.embedding": LOG_INTERVAL_ACTIVATION_EMBEDDING,
     "activation.color_merge": LOG_INTERVAL_ACTIVATION_COLOR_MERGE,
     "activation.detector.coverage": LOG_INTERVAL_ACTIVATION_COVERAGE,
@@ -301,7 +328,10 @@ LOG_INTERVALS = {
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
 }
 
-LAYOUT_CACHE_PATTERNS = ("data/layout-{count}-*.json", "layout-{count}-*.json")
+LAYOUT_CACHE_PATTERNS = (
+    "data/layout-{count}-*-article-damp.json",
+    "layout-{count}-*-article-damp.json",
+)
 
 
 def _layout_cache_paths_for_count(count: int) -> list[str]:
@@ -719,7 +749,7 @@ def _default_layout_params() -> TunedLayoutParams:
 
 def _layout_json_path(count: int, pair_radius: int | None) -> str:
     suffix = "auto" if pair_radius is None else str(pair_radius)
-    return f"data/layout-{count}-{suffix}.json"
+    return f"data/layout-{count}-{suffix}-{LAYOUT_CACHE_TAG}.json"
 
 
 def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> int:
@@ -734,22 +764,6 @@ def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> i
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         min(expected_short_radius_base, expected_short_radius_max),
     )
-
-
-def _points_in_radius(
-    center: tuple[int, int],
-    positions: list[tuple[int, int]],
-    radius_sq: float,
-) -> list[int]:
-    cy, cx = center
-    covered: list[int] = []
-    for idx, (y, x) in enumerate(positions):
-        dy = float(cy) - float(y)
-        dx = float(cx) - float(x)
-        if dy * dy + dx * dx <= radius_sq:
-            covered.append(idx)
-    return covered
-
 
 def _compute_point_energies(layout: Layout, radius: int) -> list[float]:
     if radius <= 0:
@@ -791,7 +805,8 @@ def _compute_point_energies(layout: Layout, radius: int) -> list[float]:
                 sim = sim_lambda(idx, other_idx)
                 if sim <= 0.0:
                     continue
-                energy += sim / (dist_sq + distance_eps)
+                distance = math.sqrt(dist_sq)
+                energy += sim / (distance + distance_eps)
         energies.append(energy)
     emax = max(energies)
     normalized = [e / emax if emax > 0 else 0.0 for e in energies]
@@ -806,431 +821,6 @@ def _compute_point_energies(layout: Layout, radius: int) -> list[float]:
     )
     return normalized
 
-
-def _build_detectors_from_layout_legacy(
-    layout: Layout,
-    energies: list[float],
-    *,
-    radius: int,
-    max_detectors: int,
-    output_bits: int,
-    lambda_levels: tuple[float, ...],
-) -> list[Detector]:
-    """
-    Построение иерархии детекторов "как в статье":
-    - несколько уровней λ (детекторная иерархия);
-    - радиус детектора выбирается адаптивно (приближение fill-factor) по целевому числу точек покрытия;
-    - центры детекторов выбираются из точек с высокой статической энергией и разреживаются (NMS);
-    - выходной код детектора — уникальный бит в своём слое (без коллизий).
-    """
-    if radius <= 0:
-        raise ValueError("detector radius must be positive")
-    if max_detectors <= 0:
-        raise ValueError("max_detectors must be positive")
-    if output_bits <= 0:
-        raise ValueError("output_bits must be positive")
-    if not lambda_levels:
-        raise ValueError("lambda_levels must be non-empty")
-    if len(energies) != len(layout._positions):
-        raise ValueError("energies size must match layout points")
-
-    layers = len(lambda_levels)
-    per_layer_limit = max(1, max_detectors // layers)
-    required_bits = per_layer_limit * layers
-    if output_bits < required_bits:
-        raise ValueError(
-            f"output_bits must be >= per_layer_limit*layers ({required_bits}), got {output_bits}"
-        )
-
-    # Предпочитаем точки с высокой статической энергией
-    sorted_indices = sorted(range(len(energies)), key=lambda i: energies[i], reverse=True)
-
-    # Быстрая выборка индексов по радиусу через grid/row_occupied (как в _compute_point_energies)
-    row_occupied = layout._row_occupied
-    grid = layout.grid
-    height = layout.height
-    width = layout.width
-    pos_y = layout._pos_y
-    pos_x = layout._pos_x
-
-    def covered_indices_for(center_idx: int, r: int) -> list[int]:
-        cy = pos_y[center_idx]
-        cx = pos_x[center_idx]
-        r_sq = r * r
-        covered: list[int] = []
-        y_min = max(0, cy - r)
-        y_max = min(height - 1, cy + r)
-        x_min = max(0, cx - r)
-        x_max = min(width - 1, cx + r)
-        for y in range(y_min, y_max + 1):
-            dy = cy - y
-            dy_sq = dy * dy
-            occupied = row_occupied[y]
-            if not occupied:
-                continue
-            for x in occupied:
-                if x < x_min or x > x_max:
-                    continue
-                dx = cx - x
-                if dy_sq + dx * dx > r_sq:
-                    continue
-                other_idx = grid[y][x]
-                if other_idx is None:
-                    continue
-                covered.append(other_idx)
-        return covered
-
-    # Адаптивный радиус (приближение подбора fill-factor)
-    r_min = ACTIVATION_DETECTOR_RADIUS_MIN
-    r_max = radius
-    target_points = max(1, ACTIVATION_DETECTOR_TARGET_POINTS)
-
-    def choose_radius(center_idx: int) -> tuple[int, list[int]]:
-        chosen_r = r_max
-        chosen_cov: list[int] = []
-        for r in range(r_min, r_max + 1):
-            cov = covered_indices_for(center_idx, r)
-            if len(cov) >= target_points:
-                return r, cov
-            # запомним лучший (самый большой) на случай, если до цели не дотянули
-            if len(cov) > len(chosen_cov):
-                chosen_cov = cov
-                chosen_r = r
-        return chosen_r, chosen_cov
-
-    # NMS: не даём центрам быть слишком близко (избегаем дубликатов детекторов)
-    min_dist = max(1.0, float(r_max) * float(ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR))
-    min_dist_sq = min_dist * min_dist
-    detectors: list[Detector] = []
-
-    for layer_idx, lambda_value in enumerate(lambda_levels):
-        layer_detectors: list[Detector] = []
-        # §6.4.5 запрещает перекрытие только внутри одного слоя D_lambda.
-        chosen_centers: list[tuple[float, float]] = []
-        layer_offset = layer_idx * per_layer_limit
-
-        # Берём кандидатов плотнее, чем "строго per_layer_limit", чтобы NMS не выжигал слой
-        step = max(1, len(sorted_indices) // (per_layer_limit * max(1, int(ACTIVATION_DETECTOR_STEP_DENSITY))))
-
-        local_id = 0
-        for idx in sorted_indices[::step]:
-            if len(layer_detectors) >= per_layer_limit or len(detectors) >= max_detectors:
-                break
-
-            cy = pos_y[idx]
-            cx = pos_x[idx]
-            # NMS check
-            too_close = False
-            for (py, px) in chosen_centers:
-                dy = float(cy) - float(py)
-                dx = float(cx) - float(px)
-                if dy * dy + dx * dx < min_dist_sq:
-                    too_close = True
-                    break
-            if too_close:
-                continue
-
-            chosen_r, covered = choose_radius(idx)
-            if not covered:
-                continue
-
-            # §6.3: e_d = sum(a_ji * e_ji). Активация a_ji вычисляется
-            # кодом центра при пороге lambda данного слоя, а не заменяется единицей.
-            center_code = layout._points[idx].code
-            center_ones = layout._points[idx].ones
-            energy_sum = 0.0
-            active_points = 0
-            for i in covered:
-                point_energy = energies[i]
-                if point_energy < ACTIVATION_ENERGY_THRESHOLD:
-                    continue
-                point = layout._points[i]
-                denominator = math.sqrt(center_ones * point.ones)
-                if denominator <= 0.0:
-                    continue
-                activation = center_code.common(point.code) / denominator
-                if activation < lambda_value:
-                    continue
-                energy_sum += activation * point_energy
-                active_points += 1
-            if energy_sum <= 0.0 or active_points <= 0:
-                continue
-
-            # Уникальный бит в своём слое (без коллизий)
-            bit_index = layer_offset + local_id
-            if bit_index >= output_bits:
-                break
-            output_code = BitArray(output_bits)
-            output_code.set(bit_index, 1)
-            local_id += 1
-
-            center = (cy, cx)
-            detector = Detector(
-                center=center,
-                radius=float(chosen_r),
-                lambda_threshold=lambda_value,
-                energy=energy_sum,
-                points_count=active_points,
-                output_code=output_code,
-                label=f"λ={lambda_value:.2f}",
-            )
-
-            layer_detectors.append(detector)
-            detectors.append(detector)
-            chosen_centers.append((float(cy), float(cx)))
-
-        LOGGER.event(
-            "activation.detector.layer",
-            section=DETECTOR_CONSTRUCTION,
-            data={
-                "lambda": lambda_value,
-                "layer_detectors": len(layer_detectors),
-                "per_layer_limit": per_layer_limit,
-                "total_detectors": len(detectors),
-                "radius_min": r_min,
-                "radius_max": r_max,
-                "target_points": target_points,
-            },
-        )
-
-        if len(detectors) >= max_detectors:
-            break
-
-    if not detectors:
-        raise RuntimeError("не удалось построить ни одного детектора для активации")
-    return detectors
-
-
-@dataclass(frozen=True)
-class DetectorCandidate:
-    center: tuple[float, float]
-    radius: float
-    energy: float
-    points_count: int
-    fill_factor: float
-    insertion_density: float
-
-
-class DetectorHierarchyBuilder:
-    """Строит слои D_lambda по формулам §6.3–6.4.5."""
-
-    def __init__(
-        self,
-        *,
-        layout: Layout,
-        energies: Sequence[float],
-        radius: int,
-        radius_min: int,
-        min_points: int,
-        max_detectors: int,
-        output_bits: int,
-        lambda_levels: Sequence[float],
-        energy_threshold: float,
-        candidate_density: int,
-    ) -> None:
-        if radius <= 0 or radius_min <= 0 or radius_min > radius:
-            raise ValueError("invalid detector radius range")
-        if min_points <= 0:
-            raise ValueError("min_points must be positive")
-        if max_detectors <= 0 or output_bits <= 0:
-            raise ValueError("detector and output sizes must be positive")
-        if len(energies) != len(layout._positions):
-            raise ValueError("energies size must match layout points")
-        if not lambda_levels:
-            raise ValueError("lambda_levels must be non-empty")
-        self._layout = layout
-        self._energies = [float(value) for value in energies]
-        self._radius = int(radius)
-        self._radius_min = int(radius_min)
-        self._min_points = int(min_points)
-        self._max_detectors = int(max_detectors)
-        self._output_bits = int(output_bits)
-        self._lambda_levels = tuple(float(value) for value in lambda_levels)
-        self._energy_threshold = float(energy_threshold)
-        self._candidate_density = max(1, int(candidate_density))
-        self._sorted_indices = sorted(
-            range(len(self._energies)),
-            key=lambda index: self._energies[index],
-            reverse=True,
-        )
-
-    def build(self) -> list[Detector]:
-        per_layer_limit = max(1, self._max_detectors // len(self._lambda_levels))
-        if per_layer_limit * len(self._lambda_levels) > self._output_bits:
-            raise ValueError("output_bits is too small for detector hierarchy")
-        detectors: list[Detector] = []
-        for layer_index, lambda_value in enumerate(self._lambda_levels):
-            candidates = self._build_layer(lambda_value, per_layer_limit)
-            layer_offset = layer_index * per_layer_limit
-            for local_index, candidate in enumerate(candidates):
-                output_code = BitArray(self._output_bits)
-                output_code.set(layer_offset + local_index, 1)
-                detectors.append(
-                    Detector(
-                        center=candidate.center,
-                        radius=candidate.radius,
-                        lambda_threshold=lambda_value,
-                        energy=candidate.energy,
-                        points_count=candidate.points_count,
-                        output_code=output_code,
-                        label=f"λ={lambda_value:.2f}",
-                    )
-                )
-            LOGGER.event(
-                "activation.detector.layer",
-                section=DETECTOR_CONSTRUCTION,
-                data={
-                    "lambda": lambda_value,
-                    "layer_detectors": len(candidates),
-                    "per_layer_limit": per_layer_limit,
-                    "fill_min": min((item.fill_factor for item in candidates), default=0.0),
-                    "fill_max": max((item.fill_factor for item in candidates), default=0.0),
-                    "radius_min": min((item.radius for item in candidates), default=0.0),
-                    "radius_max": max((item.radius for item in candidates), default=0.0),
-                },
-            )
-        if not detectors:
-            raise RuntimeError("не удалось построить ни одного детектора для активации")
-        return detectors
-
-    def _build_layer(self, lambda_value: float, limit: int) -> list[DetectorCandidate]:
-        selected: list[DetectorCandidate] = []
-        step = max(1, len(self._sorted_indices) // (limit * self._candidate_density))
-        for center_index in self._sorted_indices[::step]:
-            candidate = self._make_candidate(center_index, lambda_value)
-            if candidate is None:
-                continue
-            overlaps = [
-                existing
-                for existing in selected
-                if self._overlaps(candidate, existing)
-            ]
-            if overlaps:
-                if any(
-                    existing.insertion_density >= candidate.insertion_density
-                    for existing in overlaps
-                ):
-                    continue
-                selected = [item for item in selected if item not in overlaps]
-            selected.append(candidate)
-        selected.sort(key=lambda item: item.insertion_density, reverse=True)
-        return selected[:limit]
-
-    def _make_candidate(
-        self,
-        center_index: int,
-        lambda_value: float,
-    ) -> DetectorCandidate | None:
-        if self._energies[center_index] < self._energy_threshold:
-            return None
-        center_point = self._layout._points[center_index]
-        center_y = self._layout._pos_y[center_index]
-        center_x = self._layout._pos_x[center_index]
-        active: dict[tuple[int, int], tuple[int, float]] = {}
-        for point_index in self._indices_in_radius(center_y, center_x, self._radius):
-            point_energy = self._energies[point_index]
-            if point_energy < self._energy_threshold:
-                continue
-            point = self._layout._points[point_index]
-            denominator = math.sqrt(center_point.ones * point.ones)
-            if denominator <= 0.0:
-                continue
-            activation = center_point.code.common(point.code) / denominator
-            if activation < lambda_value:
-                continue
-            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
-            active[position] = (point_index, activation * point_energy)
-        seed = (center_y, center_x)
-        if seed not in active:
-            return None
-        cluster_positions = self._connected_component(seed, active)
-        if len(cluster_positions) < self._min_points:
-            return None
-        weight_sum = sum(active[position][1] for position in cluster_positions)
-        if weight_sum <= 0.0:
-            return None
-        centroid_y = sum(position[0] * active[position][1] for position in cluster_positions) / weight_sum
-        centroid_x = sum(position[1] * active[position][1] for position in cluster_positions) / weight_sum
-        distances = sorted(
-            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
-            for position in cluster_positions
-        )
-        best_radius = 0.0
-        best_fill = -1.0
-        for distance in distances:
-            candidate_radius = max(float(self._radius_min), distance)
-            if candidate_radius > self._radius:
-                continue
-            points_count = sum(1 for value in distances if value <= candidate_radius)
-            if points_count < self._min_points:
-                continue
-            fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
-            if fill_factor > best_fill:
-                best_fill = fill_factor
-                best_radius = candidate_radius
-        if best_radius <= 0.0:
-            return None
-        included = [
-            position
-            for position in cluster_positions
-            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
-        ]
-        detector_energy = sum(active[position][1] for position in included)
-        points_count = len(included)
-        if detector_energy <= 0.0 or points_count < self._min_points:
-            return None
-        return DetectorCandidate(
-            center=(centroid_y, centroid_x),
-            radius=best_radius,
-            energy=detector_energy,
-            points_count=points_count,
-            fill_factor=best_fill,
-            insertion_density=points_count / best_radius,
-        )
-
-    def _indices_in_radius(self, center_y: int, center_x: int, radius: int) -> list[int]:
-        indices: list[int] = []
-        radius_sq = radius * radius
-        for y in range(max(0, center_y - radius), min(self._layout.height - 1, center_y + radius) + 1):
-            dy_sq = (center_y - y) ** 2
-            for x in self._layout._row_occupied[y]:
-                if x < center_x - radius or x > center_x + radius:
-                    continue
-                if dy_sq + (center_x - x) ** 2 > radius_sq:
-                    continue
-                point_index = self._layout.grid[y][x]
-                if point_index is not None:
-                    indices.append(point_index)
-        return indices
-
-    @staticmethod
-    def _connected_component(
-        seed: tuple[int, int],
-        active: dict[tuple[int, int], tuple[int, float]],
-    ) -> list[tuple[int, int]]:
-        pending = [seed]
-        visited = {seed}
-        while pending:
-            y, x = pending.pop()
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    neighbour = (y + dy, x + dx)
-                    if neighbour in active and neighbour not in visited:
-                        visited.add(neighbour)
-                        pending.append(neighbour)
-        return list(visited)
-
-    @staticmethod
-    def _overlaps(left: DetectorCandidate, right: DetectorCandidate) -> bool:
-        distance = math.hypot(
-            left.center[0] - right.center[0],
-            left.center[1] - right.center[1],
-        )
-        return distance <= left.radius or distance <= right.radius
-
-
 def _build_detectors_from_layout(
     layout: Layout,
     energies: list[float],
@@ -1240,7 +830,7 @@ def _build_detectors_from_layout(
     output_bits: int,
     lambda_levels: tuple[float, ...],
 ) -> list[Detector]:
-    return DetectorHierarchyBuilder(
+    return ArticleDetectorHierarchyBuilder(
         layout=layout,
         energies=energies,
         radius=radius,
@@ -1250,7 +840,9 @@ def _build_detectors_from_layout(
         output_bits=output_bits,
         lambda_levels=lambda_levels,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
-        candidate_density=ACTIVATION_DETECTOR_STEP_DENSITY,
+        eta=ACTIVATION_ETA,
+        attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
+        seed=ACTIVATION_DETECTOR_SEED,
     ).build()
 
 
@@ -1330,12 +922,6 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
             LayoutEncodedCode(
                 code=bit_array,
                 label=str(item.get("label", "")),
-                color=(
-                    tuple(int(channel) for channel in item["color"])
-                    if isinstance(item.get("color"), list)
-                    and len(item["color"]) == 3
-                    else None
-                ),
             )
         )
     layout = Layout(
@@ -1349,6 +935,7 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=None,
         long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
+        colorizer=LAYOUT_COLORIZER,
     )
     if len(layout._positions) != len(sorted_points):
         raise RuntimeError("layout load mismatch: points count differs")
@@ -1422,6 +1009,8 @@ def _build_encoder() -> Encoder:
                 Detectors(2, 0.7),
             ],
         ),
+        random_bit=True,
+        random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
     )
 
@@ -1506,7 +1095,6 @@ def _collect_samples(
             break
     return samples
 
-SPR = 32
 def _run_layout(
     codes: dict[float, list],
     params: TunedLayoutParams | None,
@@ -1530,6 +1118,7 @@ def _run_layout(
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=run_params.long_subset_size,
         long_subset_refresh=run_params.long_subset_refresh,
+        colorizer=LAYOUT_COLORIZER,
     )
     step_offset = 1
     long_radius_start = max(
@@ -1588,7 +1177,7 @@ def _run_layout(
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
     layout.run(
-        steps=150,
+        steps=run_params.short_steps,
         pairs_per_step=run_params.short_pairs_per_step,
         pair_radius=short_radius_start,
         mode="short",
@@ -1597,6 +1186,11 @@ def _run_layout(
         min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
+        energy_radius=run_params.short_energy_radius,
+        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
         adaptive_params=adaptive_short,
         short_optim=short_optim,
     )
@@ -1620,7 +1214,10 @@ class MnistLayoutRunner:
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
-        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+        self.extractor = MnistSobelAngleMap(
+            angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
+            grad_threshold=MNIST_GRAD_THRESHOLD,
+        )
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1960,7 +1557,10 @@ class MnistDecodeRunner:
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
-        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+        self.extractor = MnistSobelAngleMap(
+            angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
+            grad_threshold=MNIST_GRAD_THRESHOLD,
+        )
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,

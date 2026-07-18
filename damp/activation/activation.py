@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import concurrent.futures
+import random
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -14,6 +15,9 @@ from damp.article_refs import (
     CODE_SPACE_ACTIVATION,
     COLOR_MERGE,
     DETECTOR_HIERARCHY,
+    DETECTOR_CLUSTERING,
+    DETECTOR_CENTER,
+    DETECTOR_CONSTRUCTION,
     DETECTOR_INSERTION,
     DETECTOR_PARAMS,
     DETECTOR_RADIUS,
@@ -137,10 +141,7 @@ class _PythonActivationBackend(_ActivationBackend):
         union = ones_a + ones_b - common
         if union == 0:
             return 0.0
-        jacc = common / union
-        if self._similarity in ("jaccard2", "j2", "jac2"):
-            return jacc * jacc
-        return jacc
+        return common / union
 
     def _apply_threshold(self, similarity: float) -> float:
         if similarity <= 0.0:
@@ -199,8 +200,6 @@ class _NumpyActivationBackend(_ActivationBackend):
                 out=self._np.zeros_like(intersection),
                 where=union > 0,
             )
-            if self._similarity in ("jaccard2", "j2", "jac2"):
-                sim = sim * sim
         sim = self._apply_threshold(sim)
         if sim.size == 0:
             return [0.0 for _ in range(self._codes.shape[0])]
@@ -270,8 +269,6 @@ class _TorchActivationBackend(_ActivationBackend):
             else:
                 union = self._ones[:, None] + stim_ones[None, :] - intersection
                 sim = torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
-                if self._similarity in ("jaccard2", "j2", "jac2"):
-                    sim = sim * sim
             sim = self._apply_threshold(sim)
             if sim.numel() == 0:
                 return [0.0 for _ in range(self._codes.shape[0])]
@@ -504,7 +501,7 @@ class ActivationMap:
         )
 
 
-class ActivationEngine:
+class _ActivationEngineBase:
     def __init__(
         self,
         layout: Layout,
@@ -582,6 +579,257 @@ class ActivationEngine:
             embedding=embedding,
         )
 
+
+@dataclass(frozen=True)
+class DetectorCandidate:
+    center: tuple[float, float]
+    radius: float
+    energy: float
+    points_count: int
+    fill_factor: float
+    insertion_density: float
+
+
+class DetectorHierarchyBuilder:
+    """Стохастически строит слои детекторов по §6.3–6.4.5."""
+
+    def __init__(
+        self,
+        *,
+        layout: Layout,
+        energies: Sequence[float],
+        radius: int,
+        radius_min: int,
+        min_points: int,
+        max_detectors: int,
+        output_bits: int,
+        lambda_levels: Sequence[float],
+        energy_threshold: float,
+        eta: float | None,
+        attempts_without_change: int,
+        seed: int,
+    ) -> None:
+        if radius <= 0 or radius_min <= 0 or radius_min > radius:
+            raise ValueError("invalid detector radius range")
+        if min_points <= 0:
+            raise ValueError("min_points must be positive")
+        if max_detectors <= 0 or output_bits <= 0:
+            raise ValueError("detector and output sizes must be positive")
+        if len(energies) != len(layout.positions()):
+            raise ValueError("energies size must match layout points")
+        if not lambda_levels:
+            raise ValueError("lambda_levels must be non-empty")
+        if attempts_without_change <= 0:
+            raise ValueError("attempts_without_change must be positive")
+        self._layout = layout
+        self._energies = [float(value) for value in energies]
+        self._radius = int(radius)
+        self._radius_min = int(radius_min)
+        self._min_points = int(min_points)
+        self._max_detectors = int(max_detectors)
+        self._output_bits = int(output_bits)
+        self._lambda_levels = tuple(float(value) for value in lambda_levels)
+        self._energy_threshold = float(energy_threshold)
+        self._eta = None if eta is None else float(eta)
+        self._attempts_without_change = int(attempts_without_change)
+        self._rng = random.Random(seed)
+        LOGGER.event(
+            "activation.detector.builder.init",
+            section=DETECTOR_CONSTRUCTION,
+            data={
+                "layers": len(self._lambda_levels),
+                "max_detectors": self._max_detectors,
+                "output_bits": self._output_bits,
+                "attempts_without_change": self._attempts_without_change,
+                "seed": seed,
+            },
+        )
+
+    def build(self) -> list[Detector]:
+        per_layer_limit = max(1, self._max_detectors // len(self._lambda_levels))
+        detectors: list[Detector] = []
+        for lambda_value in self._lambda_levels:
+            candidates = self._build_layer(lambda_value, per_layer_limit)
+            for candidate in candidates:
+                output_code = BitArray(self._output_bits)
+                output_code.set(self._rng.randrange(self._output_bits), 1)
+                detectors.append(
+                    Detector(
+                        center=candidate.center,
+                        radius=candidate.radius,
+                        lambda_threshold=lambda_value,
+                        energy=candidate.energy,
+                        points_count=candidate.points_count,
+                        output_code=output_code,
+                        label=f"λ={lambda_value:.2f}",
+                    )
+                )
+            LOGGER.event(
+                "activation.detector.layer",
+                section=DETECTOR_CONSTRUCTION,
+                data={
+                    "lambda": lambda_value,
+                    "layer_detectors": len(candidates),
+                    "per_layer_limit": per_layer_limit,
+                    "fill_min": min((item.fill_factor for item in candidates), default=0.0),
+                    "fill_max": max((item.fill_factor for item in candidates), default=0.0),
+                    "radius_min": min((item.radius for item in candidates), default=0.0),
+                    "radius_max": max((item.radius for item in candidates), default=0.0),
+                },
+            )
+        if not detectors:
+            raise RuntimeError("не удалось построить ни одного детектора для активации")
+        return detectors
+
+    def _build_layer(self, lambda_value: float, limit: int) -> list[DetectorCandidate]:
+        selected: list[DetectorCandidate] = []
+        unchanged = 0
+        point_count = len(self._energies)
+        while unchanged < self._attempts_without_change:
+            center_index = self._rng.randrange(point_count)
+            candidate = self._make_candidate(center_index, lambda_value)
+            if candidate is None:
+                unchanged += 1
+                continue
+            overlaps = [item for item in selected if self._overlaps(candidate, item)]
+            if overlaps:
+                if any(item.insertion_density >= candidate.insertion_density for item in overlaps):
+                    unchanged += 1
+                    continue
+                selected = [item for item in selected if item not in overlaps]
+                selected.append(candidate)
+                unchanged = 0
+                continue
+            if len(selected) < limit:
+                selected.append(candidate)
+                unchanged = 0
+            else:
+                unchanged += 1
+        selected.sort(key=lambda item: item.insertion_density, reverse=True)
+        return selected[:limit]
+
+    def _make_candidate(self, center_index: int, lambda_value: float) -> DetectorCandidate | None:
+        if self._energies[center_index] < self._energy_threshold:
+            return None
+        center_y = self._layout._pos_y[center_index]
+        center_x = self._layout._pos_x[center_index]
+        active: dict[tuple[int, int], tuple[int, float]] = {}
+        for point_index in self._indices_in_radius(center_y, center_x, self._radius):
+            point_energy = self._energies[point_index]
+            if point_energy < self._energy_threshold:
+                continue
+            similarity = self._layout._similarity_value(center_index, point_index)
+            activation = self._threshold_similarity(similarity, lambda_value)
+            if activation <= 0.0:
+                continue
+            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
+            active[position] = (point_index, activation * point_energy)
+        seed = (center_y, center_x)
+        if seed not in active:
+            return None
+        cluster_positions = self._connected_component(seed, active)
+        if len(cluster_positions) < self._min_points:
+            return None
+        LOGGER.event(
+            "activation.detector.cluster",
+            section=DETECTOR_CLUSTERING,
+            data={"points": len(cluster_positions), "lambda": lambda_value},
+        )
+        weight_sum = sum(active[position][1] for position in cluster_positions)
+        if weight_sum <= 0.0:
+            return None
+        centroid_y = sum(position[0] * active[position][1] for position in cluster_positions) / weight_sum
+        centroid_x = sum(position[1] * active[position][1] for position in cluster_positions) / weight_sum
+        LOGGER.event(
+            "activation.detector.center",
+            section=DETECTOR_CENTER,
+            data={"center_y": centroid_y, "center_x": centroid_x, "weight_sum": weight_sum},
+        )
+        distances = sorted(
+            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
+            for position in cluster_positions
+        )
+        best_radius = 0.0
+        best_fill = -1.0
+        for distance in distances:
+            candidate_radius = max(float(self._radius_min), distance)
+            if candidate_radius > self._radius:
+                continue
+            points_count = sum(value <= candidate_radius for value in distances)
+            if points_count < self._min_points:
+                continue
+            fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
+            if fill_factor > best_fill:
+                best_fill = fill_factor
+                best_radius = candidate_radius
+        if best_radius <= 0.0:
+            return None
+        included = [
+            position
+            for position in cluster_positions
+            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
+        ]
+        detector_energy = sum(active[position][1] for position in included)
+        points_count = len(included)
+        if detector_energy <= 0.0 or points_count < self._min_points:
+            return None
+        return DetectorCandidate(
+            center=(centroid_y, centroid_x),
+            radius=best_radius,
+            energy=detector_energy,
+            points_count=points_count,
+            fill_factor=best_fill,
+            insertion_density=points_count / best_radius,
+        )
+
+    def _threshold_similarity(self, similarity: float, lambda_value: float) -> float:
+        if similarity <= 0.0:
+            return 0.0
+        if self._eta is None:
+            return similarity if similarity >= lambda_value else 0.0
+        return similarity / (1.0 + math.exp(-self._eta * (similarity - lambda_value)))
+
+    def _indices_in_radius(self, center_y: int, center_x: int, radius: int) -> list[int]:
+        indices: list[int] = []
+        radius_sq = radius * radius
+        for y in range(max(0, center_y - radius), min(self._layout.height - 1, center_y + radius) + 1):
+            dy_sq = (center_y - y) ** 2
+            for x in self._layout._row_occupied[y]:
+                if x < center_x - radius or x > center_x + radius:
+                    continue
+                if dy_sq + (center_x - x) ** 2 > radius_sq:
+                    continue
+                point_index = self._layout.grid[y][x]
+                if point_index is not None:
+                    indices.append(point_index)
+        return indices
+
+    @staticmethod
+    def _connected_component(
+        seed: tuple[int, int],
+        active: dict[tuple[int, int], tuple[int, float]],
+    ) -> list[tuple[int, int]]:
+        pending = [seed]
+        visited = {seed}
+        while pending:
+            y, x = pending.pop()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dy == 0 and dx == 0:
+                        continue
+                    neighbour = (y + dy, x + dx)
+                    if neighbour in active and neighbour not in visited:
+                        visited.add(neighbour)
+                        pending.append(neighbour)
+        return list(visited)
+
+    @staticmethod
+    def _overlaps(left: DetectorCandidate, right: DetectorCandidate) -> bool:
+        distance = math.hypot(left.center[0] - right.center[0], left.center[1] - right.center[1])
+        return distance <= left.radius or distance <= right.radius
+
+
+class ActivationEngine(_ActivationEngineBase):
     def activate_many(
         self,
         stimuli_batch: Sequence[Sequence[BitArray]],
@@ -724,8 +972,7 @@ class ActivationEngine:
                         continue
                     energy_sum += act_value * energy
                     points_used += 1
-            raw_activation_level = 0.0 if detector.energy <= 0 else energy_sum / detector.energy
-            activation_level = max(0.0, min(1.0, raw_activation_level))
+            activation_level = 0.0 if detector.energy <= 0 else energy_sum / detector.energy
             LOGGER.event(
                 "activation.detector.level",
                 section=STIMULUS_DETECTION,
@@ -733,7 +980,6 @@ class ActivationEngine:
                     "detector": idx,
                     "detector_label": "" if detector.label is None else str(detector.label),
                     "activation_level": activation_level,
-                    "raw_activation_level": raw_activation_level,
                     "points_used": points_used,
                     "energy_sum": energy_sum,
                 },
@@ -773,7 +1019,7 @@ class ActivationEngine:
         ranked: list[tuple[float, ActivatedDetector]] = []
         for activated in selected_detectors:
             color = activated.detector.lambda_threshold
-            priority = activated.activation_level * color
+            priority = color
             if priority > 0.0:
                 ranked.append((priority, activated))
 

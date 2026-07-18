@@ -42,6 +42,7 @@ class JointEncoder(Encoder):
         self,
         *dimensions: Dimension,
         joint_layers: Sequence[JointDetectorLayer],
+        random_bit: bool = False,
         random_seed: int | None = None,
         log_every: int | None = None,
     ) -> None:
@@ -73,7 +74,11 @@ class JointEncoder(Encoder):
                 )
         self.code_length = len(self._joint_detectors)
         self._rng = random.Random(random_seed)
-        self._bit_map = list(range(self.code_length))
+        self._bit_map = (
+            [self._rng.randrange(self.code_length) for _ in range(self.code_length)]
+            if random_bit
+            else list(range(self.code_length))
+        )
         self.log_every = int(log_every) if log_every is not None else 0
         self._log_counter = 0
         LOGGER.event(
@@ -83,6 +88,8 @@ class JointEncoder(Encoder):
                 "dimensions": len(self.dimensions),
                 "layers": len(joint_layers),
                 "detectors": self.code_length,
+                "random_bit": random_bit,
+                "random_seed": random_seed,
             },
         )
 

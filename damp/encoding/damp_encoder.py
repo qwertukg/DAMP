@@ -526,3 +526,47 @@ class Encoder:
             },
         )
         return color
+
+
+@dataclass(frozen=True)
+class EncoderCodeColorizer:
+    """Назначает псевдоцвет выбранной компоненте Encoder-кода по §3.2 и §5.14."""
+
+    min_hue: float
+    max_hue: float
+    start_bit: int = 0
+    bit_length: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_hue < self.min_hue:
+            raise ValueError("max_hue must be >= min_hue")
+        if self.start_bit < 0:
+            raise ValueError("start_bit must be non-negative")
+        if self.bit_length is not None and self.bit_length <= 0:
+            raise ValueError("bit_length must be positive when set")
+
+    def color(self, code: BitArray) -> tuple[int, int, int]:
+        stop = len(code) if self.bit_length is None else self.start_bit + self.bit_length
+        if self.start_bit >= len(code) or stop > len(code):
+            raise ValueError("color component is outside Encoder code")
+        selected = BitArray(stop - self.start_bit)
+        for target, source in enumerate(range(self.start_bit, stop)):
+            if code[source]:
+                selected.set(target)
+        color = Encoder.color_from_code(
+            selected,
+            min_hue=self.min_hue,
+            max_hue=self.max_hue,
+        )
+        LOGGER.event(
+            "encoder.code.color_component",
+            section=CHROMODYNAMICS,
+            data={
+                "code_length": len(code),
+                "start_bit": self.start_bit,
+                "bit_length": len(selected),
+                "active_bits": selected.count(),
+                "color": color,
+            },
+        )
+        return color

@@ -34,6 +34,7 @@ from damp.article_refs import (
     SPARSE_BIT_VECTORS,
 )
 from damp.encoding.bitarray import BitArray
+from damp.encoding.damp_encoder import EncoderCodeColorizer
 from damp.layout.payload import LayoutEncodedCode
 from damp.logging import LOGGER
 
@@ -44,7 +45,6 @@ class LayoutPoint:
     label: str
     hue: float
     ones: int
-    color: tuple[int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,6 @@ class _ShortPair:
     radius: float
 
 _UNSET = object()
-HUE = 360.0
 _PARALLEL_SIM_MIN_PAIRS = 50_000
 _SIM_POINTS: Sequence[LayoutPoint] | None = None
 _SIM_MODE: str | None = None
@@ -323,7 +322,8 @@ class _GpuLayoutEngine:
                 if (sim <= 0.0) {
                     continue;
                 }
-                energy += sim / (dist_sq + distance_eps);
+                float distance = sqrt(dist_sq);
+                energy += sim / (distance + distance_eps);
             }
             frag = energy;
         }
@@ -1230,7 +1230,7 @@ class Layout:
 
     def __init__(
         self,
-        codes: Mapping[float, Sequence[BitArray]],
+        codes: Mapping[float, Sequence[LayoutEncodedCode | BitArray]],
         *,
         grid_size: int | None = None,
         empty_ratio: float = 0.15,
@@ -1244,6 +1244,7 @@ class Layout:
         use_gpu: bool = True,
         long_subset_size: int | None = 512,
         long_subset_refresh: int = 50,
+        colorizer: EncoderCodeColorizer,
     ) -> None:
         if not codes:
             raise ValueError("codes must be non-empty")
@@ -1265,7 +1266,8 @@ class Layout:
         self._similarity = similarity
         self._lambda = lambda_threshold
         self._eta = eta
-        self._rng = random.Random(seed)
+        self._seed = int(seed)
+        self._rng = random.Random(self._seed)
         self._parallel_workers = parallel_workers
         self._use_gpu = use_gpu
         self._precompute_similarity = bool(precompute_similarity)
@@ -1276,6 +1278,7 @@ class Layout:
         if self._long_subset_size is not None and self._long_subset_size <= 0:
             raise ValueError("long_subset_size must be positive when set")
         self._long_subset_refresh = max(1, int(long_subset_refresh))
+        self._colorizer = colorizer
         self._long_subset_indices: list[int] = []
         self._long_subset_last_step: int = 0
         self._long_step_counter: int = 0
@@ -1429,7 +1432,12 @@ class Layout:
         if precompute_similarity and self._point_count <= max_precompute:
             self._build_similarity_cache()
 
-    def replace_codes(self, codes: Mapping[float, Sequence[BitArray]]) -> None:
+    def replace_codes(
+        self,
+        codes: Mapping[float, Sequence[LayoutEncodedCode | BitArray]],
+        *,
+        colorizer: EncoderCodeColorizer,
+    ) -> None:
         """Change code resolution while preserving the established layout (§5.13.2.4)."""
         replacement_codes, replacement_points = self._materialize_codes(codes)
         if len(replacement_points) != self._point_count:
@@ -1443,6 +1451,7 @@ class Layout:
         old_code_length = len(self._points[0].code)
         self._codes = replacement_codes
         self._points = replacement_points
+        self._colorizer = colorizer
         self._labels = [self._format_label(point.label) for point in self._points]
         self._values = [point.code.to01() for point in self._points]
         self._code_matrix, self._ones_array = self._build_code_matrix()
@@ -2243,7 +2252,6 @@ class Layout:
                     "value": self._values[idx],
                     "hue": point.hue,
                     "ones": point.ones,
-                    "color": list(point.color) if point.color is not None else None,
                 }
             )
         payload = dict(base_payload) if isinstance(base_payload, dict) else {}
@@ -2256,6 +2264,7 @@ class Layout:
                 "lambda_threshold": self._lambda,
                 "eta": self._eta,
                 "pair_radius": self._pair_radius,
+                "seed": self._seed,
                 "layout": points_payload,
             }
         )
@@ -2283,12 +2292,90 @@ class Layout:
             },
         )
 
+    def restore_positions_json(self, path: str) -> bool:
+        """Restore a compatible saved placement without changing current codes."""
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            saved_points = sorted(
+                payload.get("layout", []),
+                key=lambda item: int(item["index"]),
+            )
+            compatible = (
+                int(payload.get("width", -1)) == self.width
+                and int(payload.get("height", -1)) == self.height
+                and str(payload.get("similarity", "")) == self._similarity
+                and int(payload.get("seed", -1)) == self._seed
+                and math.isclose(
+                    float(payload.get("lambda_threshold", -1.0)),
+                    self._lambda,
+                )
+                and (
+                    (payload.get("eta") is None and self._eta is None)
+                    or (
+                        payload.get("eta") is not None
+                        and self._eta is not None
+                        and math.isclose(float(payload["eta"]), self._eta)
+                    )
+                )
+                and len(saved_points) == self._point_count
+                and all(
+                    int(item["index"]) == index
+                    and str(item.get("label", "")) == self._labels[index]
+                    and str(item.get("value", "")) == self._values[index]
+                    for index, item in enumerate(saved_points)
+                )
+            )
+            if not compatible:
+                LOGGER.event(
+                    "layout.checkpoint.incompatible",
+                    section=LAID_OUT_STRUCTURE,
+                    data={"path": path, "points": len(saved_points)},
+                )
+                return False
+
+            positions = [
+                (int(item["y"]), int(item["x"])) for item in saved_points
+            ]
+            if len(set(positions)) != self._point_count or any(
+                not (0 <= y < self.height and 0 <= x < self.width)
+                for y, x in positions
+            ):
+                LOGGER.event(
+                    "layout.checkpoint.incompatible",
+                    section=LAID_OUT_STRUCTURE,
+                    data={"path": path, "reason": "invalid_positions"},
+                )
+                return False
+
+            self.grid = [[None for _ in range(self.width)] for _ in range(self.height)]
+            self._row_occupied = [set() for _ in range(self.height)]
+            for index, (y, x) in enumerate(positions):
+                self.grid[y][x] = index
+                self._row_occupied[y].add(x)
+            self._positions = positions
+            self._pos_y = [position[0] for position in positions]
+            self._pos_x = [position[1] for position in positions]
+            self.pair_radius = payload.get("pair_radius")
+            self._gpu_positions_dirty = True
+        except Exception as exc:
+            LOGGER.event(
+                "layout.checkpoint.load.error",
+                section=LAID_OUT_STRUCTURE,
+                data={"path": path, "error": str(exc)},
+            )
+            return False
+        LOGGER.event(
+            "layout.checkpoint.load",
+            section=LAID_OUT_STRUCTURE,
+            data={"path": path, "points": self._point_count},
+        )
+        return True
+
     def colors_rgb(self) -> list[tuple[int, int, int]]:
-        hues = self._normalized_hues()
-        return [
-            point.color if point.color is not None else self._hue_to_rgb(hue)
-            for point, hue in zip(self._points, hues)
-        ]
+        return [self._code_to_rgb(point.code) for point in self._points]
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
         colors = self.colors_rgb()
@@ -2413,7 +2500,8 @@ class Layout:
                     sim = sim_lambda(idx, other_idx)
                     if sim <= 0.0:
                         continue
-                    energy += sim / (dist_sq + self._distance_eps)
+                    distance = math.sqrt(dist_sq)
+                    energy += sim / (distance + self._distance_eps)
             energies.append(energy)
 
         emax = max(energies)
@@ -2554,7 +2642,8 @@ class Layout:
                     sim = self._sim_lambda_idx(idx, other_idx)
                     if sim <= 0.0:
                         continue
-                    energy += sim / (dist_sq + self._distance_eps)
+                    distance = math.sqrt(dist_sq)
+                    energy += sim / (distance + self._distance_eps)
             energies[idx] = energy
         return energies
 
@@ -3964,40 +4053,23 @@ class Layout:
             return f"{number:.3f}"
         return str(value)
 
-    def _normalized_hues(self) -> list[float]:
-        if not self._points:
-            return []
-        hues = [point.hue for point in self._points]
-        min_hue = min(hues)
-        max_hue = max(hues)
-        if max_hue == min_hue:
-            return [0.0 for _ in hues]
-        scale = HUE / (max_hue - min_hue)
-        normalized = []
-        for hue in hues:
-            value = (hue - min_hue) * scale
-            if value >= HUE:
-                value = HUE - 1e-9
-            normalized.append(value)
-        return normalized
-
     def _coerce_code_entry(
         self,
         entry: LayoutEncodedCode | BitArray | Iterable[int],
         *,
         default_label: float,
-    ) -> tuple[BitArray, int, str, tuple[int, int, int] | None]:
+    ) -> tuple[BitArray, int, str]:
         if isinstance(entry, LayoutEncodedCode):
             layout_code, ones = self._coerce_code(entry.code)
             label_text = self._format_label(entry.label)
-            return layout_code, ones, label_text, entry.color
+            return layout_code, ones, label_text
         layout_code, ones = self._coerce_code(entry)
         label_text = self._format_label(default_label)
-        return layout_code, ones, label_text, None
+        return layout_code, ones, label_text
 
     def _materialize_codes(
         self,
-        codes: Mapping[float, Sequence[BitArray]],
+        codes: Mapping[float, Sequence[LayoutEncodedCode | BitArray]],
     ) -> tuple[dict[float, list[BitArray]], list[LayoutPoint]]:
         materialized: dict[float, list[BitArray]] = {}
         points: list[LayoutPoint] = []
@@ -4005,7 +4077,7 @@ class Layout:
             hue_value = float(hue)
             bucket = materialized.setdefault(hue_value, [])
             for code_entry in label_codes:
-                layout_code, ones, label_text, color = self._coerce_code_entry(
+                layout_code, ones, label_text = self._coerce_code_entry(
                     code_entry,
                     default_label=hue_value,
                 )
@@ -4016,7 +4088,6 @@ class Layout:
                         label=label_text,
                         hue=hue_value,
                         ones=ones,
-                        color=color,
                     )
                 )
         return materialized, points
@@ -4039,15 +4110,6 @@ class Layout:
                 ones += 1
         return layout_code, ones
 
-    @staticmethod
-    def _angle_similarity(angle_a: float, angle_b: float) -> float:
-        diff = abs(angle_a - angle_b) % 360.0
-        diff = min(diff, 360.0 - diff)
-        return (math.cos(math.radians(diff)) + 1.0) / 2.0
-
-    @staticmethod
-    def _hue_to_rgb(hue: float) -> tuple[int, int, int]:
-        import colorsys
-
-        r, g, b = colorsys.hsv_to_rgb((hue % HUE) / HUE, 1.0, 1.0)
-        return int(r * 255), int(g * 255), int(b * 255)
+    def _code_to_rgb(self, code: BitArray) -> tuple[int, int, int]:
+        """Сумма псевдоцветов единичных битов от красного до фиолетового (§5.14)."""
+        return self._colorizer.color(code)

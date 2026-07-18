@@ -1,4 +1,11 @@
-from .activation import ActivationEngine, ActivationMap, ActivationResult, ActivatedDetector, Detector
+from .activation import (
+    ActivationEngine,
+    ActivationMap,
+    ActivationResult,
+    ActivatedDetector,
+    Detector,
+    DetectorHierarchyBuilder,
+)
 
 __all__ = [
     "ActivationEngine",
@@ -6,4 +13,5 @@ __all__ = [
     "ActivationResult",
     "ActivatedDetector",
     "Detector",
+    "DetectorHierarchyBuilder",
 ]
