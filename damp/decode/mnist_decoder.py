@@ -39,6 +39,256 @@ class LabeledEmbedding:
     embedding: BitArray
 
 
+class _EvaluationDiagnostics:
+    """Собирает диагностические представления классификации (§6.5)."""
+
+    def __init__(
+        self,
+        expected_classes: Sequence[int],
+        *,
+        confidence_bins: int,
+        error_examples: int,
+    ) -> None:
+        if confidence_bins <= 0 or error_examples <= 0:
+            raise ValueError("evaluation diagnostic sizes must be positive")
+        self._classes = tuple(int(value) for value in expected_classes)
+        self._class_index = {
+            class_label: index for index, class_label in enumerate(self._classes)
+        }
+        self._confusion = np.zeros(
+            (len(self._classes), len(self._classes)), dtype=np.int64
+        )
+        self._error_limit = int(error_examples)
+        self._confidences: list[float] = []
+        self._correct_confidences: list[float] = []
+        self._wrong_confidences: list[float] = []
+        self._errors: list[tuple[np.ndarray, int, int, float]] = []
+        self._correct = 0
+
+    def update(
+        self,
+        *,
+        sample_index: int,
+        image: np.ndarray,
+        expected: int,
+        prediction: PredictionResult,
+    ) -> None:
+        predicted = int(prediction.predicted_class)
+        is_correct = expected == predicted
+        self._correct += int(is_correct)
+        self._confidences.append(float(prediction.confidence))
+        target = self._correct_confidences if is_correct else self._wrong_confidences
+        target.append(float(prediction.confidence))
+        if expected in self._class_index and predicted in self._class_index:
+            self._confusion[
+                self._class_index[expected], self._class_index[predicted]
+            ] += 1
+        if not is_correct and len(self._errors) < self._error_limit:
+            self._errors.append(
+                (np.asarray(image, dtype=np.float32), expected, predicted, prediction.confidence)
+            )
+        probabilities = sorted(prediction.probabilities, reverse=True)
+        margin = (
+            probabilities[0] - probabilities[1]
+            if len(probabilities) > 1
+            else prediction.confidence
+        )
+        samples = sample_index + 1
+        running_accuracy = self._correct / samples
+        log_progress = LOGGER.should_log("decoder.evaluation.sample")
+        visuals = (
+            self._metric_visuals(
+                samples=samples,
+                running_accuracy=running_accuracy,
+                confidence=prediction.confidence,
+                margin=margin,
+            )
+            if log_progress
+            else None
+        )
+        LOGGER.event(
+            "decoder.evaluation.sample",
+            section=STIMULUS_DETECTION,
+            data={
+                "sample": samples,
+                "expected": expected,
+                "predicted": predicted,
+                "correct": is_correct,
+                "running_accuracy": running_accuracy,
+                "confidence": prediction.confidence,
+                "margin": margin,
+            },
+            visuals=visuals,
+            force=log_progress,
+        )
+
+    def log_summary(self) -> None:
+        samples = len(self._confidences)
+        if samples == 0:
+            return
+        final_accuracy = self._correct / samples
+        confusion_positions = [
+            (row, column)
+            for row in range(len(self._classes))
+            for column in range(len(self._classes))
+        ]
+        visuals = [
+            *self._metric_visuals(
+                samples=samples,
+                running_accuracy=final_accuracy,
+                confidence=self._confidences[-1],
+                margin=0.0,
+            ),
+            LOGGER.visual_scalar_map(
+                "evaluate/confusion/matrix",
+                self._confusion.astype(np.float64).ravel().tolist(),
+                confusion_positions,
+                height=len(self._classes),
+                width=len(self._classes),
+                static=True,
+            ),
+            LOGGER.visual_points2d(
+                "evaluate/confusion/axes",
+                [
+                    *[(-0.5, row + 0.5) for row in range(len(self._classes))],
+                    *[(column + 0.5, -0.5) for column in range(len(self._classes))],
+                ],
+                labels=[
+                    *[f"истина {value}" for value in self._classes],
+                    *[f"прогноз {value}" for value in self._classes],
+                ],
+                show_labels=True,
+                radii=0.1,
+                static=True,
+            ),
+        ]
+        error_montage = self._error_montage()
+        if error_montage is not None:
+            montage_image, label_positions, labels = error_montage
+            visuals.append(
+                LOGGER.visual_image(
+                    "evaluate/errors/images",
+                    montage_image,
+                    static=True,
+                )
+            )
+            visuals.append(
+                LOGGER.visual_points2d(
+                    "evaluate/errors/labels",
+                    label_positions,
+                    colors=[(255, 64, 64, 255) for _ in labels],
+                    radii=0.25,
+                    labels=labels,
+                    show_labels=True,
+                    static=True,
+                )
+            )
+        LOGGER.event(
+            "decoder.evaluation.summary",
+            section=STIMULUS_DETECTION,
+            data={
+                "samples": samples,
+                "accuracy": final_accuracy,
+                "errors": samples - self._correct,
+                "mean_confidence": float(np.mean(self._confidences)),
+                "classes": self._classes,
+                "confusion_matrix": self._confusion.tolist(),
+                "error_examples": [
+                    {
+                        "expected": expected,
+                        "predicted": predicted,
+                        "confidence": confidence,
+                    }
+                    for _, expected, predicted, confidence in self._errors
+                ],
+            },
+            visuals=visuals,
+        )
+
+    def _metric_visuals(
+        self,
+        *,
+        samples: int,
+        running_accuracy: float,
+        confidence: float,
+        margin: float,
+    ) -> list[object]:
+        row_totals = self._confusion.sum(axis=1)
+        class_accuracy = np.divide(
+            np.diag(self._confusion),
+            row_totals,
+            out=np.zeros(len(self._classes), dtype=np.float64),
+            where=row_totals > 0,
+        )
+        class_metrics = {
+            f"class_{label}": float(class_accuracy[index])
+            for index, label in enumerate(self._classes)
+            if row_totals[index] > 0
+        }
+        confidence_metrics = {
+            "current": confidence,
+            "mean_all": float(np.mean(self._confidences)),
+            "mean_correct": float(np.mean(self._correct_confidences))
+            if self._correct_confidences
+            else 0.0,
+            "mean_wrong": float(np.mean(self._wrong_confidences))
+            if self._wrong_confidences
+            else 0.0,
+            "probability_margin": margin,
+        }
+        return [
+            *LOGGER.visual_scalars(
+                "evaluate/metrics",
+                {
+                    "running_accuracy": running_accuracy,
+                    "error_rate": 1.0 - running_accuracy,
+                },
+                step=samples,
+                timeline="sample",
+            ),
+            *LOGGER.visual_scalars(
+                "evaluate/class_accuracy",
+                class_metrics,
+                step=samples,
+                timeline="sample",
+            ),
+            *LOGGER.visual_scalars(
+                "evaluate/confidence",
+                confidence_metrics,
+                step=samples,
+                timeline="sample",
+            ),
+        ]
+
+    def _error_montage(
+        self,
+    ) -> tuple[np.ndarray, list[tuple[float, float]], list[str]] | None:
+        if not self._errors:
+            return None
+        columns = int(math.ceil(math.sqrt(len(self._errors))))
+        rows = int(math.ceil(len(self._errors) / columns))
+        height, width = self._errors[0][0].shape[:2]
+        montage = np.zeros((rows * height, columns * width), dtype=np.float32)
+        label_positions: list[tuple[float, float]] = []
+        labels: list[str] = []
+        for index, (image, expected, predicted, confidence) in enumerate(self._errors):
+            row, column = divmod(index, columns)
+            normalized = np.asarray(image, dtype=np.float32)
+            if normalized.max() > 1.0:
+                normalized = normalized / 255.0
+            montage[
+                row * height : (row + 1) * height,
+                column * width : (column + 1) * width,
+            ] = normalized
+            label_positions.append((column * width + 1.0, row * height + 1.0))
+            labels.append(f"{expected}→{predicted} ({confidence:.2f})")
+        return (
+            np.asarray(np.clip(montage * 255.0, 0.0, 255.0), dtype=np.uint8),
+            label_positions,
+            labels,
+        )
+
+
 class EmbeddingDatabase:
     def __init__(self, embeddings: Sequence[LabeledEmbedding], config: DecoderConfig) -> None:
         if not embeddings:
@@ -281,11 +531,16 @@ class MnistDecoder:
         extractor: MnistSobelAngleMap,
         activation_engine: ActivationEngine,
         embedding_db: EmbeddingDatabase,
+        evaluation_confidence_bins: int,
+        evaluation_error_examples: int,
     ) -> None:
         self._encoder = encoder
         self._extractor = extractor
         self._activation_engine = activation_engine
         self._embedding_db = embedding_db
+        self._evaluation_confidence_bins = int(evaluation_confidence_bins)
+        self._evaluation_error_examples = int(evaluation_error_examples)
+        self._last_activation_values: list[float] | None = None
         code_len = getattr(activation_engine, "_code_length", None)
         LOGGER.event(
             "decoder.init",
@@ -332,6 +587,7 @@ class MnistDecoder:
             codes.append(code)
             first = False
         activation_result = self._activation_engine.activate(codes)
+        self._last_activation_values = list(activation_result.activation_values)
         LOGGER.event(
             "decoder.embed",
             section=CODE_SPACE_ACTIVATION,
@@ -376,6 +632,15 @@ class MnistDecoder:
     ) -> tuple[list[PredictionResult], float | None]:
         results: list[PredictionResult] = []
         correct = 0
+        diagnostics = (
+            _EvaluationDiagnostics(
+                self.expected_classes,
+                confidence_bins=self._evaluation_confidence_bins,
+                error_examples=self._evaluation_error_examples,
+            )
+            if labels is not None
+            else None
+        )
         for idx, image in enumerate(images):
             label_hint = labels[idx] if labels and idx < len(labels) else None
             prediction = self.predict_image(
@@ -388,9 +653,22 @@ class MnistDecoder:
             if labels and idx < len(labels):
                 if int(labels[idx]) == prediction.predicted_class:
                     correct += 1
+                if diagnostics is not None:
+                    diagnostics.update(
+                        sample_index=idx,
+                        image=image,
+                        expected=int(labels[idx]),
+                        prediction=prediction,
+                    )
         accuracy = None
         if labels and results:
             accuracy = correct / len(results)
+        if diagnostics is not None:
+            diagnostics.log_summary()
+        if self._last_activation_values is not None:
+            self._activation_engine.log_activation_overview(
+                self._last_activation_values
+            )
         LOGGER.event(
             "decoder.predict.batch",
             section=STIMULUS_DETECTION,

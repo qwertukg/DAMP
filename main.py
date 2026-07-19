@@ -52,8 +52,8 @@ LOG_INTERVAL_LAYOUT_ENERGY = 1000
 LOG_INTERVAL_LAYOUT_PAIR = 250000
 LOG_INTERVAL_LAYOUT_AVG_ENERGY = 200
 LOG_INTERVAL_LAYOUT_VISUAL = 1
-LOG_INTERVAL_LAYOUT_ADAPTIVE = 200
-LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
+LOG_INTERVAL_LAYOUT_ADAPTIVE = 5
+LOG_INTERVAL_LAYOUT_SWAP_RATIO = 5
 LOG_INTERVAL_LAYOUT_EXPORT = 1
 LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS = 1
 LOG_INTERVAL_ACTIVATION_INIT = 1
@@ -70,6 +70,7 @@ LOG_INTERVAL_ACTIVATION_DETECTOR_CENTER = 100
 LOG_INTERVAL_ACTIVATION_SAMPLE = 100
 LOG_INTERVAL_ACTIVATION_VISUAL = 100
 LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
+LOG_INTERVAL_EVALUATION_PROGRESS = 10
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
@@ -228,6 +229,8 @@ DECODER_EXPECTED_CLASSES = tuple(range(10))
 DECODER_DATASET_LIMIT = 64
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
+EVALUATION_CONFIDENCE_BINS = 10
+EVALUATION_ERROR_EXAMPLES = 16
 
 LAYOUT_TUNE_LONG_PAIR_FACTOR = 0.35
 LAYOUT_TUNE_LONG_PAIRS_MIN = 4000
@@ -324,6 +327,7 @@ LOG_INTERVALS = {
     "layout.run.settings": LOG_INTERVAL_INIT,
     "layout.run.swap_monitor": LOG_INTERVAL_INIT,
     "layout.run.swap_ratio": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
+    "layout.run.progress": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
     "layout.run.swap_stability.stop": LOG_INTERVAL_INIT,
     "layout.run.save_on_stop": LOG_INTERVAL_LAYOUT_EXPORT,
     "layout.run.save_on_stop.error": LOG_INTERVAL_LAYOUT_EXPORT,
@@ -364,9 +368,55 @@ LOG_INTERVALS = {
     "activation.detector.coverage": LOG_INTERVAL_ACTIVATION_COVERAGE,
     "activation.energy.map": LOG_INTERVAL_ACTIVATION_ENERGY_MAP,
     "activation.sample": LOG_INTERVAL_ACTIVATION_SAMPLE,
+    "activation.progress": LOG_INTERVAL_ACTIVATION_SAMPLE,
     "activation.map.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.energy.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
+    "decoder.evaluation.sample": LOG_INTERVAL_EVALUATION_PROGRESS,
+    "decoder.evaluation.summary": LOG_INTERVAL_INIT,
+}
+
+RERUN_LAYOUT_EVENTS = {
+    "mnist.codes",
+    "mnist.encoding.skip",
+    "layout.cache.hit",
+    "layout.cache.miss",
+    "layout.payload.resume",
+    "layout.tune",
+    "layout.init",
+    "layout.grid",
+    "layout.run.mode",
+    "layout.run.settings",
+    "layout.run.progress",
+    "layout.energy.long.progress",
+    "layout.adaptive.radius",
+    "layout.run.swap_stability.stop",
+    "layout.run.energy_stability.stop",
+    "layout.run.done",
+    "layout.continuity.start",
+    "layout.continuity.sweep",
+    "layout.continuity.done",
+    "layout.visual",
+    "layout.render_image",
+    "layout.export.json",
+    "activation.structure.visual",
+    "activation.map.visual",
+    "activation.detector.layer",
+    "activation.engine.init",
+    "activation.sample",
+    "activation.progress",
+    "activation.embedding.save",
+    "pipeline.checkpoint.save",
+}
+
+RERUN_EVALUATE_EVENTS = {
+    "decoder.layout.use",
+    "decoder.build",
+    "decoder.evaluation.sample",
+    "decoder.evaluation.summary",
+    "decoder.dataset.eval",
+    "activation.structure.visual",
+    "activation.map.visual",
 }
 
 LAYOUT_CACHE_PATTERNS = (
@@ -418,8 +468,14 @@ def _load_layout_metadata_from_path(path: str) -> tuple[int, int | None, bool] |
     return total_points, pair_radius, ready
 
 
-def configure_logging() -> None:
+def configure_logging(*, profile: str | None = None) -> None:
     LOGGER.configure_intervals(LOG_INTERVALS, default_interval=LOG_INTERVAL_DEFAULT)
+    rerun_events = None
+    if profile == "layout":
+        rerun_events = RERUN_LAYOUT_EVENTS
+    elif profile == "evaluate":
+        rerun_events = RERUN_EVALUATE_EVENTS
+    LOGGER.configure_rerun(events=rerun_events, dashboard_profile=profile)
 
 
 class GpuEnvironment:
@@ -1268,7 +1324,7 @@ class MnistLayoutRunner:
         if resolved_activation_samples <= 0:
             raise ValueError("activation_samples must be positive")
         self._activation_samples = resolved_activation_samples
-        configure_logging()
+        configure_logging(profile="layout")
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
         self.extractor = MnistSobelAngleMap(
@@ -1668,12 +1724,18 @@ def _load_image_from_path(path: str) -> "np.ndarray":
 
 
 class MnistDecodeRunner:
-    def __init__(self, *, count: int, layout_path: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        count: int,
+        layout_path: str | None = None,
+        logging_profile: str | None = None,
+    ) -> None:
         self.count = count
         self.layout_path = layout_path
         self._decoder: MnistDecoder | None = None
         self._temperature_override: float | None = None
-        configure_logging()
+        configure_logging(profile=logging_profile)
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
         self.extractor = MnistSobelAngleMap(
@@ -1760,6 +1822,8 @@ class MnistDecodeRunner:
             extractor=self.extractor,
             activation_engine=activation_engine,
             embedding_db=database,
+            evaluation_confidence_bins=EVALUATION_CONFIDENCE_BINS,
+            evaluation_error_examples=EVALUATION_ERROR_EXAMPLES,
         )
         LOGGER.event(
             "decoder.build",
@@ -1989,7 +2053,11 @@ def main() -> None:
         runner.run()
         return
     if command == "predict":
-        decode_runner = MnistDecodeRunner(count=args.count, layout_path=args.layout_path)
+        decode_runner = MnistDecodeRunner(
+            count=args.count,
+            layout_path=args.layout_path,
+            logging_profile="predict",
+        )
         temperature = args.temperature
         if args.calibrate:
             best_temp, best_acc = decode_runner.calibrate_temperature(
@@ -2019,7 +2087,11 @@ def main() -> None:
         print(f"dataset={split} samples={args.limit} accuracy={accuracy:.4f}")
         return
     if command == "evaluate":
-        decode_runner = MnistDecodeRunner(count=args.count, layout_path=args.layout_path)
+        decode_runner = MnistDecodeRunner(
+            count=args.count,
+            layout_path=args.layout_path,
+            logging_profile="evaluate",
+        )
         _, accuracy = decode_runner.predict_dataset(
             split=args.split,
             limit=args.limit,

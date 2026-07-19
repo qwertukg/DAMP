@@ -5,6 +5,7 @@ import os
 import random
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from damp.activation import ActivationEngine, Detector
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding
@@ -17,6 +18,7 @@ from damp.layout.damp_layout import (
     _WeightedIndexSampler,
 )
 from damp.layout.payload import LayoutPayloadBuilder
+from damp.logging import DampLogger, RerunDashboard
 from pinwheel_test import (
     PinwheelExperiment,
     PinwheelPositionGenerator,
@@ -40,6 +42,32 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_rerun_event_filter_keeps_only_dashboard_events(self) -> None:
+        logger = DampLogger(spawn=False)
+        logger._initialized = True
+        logger.configure_rerun(
+            events={"decoder.evaluation.summary"},
+            dashboard_profile=None,
+        )
+        with (
+            patch("damp.logging.rr.is_enabled", return_value=True),
+            patch("damp.logging.rr.reset_time"),
+            patch("damp.logging.rr.set_time"),
+            patch("damp.logging.rr.log") as log,
+        ):
+            logger.event("decoder.internal", section="6.5", data={"value": 1})
+            self.assertEqual(log.call_count, 0)
+            logger.event(
+                "decoder.evaluation.summary",
+                section="6.5",
+                data={"accuracy": 0.9},
+            )
+            self.assertGreater(log.call_count, 0)
+
+    def test_rerun_dashboards_are_explicit(self) -> None:
+        self.assertIsNotNone(RerunDashboard.build("layout"))
+        self.assertIsNotNone(RerunDashboard.build("evaluate"))
+
     @staticmethod
     def _single_bit(length: int, index: int) -> BitArray:
         code = BitArray(length)

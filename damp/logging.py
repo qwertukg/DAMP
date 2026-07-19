@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Collection, Mapping, Sequence
 
 import rerun as rr
 
@@ -43,6 +43,147 @@ class LogIntervalPolicy:
         self._counters.clear()
 
 
+class RerunDashboard:
+    """Строит устойчивые рабочие экраны для основных команд DAMP."""
+
+    @staticmethod
+    def build(profile: str):
+        import rerun.blueprint as rrb
+
+        if profile == "layout":
+            dashboard = rrb.Grid(
+                rrb.Spatial2DView(
+                    origin="layout/progress",
+                    contents="layout/progress/**",
+                    name="Ход раскладки",
+                ),
+                rrb.Spatial2DView(
+                    origin="layout/final",
+                    contents="layout/final/**",
+                    name="Итоговая раскладка",
+                ),
+                rrb.Spatial2DView(
+                    origin="activation/latest",
+                    contents="activation/latest/**",
+                    name="Последняя активация",
+                    background=(0, 0, 0, 255),
+                ),
+                rrb.Spatial2DView(
+                    origin="layout/diagnostics/local_energy",
+                    contents="layout/diagnostics/local_energy/**",
+                    name="Локальная энергия",
+                    background=(0, 0, 0, 255),
+                ),
+                rrb.TimeSeriesView(
+                    origin="layout/metrics/swap",
+                    contents="layout/metrics/swap/**",
+                    name="Принятые свопы",
+                ),
+                rrb.TimeSeriesView(
+                    origin="layout/metrics/energy",
+                    contents="layout/metrics/energy/**",
+                    name="Динамика энергии",
+                ),
+                rrb.TimeSeriesView(
+                    origin="layout/metrics/parameters",
+                    contents="layout/metrics/parameters/**",
+                    name="Адаптивные параметры",
+                ),
+                rrb.TimeSeriesView(
+                    origin="layout/metrics/continuity",
+                    contents="layout/metrics/continuity/**",
+                    name="Непрерывность карты",
+                ),
+                rrb.Spatial2DView(
+                    origin="layout/diagnostics/detectors",
+                    contents="layout/diagnostics/detectors/**",
+                    name="Иерархия детекторов",
+                    background=(0, 0, 0, 255),
+                ),
+                rrb.TimeSeriesView(
+                    origin="activation/metrics/map",
+                    contents="activation/metrics/map/**",
+                    name="Динамика активации",
+                ),
+                rrb.TimeSeriesView(
+                    origin="activation/metrics/embedding",
+                    contents="activation/metrics/embedding/**",
+                    name="Динамика эмбеддинга",
+                ),
+                rrb.TextLogView(
+                    origin="damp/log",
+                    contents="damp/log",
+                    name="Ключевые события",
+                ),
+                grid_columns=4,
+                name="DAMP layout",
+            )
+            return rrb.Blueprint(
+                dashboard,
+                auto_views=False,
+                collapse_panels=True,
+            )
+
+        if profile == "evaluate":
+            dashboard = rrb.Grid(
+                rrb.Spatial2DView(
+                    origin="evaluate/confusion",
+                    contents="evaluate/confusion/**",
+                    name="Матрица ошибок",
+                ),
+                rrb.Spatial2DView(
+                    origin="evaluate/errors",
+                    contents="evaluate/errors/**",
+                    name="Ошибочные примеры",
+                ),
+                rrb.TimeSeriesView(
+                    origin="evaluate/class_accuracy",
+                    contents="evaluate/class_accuracy/**",
+                    name="Точность по классам",
+                ),
+                rrb.Spatial2DView(
+                    origin="activation/latest",
+                    contents="activation/latest/**",
+                    name="Последняя активация",
+                    background=(0, 0, 0, 255),
+                ),
+                rrb.Spatial2DView(
+                    origin="layout/diagnostics/local_energy",
+                    contents="layout/diagnostics/local_energy/**",
+                    name="Локальная энергия",
+                    background=(0, 0, 0, 255),
+                ),
+                rrb.Spatial2DView(
+                    origin="layout/diagnostics/detectors",
+                    contents="layout/diagnostics/detectors/**",
+                    name="Детекторы",
+                ),
+                rrb.TimeSeriesView(
+                    origin="evaluate/metrics",
+                    contents="evaluate/metrics/**",
+                    name="Точность и уверенность",
+                ),
+                rrb.TimeSeriesView(
+                    origin="evaluate/confidence",
+                    contents="evaluate/confidence/**",
+                    name="Динамика уверенности",
+                ),
+                rrb.TextLogView(
+                    origin="damp/log",
+                    contents="damp/log",
+                    name="Ключевые события",
+                ),
+                grid_columns=3,
+                name="DAMP evaluate",
+            )
+            return rrb.Blueprint(
+                dashboard,
+                auto_views=False,
+                collapse_panels=True,
+            )
+        return None
+
+
 class DampLogger:
     def __init__(self, app_id: str = "damp", base_path: str = LOG_PATH, *, spawn: bool = True) -> None:
         self._app_id = app_id
@@ -52,6 +193,9 @@ class DampLogger:
         self._spawned = False
         self._event_sequence = 0
         self._interval_policy: LogIntervalPolicy | None = None
+        self._rerun_events: set[str] | None = None
+        self._dashboard_profile: str | None = None
+        self._blueprint_sent = False
 
     def _ensure_rerun(self) -> None:
         if not self._initialized:
@@ -60,6 +204,11 @@ class DampLogger:
         if self._spawn and not self._spawned and rr.is_enabled():
             rr.spawn()
             self._spawned = True
+        if rr.is_enabled() and not self._blueprint_sent and self._dashboard_profile:
+            blueprint = RerunDashboard.build(self._dashboard_profile)
+            if blueprint is not None:
+                rr.send_blueprint(blueprint)
+            self._blueprint_sent = True
 
     def _console_log(self, message: str) -> None:
         stream = sys.stdout
@@ -144,6 +293,16 @@ class DampLogger:
     def configure_intervals(self, intervals: Mapping[str, int], *, default_interval: int = 1) -> None:
         self._interval_policy = LogIntervalPolicy(intervals, default_interval=default_interval)
 
+    def configure_rerun(
+        self,
+        *,
+        events: Collection[str] | None,
+        dashboard_profile: str | None,
+    ) -> None:
+        self._rerun_events = None if events is None else {str(event) for event in events}
+        self._dashboard_profile = dashboard_profile
+        self._blueprint_sent = False
+
     def should_log(self, event: str) -> bool:
         if self._interval_policy is None:
             return True
@@ -176,6 +335,13 @@ class DampLogger:
         self._ensure_rerun()
         if not rr.is_enabled():
             return
+        rerun_event = (
+            self._rerun_events is None
+            or event in self._rerun_events
+            or event.endswith((".error", ".failed"))
+        )
+        if not rerun_event:
+            return
         self._event_sequence += 1
         rr.reset_time()
         rr.set_time("event", sequence=self._event_sequence)
@@ -196,10 +362,24 @@ class DampLogger:
                 rr.log(visual.path, visual.payload, static=visual.static)
         rr.reset_time()
 
-    def visual_image(self, path: str, image, *, static: bool = False) -> LogVisual:
+    def visual_image(
+        self,
+        path: str,
+        image,
+        *,
+        static: bool = False,
+        timeline: str | None = None,
+        time: int | float | None = None,
+    ) -> LogVisual:
         import numpy as np
 
-        return LogVisual(path=path, payload=rr.Image(np.asarray(image)), static=static)
+        return LogVisual(
+            path=path,
+            payload=rr.Image(np.asarray(image)),
+            timeline=timeline,
+            time=time,
+            static=static,
+        )
 
     def visual_points2d(
         self,
@@ -208,16 +388,34 @@ class DampLogger:
         *,
         colors: Sequence[Sequence[int]] | None = None,
         radii: float | Sequence[float] | None = None,
+        labels: Sequence[str] | None = None,
+        show_labels: bool | None = None,
         static: bool = False,
+        timeline: str | None = None,
+        time: int | float | None = None,
     ) -> LogVisual:
         return LogVisual(
             path=path,
-            payload=rr.Points2D(positions, colors=colors, radii=radii),
+            payload=rr.Points2D(
+                positions,
+                colors=colors,
+                radii=radii,
+                labels=labels,
+                show_labels=show_labels,
+            ),
+            timeline=timeline,
+            time=time,
             static=static,
         )
 
-    def visual_bar_chart(self, path: str, values: Sequence[int]) -> LogVisual:
-        return LogVisual(path=path, payload=rr.BarChart(list(values)))
+    def visual_bar_chart(
+        self,
+        path: str,
+        values: Sequence[int | float],
+        *,
+        static: bool = False,
+    ) -> LogVisual:
+        return LogVisual(path=path, payload=rr.BarChart(list(values)), static=static)
 
     def visual_boxes2d(
         self,
@@ -226,8 +424,40 @@ class DampLogger:
         sizes: Sequence[Sequence[float]],
         *,
         colors: Sequence[Sequence[int]] | None = None,
+        static: bool = False,
     ) -> LogVisual:
-        return LogVisual(path=path, payload=rr.Boxes2D(mins=mins, sizes=sizes, colors=colors))
+        return LogVisual(
+            path=path,
+            payload=rr.Boxes2D(mins=mins, sizes=sizes, colors=colors),
+            static=static,
+        )
+
+    def visual_scalar_map(
+        self,
+        path: str,
+        values: Sequence[float],
+        positions: Sequence[Sequence[int]],
+        *,
+        height: int,
+        width: int,
+        static: bool = False,
+    ) -> LogVisual:
+        import numpy as np
+
+        matrix = np.zeros((height, width), dtype=np.float32)
+        for value, position in zip(values, positions):
+            y, x = int(position[0]), int(position[1])
+            if 0 <= y < height and 0 <= x < width:
+                matrix[y, x] = float(value)
+        maximum = float(matrix.max()) if matrix.size else 0.0
+        if maximum > 0.0:
+            matrix /= maximum
+        intensity = np.asarray(
+            np.clip(matrix * 255.0, 0.0, 255.0), dtype=np.uint8
+        )
+        image = np.zeros((height, width, 3), dtype=np.uint8)
+        image[..., 0] = intensity
+        return self.visual_image(path, image, static=static)
 
     def visual_scalars(
         self,

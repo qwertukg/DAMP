@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import concurrent.futures
 import random
+import threading
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -534,6 +535,8 @@ class _ActivationEngineBase:
         self._energies_array = np.asarray(self._energies, dtype=np.float32) if np is not None else None
         self._coverage = self._precompute_coverage()
         self._code_length = self._resolve_code_length()
+        self._activation_sequence = 0
+        self._activation_sequence_lock = threading.Lock()
         LOGGER.event(
             "activation.engine.init",
             section=DETECTOR_HIERARCHY,
@@ -545,6 +548,7 @@ class _ActivationEngineBase:
                 "saturation_limit": self._saturation_limit,
             },
         )
+        self._log_structure_overview()
 
     def activate(self, stimuli: Sequence[BitArray]) -> ActivationResult:
         activation_values = self._activation_map.compute(stimuli)
@@ -553,16 +557,20 @@ class _ActivationEngineBase:
             activation_values,
             event="activation.map.visual",
             section=CODE_SPACE_ACTIVATION,
-            path="activation/map",
-        )
-        self._log_map(
-            self._energies,
-            event="activation.energy.visual",
-            section=ENERGY_CALC,
-            path="activation/energy",
+            path="activation/latest",
         )
         active_detectors = self._evaluate_detectors(activation_values)
         embedding = self._build_embedding(active_detectors)
+        with self._activation_sequence_lock:
+            self._activation_sequence += 1
+            activation_sequence = self._activation_sequence
+        activation_max = max(activation_values, default=0.0)
+        activation_mean = (
+            sum(activation_values) / len(activation_values)
+            if activation_values
+            else 0.0
+        )
+        active_points = sum(value > 0.0 for value in activation_values)
         LOGGER.event(
             "activation.embedding",
             section=DETECTOR_INSERTION,
@@ -572,11 +580,54 @@ class _ActivationEngineBase:
                 "saturation_limit": self._saturation_limit,
             },
         )
+        LOGGER.event(
+            "activation.progress",
+            section=CODE_SPACE_ACTIVATION,
+            data={
+                "sample": activation_sequence,
+                "activation_max": activation_max,
+                "activation_mean": activation_mean,
+                "active_points": active_points,
+                "active_detectors": len(active_detectors),
+                "embedding_bits": embedding.count(),
+            },
+            visuals=[
+                *LOGGER.visual_scalars(
+                    "activation/metrics/map",
+                    {
+                        "maximum": activation_max,
+                        "mean": activation_mean,
+                        "active_points": active_points,
+                    },
+                    step=activation_sequence,
+                    timeline="activation_sample",
+                ),
+                *LOGGER.visual_scalars(
+                    "activation/metrics/embedding",
+                    {
+                        "active_detectors": len(active_detectors),
+                        "active_bits": embedding.count(),
+                    },
+                    step=activation_sequence,
+                    timeline="activation_sample",
+                ),
+            ],
+        )
         return ActivationResult(
             activation_values=activation_values,
             activation_matrix=activation_matrix,
             active_detectors=active_detectors,
             embedding=embedding,
+        )
+
+    def log_activation_overview(self, values: Sequence[float]) -> None:
+        """Фиксирует последнюю карту независимо от интервала (§6.1)."""
+        self._log_map(
+            values,
+            event="activation.map.visual",
+            section=CODE_SPACE_ACTIVATION,
+            path="activation/latest",
+            force=True,
         )
 
 
@@ -858,6 +909,8 @@ class ActivationEngine(_ActivationEngineBase):
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
                 results = list(executor.map(self.activate, batches))
+        if results:
+            self.log_activation_overview(results[-1].activation_values)
         LOGGER.event(
             "activation.parallel.done",
             section=PARALLEL_PROCESSING,
@@ -1090,6 +1143,88 @@ class ActivationEngine(_ActivationEngineBase):
         alpha = int(v * 255)
         return 255, 0, 0, alpha
 
+    @staticmethod
+    def _detector_color(value: float) -> tuple[int, int, int, int]:
+        v = max(0.0, min(1.0, value))
+        return (
+            int(255.0 * v),
+            int(255.0 * (1.0 - abs(2.0 * v - 1.0))),
+            int(255.0 * (1.0 - v)),
+            255,
+        )
+
+    def _log_structure_overview(self) -> None:
+        positions = self._activation_map.positions
+        point_positions = [(x + 0.5, y + 0.5) for y, x in positions]
+        energy_max = max(self._energies, default=0.0)
+        energy_scale = 1.0 / energy_max if energy_max > 0.0 else 0.0
+        energy_colors = [
+            self._value_to_rgba(value * energy_scale) for value in self._energies
+        ]
+        detector_mins = [
+            (detector.center[1] - detector.radius, detector.center[0] - detector.radius)
+            for detector in self._detectors
+        ]
+        detector_sizes = [
+            (detector.radius * 2.0, detector.radius * 2.0)
+            for detector in self._detectors
+        ]
+        detector_positions = [
+            (detector.center[1], detector.center[0]) for detector in self._detectors
+        ]
+        detector_colors = [
+            self._detector_color(detector.lambda_threshold)
+            for detector in self._detectors
+        ]
+        visuals = [
+            LOGGER.visual_scalar_map(
+                "layout/diagnostics/local_energy/map",
+                self._energies,
+                positions,
+                height=self._activation_map.height,
+                width=self._activation_map.width,
+                static=True,
+            ),
+            LOGGER.visual_points2d(
+                "layout/diagnostics/local_energy/points",
+                point_positions,
+                colors=energy_colors,
+                radii=0.45,
+                static=True,
+            ),
+            LOGGER.visual_boxes2d(
+                "layout/diagnostics/detectors/receptive_fields",
+                detector_mins,
+                detector_sizes,
+                colors=detector_colors,
+                static=True,
+            ),
+            LOGGER.visual_points2d(
+                "layout/diagnostics/detectors/centers",
+                detector_positions,
+                colors=detector_colors,
+                radii=0.65,
+                static=True,
+            ),
+        ]
+        LOGGER.event(
+            "activation.structure.visual",
+            section=DETECTOR_HIERARCHY,
+            data={
+                "points": len(positions),
+                "detectors": len(self._detectors),
+                "energy_min": min(self._energies, default=0.0),
+                "energy_max": energy_max,
+                "radius_min": min(
+                    (detector.radius for detector in self._detectors), default=0.0
+                ),
+                "radius_max": max(
+                    (detector.radius for detector in self._detectors), default=0.0
+                ),
+            },
+            visuals=visuals,
+        )
+
     def _log_map(
         self,
         values: Sequence[float],
@@ -1097,15 +1232,20 @@ class ActivationEngine(_ActivationEngineBase):
         event: str,
         section: str,
         path: str,
+        force: bool = False,
     ) -> None:
         if not values:
             return
         if len(values) != self._activation_map.point_count:
             raise ValueError("map values length must match points count")
+        log_visual = force or LOGGER.should_log(event)
+        if not log_visual:
+            return
         vmax = max(values)
         scale = 1.0 / vmax if vmax > 0 else 0.0
         colors = [self._value_to_rgba(val * scale) for val in values]
         positions = self._activation_map.positions
+        point_positions = [(x + 0.5, y + 0.5) for y, x in positions]
         LOGGER.event(
             event,
             section=section,
@@ -1115,11 +1255,19 @@ class ActivationEngine(_ActivationEngineBase):
                 "value_min": min(values),
             },
             visuals=[
-                LOGGER.visual_points2d(
-                    path,
+                LOGGER.visual_scalar_map(
+                    f"{path}/map",
+                    values,
                     positions,
+                    height=self._activation_map.height,
+                    width=self._activation_map.width,
+                ),
+                LOGGER.visual_points2d(
+                    f"{path}/points",
+                    point_positions,
                     colors=colors,
                     radii=0.45,
                 )
             ],
+            force=True,
         )

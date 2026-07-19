@@ -1826,13 +1826,14 @@ class Layout:
                     swaps, pairs_per_step
                 )
                 avg_swaps_window = avg_ratio * pairs_per_step
-                log_swap_ratio = LOGGER.should_log("layout.run.swap_ratio")
+                log_swap_ratio = LOGGER.should_log("layout.run.progress")
                 swap_visuals = (
                     LOGGER.visual_scalars(
-                        f"{log_path}/swap_ratio",
+                        "layout/metrics/swap",
                         {
+                            "accepted_swaps": swaps,
                             "swap_ratio": swap_ratio,
-                            "avg_ratio": avg_ratio,
+                            "average_swap_ratio": avg_ratio,
                         },
                         step=current_step,
                         timeline=_LAYOUT_STEP_TIMELINE,
@@ -1841,10 +1842,12 @@ class Layout:
                     else None
                 )
                 LOGGER.event(
-                    "layout.run.swap_ratio",
+                    "layout.run.progress",
                     section=OPTIM_PAIR_SELECTION,
                     data={
                         "step": current_step,
+                        "mode": mode,
+                        "accepted_swaps": swaps,
                         "swap_ratio": swap_ratio,
                         "avg_ratio": avg_ratio,
                         "avg_swaps": avg_swaps_window,
@@ -1872,6 +1875,7 @@ class Layout:
                         self._log_layout_state(
                             path=log_path,
                             step=current_step,
+                            mode=mode,
                             log_visuals=log_visuals,
                             force=True,
                         )
@@ -1884,7 +1888,10 @@ class Layout:
                     break
             if log_every is not None and step % log_every == 0:
                 self._log_layout_state(
-                    path=log_path, step=step + step_offset, log_visuals=log_visuals
+                    path=log_path,
+                    step=step + step_offset,
+                    mode=mode,
+                    log_visuals=log_visuals,
                 )
             energy_for_stability: float | None = None
             previous_energy: float | None = None
@@ -1915,8 +1922,11 @@ class Layout:
                 log_energy_progress = LOGGER.should_log("layout.energy.long.progress")
                 energy_visuals = (
                     LOGGER.visual_scalars(
-                        f"{log_path}/energy/long",
-                        {"energy_minimization": minimization},
+                        "layout/metrics/energy",
+                        {
+                            "average_local_energy": energy_for_stability,
+                            "energy_delta": minimization,
+                        },
                         step=current_step,
                         timeline=_LAYOUT_STEP_TIMELINE,
                     )
@@ -1940,6 +1950,20 @@ class Layout:
                 new_lambda, swap_ratio = adaptive_state.update_after_step(
                     step=step, swaps=swaps, current_lambda=self._lambda
                 )
+                log_adaptive = LOGGER.should_log("layout.adaptive.radius")
+                adaptive_visuals = (
+                    LOGGER.visual_scalars(
+                        "layout/metrics/parameters",
+                        {
+                            "pair_radius": effective_pair_radius,
+                            "lambda_threshold": self._lambda,
+                        },
+                        step=current_step,
+                        timeline=_LAYOUT_STEP_TIMELINE,
+                    )
+                    if log_adaptive
+                    else None
+                )
                 LOGGER.event(
                     "layout.adaptive.radius",
                     section=LAYOUT_PARAMETERS,
@@ -1949,6 +1973,8 @@ class Layout:
                         "swap_ratio": swap_ratio,
                         "lambda_threshold": self._lambda,
                     },
+                    visuals=adaptive_visuals,
+                    force=log_adaptive,
                 )
                 if new_lambda is not None and new_lambda != self._lambda:
                     self._lambda = new_lambda
@@ -1983,6 +2009,7 @@ class Layout:
                         self._log_layout_state(
                             path=log_path,
                             step=current_step,
+                            mode=mode,
                             log_visuals=log_visuals,
                             force=True,
                         )
@@ -1996,14 +2023,33 @@ class Layout:
 
         self.last_steps = steps_executed
         avg_swaps = (total_swaps / steps_executed) if steps_executed else 0.0
+        final_step = step_offset + max(steps_executed - 1, 0)
+        self._log_layout_state(
+            path=log_path,
+            step=final_step,
+            mode=mode,
+            log_visuals=log_visuals,
+            force=True,
+        )
         LOGGER.event(
             "layout.run.done",
             section=LAYOUT_ALGORITHM,
             data={
+                "mode": mode,
+                "final_step": final_step,
                 "steps": steps_executed,
                 "total_swaps": total_swaps,
                 "avg_swaps": avg_swaps,
             },
+            visuals=LOGGER.visual_scalars(
+                "layout/metrics/summary",
+                {
+                    f"{mode}_total_swaps": total_swaps,
+                    f"{mode}_average_swaps": avg_swaps,
+                },
+                step=final_step,
+                timeline=_LAYOUT_STEP_TIMELINE,
+            ),
         )
         return total_swaps
 
@@ -2041,6 +2087,7 @@ class Layout:
         path: str,
         step: int,
         *,
+        mode: str,
         log_visuals: bool,
         force: bool = False,
     ) -> None:
@@ -2054,14 +2101,18 @@ class Layout:
             image = self._build_image(colors)
             visuals = [
                 LOGGER.visual_image(
-                    f"{path}/image",
+                    "layout/progress/map",
                     image,
+                    timeline=_LAYOUT_STEP_TIMELINE,
+                    time=step,
                 ),
                 LOGGER.visual_points2d(
-                    f"{path}/image",
+                    "layout/progress/points",
                     positions,
                     colors=colors,
                     radii=0.5,
+                    timeline=_LAYOUT_STEP_TIMELINE,
+                    time=step,
                 ),
             ]
         energy_radius: int | None = None
@@ -2093,6 +2144,7 @@ class Layout:
             section=LAYOUT_ALGORITHM,
             data={
                 "step": step,
+                "mode": mode,
                 "points": self._point_count,
                 "grid_size": self.width,
                 "energy": energy_value,
@@ -2530,6 +2582,16 @@ class Layout:
                     "gain": gain_sum,
                     "worst_defect": defects[0][0] if defects else 0.0,
                 },
+                visuals=LOGGER.visual_scalars(
+                    "layout/metrics/continuity",
+                    {
+                        "accepted_swaps": swaps,
+                        "energy_gain": gain_sum,
+                        "worst_defect": defects[0][0] if defects else 0.0,
+                    },
+                    step=sweep,
+                    timeline="continuity_sweep",
+                ),
             )
             if swaps == 0:
                 stalled += 1
