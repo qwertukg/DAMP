@@ -7,16 +7,27 @@ from damp.activation import ActivationEngine, Detector
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, EncoderCodeColorizer
+from damp.encoding.orientation_encoder import RetinotopicOrientationEncoder
 from damp.layout.damp_layout import Layout
-from pinwheel_test import PinwheelExperiment, PinwheelQualityEvaluator, RetinotopicAngleSurface
+from pinwheel_test import (
+    PinwheelExperiment,
+    PinwheelPositionGenerator,
+    PinwheelQualityEvaluator,
+    RetinotopicAngleSurface,
+)
 from main import (
     LAYOUT_PSEUDO_COLOR_MAX_HUE,
     LAYOUT_PSEUDO_COLOR_MIN_HUE,
     PINWHEEL_ANGLE_COUNT,
     PINWHEEL_COUNT,
     PINWHEEL_LAMBDA_THRESHOLD,
+    PINWHEEL_POSITION_GENERATOR_CANDIDATES,
+    PINWHEEL_POSITION_GENERATOR_MARGIN,
+    PINWHEEL_POSITION_MAX,
+    PINWHEEL_POSITION_MIN,
     PINWHEEL_SHORT_ANGLE_LAYERS,
     PINWHEEL_SHORT_SPATIAL_JOINT_LAYERS,
+    _build_encoder,
 )
 
 
@@ -61,6 +72,17 @@ class ArticleInvariantTests(unittest.TestCase):
         _, first = encoder.encode(0.0)
         _, last = encoder.encode(359.0)
         self.assertGreater(first.common(last), 0)
+
+    def test_main_uses_shared_axial_orientation_encoder(self) -> None:
+        encoder = _build_encoder()
+        self.assertIsInstance(encoder, RetinotopicOrientationEncoder)
+        values_zero, code_zero = encoder.encode(0.0, 3.0, 3.0)
+        values_half_turn, code_half_turn = encoder.encode(180.0, 3.0, 3.0)
+        self.assertTrue(math.isclose(values_zero[0], values_half_turn[0]))
+        self.assertEqual(code_zero.to01(), code_half_turn.to01())
+        descriptor = encoder.describe(45.0, center_index=24)
+        spatial_bits, angular_bits = encoder.active_component_counts(descriptor)
+        self.assertGreater(spatial_bits, angular_bits)
 
     def test_point_energy_uses_euclidean_distance(self) -> None:
         code = self._single_bit(8, 0)
@@ -211,23 +233,26 @@ class ArticleInvariantTests(unittest.TestCase):
             PINWHEEL_SHORT_SPATIAL_JOINT_LAYERS,
             PINWHEEL_SHORT_ANGLE_LAYERS,
         )
-        first = surface.samples[0]
-        same_encoded_angle_other_position = surface.samples[
-            8 * PINWHEEL_ANGLE_COUNT
-        ]
-        first_code = encoder.encode(first)
-        other_code = encoder.encode(same_encoded_angle_other_position)
-        self.assertNotEqual(first_code.to01(), other_code.to01())
-        self.assertEqual(first.encoded_angle, same_encoded_angle_other_position.encoded_angle)
+        first, same_encoded_angle_other_position = self._shared_boundary(surface, 0, 1)[0]
+        first_code = encoder.encode_sample(first)
+        other_code = encoder.encode_sample(same_encoded_angle_other_position)
+        self.assertEqual(first_code.to01(), other_code.to01())
+        self.assertTrue(
+            math.isclose(
+                first.encoded_angle,
+                same_encoded_angle_other_position.encoded_angle,
+                abs_tol=1e-9,
+            )
+        )
         self.assertEqual(
             encoder.colorizer.color(first_code),
             encoder.colorizer.color(other_code),
         )
         colors = {
-            encoder.colorizer.color(encoder.encode(sample))
-            for sample in surface.samples[:PINWHEEL_ANGLE_COUNT]
+            encoder.colorizer.color(encoder.encode_sample(sample))
+            for sample in surface.samples
         }
-        self.assertEqual(len(colors), PINWHEEL_ANGLE_COUNT)
+        self.assertGreaterEqual(len(colors), PINWHEEL_ANGLE_COUNT)
 
     def test_pinwheel_input_phases_match_shared_boundaries(self) -> None:
         surface = RetinotopicAngleSurface()
@@ -236,13 +261,15 @@ class ArticleInvariantTests(unittest.TestCase):
         self.assertGreaterEqual(len(horizontal), 1)
         self.assertGreaterEqual(len(vertical), 1)
         for first, second in horizontal + vertical:
-            self.assertEqual(first.encoded_angle, second.encoded_angle)
+            self.assertTrue(
+                math.isclose(first.encoded_angle, second.encoded_angle, abs_tol=1e-9)
+            )
             self.assertEqual(first.radius_index, second.radius_index)
             self.assertTrue(math.isclose(first.position_x, second.position_x))
             self.assertTrue(math.isclose(first.position_y, second.position_y))
         horizontal_left, horizontal_right = horizontal[0]
-        self.assertEqual(horizontal_left.chirality, 1)
-        self.assertEqual(horizontal_right.chirality, -1)
+        self.assertIn(horizontal_left.chirality, (-1, 1))
+        self.assertIn(horizontal_right.chirality, (-1, 1))
 
         self.assertTrue(
             all(
@@ -252,6 +279,64 @@ class ArticleInvariantTests(unittest.TestCase):
             )
         )
 
+    def test_pinwheel_field_is_continuous_for_arbitrary_centers(self) -> None:
+        center_sets = (
+            ((0.19, 0.22), (0.81, 0.76)),
+            ((0.14, 0.18), (0.73, 0.21), (0.43, 0.84)),
+            ((0.12, 0.31), (0.66, 0.13), (0.88, 0.69), (0.37, 0.82)),
+        )
+        for centers in center_sets:
+            with self.subTest(centers=len(centers)):
+                surface = RetinotopicAngleSurface(centers)
+                self.assertEqual(
+                    len(surface.samples), len(centers) * PINWHEEL_ANGLE_COUNT
+                )
+                for position in range(len(centers)):
+                    samples = surface.samples[
+                        position * PINWHEEL_ANGLE_COUNT :
+                        (position + 1) * PINWHEEL_ANGLE_COUNT
+                    ]
+                    deltas = [
+                        PinwheelQualityEvaluator._angle_delta(
+                            samples[index].encoded_angle,
+                            samples[(index + 1) % len(samples)].encoded_angle,
+                        )
+                        for index in range(len(samples))
+                    ]
+                    self.assertLess(max(deltas), 15.0)
+
+    def test_pinwheel_position_generator_is_seeded_and_non_symmetric(self) -> None:
+        generator = PinwheelPositionGenerator(
+            minimum=PINWHEEL_POSITION_MIN,
+            maximum=PINWHEEL_POSITION_MAX,
+            margin=PINWHEEL_POSITION_GENERATOR_MARGIN,
+            candidates=PINWHEEL_POSITION_GENERATOR_CANDIDATES,
+        )
+        first = generator.generate(4, seed=17)
+        second = generator.generate(4, seed=17)
+        different = generator.generate(4, seed=18)
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different)
+        self.assertEqual(len(set(first)), 4)
+        self.assertTrue(
+            all(
+                PINWHEEL_POSITION_MIN < x < PINWHEEL_POSITION_MAX
+                and PINWHEEL_POSITION_MIN < y < PINWHEEL_POSITION_MAX
+                for x, y in first
+            )
+        )
+
+    def test_pinwheel_position_bits_outweigh_angle_bits(self) -> None:
+        surface = RetinotopicAngleSurface()
+        encoder = PinwheelExperiment.build_encoder(
+            PINWHEEL_SHORT_SPATIAL_JOINT_LAYERS,
+            PINWHEEL_SHORT_ANGLE_LAYERS,
+            spatial_bounds=surface.spatial_bounds,
+        )
+        for sample in surface.samples[::PINWHEEL_ANGLE_COUNT // 8]:
+            spatial_bits, angular_bits = encoder.active_sample_component_counts(sample)
+            self.assertGreater(spatial_bits, angular_bits)
+
     def test_pinwheel_codes_are_continuous_across_shared_boundaries(self) -> None:
         surface = RetinotopicAngleSurface()
         encoder = PinwheelExperiment.build_encoder(
@@ -260,8 +345,8 @@ class ArticleInvariantTests(unittest.TestCase):
         )
 
         def cosine(first_sample: object, second_sample: object) -> float:
-            first = encoder.encode(first_sample)
-            second = encoder.encode(second_sample)
+            first = encoder.encode_sample(first_sample)
+            second = encoder.encode_sample(second_sample)
             return first.common(second) / math.sqrt(first.count() * second.count())
 
         horizontal_pair = self._shared_boundary(surface, 0, 1)[0]

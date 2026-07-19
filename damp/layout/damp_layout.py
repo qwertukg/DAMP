@@ -4,6 +4,7 @@ import bisect
 import concurrent.futures
 from dataclasses import dataclass, field
 from collections import deque
+import hashlib
 import json
 import math
 import os
@@ -20,6 +21,7 @@ from damp.article_refs import (
     LAYOUT_ALGORITHM,
     LAYOUT_COMPACTNESS,
     LAYOUT_PARAMETERS,
+    MAPPING_CONTINUITY,
     OPTIM_ENERGY,
     OPTIM_FIRST_POINT,
     OPTIM_PAIR_SELECTION,
@@ -64,6 +66,39 @@ class ShortLayoutOptimConfig:
     use_weighted_first_point: bool = True
     similarity_cutoff: float | None = None
     partitions: int = 1
+
+
+@dataclass(frozen=True)
+class ContinuityLayoutConfig:
+    sweeps: int
+    defect_points: int
+    candidates_per_point: int
+    min_gain: float = 1e-6
+    stall_sweeps: int = 3
+    cyclic_period: float | None = None
+    cyclic_weight: float = 0.0
+    cyclic_sharp_threshold: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.sweeps < 0:
+            raise ValueError("sweeps must be non-negative")
+        if self.defect_points <= 0:
+            raise ValueError("defect_points must be positive")
+        if self.candidates_per_point <= 0:
+            raise ValueError("candidates_per_point must be positive")
+        if self.min_gain < 0.0:
+            raise ValueError("min_gain must be non-negative")
+        if self.stall_sweeps <= 0:
+            raise ValueError("stall_sweeps must be positive")
+        if self.cyclic_period is not None and self.cyclic_period <= 0.0:
+            raise ValueError("cyclic_period must be positive when set")
+        if self.cyclic_weight < 0.0:
+            raise ValueError("cyclic_weight must be non-negative")
+        if self.cyclic_sharp_threshold is not None:
+            if self.cyclic_period is None:
+                raise ValueError("cyclic_period is required for a sharp threshold")
+            if not 0.0 < self.cyclic_sharp_threshold < self.cyclic_period / 2.0:
+                raise ValueError("cyclic_sharp_threshold must be in (0, period/2)")
 
 
 @dataclass(frozen=True)
@@ -2216,6 +2251,253 @@ class Layout:
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
 
+    @staticmethod
+    def _grid_neighbours(y: int, x: int, height: int, width: int) -> tuple[tuple[int, int], ...]:
+        neighbours: list[tuple[int, int]] = []
+        if y > 0:
+            neighbours.append((y - 1, x))
+        if y + 1 < height:
+            neighbours.append((y + 1, x))
+        if x > 0:
+            neighbours.append((y, x - 1))
+        if x + 1 < width:
+            neighbours.append((y, x + 1))
+        return tuple(neighbours)
+
+    def _continuity_edges(
+        self, first: tuple[int, int], second: tuple[int, int]
+    ) -> set[tuple[tuple[int, int], tuple[int, int]]]:
+        edges: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+        for point in (first, second):
+            for neighbour in self._grid_neighbours(
+                point[0], point[1], self.height, self.width
+            ):
+                edges.add(tuple(sorted((point, neighbour))))
+        return edges
+
+    def _continuity_swap_gain(
+        self,
+        first: tuple[int, int],
+        second: tuple[int, int],
+        config: ContinuityLayoutConfig,
+    ) -> float:
+        first_index = self.grid[first[0]][first[1]]
+        second_index = self.grid[second[0]][second[1]]
+        if first_index is None or second_index is None or first_index == second_index:
+            return 0.0
+
+        def after_index(position: tuple[int, int]) -> int | None:
+            if position == first:
+                return second_index
+            if position == second:
+                return first_index
+            return self.grid[position[0]][position[1]]
+
+        before = 0.0
+        after = 0.0
+        for start, end in self._continuity_edges(first, second):
+            start_before = self.grid[start[0]][start[1]]
+            end_before = self.grid[end[0]][end[1]]
+            if start_before is not None and end_before is not None:
+                before += self._continuity_pair_score(start_before, end_before, config)
+            start_after = after_index(start)
+            end_after = after_index(end)
+            if start_after is not None and end_after is not None:
+                after += self._continuity_pair_score(start_after, end_after, config)
+        return after - before
+
+    def _continuity_pair_score(
+        self,
+        first: int,
+        second: int,
+        config: ContinuityLayoutConfig,
+    ) -> float:
+        score = self._sim_lambda_idx(first, second)
+        if config.cyclic_period is None or config.cyclic_weight <= 0.0:
+            return score
+        delta = abs(self._points[first].hue - self._points[second].hue)
+        delta %= config.cyclic_period
+        delta = min(delta, config.cyclic_period - delta)
+        cyclic_similarity = 0.5 * (
+            1.0 + math.cos(2.0 * math.pi * delta / config.cyclic_period)
+        )
+        return score + config.cyclic_weight * cyclic_similarity
+
+    def _continuity_cyclic_penalty(
+        self,
+        first: int | None,
+        second: int | None,
+        config: ContinuityLayoutConfig,
+    ) -> float:
+        if (
+            first is None
+            or second is None
+            or config.cyclic_period is None
+            or config.cyclic_sharp_threshold is None
+        ):
+            return 0.0
+        delta = abs(self._points[first].hue - self._points[second].hue)
+        delta %= config.cyclic_period
+        delta = min(delta, config.cyclic_period - delta)
+        excess = max(0.0, delta - config.cyclic_sharp_threshold)
+        return excess * excess
+
+    def _continuity_swap_sharp_gain(
+        self,
+        first: tuple[int, int],
+        second: tuple[int, int],
+        config: ContinuityLayoutConfig,
+    ) -> float:
+        first_index = self.grid[first[0]][first[1]]
+        second_index = self.grid[second[0]][second[1]]
+
+        def after_index(position: tuple[int, int]) -> int | None:
+            if position == first:
+                return second_index
+            if position == second:
+                return first_index
+            return self.grid[position[0]][position[1]]
+
+        before = 0.0
+        after = 0.0
+        for start, end in self._continuity_edges(first, second):
+            before += self._continuity_cyclic_penalty(
+                self.grid[start[0]][start[1]],
+                self.grid[end[0]][end[1]],
+                config,
+            )
+            after += self._continuity_cyclic_penalty(
+                after_index(start), after_index(end), config
+            )
+        return before - after
+
+    def _continuity_defects(
+        self, config: ContinuityLayoutConfig
+    ) -> list[tuple[float, tuple[int, int]]]:
+        defects: list[tuple[float, tuple[int, int]]] = []
+        for index, (y, x) in enumerate(self._positions):
+            similarities: list[float] = []
+            for neighbour_y, neighbour_x in self._grid_neighbours(
+                y, x, self.height, self.width
+            ):
+                neighbour = self.grid[neighbour_y][neighbour_x]
+                if neighbour is not None:
+                    similarities.append(
+                        self._continuity_pair_score(index, neighbour, config)
+                    )
+            if similarities:
+                maximum = 1.0 + config.cyclic_weight
+                sharp_penalty = sum(
+                    self._continuity_cyclic_penalty(
+                        index,
+                        self.grid[neighbour_y][neighbour_x],
+                        config,
+                    )
+                    for neighbour_y, neighbour_x in self._grid_neighbours(
+                        y, x, self.height, self.width
+                    )
+                )
+                defects.append(
+                    (
+                        sharp_penalty
+                        + maximum
+                        - sum(similarities) / len(similarities),
+                        (y, x),
+                    )
+                )
+        defects.sort(reverse=True)
+        return defects
+
+    def run_continuity_relaxation(self, config: ContinuityLayoutConfig) -> int:
+        """Устраняет локальные складки точными улучшающими обменами (§5.5.2)."""
+        if config.sweeps == 0 or self._point_count < 2:
+            return 0
+        occupied = list(self._positions)
+        total_swaps = 0
+        stalled = 0
+        LOGGER.event(
+            "layout.continuity.start",
+            section=ENERGY_SHORT,
+            data={
+                "sweeps": config.sweeps,
+                "defect_points": config.defect_points,
+                "candidates_per_point": config.candidates_per_point,
+                "min_gain": config.min_gain,
+                "stall_sweeps": config.stall_sweeps,
+                "cyclic_period": config.cyclic_period,
+                "cyclic_weight": config.cyclic_weight,
+                "cyclic_sharp_threshold": config.cyclic_sharp_threshold,
+            },
+        )
+        for sweep in range(config.sweeps):
+            defects = self._continuity_defects(config)[: config.defect_points]
+            swaps = 0
+            gain_sum = 0.0
+            for _, first in defects:
+                if len(occupied) <= config.candidates_per_point:
+                    candidates = occupied
+                else:
+                    candidates = self._rng.sample(occupied, config.candidates_per_point)
+                best_second: tuple[int, int] | None = None
+                best_gain = config.min_gain
+                best_sharp_gain = 0.0
+                for second in candidates:
+                    if second == first:
+                        continue
+                    gain = self._continuity_swap_gain(first, second, config)
+                    if gain <= config.min_gain:
+                        continue
+                    sharp_gain = self._continuity_swap_sharp_gain(
+                        first, second, config
+                    )
+                    if (
+                        config.cyclic_sharp_threshold is not None
+                        and sharp_gain <= 1e-12
+                    ):
+                        continue
+                    if (
+                        best_second is None
+                        or sharp_gain > best_sharp_gain + 1e-12
+                        or (
+                            abs(sharp_gain - best_sharp_gain) <= 1e-12
+                            and gain > best_gain
+                        )
+                    ):
+                        best_gain = gain
+                        best_sharp_gain = sharp_gain
+                        best_second = second
+                if best_second is None:
+                    continue
+                if self._apply_swaps(
+                    [(first[0], first[1], best_second[0], best_second[1])],
+                    mode="short",
+                ):
+                    swaps += 1
+                    total_swaps += 1
+                    gain_sum += best_gain
+            LOGGER.event(
+                "layout.continuity.sweep",
+                section=ENERGY_SHORT,
+                data={
+                    "sweep": sweep,
+                    "swaps": swaps,
+                    "gain": gain_sum,
+                    "worst_defect": defects[0][0] if defects else 0.0,
+                },
+            )
+            if swaps == 0:
+                stalled += 1
+                if stalled >= config.stall_sweeps:
+                    break
+            else:
+                stalled = 0
+        LOGGER.event(
+            "layout.continuity.done",
+            section=MAPPING_CONTINUITY,
+            data={"swaps": total_swaps, "sweeps": sweep + 1},
+        )
+        return total_swaps
+
     def labels(self) -> list[str]:
         return list(self._labels)
 
@@ -2224,6 +2506,13 @@ class Layout:
 
     def hues(self) -> list[float]:
         return [point.hue for point in self._points]
+
+    def _code_signature(self) -> str:
+        digest = hashlib.sha256()
+        for point in self._points:
+            digest.update(len(point.code).to_bytes(8, "little", signed=False))
+            digest.update(bytes(point.code))
+        return digest.hexdigest()
 
     def save_json(self, path: str) -> None:
         if not path:
@@ -2265,6 +2554,7 @@ class Layout:
                 "eta": self._eta,
                 "pair_radius": self._pair_radius,
                 "seed": self._seed,
+                "code_signature": self._code_signature(),
                 "layout": points_payload,
             }
         )
@@ -2308,6 +2598,7 @@ class Layout:
                 and int(payload.get("height", -1)) == self.height
                 and str(payload.get("similarity", "")) == self._similarity
                 and int(payload.get("seed", -1)) == self._seed
+                and str(payload.get("code_signature", "")) == self._code_signature()
                 and math.isclose(
                     float(payload.get("lambda_threshold", -1.0)),
                     self._lambda,

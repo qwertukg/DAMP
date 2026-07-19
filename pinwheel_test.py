@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import argparse
 import math
+import random
 from typing import Mapping, Sequence
 
 from main import (
@@ -11,6 +13,8 @@ from main import (
     LAYOUT_ADAPTIVE_RADIUS_MIN,
     LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
     LAYOUT_ADAPTIVE_SWAP_TRIGGER,
+    LAYOUT_CONTINUITY_MIN_GAIN,
+    LAYOUT_CONTINUITY_STALL_SWEEPS,
     LAYOUT_ENERGY_STABILITY_DELTA,
     LAYOUT_ENERGY_STABILITY_EVERY,
     LAYOUT_ENERGY_STABILITY_MAX_POINTS,
@@ -28,7 +32,9 @@ from main import (
     PINWHEEL_ANGLE_MIN,
     PINWHEEL_COLOR_MAX_HUE,
     PINWHEEL_COLOR_MIN_HUE,
-    PINWHEEL_COUNT,
+    PINWHEEL_CONTINUITY_CANDIDATES,
+    PINWHEEL_CONTINUITY_DEFECT_POINTS,
+    PINWHEEL_CONTINUITY_SWEEPS,
     PINWHEEL_EMPTY_RATIO,
     PINWHEEL_ETA,
     PINWHEEL_LAMBDA_THRESHOLD,
@@ -42,11 +48,13 @@ from main import (
     PINWHEEL_MIN_SWAP_WINDOW,
     PINWHEEL_MIN_UNIQUE_COLORS,
     PINWHEEL_OUTPUT_PATH,
-    PINWHEEL_PHASE_STEP,
     PINWHEEL_POSITION_COORDINATES,
+    PINWHEEL_POSITION_GENERATOR_CANDIDATES,
+    PINWHEEL_POSITION_GENERATOR_MARGIN,
     PINWHEEL_POSITION_MAX,
     PINWHEEL_POSITION_MIN,
-    PINWHEEL_RING_RADIUS,
+    PINWHEEL_RADIUS_FACTOR,
+    PINWHEEL_ISOLATED_RADIUS,
     PINWHEEL_RESUME_LONG_CHECKPOINT,
     PINWHEEL_SEED,
     PINWHEEL_SHORT_ANGLE_LAYERS,
@@ -57,25 +65,26 @@ from main import (
     PINWHEEL_SHORT_STEPS,
     PINWHEEL_SIMILARITY,
     PINWHEEL_SMOOTH_DELTA,
+    PINWHEEL_SPATIAL_BOUND_MARGIN_FACTOR,
     configure_logging,
 )
 from damp.article_refs import (
     CHROMODYNAMICS,
-    CYCLIC_COORDS,
     LAID_OUT_STRUCTURE,
     MAPPING_CONTINUITY,
     MULTI_DIM_CODES,
 )
-from damp.encoding.bitarray import BitArray
-from damp.encoding.damp_encoder import (
-    ClosedDimension,
-    Detectors,
-    Encoder,
-    EncoderCodeColorizer,
-    OpenedDimension,
+from damp.encoding.orientation_encoder import (
+    RetinotopicOrientationEncoder,
+    RetinotopicOrientationEncoderFactory,
 )
-from damp.encoding.joint_encoder import JointDetectorLayer, JointEncoder
-from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
+from damp.layout.damp_layout import (
+    AdaptiveLayoutConfig,
+    ContinuityLayoutConfig,
+    Layout,
+    ShortLayoutOptimConfig,
+)
+from damp.layout.pinwheel_topology import ContinuousPinwheelTopology
 from damp.layout.payload import LayoutEncodedCode
 from damp.logging import LOGGER
 
@@ -109,48 +118,22 @@ class RetinotopicAngleSample:
         )
 
 
-@dataclass(frozen=True)
-class AlternatingPinwheelTopology:
-    """Согласует входные циклические координаты соседних пинвилов."""
-
-    phase_step: float
-
-    @staticmethod
-    def chirality(row: int, column: int) -> int:
-        return 1 if (row + column) % 2 == 0 else -1
-
-    def phase(self, column: int) -> float:
-        return (column % 2) * self.phase_step
-
-    def encode_angle(self, angle: float, *, row: int, column: int) -> float:
-        period = PINWHEEL_ANGLE_MAX - PINWHEEL_ANGLE_MIN
-        chirality = self.chirality(row, column)
-        phase = self.phase(column)
-        encoded = (
-            chirality * (angle - PINWHEEL_ANGLE_MIN)
-            + phase
-        ) % period
-        encoded_angle = PINWHEEL_ANGLE_MIN + encoded
-        LOGGER.event(
-            "pinwheel.topology.angle",
-            section=CYCLIC_COORDS,
-            data={
-                "row": row,
-                "column": column,
-                "source_angle": angle,
-                "chirality": chirality,
-                "phase": phase,
-                "encoded_angle": encoded_angle,
-            },
-        )
-        return encoded_angle
-
-
 class RetinotopicAngleSurface:
-    """Девять локальных циклических пространств: 9 позиций × 360 углов (§4.4–§4.6)."""
+    """Локальные циклические пространства: N позиций × 360 углов (§4.4–§4.6)."""
 
-    def __init__(self) -> None:
-        self._topology = AlternatingPinwheelTopology(PINWHEEL_PHASE_STEP)
+    def __init__(self, centers: Sequence[tuple[float, float]] | None = None) -> None:
+        if centers is None:
+            centers = tuple(
+                (center_x, center_y)
+                for center_y in PINWHEEL_POSITION_COORDINATES
+                for center_x in PINWHEEL_POSITION_COORDINATES
+            )
+        self._topology = ContinuousPinwheelTopology(
+            centers,
+            angle_period=PINWHEEL_ANGLE_MAX - PINWHEEL_ANGLE_MIN,
+            radius_factor=PINWHEEL_RADIUS_FACTOR,
+            isolated_radius=PINWHEEL_ISOLATED_RADIUS,
+        )
         self._samples = self._build_samples(self._topology)
         self._by_label = {sample.label: sample for sample in self._samples}
         LOGGER.event(
@@ -158,11 +141,11 @@ class RetinotopicAngleSurface:
             section=MULTI_DIM_CODES,
             data={
                 "samples": len(self._samples),
-                "positions": PINWHEEL_COUNT,
+                "positions": self.position_count,
                 "angles_per_position": PINWHEEL_ANGLE_COUNT,
                 "topology": "retinotopic_x_y_plus_closed_angle",
-                "chirality_pattern": "checkerboard",
-                "phase_step": PINWHEEL_PHASE_STEP,
+                "chirality_pattern": "gabriel_graph_max_cut",
+                "phase_rule": "graph_boundary_angular_synchronization",
             },
         )
 
@@ -170,118 +153,127 @@ class RetinotopicAngleSurface:
     def samples(self) -> Sequence[RetinotopicAngleSample]:
         return self._samples
 
+    @property
+    def topology(self) -> ContinuousPinwheelTopology:
+        return self._topology
+
+    @property
+    def position_count(self) -> int:
+        return len(self._topology.charts)
+
+    @property
+    def spatial_bounds(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        xs = [sample.position_x for sample in self._samples]
+        ys = [sample.position_y for sample in self._samples]
+        margin_x = max(xs) - min(xs)
+        margin_y = max(ys) - min(ys)
+        margin_x = max(1e-9, margin_x * PINWHEEL_SPATIAL_BOUND_MARGIN_FACTOR)
+        margin_y = max(1e-9, margin_y * PINWHEEL_SPATIAL_BOUND_MARGIN_FACTOR)
+        return (
+            (
+                min(PINWHEEL_POSITION_MIN, min(xs) - margin_x),
+                max(PINWHEEL_POSITION_MAX, max(xs) + margin_x),
+            ),
+            (
+                min(PINWHEEL_POSITION_MIN, min(ys) - margin_y),
+                max(PINWHEEL_POSITION_MAX, max(ys) + margin_y),
+            ),
+        )
+
     def sample(self, label: str) -> RetinotopicAngleSample:
         return self._by_label[label]
 
     @staticmethod
     def _build_samples(
-        topology: AlternatingPinwheelTopology,
+        topology: ContinuousPinwheelTopology,
     ) -> tuple[RetinotopicAngleSample, ...]:
         samples: list[RetinotopicAngleSample] = []
         angle_period = PINWHEEL_ANGLE_MAX - PINWHEEL_ANGLE_MIN
-        position_index = 0
-        for row, center_y in enumerate(PINWHEEL_POSITION_COORDINATES):
-            for column, center_x in enumerate(PINWHEEL_POSITION_COORDINATES):
-                chirality = topology.chirality(row, column)
-                phase = topology.phase(column)
-                for angle_index in range(PINWHEEL_ANGLE_COUNT):
-                    angle = PINWHEEL_ANGLE_MIN + (
-                        angle_period * angle_index / PINWHEEL_ANGLE_COUNT
+        for position_index, chart in enumerate(topology.charts):
+            for angle_index in range(PINWHEEL_ANGLE_COUNT):
+                angle = PINWHEEL_ANGLE_MIN + (
+                    angle_period * angle_index / PINWHEEL_ANGLE_COUNT
+                )
+                polar_angle = math.radians(2.0 * angle)
+                position_x = chart.center_x + chart.radius * math.cos(polar_angle)
+                position_y = chart.center_y + chart.radius * math.sin(polar_angle)
+                encoded_angle, phase = topology.encode_angle(
+                    angle,
+                    center_index=position_index,
+                    position_x=position_x,
+                    position_y=position_y,
+                )
+                samples.append(
+                    RetinotopicAngleSample(
+                        index=len(samples),
+                        position_index=position_index,
+                        center_x=chart.center_x,
+                        center_y=chart.center_y,
+                        position_x=position_x,
+                        position_y=position_y,
+                        radius_index=0,
+                        radius=chart.radius,
+                        angle_index=angle_index,
+                        angle=angle,
+                        encoded_angle=encoded_angle,
+                        chirality=chart.chirality,
+                        phase=phase,
                     )
-                    encoded_angle = topology.encode_angle(
-                        angle,
-                        row=row,
-                        column=column,
-                    )
-                    polar_angle = math.radians(2.0 * angle)
-                    position_x = center_x + PINWHEEL_RING_RADIUS * math.cos(polar_angle)
-                    position_y = center_y + PINWHEEL_RING_RADIUS * math.sin(polar_angle)
-                    samples.append(
-                        RetinotopicAngleSample(
-                            index=len(samples),
-                            position_index=position_index,
-                            center_x=center_x,
-                            center_y=center_y,
-                            position_x=position_x,
-                            position_y=position_y,
-                            radius_index=0,
-                            radius=PINWHEEL_RING_RADIUS,
-                            angle_index=angle_index,
-                            angle=angle,
-                            encoded_angle=encoded_angle,
-                            chirality=chirality,
-                            phase=phase,
-                        )
-                    )
-                position_index += 1
+                )
         return tuple(samples)
 
 
-class RetinotopicAngleEncoder:
-    """Объединяет пространственный код кольца и преобразованный угловой код."""
+class PinwheelPositionGenerator:
+    """Детерминированно разносит произвольное число тестовых центров по области."""
 
     def __init__(
         self,
-        spatial_encoder: JointEncoder,
-        angle_encoder: Encoder,
         *,
-        color_angle_start: int,
-        color_angle_length: int,
+        minimum: float,
+        maximum: float,
+        margin: float,
+        candidates: int,
     ) -> None:
-        self._spatial_encoder = spatial_encoder
-        self._angle_encoder = angle_encoder
-        self._spatial_code_length = spatial_encoder.code_length
-        self.code_length = self._spatial_code_length + angle_encoder.code_length
-        self.colorizer = EncoderCodeColorizer(
-            min_hue=PINWHEEL_COLOR_MIN_HUE,
-            max_hue=PINWHEEL_COLOR_MAX_HUE,
-            start_bit=self._spatial_code_length + color_angle_start,
-            bit_length=color_angle_length,
-        )
-        LOGGER.event(
-            "pinwheel.encoder.init",
-            section=MULTI_DIM_CODES,
-            data={
-                "spatial_bits": spatial_encoder.code_length,
-                "angular_bits": angle_encoder.code_length,
-                "color_angle_start": color_angle_start,
-                "color_angle_length": color_angle_length,
-                "code_length": self.code_length,
-                "color_source": "angular_encoder_bits",
-            },
-        )
+        if maximum <= minimum:
+            raise ValueError("maximum must be greater than minimum")
+        if margin < 0.0 or 2.0 * margin >= maximum - minimum:
+            raise ValueError("margin leaves no position generation area")
+        if candidates <= 0:
+            raise ValueError("candidates must be positive")
+        self._minimum = minimum + margin
+        self._maximum = maximum - margin
+        self._candidates = candidates
 
-    @staticmethod
-    def _concatenate(first: BitArray, second: BitArray) -> BitArray:
-        code = BitArray(len(first) + len(second))
-        for index, bit in enumerate(first):
-            if bit:
-                code.set(index)
-        offset = len(first)
-        for index, bit in enumerate(second):
-            if bit:
-                code.set(offset + index)
-        return code
-
-    def encode(self, sample: RetinotopicAngleSample) -> BitArray:
-        _, spatial = self._spatial_encoder.encode(sample.position_x, sample.position_y)
-        _, angular = self._angle_encoder.encode(sample.encoded_angle)
-        code = self._concatenate(spatial, angular)
+    def generate(self, count: int, *, seed: int) -> tuple[tuple[float, float], ...]:
+        if count <= 0:
+            raise ValueError("count must be positive")
+        rng = random.Random(seed)
+        positions: list[tuple[float, float]] = []
+        for _ in range(count):
+            candidates = [
+                (
+                    rng.uniform(self._minimum, self._maximum),
+                    rng.uniform(self._minimum, self._maximum),
+                )
+                for _ in range(self._candidates)
+            ]
+            if not positions:
+                selected = candidates[0]
+            else:
+                selected = max(
+                    candidates,
+                    key=lambda candidate: min(
+                        math.dist(candidate, existing) for existing in positions
+                    ),
+                )
+            positions.append(selected)
+        result = tuple(positions)
         LOGGER.event(
-            "pinwheel.encoder.code",
+            "pinwheel.positions.generate",
             section=MULTI_DIM_CODES,
-            data={
-                "position": sample.position_index,
-                "source_angle": sample.angle,
-                "encoded_angle": sample.encoded_angle,
-                "chirality": sample.chirality,
-                "phase": sample.phase,
-                "active_spatial_bits": spatial.count(),
-                "active_angular_bits": angular.count(),
-                "active_bits": code.count(),
-            },
+            data={"count": count, "seed": seed, "positions": result},
         )
-        return code
+        return result
 
 
 class PinwheelQualityEvaluator:
@@ -320,7 +312,7 @@ class PinwheelQualityEvaluator:
 
     def _singularity_metrics(self, layout: Layout) -> tuple[dict[int, int], int, int]:
         candidates_by_position: dict[int, set[tuple[int, int]]] = {
-            position: set() for position in range(PINWHEEL_COUNT)
+            position: set() for position in range(self._surface.position_count)
         }
         all_winding_cells: set[tuple[int, int]] = set()
         boundary_winding_cells = 0
@@ -382,7 +374,7 @@ class PinwheelQualityEvaluator:
     def evaluate(
         self,
         layout: Layout,
-        encoder: RetinotopicAngleEncoder,
+        encoder: RetinotopicOrientationEncoder,
     ) -> Mapping[str, float | int | bool | str]:
         angle_deltas: list[float] = []
         for y, row in enumerate(layout.grid):
@@ -402,12 +394,19 @@ class PinwheelQualityEvaluator:
                     )
 
         first_position = self._surface.samples[:PINWHEEL_ANGLE_COUNT]
-        colors = [encoder.colorizer.color(encoder.encode(sample)) for sample in first_position]
+        colors = [
+            encoder.colorizer.color(encoder.encode_sample(sample))
+            for sample in first_position
+        ]
+        all_colors = {
+            encoder.colorizer.color(encoder.encode_sample(sample))
+            for sample in self._surface.samples
+        }
         color_steps = [
             math.dist(colors[index], colors[(index + 1) % len(colors)])
             for index in range(len(colors))
         ]
-        unique_colors = len(set(colors))
+        unique_colors = len(all_colors)
         (
             singularities_by_position,
             boundary_winding_cells,
@@ -416,7 +415,7 @@ class PinwheelQualityEvaluator:
         positions_with_one = sum(value == 1 for value in singularities_by_position.values())
         metrics: dict[str, float | int | bool | str] = {
             "samples": len(self._surface.samples),
-            "positions": PINWHEEL_COUNT,
+            "positions": self._surface.position_count,
             "angles_per_position": PINWHEEL_ANGLE_COUNT,
             "unique_code_colors": unique_colors,
             "mean_color_step": sum(color_steps) / len(color_steps),
@@ -429,7 +428,7 @@ class PinwheelQualityEvaluator:
             "positions_with_one_singularity": positions_with_one,
             "boundary_winding_cells": boundary_winding_cells,
             "full_spectrum": unique_colors >= PINWHEEL_MIN_UNIQUE_COLORS,
-            "target_singularities": singularities == PINWHEEL_COUNT,
+            "target_singularities": singularities == self._surface.position_count,
         }
         LOGGER.event("pinwheel.quality", section=MAPPING_CONTINUITY, data=metrics)
         LOGGER.event(
@@ -449,70 +448,62 @@ class PinwheelExperiment:
     def __init__(
         self,
         surface: RetinotopicAngleSurface,
-        long_encoder: RetinotopicAngleEncoder,
-        short_encoder: RetinotopicAngleEncoder,
+        long_encoder: RetinotopicOrientationEncoder,
+        short_encoder: RetinotopicOrientationEncoder,
+        *,
+        output_path: str = PINWHEEL_OUTPUT_PATH,
+        layout_path: str = PINWHEEL_LAYOUT_PATH,
+        long_layout_path: str = PINWHEEL_LONG_LAYOUT_PATH,
     ) -> None:
         self._surface = surface
         self._long_encoder = long_encoder
         self._short_encoder = short_encoder
         self._quality = PinwheelQualityEvaluator(surface)
+        self._output_path = output_path
+        self._layout_path = layout_path
+        self._long_layout_path = long_layout_path
 
     @staticmethod
     def build_encoder(
         spatial_layers: Sequence[tuple[tuple[int, ...], tuple[float, ...]]],
         angle_layers: Sequence[tuple[int, float]],
-    ) -> RetinotopicAngleEncoder:
-        spatial_encoder = JointEncoder(
-            OpenedDimension(
-                "x",
-                (PINWHEEL_POSITION_MIN, PINWHEEL_POSITION_MAX),
-                [Detectors(1, 0.0)],
-            ),
-            OpenedDimension(
-                "y",
-                (PINWHEEL_POSITION_MIN, PINWHEEL_POSITION_MAX),
-                [Detectors(1, 0.0)],
-            ),
-            joint_layers=[
-                JointDetectorLayer(counts=counts, overlaps=overlaps)
-                for counts, overlaps in spatial_layers
-            ],
-            random_bit=False,
+        *,
+        spatial_bounds: tuple[tuple[float, float], tuple[float, float]] | None = None,
+        surface: RetinotopicAngleSurface | None = None,
+    ) -> RetinotopicOrientationEncoder:
+        resolved_surface = surface or RetinotopicAngleSurface()
+        bounds = spatial_bounds or (
+            (PINWHEEL_POSITION_MIN, PINWHEEL_POSITION_MAX),
+            (PINWHEEL_POSITION_MIN, PINWHEEL_POSITION_MAX),
+        )
+        centers = tuple(
+            (chart.center_x, chart.center_y)
+            for chart in resolved_surface.topology.charts
+        )
+        return RetinotopicOrientationEncoderFactory.create(
+            centers,
+            spatial_bounds=bounds,
+            spatial_layers=spatial_layers,
+            angle_layers=angle_layers,
+            angle_minimum=PINWHEEL_ANGLE_MIN,
+            angle_maximum=PINWHEEL_ANGLE_MAX,
+            radius_factor=PINWHEEL_RADIUS_FACTOR,
+            isolated_radius=PINWHEEL_ISOLATED_RADIUS,
+            color_minimum_hue=PINWHEEL_COLOR_MIN_HUE,
+            color_maximum_hue=PINWHEEL_COLOR_MAX_HUE,
             random_seed=ENCODER_RANDOM_SEED,
             log_every=ENCODER_LOG_EVERY,
-        )
-        angle_encoder = Encoder(
-            ClosedDimension(
-                "angle",
-                (PINWHEEL_ANGLE_MIN, PINWHEEL_ANGLE_MAX),
-                [Detectors(count, overlap) for count, overlap in angle_layers],
-            ),
-            random_bit=False,
-            random_seed=ENCODER_RANDOM_SEED,
-            log_every=ENCODER_LOG_EVERY,
-        )
-        LOGGER.event(
-            "pinwheel.angle.closed",
-            section=CYCLIC_COORDS,
-            data={"minimum": PINWHEEL_ANGLE_MIN, "maximum": PINWHEEL_ANGLE_MAX},
-        )
-        color_angle_start = sum(count for count, _ in angle_layers[:-1])
-        color_angle_length = angle_layers[-1][0]
-        return RetinotopicAngleEncoder(
-            spatial_encoder,
-            angle_encoder,
-            color_angle_start=color_angle_start,
-            color_angle_length=color_angle_length,
+            topology=resolved_surface.topology,
         )
 
     def _encode_codes(
         self,
-        encoder: RetinotopicAngleEncoder,
+        encoder: RetinotopicOrientationEncoder,
     ) -> Mapping[float, Sequence[LayoutEncodedCode]]:
         codes: dict[float, list[LayoutEncodedCode]] = defaultdict(list)
         for sample in self._surface.samples:
             codes[sample.encoded_angle].append(
-                LayoutEncodedCode(code=encoder.encode(sample), label=sample.label)
+                LayoutEncodedCode(code=encoder.encode_sample(sample), label=sample.label)
             )
         return codes
 
@@ -525,16 +516,15 @@ class PinwheelExperiment:
             lambda_step=PINWHEEL_ADAPTIVE_LAMBDA_STEP,
         )
 
-    @staticmethod
-    def _save(layout: Layout) -> None:
+    def _save(self, layout: Layout) -> None:
         from PIL import Image
 
-        Image.fromarray(layout.render_image(log=True)).save(PINWHEEL_OUTPUT_PATH)
-        layout.save_json(PINWHEEL_LAYOUT_PATH)
+        Image.fromarray(layout.render_image(log=True)).save(self._output_path)
+        layout.save_json(self._layout_path)
         LOGGER.event(
             "pinwheel.image.save",
             section=LAID_OUT_STRUCTURE,
-            data={"image": PINWHEEL_OUTPUT_PATH, "layout": PINWHEEL_LAYOUT_PATH},
+            data={"image": self._output_path, "layout": self._layout_path},
         )
 
     def run(self) -> Layout:
@@ -554,7 +544,7 @@ class PinwheelExperiment:
         )
         resumed = (
             PINWHEEL_RESUME_LONG_CHECKPOINT
-            and layout.restore_positions_json(PINWHEEL_LONG_LAYOUT_PATH)
+            and layout.restore_positions_json(self._long_layout_path)
         )
         if resumed:
             step_offset = 1
@@ -576,7 +566,7 @@ class PinwheelExperiment:
                 log_visuals=LAYOUT_LOG_VISUALS,
             )
             step_offset = 1 + layout.last_steps
-            layout.save_json(PINWHEEL_LONG_LAYOUT_PATH)
+            layout.save_json(self._long_layout_path)
         layout.replace_codes(
             self._encode_codes(self._short_encoder),
             colorizer=self._short_encoder.colorizer,
@@ -613,23 +603,60 @@ class PinwheelExperiment:
             short_optim=short_optim,
             log_visuals=LAYOUT_LOG_VISUALS,
         )
+        layout.run_continuity_relaxation(
+            ContinuityLayoutConfig(
+                sweeps=PINWHEEL_CONTINUITY_SWEEPS,
+                defect_points=PINWHEEL_CONTINUITY_DEFECT_POINTS,
+                candidates_per_point=PINWHEEL_CONTINUITY_CANDIDATES,
+                min_gain=LAYOUT_CONTINUITY_MIN_GAIN,
+                stall_sweeps=LAYOUT_CONTINUITY_STALL_SWEEPS,
+                cyclic_period=PINWHEEL_ANGLE_MAX - PINWHEEL_ANGLE_MIN,
+                cyclic_sharp_threshold=PINWHEEL_SMOOTH_DELTA,
+            )
+        )
         self._quality.evaluate(layout, self._short_encoder)
         self._save(layout)
         return layout
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="DAMP pinwheel layout test")
+    parser.add_argument("--position-count", type=int, default=None)
+    parser.add_argument("--position-seed", type=int, default=PINWHEEL_SEED)
+    args = parser.parse_args()
     configure_logging()
-    surface = RetinotopicAngleSurface()
+    centers = None
+    stem = "pinwheel_test"
+    if args.position_count is not None:
+        generator = PinwheelPositionGenerator(
+            minimum=PINWHEEL_POSITION_MIN,
+            maximum=PINWHEEL_POSITION_MAX,
+            margin=PINWHEEL_POSITION_GENERATOR_MARGIN,
+            candidates=PINWHEEL_POSITION_GENERATOR_CANDIDATES,
+        )
+        centers = generator.generate(args.position_count, seed=args.position_seed)
+        stem = f"pinwheel_test_{args.position_count}_{args.position_seed}"
+    surface = RetinotopicAngleSurface(centers)
     long_encoder = PinwheelExperiment.build_encoder(
         PINWHEEL_LONG_SPATIAL_JOINT_LAYERS,
         PINWHEEL_LONG_ANGLE_LAYERS,
+        spatial_bounds=surface.spatial_bounds,
+        surface=surface,
     )
     short_encoder = PinwheelExperiment.build_encoder(
         PINWHEEL_SHORT_SPATIAL_JOINT_LAYERS,
         PINWHEEL_SHORT_ANGLE_LAYERS,
+        spatial_bounds=surface.spatial_bounds,
+        surface=surface,
     )
-    PinwheelExperiment(surface, long_encoder, short_encoder).run()
+    PinwheelExperiment(
+        surface,
+        long_encoder,
+        short_encoder,
+        output_path=f"{stem}.png",
+        layout_path=f"{stem}.json",
+        long_layout_path=f"{stem}.long.checkpoint.json",
+    ).run()
 
 
 if __name__ == "__main__":

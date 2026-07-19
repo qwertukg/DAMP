@@ -25,13 +25,18 @@ from damp.article_refs import (
 from damp.activation import ActivationEngine, Detector, DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import (
-    ClosedDimension,
-    Detectors,
-    Encoder,
     EncoderCodeColorizer,
-    OpenedDimension,
 )
-from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
+from damp.encoding.orientation_encoder import (
+    RetinotopicOrientationEncoder,
+    RetinotopicOrientationEncoderFactory,
+)
+from damp.layout.damp_layout import (
+    AdaptiveLayoutConfig,
+    ContinuityLayoutConfig,
+    Layout,
+    ShortLayoutOptimConfig,
+)
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
@@ -71,7 +76,7 @@ EMBEDDINGS_VERSION_KEY = "embeddings_version"
 EMBEDDINGS_VERSION = 4
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
 PIPELINE_CHECKPOINT_VERSION = 3
-LAYOUT_CACHE_TAG = "article-damp"
+LAYOUT_CACHE_TAG = "orientation-topology-v2"
 
 LAYOUT_SIMILARITY = "cosine"
 LAYOUT_LAMBDA_THRESHOLD = 0.65
@@ -107,6 +112,22 @@ ENCODER_LOG_EVERY = 50
 ENCODER_RANDOM_SEED = 0
 MNIST_ANGLE_IN_DEGREES = True
 MNIST_GRAD_THRESHOLD = 0.05
+MNIST_ORIENTATION_MIN = 0.0
+MNIST_ORIENTATION_MAX = 180.0
+MNIST_ORIENTATION_COLOR_MAX_HUE = 360.0
+MNIST_POSITION_MIN = 0.0
+MNIST_POSITION_MAX = 6.0
+MNIST_POSITION_GRID_SIZE = 7
+MNIST_ORIENTATION_RADIUS_FACTOR = 0.5
+MNIST_ORIENTATION_ISOLATED_RADIUS = 0.5
+MNIST_ORIENTATION_SPATIAL_BOUNDS = ((-0.75, 6.75), (-0.75, 6.75))
+MNIST_ORIENTATION_SPATIAL_JOINT_LAYERS = (
+    ((7, 7), (0.75, 0.75)),
+    ((14, 14), (0.70, 0.70)),
+    ((28, 28), (0.60, 0.60)),
+)
+MNIST_ORIENTATION_ANGLE_LAYERS = ((180, 0.50),)
+MNIST_ORIENTATION_SMOOTH_DELTA = 15.0
 LAYOUT_LOG_EVERY_LONG = 150
 LAYOUT_LOG_EVERY_SHORT = 50
 LAYOUT_LOG_VISUALS = True
@@ -121,6 +142,11 @@ LAYOUT_ENERGY_STABILITY_EVERY = 25
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
 LAYOUT_MIN_SWAP_RATIO = 0.003
 LAYOUT_MIN_SWAP_WINDOW = 1
+LAYOUT_CONTINUITY_SWEEPS = 20
+LAYOUT_CONTINUITY_DEFECT_POINTS = 256
+LAYOUT_CONTINUITY_CANDIDATES = 256
+LAYOUT_CONTINUITY_MIN_GAIN = 1e-5
+LAYOUT_CONTINUITY_STALL_SWEEPS = 3
 
 PINWHEEL_ANGLE_MIN = 0.0
 PINWHEEL_ANGLE_MAX = 180.0
@@ -129,8 +155,11 @@ PINWHEEL_POSITION_MIN = 0.0
 PINWHEEL_POSITION_MAX = 1.0
 PINWHEEL_POSITION_COORDINATES = (0.25, 0.50, 0.75)
 PINWHEEL_COUNT = len(PINWHEEL_POSITION_COORDINATES) ** 2
-PINWHEEL_PHASE_STEP = 90.0
-PINWHEEL_RING_RADIUS = 0.125
+PINWHEEL_RADIUS_FACTOR = 0.50
+PINWHEEL_ISOLATED_RADIUS = 0.125
+PINWHEEL_SPATIAL_BOUND_MARGIN_FACTOR = 0.05
+PINWHEEL_POSITION_GENERATOR_MARGIN = 0.12
+PINWHEEL_POSITION_GENERATOR_CANDIDATES = 64
 PINWHEEL_LONG_SPATIAL_JOINT_LAYERS = (
     ((3, 3), (0.80, 0.80)),
     ((6, 6), (0.80, 0.80)),
@@ -161,6 +190,9 @@ PINWHEEL_SHORT_LOCAL_RADIUS_FACTOR = 0.06
 PINWHEEL_SHORT_PARTITIONS = 1
 PINWHEEL_MIN_SWAP_RATIO = 0.003
 PINWHEEL_MIN_SWAP_WINDOW = 150
+PINWHEEL_CONTINUITY_SWEEPS = 60
+PINWHEEL_CONTINUITY_DEFECT_POINTS = 384
+PINWHEEL_CONTINUITY_CANDIDATES = 512
 PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
 PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
 PINWHEEL_LONG_LAYOUT_PATH = "pinwheel_test.long.checkpoint.json"
@@ -236,6 +268,10 @@ LOG_INTERVALS = {
     "pinwheel.encoder.code_union": LOG_INTERVAL_ENCODER_ENCODE,
     "pinwheel.encoder.code": LOG_INTERVAL_ENCODER_ENCODE,
     "pinwheel.topology.angle": LOG_INTERVAL_ENCODER_ENCODE,
+    "pinwheel.topology.solve": LOG_INTERVAL_INIT,
+    "orientation.encoder.init": LOG_INTERVAL_INIT,
+    "orientation.encoder.code": LOG_INTERVAL_ENCODER_ENCODE,
+    "orientation.encoder.input": LOG_INTERVAL_ENCODER_ENCODE,
     "encoder.code.color": LOG_INTERVAL_ENCODER_ENCODE,
     "encoder.code.color_component": LOG_INTERVAL_ENCODER_ENCODE,
     "layout.codes": LOG_INTERVAL_INIT,
@@ -329,8 +365,8 @@ LOG_INTERVALS = {
 }
 
 LAYOUT_CACHE_PATTERNS = (
-    "data/layout-{count}-*-article-damp.json",
-    "layout-{count}-*-article-damp.json",
+    f"data/layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
+    f"layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
 )
 
 
@@ -869,7 +905,12 @@ def _build_activation_engine(layout: Layout, energies: list[float]) -> Activatio
     )
 
 
-def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout | None:
+def _load_layout_from_file(
+    path: str,
+    run_params: TunedLayoutParams,
+    *,
+    colorizer: EncoderCodeColorizer = LAYOUT_COLORIZER,
+) -> Layout | None:
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as fp:
@@ -935,7 +976,7 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=None,
         long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
-        colorizer=LAYOUT_COLORIZER,
+        colorizer=colorizer,
     )
     if len(layout._positions) != len(sorted_points):
         raise RuntimeError("layout load mismatch: points count differs")
@@ -967,49 +1008,23 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
     return layout
 
 
-def _build_encoder() -> Encoder:
-    return Encoder(
-        # Angle
-        ClosedDimension(
-            "Angle",
-            (0.0, 360.0),
-            [
-                #Detectors(360, 0.4),
-                #Detectors(180, 0.4),
-                Detectors(90, 0.7),
-                Detectors(45, 0.7),
-                Detectors(30, 0.7),
-                Detectors(10, 0.7),
-                #Detectors(5, 0.4),
-            ],
-        ),
-        # X
-        OpenedDimension(
-            "X",
-            (0, 6),
-            [
-                Detectors(7, 0.7),
-                Detectors(6, 0.7),
-                Detectors(5, 0.7),
-                Detectors(4, 0.7),
-                Detectors(3, 0.7),
-                Detectors(2, 0.7),
-            ],
-        ),
-        # Y
-        OpenedDimension(
-            "Y",
-            (0, 6),
-            [
-                Detectors(7, 0.7),
-                Detectors(6, 0.7),
-                Detectors(5, 0.7),
-                Detectors(4, 0.7),
-                Detectors(3, 0.7),
-                Detectors(2, 0.7),
-            ],
-        ),
-        random_bit=True,
+def _build_encoder() -> RetinotopicOrientationEncoder:
+    centers = tuple(
+        (float(x), float(y))
+        for y in range(MNIST_POSITION_GRID_SIZE)
+        for x in range(MNIST_POSITION_GRID_SIZE)
+    )
+    return RetinotopicOrientationEncoderFactory.create(
+        centers,
+        spatial_bounds=MNIST_ORIENTATION_SPATIAL_BOUNDS,
+        spatial_layers=MNIST_ORIENTATION_SPATIAL_JOINT_LAYERS,
+        angle_layers=MNIST_ORIENTATION_ANGLE_LAYERS,
+        angle_minimum=MNIST_ORIENTATION_MIN,
+        angle_maximum=MNIST_ORIENTATION_MAX,
+        radius_factor=MNIST_ORIENTATION_RADIUS_FACTOR,
+        isolated_radius=MNIST_ORIENTATION_ISOLATED_RADIUS,
+        color_minimum_hue=LAYOUT_PSEUDO_COLOR_MIN_HUE,
+        color_maximum_hue=MNIST_ORIENTATION_COLOR_MAX_HUE,
         random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
     )
@@ -1019,7 +1034,7 @@ def _collect_codes(
     dataset,
     label: int | None,
     count: int,
-    encoder: Encoder,
+    encoder: RetinotopicOrientationEncoder,
     extractor: MnistSobelAngleMap,
 ) -> tuple[LayoutPayloadBuilder, int]:
     payload = LayoutPayloadBuilder(
@@ -1044,7 +1059,7 @@ def _collect_codes(
             log_image = img if first else None
             log_label = int(digit) if first else None
             log_measurements = measurements if first else None
-            _, code = encoder.encode(
+            encoded_values, code = encoder.encode(
                 float(a),
                 float(x),
                 float(y),
@@ -1052,7 +1067,11 @@ def _collect_codes(
                 log_label=log_label,
                 log_measurements=log_measurements,
             )
-            payload.add_code(label=int(digit), hue=float(a), code=code)
+            payload.add_code(
+                label=int(digit),
+                hue=float(encoded_values[0]),
+                code=code,
+            )
             total_codes += 1
             first = False
     return payload, total_codes
@@ -1061,7 +1080,7 @@ def _collect_codes(
 def _collect_samples(
     dataset,
     sample_count: int,
-    encoder: Encoder,
+    encoder: RetinotopicOrientationEncoder,
     extractor: MnistSobelAngleMap,
     *,
     label: int | None,
@@ -1101,11 +1120,16 @@ def _run_layout(
     *,
     count: int,
     total_codes: int,
+    colorizer: EncoderCodeColorizer,
 ) -> Layout:
     run_params = params or _default_layout_params()
     expected_pair_radius = _expected_pair_radius(total_codes, run_params)
     layout_path = _layout_json_path(count, expected_pair_radius)
-    cached_layout = _load_layout_from_file(layout_path, run_params)
+    cached_layout = _load_layout_from_file(
+        layout_path,
+        run_params,
+        colorizer=colorizer,
+    )
     if cached_layout is not None:
         return cached_layout
     layout = Layout(
@@ -1118,7 +1142,7 @@ def _run_layout(
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=run_params.long_subset_size,
         long_subset_refresh=run_params.long_subset_refresh,
-        colorizer=LAYOUT_COLORIZER,
+        colorizer=colorizer,
     )
     step_offset = 1
     long_radius_start = max(
@@ -1194,6 +1218,17 @@ def _run_layout(
         adaptive_params=adaptive_short,
         short_optim=short_optim,
     )
+    layout.run_continuity_relaxation(
+        ContinuityLayoutConfig(
+            sweeps=LAYOUT_CONTINUITY_SWEEPS,
+            defect_points=LAYOUT_CONTINUITY_DEFECT_POINTS,
+            candidates_per_point=LAYOUT_CONTINUITY_CANDIDATES,
+            min_gain=LAYOUT_CONTINUITY_MIN_GAIN,
+            stall_sweeps=LAYOUT_CONTINUITY_STALL_SWEEPS,
+            cyclic_period=MNIST_ORIENTATION_MAX - MNIST_ORIENTATION_MIN,
+            cyclic_sharp_threshold=MNIST_ORIENTATION_SMOOTH_DELTA,
+        )
+    )
     return layout
 
 
@@ -1252,7 +1287,11 @@ class MnistLayoutRunner:
                 )
                 continue
             tuned_params = self._tune_layout(total_points)
-            layout = _load_layout_from_file(path, tuned_params)
+            layout = _load_layout_from_file(
+                path,
+                tuned_params,
+                colorizer=self.encoder.colorizer,
+            )
             if layout is None:
                 LOGGER.event(
                     "layout.cache.mismatch",
@@ -1324,7 +1363,11 @@ class MnistLayoutRunner:
         resolved_layout_path = layout_path or _layout_json_path(self.count, layout.pair_radius)
         if save_json:
             layout.save_json(resolved_layout_path)
-        visual_layout = _load_layout_from_file(resolved_layout_path, run_params)
+        visual_layout = _load_layout_from_file(
+            resolved_layout_path,
+            run_params,
+            colorizer=self.encoder.colorizer,
+        )
         if visual_layout is None:
             LOGGER.event(
                 "layout.export.json.error",
@@ -1466,6 +1509,7 @@ class MnistLayoutRunner:
                 tuned_params,
                 count=self.count,
                 total_codes=total_codes,
+                colorizer=self.encoder.colorizer,
             )
             save_json = True
         checkpoint = self._checkpoint_store.load(layout_path)
@@ -1588,7 +1632,11 @@ class MnistDecodeRunner:
                 start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
             )
             tuned_params = tuner.tune(total_points)
-            layout = _load_layout_from_file(path, tuned_params)
+            layout = _load_layout_from_file(
+                path,
+                tuned_params,
+                colorizer=self.encoder.colorizer,
+            )
             if layout is None:
                 continue
             LOGGER.event(
