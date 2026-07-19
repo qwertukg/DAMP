@@ -174,6 +174,8 @@ class DampLogger:
         message = f"{message} [{section}]"
         self._console_log(message)
         self._ensure_rerun()
+        if not rr.is_enabled():
+            return
         self._event_sequence += 1
         rr.reset_time()
         rr.set_time("event", sequence=self._event_sequence)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
+import math
 import random
 from typing import Sequence, Tuple
 
@@ -35,6 +36,16 @@ class JointDetectorWindow:
         )
 
 
+@dataclass(frozen=True)
+class JointDetectorLayerIndex:
+    """Индекс декартова слоя без изменения порядка его битов (§4.6)."""
+
+    offset: int
+    fields_by_dimension: tuple[tuple[DetectorWindow, ...], ...]
+    strides: tuple[int, ...]
+    detector_count: int
+
+
 class JointEncoder(Encoder):
     """Wide detectors whose receptive fields jointly cover an n-D space (§4.6)."""
 
@@ -50,6 +61,7 @@ class JointEncoder(Encoder):
         if not joint_layers:
             raise ValueError("joint_layers must be non-empty")
         self._joint_detectors: list[JointDetectorWindow] = []
+        self._joint_layer_indices: list[JointDetectorLayerIndex] = []
         for layer_index, layer in enumerate(joint_layers):
             layer.validate(len(self.dimensions))
             fields_by_dimension: list[list[DetectorWindow]] = []
@@ -65,6 +77,21 @@ class JointEncoder(Encoder):
                         start_index=0,
                     )
                 )
+            layer_offset = len(self._joint_detectors)
+            counts = tuple(len(fields) for fields in fields_by_dimension)
+            self._joint_layer_indices.append(
+                JointDetectorLayerIndex(
+                    offset=layer_offset,
+                    fields_by_dimension=tuple(
+                        tuple(fields) for fields in fields_by_dimension
+                    ),
+                    strides=tuple(
+                        math.prod(counts[index + 1 :])
+                        for index in range(len(counts))
+                    ),
+                    detector_count=math.prod(counts),
+                )
+            )
             for receptive_fields in product(*fields_by_dimension):
                 self._joint_detectors.append(
                     JointDetectorWindow(
@@ -120,9 +147,26 @@ class JointEncoder(Encoder):
             data={"values": normalized_values},
         )
         code = BitArray(self.code_length)
-        for detector in self._joint_detectors:
-            if detector.is_active(normalized_values):
-                code.set(self._bit_map[detector.detector_index], 1)
+        for layer in self._joint_layer_indices:
+            active_by_dimension = [
+                tuple(
+                    index
+                    for index, receptive_field in enumerate(fields)
+                    if receptive_field.is_active(value)
+                )
+                for fields, value in zip(
+                    layer.fields_by_dimension,
+                    normalized_values,
+                )
+            ]
+            if any(not active for active in active_by_dimension):
+                continue
+            for active_indices in product(*active_by_dimension):
+                detector_index = layer.offset + sum(
+                    index * stride
+                    for index, stride in zip(active_indices, layer.strides)
+                )
+                code.set(self._bit_map[detector_index], 1)
         self._log_counter += 1
         LOGGER.event(
             "encoder.joint.code",

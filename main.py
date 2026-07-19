@@ -77,6 +77,9 @@ EMBEDDINGS_VERSION = 4
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
 PIPELINE_CHECKPOINT_VERSION = 3
 LAYOUT_CACHE_TAG = "orientation-topology-v2"
+LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
+LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
+LAYOUT_CONTINUITY_PHASE_SUFFIX = ".continuity-phase.json"
 
 LAYOUT_SIMILARITY = "cosine"
 LAYOUT_LAMBDA_THRESHOLD = 0.65
@@ -336,6 +339,8 @@ LOG_INTERVALS = {
     "layout.export.json": LOG_INTERVAL_LAYOUT_EXPORT,
     "layout.export.json.error": LOG_INTERVAL_LAYOUT_EXPORT,
     "layout.load.cache": LOG_INTERVAL_INIT,
+    "layout.payload.load": LOG_INTERVAL_INIT,
+    "layout.payload.resume": LOG_INTERVAL_INIT,
     "sobel_map.extract": LOG_INTERVAL_SOBEL_IMAGE,
     "sobel_map.init": LOG_INTERVAL_INIT,
     "sobel_map.patch.angle": LOG_INTERVAL_SOBEL_PATCH,
@@ -910,6 +915,7 @@ def _load_layout_from_file(
     run_params: TunedLayoutParams,
     *,
     colorizer: EncoderCodeColorizer = LAYOUT_COLORIZER,
+    prepare_compute: bool = True,
 ) -> Layout | None:
     if not os.path.exists(path):
         return None
@@ -973,7 +979,8 @@ def _load_layout_from_file(
         lambda_threshold=data.get("lambda_threshold", LAYOUT_LAMBDA_THRESHOLD),
         eta=data.get("eta", LAYOUT_ETA),
         seed=0,
-        use_gpu=LAYOUT_USE_GPU,
+        precompute_similarity=prepare_compute,
+        use_gpu=LAYOUT_USE_GPU if prepare_compute else False,
         long_subset_size=None,
         long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
         colorizer=colorizer,
@@ -1144,6 +1151,16 @@ def _run_layout(
         long_subset_refresh=run_params.long_subset_refresh,
         colorizer=colorizer,
     )
+    long_checkpoint_path = f"{layout_path}{LAYOUT_LONG_PHASE_SUFFIX}"
+    short_checkpoint_path = f"{layout_path}{LAYOUT_SHORT_PHASE_SUFFIX}"
+    continuity_checkpoint_path = f"{layout_path}{LAYOUT_CONTINUITY_PHASE_SUFFIX}"
+    continuity_ready = layout.restore_positions_json(continuity_checkpoint_path)
+    short_ready = False
+    long_ready = False
+    if not continuity_ready:
+        short_ready = layout.restore_positions_json(short_checkpoint_path)
+    if not continuity_ready and not short_ready:
+        long_ready = layout.restore_positions_json(long_checkpoint_path)
     step_offset = 1
     long_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
@@ -1155,24 +1172,25 @@ def _run_layout(
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
     )
-    layout.run(
-        steps=run_params.long_steps,
-        pairs_per_step=run_params.long_pairs_per_step,
-        pair_radius=adaptive_long.start_radius,
-        mode="long",
-        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
-        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
-        log_every=LAYOUT_LOG_EVERY_LONG,
-        step_offset=step_offset,
-        energy_radius=None,
-        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
-        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
-        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
-        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
-        log_visuals=LAYOUT_LOG_VISUALS,
-        adaptive_params=adaptive_long,
-        save_on_stop_path=layout_path,
-    )
+    if not (long_ready or short_ready or continuity_ready):
+        layout.run(
+            steps=run_params.long_steps,
+            pairs_per_step=run_params.long_pairs_per_step,
+            pair_radius=adaptive_long.start_radius,
+            mode="long",
+            min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+            min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
+            log_every=LAYOUT_LOG_EVERY_LONG,
+            step_offset=step_offset,
+            energy_radius=None,
+            energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+            energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+            energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+            energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+            log_visuals=LAYOUT_LOG_VISUALS,
+            adaptive_params=adaptive_long,
+        )
+        layout.save_json(long_checkpoint_path)
     step_offset += layout.last_steps
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
@@ -1200,35 +1218,39 @@ def _run_layout(
         similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF,
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
-    layout.run(
-        steps=run_params.short_steps,
-        pairs_per_step=run_params.short_pairs_per_step,
-        pair_radius=short_radius_start,
-        mode="short",
-        local_radius=run_params.short_local_radius,
-        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
-        min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
-        log_every=LAYOUT_LOG_EVERY_SHORT,
-        step_offset=step_offset,
-        energy_radius=run_params.short_energy_radius,
-        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
-        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
-        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
-        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
-        adaptive_params=adaptive_short,
-        short_optim=short_optim,
-    )
-    layout.run_continuity_relaxation(
-        ContinuityLayoutConfig(
-            sweeps=LAYOUT_CONTINUITY_SWEEPS,
-            defect_points=LAYOUT_CONTINUITY_DEFECT_POINTS,
-            candidates_per_point=LAYOUT_CONTINUITY_CANDIDATES,
-            min_gain=LAYOUT_CONTINUITY_MIN_GAIN,
-            stall_sweeps=LAYOUT_CONTINUITY_STALL_SWEEPS,
-            cyclic_period=MNIST_ORIENTATION_MAX - MNIST_ORIENTATION_MIN,
-            cyclic_sharp_threshold=MNIST_ORIENTATION_SMOOTH_DELTA,
+    if not (short_ready or continuity_ready):
+        layout.run(
+            steps=run_params.short_steps,
+            pairs_per_step=run_params.short_pairs_per_step,
+            pair_radius=short_radius_start,
+            mode="short",
+            local_radius=run_params.short_local_radius,
+            min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+            min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
+            log_every=LAYOUT_LOG_EVERY_SHORT,
+            step_offset=step_offset,
+            energy_radius=run_params.short_energy_radius,
+            energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
+            energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
+            energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
+            energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+            adaptive_params=adaptive_short,
+            short_optim=short_optim,
         )
-    )
+        layout.save_json(short_checkpoint_path)
+    if not continuity_ready:
+        layout.run_continuity_relaxation(
+            ContinuityLayoutConfig(
+                sweeps=LAYOUT_CONTINUITY_SWEEPS,
+                defect_points=LAYOUT_CONTINUITY_DEFECT_POINTS,
+                candidates_per_point=LAYOUT_CONTINUITY_CANDIDATES,
+                min_gain=LAYOUT_CONTINUITY_MIN_GAIN,
+                stall_sweeps=LAYOUT_CONTINUITY_STALL_SWEEPS,
+                cyclic_period=MNIST_ORIENTATION_MAX - MNIST_ORIENTATION_MIN,
+                cyclic_sharp_threshold=MNIST_ORIENTATION_SMOOTH_DELTA,
+            )
+        )
+        layout.save_json(continuity_checkpoint_path)
     return layout
 
 
@@ -1287,10 +1309,20 @@ class MnistLayoutRunner:
                 )
                 continue
             tuned_params = self._tune_layout(total_points)
+            pipeline_checkpoint = self._checkpoint_store.load(path)
+            completed_embeddings = len(
+                self._checkpoint_store.records(pipeline_checkpoint)
+            )
+            stages = pipeline_checkpoint.get("stages", {})
+            prepare_compute = not (
+                bool(stages.get("activation"))
+                and completed_embeddings >= self._activation_samples
+            )
             layout = _load_layout_from_file(
                 path,
                 tuned_params,
                 colorizer=self.encoder.colorizer,
+                prepare_compute=prepare_compute,
             )
             if layout is None:
                 LOGGER.event(
@@ -1318,6 +1350,58 @@ class MnistLayoutRunner:
             section=LAYOUT_PARAMETERS,
             data={"count": self.count, "label": self.label},
         )
+        return None
+
+    def _try_load_encoded_payload(
+        self,
+    ) -> tuple[LayoutPayloadBuilder, int, TunedLayoutParams, str] | None:
+        # Старые файлы без метаданных label безопасны только для общего MNIST-набора.
+        if self.label is not None:
+            return None
+        for path in self._layout_cache_paths():
+            metadata = self._load_layout_metadata(path)
+            if metadata is None:
+                continue
+            total_points, _, ready = metadata
+            if ready or total_points <= 0:
+                continue
+            checkpoint = self._checkpoint_store.load(path)
+            if not bool(checkpoint.get("stages", {}).get("encoding")):
+                continue
+            try:
+                payload = LayoutPayloadBuilder.load_base(path)
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.payload.resume.error",
+                    section=LAID_OUT_STRUCTURE,
+                    data={"path": path, "error": str(exc)},
+                )
+                continue
+            if len(payload.records) != total_points:
+                continue
+            code_lengths = {len(record.code) for record in payload.records}
+            if code_lengths != {self.encoder.code_length}:
+                continue
+            tuned_params = self._tune_layout(total_points)
+            expected_path = _layout_json_path(
+                self.count,
+                _expected_pair_radius(total_points, tuned_params),
+            )
+            if os.path.normcase(os.path.normpath(path)) != os.path.normcase(
+                os.path.normpath(expected_path)
+            ):
+                continue
+            LOGGER.event(
+                "layout.payload.resume",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "path": path,
+                    "points": total_points,
+                    "code_length": self.encoder.code_length,
+                    "next_stage": "long",
+                },
+            )
+            return payload, total_points, tuned_params, path
         return None
 
     def _build_dataset(self):
@@ -1353,7 +1437,6 @@ class MnistLayoutRunner:
     def _export_layout(
         self,
         layout: Layout,
-        run_params: TunedLayoutParams,
         *,
         layout_path: str | None = None,
         save_json: bool = True,
@@ -1363,20 +1446,8 @@ class MnistLayoutRunner:
         resolved_layout_path = layout_path or _layout_json_path(self.count, layout.pair_radius)
         if save_json:
             layout.save_json(resolved_layout_path)
-        visual_layout = _load_layout_from_file(
-            resolved_layout_path,
-            run_params,
-            colorizer=self.encoder.colorizer,
-        )
-        if visual_layout is None:
-            LOGGER.event(
-                "layout.export.json.error",
-                section=LAID_OUT_STRUCTURE,
-                data={"path": resolved_layout_path, "reason": "load_failed"},
-            )
-            raise RuntimeError("не удалось загрузить раскладку из json для визуализации")
-        image = visual_layout.render_image()
-        suffix = "auto" if visual_layout.pair_radius is None else str(visual_layout.pair_radius)
+        image = layout.render_image()
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
         filename = f"data/{self.count}-{suffix}.png"
         Image.fromarray(image).save(filename)
         LOGGER.event(
@@ -1385,7 +1456,7 @@ class MnistLayoutRunner:
             data={
                 "path": resolved_layout_path,
                 "image": filename,
-                "points": len(visual_layout.positions()),
+                "points": len(layout.positions()),
             },
         )
 
@@ -1481,29 +1552,33 @@ class MnistLayoutRunner:
             )
             save_json = False
         else:
-            payload, total_codes = _collect_codes(
-                dataset,
-                self.label,
-                self.count,
-                self.encoder,
-                self.extractor,
-            )
+            encoded_payload = self._try_load_encoded_payload()
+            if encoded_payload is None:
+                payload, total_codes = _collect_codes(
+                    dataset,
+                    self.label,
+                    self.count,
+                    self.encoder,
+                    self.extractor,
+                )
+                tuned_params = self._tune_layout(total_codes)
+                expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
+                layout_path = _layout_json_path(self.count, expected_pair_radius)
+                payload.save_base(layout_path)
+                encoding_checkpoint = self._checkpoint_store.load(layout_path)
+                encoding_stages = dict(encoding_checkpoint.get("stages", {}))
+                encoding_stages["encoding"] = True
+                self._checkpoint_store.save(
+                    layout_path,
+                    stages=encoding_stages,
+                    target_samples=self._activation_samples,
+                    embeddings=self._checkpoint_store.records(encoding_checkpoint),
+                )
+            else:
+                payload, total_codes, tuned_params, layout_path = encoded_payload
             codes = payload.codes_by_hue()
             angles = len(codes)
             self._log_dataset(angles, total_codes)
-            tuned_params = self._tune_layout(total_codes)
-            expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
-            layout_path = _layout_json_path(self.count, expected_pair_radius)
-            payload.save_base(layout_path)
-            encoding_checkpoint = self._checkpoint_store.load(layout_path)
-            encoding_stages = dict(encoding_checkpoint.get("stages", {}))
-            encoding_stages["encoding"] = True
-            self._checkpoint_store.save(
-                layout_path,
-                stages=encoding_stages,
-                target_samples=self._activation_samples,
-                embeddings=self._checkpoint_store.records(encoding_checkpoint),
-            )
             layout = _run_layout(
                 codes,
                 tuned_params,
@@ -1559,7 +1634,7 @@ class MnistLayoutRunner:
             target_samples=self._activation_samples,
             embeddings=embeddings,
         )
-        self._export_layout(layout, tuned_params, layout_path=layout_path, save_json=save_json)
+        self._export_layout(layout, layout_path=layout_path, save_json=save_json)
         stages["export"] = True
         self._checkpoint_store.save(
             layout_path,

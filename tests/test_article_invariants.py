@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+import os
+import random
+import tempfile
 import unittest
 
 from damp.activation import ActivationEngine, Detector
@@ -8,7 +11,12 @@ from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, EncoderCodeColorizer
 from damp.encoding.orientation_encoder import RetinotopicOrientationEncoder
-from damp.layout.damp_layout import Layout
+from damp.layout.damp_layout import (
+    ContinuityLayoutConfig,
+    Layout,
+    _WeightedIndexSampler,
+)
+from damp.layout.payload import LayoutPayloadBuilder
 from pinwheel_test import (
     PinwheelExperiment,
     PinwheelPositionGenerator,
@@ -83,6 +91,183 @@ class ArticleInvariantTests(unittest.TestCase):
         descriptor = encoder.describe(45.0, center_index=24)
         spatial_bits, angular_bits = encoder.active_component_counts(descriptor)
         self.assertGreater(spatial_bits, angular_bits)
+
+    def test_joint_encoder_index_preserves_exhaustive_detector_code(self) -> None:
+        encoder = _build_encoder()
+        spatial_encoder = encoder._spatial_encoder
+        for values in ((0.0, 0.0), (3.5, 2.75), (6.0, 6.0)):
+            _, indexed_code = spatial_encoder.encode(*values)
+            exhaustive_code = BitArray(spatial_encoder.code_length)
+            for detector in spatial_encoder._joint_detectors:
+                if detector.is_active(values):
+                    exhaustive_code.set(
+                        spatial_encoder._bit_map[detector.detector_index],
+                        1,
+                    )
+            self.assertEqual(indexed_code.to01(), exhaustive_code.to01())
+
+    def test_sparse_integer_similarity_matches_binary_cosine(self) -> None:
+        first = BitArray(16)
+        second = BitArray(16)
+        for index in (1, 4, 9):
+            first.set(index)
+        for index in (1, 7, 9, 12):
+            second.set(index)
+        layout = Layout(
+            {0.0: [first, second]},
+            grid_size=2,
+            empty_ratio=0.0,
+            similarity="cosine",
+            lambda_threshold=0.0,
+            eta=None,
+            precompute_similarity=False,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(0.0, 300.0),
+        )
+        expected = 2.0 / math.sqrt(3.0 * 4.0)
+        self.assertTrue(math.isclose(layout._similarity_value(0, 1), expected))
+
+    def test_cached_weight_sampler_preserves_random_choices_sequence(self) -> None:
+        population = tuple(range(7))
+        weights = (0.5, 1.5, 0.25, 4.0, 2.0, 0.75, 3.0)
+        reference_rng = random.Random(19)
+        indexed_rng = random.Random(19)
+        expected = [
+            reference_rng.choices(population, weights=weights, k=1)[0]
+            for _ in range(100)
+        ]
+        sampler = _WeightedIndexSampler(population, weights)
+        actual = [sampler.sample(indexed_rng) for _ in range(100)]
+        self.assertEqual(actual, expected)
+
+    def test_layout_checkpoint_restores_rng_and_next_swaps(self) -> None:
+        codes = {
+            float(index): [self._single_bit(24, index)]
+            for index in range(12)
+        }
+
+        def build() -> Layout:
+            return Layout(
+                codes,
+                grid_size=5,
+                empty_ratio=0.0,
+                similarity="cosine",
+                lambda_threshold=0.0,
+                eta=None,
+                seed=7,
+                use_gpu=False,
+                colorizer=EncoderCodeColorizer(0.0, 300.0),
+            )
+
+        original = build()
+        original.run(
+            steps=3,
+            pairs_per_step=20,
+            pair_radius=3,
+            mode="long",
+            min_swap_ratio=0.0,
+            log_visuals=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "phase.json")
+            original.save_json(path)
+            restored = build()
+            self.assertTrue(restored.restore_positions_json(path))
+            for layout in (original, restored):
+                layout.run(
+                    steps=2,
+                    pairs_per_step=20,
+                    pair_radius=3,
+                    mode="long",
+                    min_swap_ratio=0.0,
+                    log_visuals=False,
+                )
+            self.assertEqual(original.positions(), restored.positions())
+
+    def test_continuity_swap_gain_matches_affected_edge_energy(self) -> None:
+        codes: dict[float, list[BitArray]] = {}
+        for index in range(10):
+            code = BitArray(16)
+            code.set(index)
+            code.set((index + 1) % 10)
+            codes[float(index * 18)] = [code]
+        layout = Layout(
+            codes,
+            grid_size=4,
+            empty_ratio=0.0,
+            similarity="cosine",
+            lambda_threshold=0.0,
+            eta=10.0,
+            seed=5,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(0.0, 180.0),
+        )
+        config = ContinuityLayoutConfig(
+            sweeps=1,
+            defect_points=4,
+            candidates_per_point=4,
+            cyclic_period=180.0,
+            cyclic_sharp_threshold=15.0,
+        )
+
+        def reference(first: tuple[int, int], second: tuple[int, int]) -> float:
+            first_index = layout.grid[first[0]][first[1]]
+            second_index = layout.grid[second[0]][second[1]]
+            assert first_index is not None and second_index is not None
+            edges = set()
+            for point in (first, second):
+                for neighbour in layout._continuity_neighbours(point):
+                    edges.add(tuple(sorted((point, neighbour))))
+
+            def after(position: tuple[int, int]) -> int | None:
+                if position == first:
+                    return second_index
+                if position == second:
+                    return first_index
+                return layout.grid[position[0]][position[1]]
+
+            before = 0.0
+            after_total = 0.0
+            for start, end in edges:
+                start_before = layout.grid[start[0]][start[1]]
+                end_before = layout.grid[end[0]][end[1]]
+                if start_before is not None and end_before is not None:
+                    before += layout._continuity_pair_score(
+                        start_before, end_before, config
+                    )
+                start_after = after(start)
+                end_after = after(end)
+                if start_after is not None and end_after is not None:
+                    after_total += layout._continuity_pair_score(
+                        start_after, end_after, config
+                    )
+            return after_total - before
+
+        positions = layout.positions()
+        for first, second in zip(positions[:4], positions[-4:]):
+            self.assertTrue(
+                math.isclose(
+                    layout._continuity_swap_gain(first, second, config),
+                    reference(first, second),
+                    abs_tol=1e-12,
+                )
+            )
+
+    def test_encoded_payload_round_trip_preserves_codes(self) -> None:
+        payload = LayoutPayloadBuilder(
+            similarity=None,
+            lambda_threshold=None,
+            eta=None,
+        )
+        payload.add_code(label=3, hue=42.0, code=self._single_bit(12, 5))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "encoded.json")
+            payload.save_base(path)
+            restored = LayoutPayloadBuilder.load_base(path)
+        self.assertEqual(len(restored.records), 1)
+        self.assertEqual(restored.records[0].label, "3")
+        self.assertEqual(restored.records[0].hue, 42.0)
+        self.assertEqual(restored.records[0].code.to01(), payload.records[0].code.to01())
 
     def test_point_energy_uses_euclidean_distance(self) -> None:
         code = self._single_bit(8, 0)

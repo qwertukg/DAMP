@@ -57,6 +57,45 @@ class LayoutPayloadBuilder:
     def records(self) -> Sequence[LayoutCodeRecord]:
         return tuple(self._records)
 
+    @classmethod
+    def load_base(cls, path: str) -> "LayoutPayloadBuilder":
+        """Восстанавливает коды незавершённой раскладки без перекодирования (§5.14)."""
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        payload = cls(
+            similarity=data.get("similarity"),
+            lambda_threshold=data.get("lambda_threshold"),
+            eta=data.get("eta"),
+        )
+        items = sorted(data.get("layout", []), key=lambda item: int(item["index"]))
+        for expected_index, item in enumerate(items):
+            if int(item["index"]) != expected_index:
+                raise ValueError("layout payload indices must be contiguous")
+            value = str(item["value"])
+            if not value:
+                raise ValueError("layout payload code must not be empty")
+            code = BitArray(len(value))
+            for index, bit in enumerate(value):
+                if bit == "1":
+                    code.set(index)
+                elif bit != "0":
+                    raise ValueError("layout payload code must be binary")
+            payload.add_code(
+                label=str(item.get("label", "")),
+                hue=float(item["hue"]),
+                code=code,
+            )
+        LOGGER.event(
+            "layout.payload.load",
+            section=LAID_OUT_STRUCTURE,
+            data={
+                "path": path,
+                "points": len(payload._records),
+                "code_length": len(payload._records[0].code) if payload._records else 0,
+            },
+        )
+        return payload
+
     def add_code(self, *, label: int | str, hue: float, code: BitArray) -> LayoutCodeRecord:
         record = LayoutCodeRecord(
             index=len(self._records),
