@@ -26,6 +26,9 @@ from pinwheel_test import (
     RetinotopicAngleSurface,
 )
 from main import (
+    ACTIVATION_MAX_EMBEDDING_DENSITY,
+    ACTIVATION_OUTPUT_BITS,
+    ACTIVATION_SATURATION_LIMIT,
     LAYOUT_PSEUDO_COLOR_MAX_HUE,
     LAYOUT_PSEUDO_COLOR_MIN_HUE,
     PINWHEEL_ANGLE_COUNT,
@@ -42,6 +45,34 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_embedding_density_does_not_exceed_configured_limit(self) -> None:
+        self.assertLessEqual(
+            ACTIVATION_SATURATION_LIMIT / ACTIVATION_OUTPUT_BITS,
+            ACTIVATION_MAX_EMBEDDING_DENSITY,
+        )
+
+    def test_file_logs_are_filtered_and_only_active_log_is_replaced(self) -> None:
+        logger = DampLogger(spawn=False)
+        with tempfile.TemporaryDirectory() as directory:
+            layout_log = os.path.join(directory, "layout.log")
+            evaluate_log = os.path.join(directory, "evaluate.log")
+            with open(layout_log, "w", encoding="utf-8") as stream:
+                stream.write("previous layout\n")
+            logger.configure_file(
+                all_paths=(layout_log, evaluate_log),
+                active_path=evaluate_log,
+                events={"keep"},
+            )
+            with patch("damp.logging.rr.is_enabled", return_value=False):
+                logger.event("drop", section="6.5")
+                logger.event("keep", section="6.5", data={"accuracy": 0.9})
+            with open(layout_log, encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), "previous layout\n")
+            with open(evaluate_log, encoding="utf-8") as stream:
+                content = stream.read()
+            self.assertIn("keep accuracy=0.9", content)
+            self.assertNotIn("drop", content)
+
     def test_logger_uses_completion_title_in_console_and_rerun_text(self) -> None:
         logger = DampLogger(spawn=False)
         with (

@@ -753,6 +753,7 @@ class DetectorHierarchyBuilder:
         self._eta = None if eta is None else float(eta)
         self._attempts_without_change = int(attempts_without_change)
         self._rng = random.Random(seed)
+        self._output_rng = random.Random(seed)
         LOGGER.event(
             "activation.detector.builder.init",
             section=DETECTOR_CONSTRUCTION,
@@ -773,7 +774,7 @@ class DetectorHierarchyBuilder:
             candidates = self._build_layer(layer, per_layer_limit)
             for candidate in candidates:
                 output_code = BitArray(self._output_bits)
-                output_code.set(self._rng.randrange(self._output_bits), 1)
+                output_code.set(self._output_rng.randrange(self._output_bits), 1)
                 detectors.append(
                     Detector(
                         center=candidate.center,

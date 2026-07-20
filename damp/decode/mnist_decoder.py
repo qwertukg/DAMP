@@ -127,6 +127,13 @@ class _EvaluationDiagnostics:
         if samples == 0:
             return
         final_accuracy = self._correct / samples
+        row_totals = self._confusion.sum(axis=1)
+        per_class_accuracy = np.divide(
+            np.diag(self._confusion),
+            row_totals,
+            out=np.zeros(len(self._classes), dtype=np.float64),
+            where=row_totals > 0,
+        )
         confusion_positions = [
             (row, column)
             for row in range(len(self._classes))
@@ -191,16 +198,10 @@ class _EvaluationDiagnostics:
                 "accuracy": final_accuracy,
                 "errors": samples - self._correct,
                 "mean_confidence": float(np.mean(self._confidences)),
-                "classes": self._classes,
-                "confusion_matrix": self._confusion.tolist(),
-                "error_examples": [
-                    {
-                        "expected": expected,
-                        "predicted": predicted,
-                        "confidence": confidence,
-                    }
-                    for _, expected, predicted, confidence in self._errors
-                ],
+                "per_class_accuracy": {
+                    str(label): float(per_class_accuracy[index])
+                    for index, label in enumerate(self._classes)
+                },
             },
             visuals=visuals,
         )

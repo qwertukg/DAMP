@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import sys
+import threading
 from typing import Any, Collection, Mapping, Sequence
 
 import rerun as rr
@@ -196,6 +198,9 @@ class DampLogger:
         self._rerun_events: set[str] | None = None
         self._dashboard_profile: str | None = None
         self._blueprint_sent = False
+        self._file_path: str | None = None
+        self._file_events: set[str] | None = None
+        self._file_lock = threading.Lock()
 
     def _ensure_rerun(self) -> None:
         if not self._initialized:
@@ -218,6 +223,14 @@ class DampLogger:
             encoding = getattr(stream, "encoding", None) or "utf-8"
             safe_message = message.encode(encoding, errors="backslashreplace").decode(encoding)
             print(safe_message, file=stream)
+
+    def _file_log(self, message: str) -> None:
+        if self._file_path is None:
+            return
+        with self._file_lock:
+            with open(self._file_path, "a", encoding="utf-8") as stream:
+                stream.write(message)
+                stream.write("\n")
 
     @staticmethod
     def _format_value(value: Any, *, max_items: int = 8, max_chars: int = 200) -> str:
@@ -303,6 +316,27 @@ class DampLogger:
         self._dashboard_profile = dashboard_profile
         self._blueprint_sent = False
 
+    def configure_file(
+        self,
+        *,
+        all_paths: Collection[str],
+        active_path: str | None,
+        events: Collection[str] | None,
+    ) -> None:
+        normalized_paths = tuple(dict.fromkeys(str(path) for path in all_paths))
+        resolved_active = None if active_path is None else str(active_path)
+        if resolved_active is not None and resolved_active not in normalized_paths:
+            raise ValueError("active log path must be included in all_paths")
+        for path in normalized_paths:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            mode = "w" if path == resolved_active else "a"
+            with open(path, mode, encoding="utf-8"):
+                pass
+        self._file_path = resolved_active
+        self._file_events = None if events is None else {str(event) for event in events}
+
     def should_log(self, event: str) -> bool:
         if self._interval_policy is None:
             return True
@@ -334,6 +368,16 @@ class DampLogger:
             message = display_name
         message = f"{message} [{section}]"
         self._console_log(message)
+        file_event = (
+            self._file_path is not None
+            and (
+                self._file_events is None
+                or event in self._file_events
+                or event.endswith((".error", ".failed"))
+            )
+        )
+        if file_event:
+            self._file_log(message)
         self._ensure_rerun()
         if not rr.is_enabled():
             return

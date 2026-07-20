@@ -82,12 +82,14 @@ LAYOUT_COMPLETION_EVENT = "pipeline.layout.completed"
 LAYOUT_COMPLETION_TITLE = "================ РАСКЛАДКА ЗАВЕРШЕНА ================"
 EVALUATION_COMPLETION_EVENT = "pipeline.evaluation.completed"
 EVALUATION_COMPLETION_TITLE = "================ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО ================"
+LAYOUT_LOG_PATH = "layout.log"
+EVALUATION_LOG_PATH = "evaluate.log"
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 5
+EMBEDDINGS_VERSION = 8
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 4
+PIPELINE_CHECKPOINT_VERSION = 7
 LAYOUT_CACHE_TAG = "orientation-topology-v2"
 LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
 LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
@@ -215,9 +217,15 @@ PINWHEEL_RESUME_LONG_CHECKPOINT = True
 
 ACTIVATION_LAMBDA_THRESHOLD = 0.55
 ACTIVATION_ETA = 10.0
-ACTIVATION_ENERGY_THRESHOLD = 0.12
+ACTIVATION_ENERGY_THRESHOLD = 0.25
 ACTIVATION_DETECTOR_THRESHOLD = 0.5
-ACTIVATION_SATURATION_LIMIT = 50
+ACTIVATION_OUTPUT_BITS = 2048
+ACTIVATION_MAX_EMBEDDING_DENSITY = 0.25
+ACTIVATION_TARGET_ACTIVE_BITS = 125
+ACTIVATION_SATURATION_LIMIT = min(
+    ACTIVATION_TARGET_ACTIVE_BITS,
+    int(ACTIVATION_OUTPUT_BITS * ACTIVATION_MAX_EMBEDDING_DENSITY),
+)
 ACTIVATION_POINT_ENERGY_RADIUS = 3
 ACTIVATION_DETECTOR_RADIUS_MIN = 1
 ACTIVATION_DETECTOR_RADIUS_MAX = 24
@@ -226,7 +234,6 @@ ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 1000
 ACTIVATION_DETECTOR_SEED = 0
 
 ACTIVATION_MAX_DETECTORS = 256
-ACTIVATION_OUTPUT_BITS = 256
 ACTIVATION_DETECTOR_LAYER_SPECS = (
     (0.50, 0.35, 3.50),
     (0.60, 0.29, 3.20),
@@ -241,12 +248,15 @@ ACTIVATION_BATCH_SIZE = 10
 ACTIVATION_CHECKPOINT_EVERY = 10
 
 DECODER_SIMILARITY = "jaccard"
-DECODER_SOFTMAX_TEMPERATURE = 0.35
+DECODER_SOFTMAX_TEMPERATURE = 0.03
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
+DECODER_KNN_TOP_K = 35
+DECODER_TOP_K_PER_CLASS = 0
+DECODER_MIN_SIMILARITY = 0.0
 DECODER_DATASET_LIMIT = 64
 DECODER_DEFAULT_COUNT = 1000
-DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
+DECODER_CALIBRATION_TEMPERATURES = (0.01, 0.02, 0.03, 0.05, 0.1)
 EVALUATION_CONFIDENCE_BINS = 10
 EVALUATION_ERROR_EXAMPLES = 16
 
@@ -443,6 +453,42 @@ RERUN_EVALUATE_EVENTS = {
     EVALUATION_COMPLETION_EVENT,
 }
 
+FILE_LAYOUT_EVENTS = {
+    "mnist.codes",
+    "layout.cache.hit",
+    "layout.cache.miss",
+    "layout.payload.resume",
+    "layout.tune",
+    "layout.run.settings",
+    "layout.run.progress",
+    "layout.energy.long.progress",
+    "layout.run.swap_stability.stop",
+    "layout.run.energy_stability.stop",
+    "layout.run.done",
+    "layout.continuity.start",
+    "layout.continuity.sweep",
+    "layout.continuity.done",
+    "activation.detector.layers.resolve",
+    "activation.detector.layer",
+    "activation.engine.init",
+    "activation.embedding.save",
+    "pipeline.checkpoint.save",
+    LAYOUT_COMPLETION_EVENT,
+}
+
+FILE_EVALUATE_EVENTS = {
+    "decoder.layout.use",
+    "decoder.build",
+    "activation.detector.layers.resolve",
+    "activation.detector.layer",
+    "activation.engine.init",
+    "decoder.evaluation.sample",
+    "decoder.evaluation.summary",
+    "decoder.predict.batch",
+    "decoder.dataset.eval",
+    EVALUATION_COMPLETION_EVENT,
+}
+
 LAYOUT_CACHE_PATTERNS = (
     f"data/layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
     f"layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
@@ -500,6 +546,19 @@ def configure_logging(*, profile: str | None = None) -> None:
     elif profile == "evaluate":
         rerun_events = RERUN_EVALUATE_EVENTS
     LOGGER.configure_rerun(events=rerun_events, dashboard_profile=profile)
+    active_log_path = None
+    file_events = None
+    if profile == "layout":
+        active_log_path = LAYOUT_LOG_PATH
+        file_events = FILE_LAYOUT_EVENTS
+    elif profile == "evaluate":
+        active_log_path = EVALUATION_LOG_PATH
+        file_events = FILE_EVALUATE_EVENTS
+    LOGGER.configure_file(
+        all_paths=(LAYOUT_LOG_PATH, EVALUATION_LOG_PATH),
+        active_path=active_log_path,
+        events=file_events,
+    )
 
 
 class GpuEnvironment:
@@ -1851,9 +1910,9 @@ class MnistDecodeRunner:
                 temperature=DECODER_SOFTMAX_TEMPERATURE,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
-                knn_top_k=200,
-                top_k_per_class=20,
-                min_similarity=0.0,
+                knn_top_k=DECODER_KNN_TOP_K,
+                top_k_per_class=DECODER_TOP_K_PER_CLASS,
+                min_similarity=DECODER_MIN_SIMILARITY,
             ),
         )
         self._decoder = MnistDecoder(
