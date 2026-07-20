@@ -27,8 +27,10 @@ from damp.activation import (
     ActivationEngine,
     Detector,
     DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder,
+    DetectorHierarchyScale,
     DetectorHierarchyScaleResolver,
     DetectorLayerConfigFactory,
+    EmbeddingSaturationResolver,
 )
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import (
@@ -38,6 +40,7 @@ from damp.encoding.orientation_encoder import (
     RetinotopicOrientationEncoder,
     RetinotopicOrientationEncoderFactory,
 )
+from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
 from damp.layout.damp_layout import (
     AdaptiveLayoutConfig,
     ContinuityLayoutConfig,
@@ -47,7 +50,14 @@ from damp.layout.damp_layout import (
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
-from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding, MnistDecoder, PredictionResult
+from damp.decode import (
+    DecoderConfig,
+    DecoderParameterScaleResolver,
+    EmbeddingDatabase,
+    LabeledEmbedding,
+    MnistDecoder,
+    PredictionResult,
+)
 
 LOG_INTERVAL_DEFAULT = 1
 LOG_INTERVAL_INIT = 1
@@ -88,10 +98,12 @@ EVALUATION_LOG_PATH = "evaluate.log"
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 9
+EMBEDDINGS_VERSION = 14
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 8
-LAYOUT_CACHE_TAG = "orientation-topology-v2"
+PIPELINE_CHECKPOINT_VERSION = 13
+PIPELINE_CHECKPOINT_REPLACE_ATTEMPTS = 8
+PIPELINE_CHECKPOINT_REPLACE_DELAY = 0.1
+LAYOUT_CACHE_TAG = "orientation-topology-v3"
 LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
 LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
 LAYOUT_CONTINUITY_PHASE_SUFFIX = ".continuity-phase.json"
@@ -130,6 +142,9 @@ ENCODER_LOG_EVERY = 50
 ENCODER_RANDOM_SEED = 0
 MNIST_ANGLE_IN_DEGREES = True
 MNIST_GRAD_THRESHOLD = 0.05
+MNIST_LOCAL_ORIENTATION_LIMIT = 4
+MNIST_STIMULUS_EMBEDDING_MAX_DENSITY = 0.25
+MNIST_REFERENCE_LAYOUT_COUNT = 100
 MNIST_ORIENTATION_MIN = 0.0
 MNIST_ORIENTATION_MAX = 180.0
 MNIST_ORIENTATION_COLOR_MAX_HUE = 360.0
@@ -234,6 +249,8 @@ ACTIVATION_DETECTOR_REFERENCE_EXTENT = 51
 ACTIVATION_DETECTOR_MIN_POINTS = 3
 ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 1000
 ACTIVATION_DETECTOR_SEED = 0
+ACTIVATION_DETECTOR_SHAPE = "circle"
+ACTIVATION_DETECTOR_MAX_AXIS_RATIO = 3.0
 
 ACTIVATION_MAX_DETECTORS = 256
 ACTIVATION_DETECTOR_LAYER_SPECS = (
@@ -248,12 +265,16 @@ ACTIVATION_USE_GPU = True
 ACTIVATION_PARALLEL_WORKERS = 4
 ACTIVATION_BATCH_SIZE = 10
 ACTIVATION_CHECKPOINT_EVERY = 10
+ACTIVATION_STRUCTURAL_DIAGNOSTIC_EVERY = 100
+ACTIVATION_STRUCTURAL_DIAGNOSTICS_REQUIRE_RERUN = True
 
 DECODER_SIMILARITY = "jaccard"
-DECODER_SOFTMAX_TEMPERATURE = 0.03
+DECODER_SOFTMAX_TEMPERATURE = 0.05
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
-DECODER_KNN_TOP_K = 35
+DECODER_KNN_TOP_K = 5
+DECODER_REFERENCE_EMBEDDINGS = 100
+DECODER_SOFTMAX_TEMPERATURE_MAX = 0.10
 DECODER_TOP_K_PER_CLASS = 0
 DECODER_MIN_SIMILARITY = 0.0
 DECODER_DATASET_LIMIT = 64
@@ -394,6 +415,7 @@ LOG_INTERVALS = {
     "activation.detector.builder.init": LOG_INTERVAL_INIT,
     "activation.detector.cluster": LOG_INTERVAL_ACTIVATION_DETECTOR_CLUSTER,
     "activation.detector.center": LOG_INTERVAL_ACTIVATION_DETECTOR_CENTER,
+    "activation.detector.ellipse": LOG_INTERVAL_ACTIVATION_DETECTOR_CENTER,
     "activation.embedding": LOG_INTERVAL_ACTIVATION_EMBEDDING,
     "activation.color_merge": LOG_INTERVAL_ACTIVATION_COLOR_MERGE,
     "activation.detector.coverage": LOG_INTERVAL_ACTIVATION_COVERAGE,
@@ -413,6 +435,7 @@ RERUN_LAYOUT_EVENTS = {
     "mnist.codes",
     "mnist.encoding.skip",
     "layout.cache.hit",
+    "layout.reference.clone",
     "layout.cache.miss",
     "layout.payload.resume",
     "layout.tune",
@@ -440,13 +463,16 @@ RERUN_LAYOUT_EVENTS = {
     "activation.sample",
     "activation.progress",
     "activation.embedding.save",
+    "encoder.stimulus.color_merge",
     "pipeline.checkpoint.save",
+    "pipeline.checkpoint.replace.retry",
     LAYOUT_COMPLETION_EVENT,
 }
 
 RERUN_EVALUATE_EVENTS = {
     "decoder.layout.use",
     "decoder.build",
+    "decoder.parameters.scale.resolve",
     "decoder.evaluation.sample",
     "decoder.evaluation.summary",
     "decoder.dataset.eval",
@@ -472,18 +498,23 @@ FILE_LAYOUT_EVENTS = {
     "layout.continuity.done",
     "activation.detector.scale.resolve",
     "activation.detector.layers.resolve",
+    "activation.embedding.saturation.resolve",
     "activation.detector.layer",
     "activation.engine.init",
+    "encoder.stimulus.color_merge",
     "activation.embedding.save",
     "pipeline.checkpoint.save",
+    "pipeline.checkpoint.replace.retry",
     LAYOUT_COMPLETION_EVENT,
 }
 
 FILE_EVALUATE_EVENTS = {
     "decoder.layout.use",
     "decoder.build",
+    "decoder.parameters.scale.resolve",
     "activation.detector.scale.resolve",
     "activation.detector.layers.resolve",
+    "activation.embedding.saturation.resolve",
     "activation.detector.layer",
     "activation.engine.init",
     "decoder.evaluation.sample",
@@ -563,6 +594,12 @@ def configure_logging(*, profile: str | None = None) -> None:
         active_path=active_log_path,
         events=file_events,
     )
+
+
+def _structural_diagnostics_enabled() -> bool:
+    if not ACTIVATION_STRUCTURAL_DIAGNOSTICS_REQUIRE_RERUN:
+        return True
+    return os.environ.get("RERUN", "off").strip().lower() == "on"
 
 
 class GpuEnvironment:
@@ -717,9 +754,20 @@ def _load_embeddings_from_file(path: str) -> list["EmbeddingRecord"]:
 class PipelineCheckpointStore:
     """Атомарно сохраняет прогресс этапов и частичные эмбеддинги."""
 
-    def __init__(self, *, suffix: str, version: int) -> None:
+    def __init__(
+        self,
+        *,
+        suffix: str,
+        version: int,
+        replace_attempts: int,
+        replace_delay: float,
+    ) -> None:
+        if replace_attempts <= 0 or replace_delay < 0.0:
+            raise ValueError("invalid checkpoint replacement retry settings")
         self._suffix = str(suffix)
         self._version = int(version)
+        self._replace_attempts = int(replace_attempts)
+        self._replace_delay = float(replace_delay)
 
     def path_for(self, layout_path: str) -> str:
         return f"{layout_path}{self._suffix}"
@@ -780,7 +828,7 @@ class PipelineCheckpointStore:
             json.dump(payload, fp, ensure_ascii=True, indent=2)
             fp.flush()
             os.fsync(fp.fileno())
-        os.replace(temporary_path, path)
+        self._replace(temporary_path, path)
         LOGGER.event(
             "pipeline.checkpoint.save",
             section=PARALLEL_PROCESSING,
@@ -791,6 +839,27 @@ class PipelineCheckpointStore:
                 "stages": stages,
             },
         )
+
+    def _replace(self, temporary_path: str, path: str) -> None:
+        for attempt in range(1, self._replace_attempts + 1):
+            try:
+                os.replace(temporary_path, path)
+                return
+            except PermissionError as exc:
+                if attempt >= self._replace_attempts:
+                    raise
+                LOGGER.event(
+                    "pipeline.checkpoint.replace.retry",
+                    section=PARALLEL_PROCESSING,
+                    data={
+                        "path": path,
+                        "attempt": attempt,
+                        "max_attempts": self._replace_attempts,
+                        "delay_seconds": self._replace_delay,
+                        "error": str(exc),
+                    },
+                )
+                time.sleep(self._replace_delay)
 
     def records(self, payload: dict[str, object]) -> list[EmbeddingRecord]:
         records: list[EmbeddingRecord] = []
@@ -1011,12 +1080,14 @@ def _build_detectors_from_layout(
     *,
     max_detectors: int,
     output_bits: int,
+    hierarchy_scale: DetectorHierarchyScale | None = None,
 ) -> list[Detector]:
-    hierarchy_scale = DetectorHierarchyScaleResolver(
-        reference_extent=ACTIVATION_DETECTOR_REFERENCE_EXTENT,
-        base_radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
-        base_max_detectors=max_detectors,
-    ).resolve(layout)
+    if hierarchy_scale is None:
+        hierarchy_scale = DetectorHierarchyScaleResolver(
+            reference_extent=ACTIVATION_DETECTOR_REFERENCE_EXTENT,
+            base_radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
+            base_max_detectors=max_detectors,
+        ).resolve(layout)
     layer_configs = DetectorLayerConfigFactory(
         radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
         radius_max=hierarchy_scale.radius_max,
@@ -1033,16 +1104,29 @@ def _build_detectors_from_layout(
         eta=ACTIVATION_ETA,
         attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
         seed=ACTIVATION_DETECTOR_SEED,
+        receptive_field_shape=ACTIVATION_DETECTOR_SHAPE,
+        max_axis_ratio=ACTIVATION_DETECTOR_MAX_AXIS_RATIO,
     ).build()
 
 
 def _build_activation_engine(layout: Layout, energies: list[float]) -> ActivationEngine:
+    hierarchy_scale = DetectorHierarchyScaleResolver(
+        reference_extent=ACTIVATION_DETECTOR_REFERENCE_EXTENT,
+        base_radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
+        base_max_detectors=ACTIVATION_MAX_DETECTORS,
+    ).resolve(layout)
     detectors = _build_detectors_from_layout(
         layout,
         energies,
         max_detectors=ACTIVATION_MAX_DETECTORS,
         output_bits=ACTIVATION_OUTPUT_BITS,
+        hierarchy_scale=hierarchy_scale,
     )
+    saturation_limit = EmbeddingSaturationResolver(
+        output_bits=ACTIVATION_OUTPUT_BITS,
+        max_density=ACTIVATION_MAX_EMBEDDING_DENSITY,
+        base_active_bits=ACTIVATION_TARGET_ACTIVE_BITS,
+    ).resolve(hierarchy_scale.factor)
     eta_value = ACTIVATION_ETA
     return ActivationEngine(
         layout=layout,
@@ -1051,7 +1135,7 @@ def _build_activation_engine(layout: Layout, energies: list[float]) -> Activatio
         eta=eta_value,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
         detector_threshold=ACTIVATION_DETECTOR_THRESHOLD,
-        saturation_limit=ACTIVATION_SATURATION_LIMIT,
+        saturation_limit=saturation_limit,
         energy_map=energies,
         use_gpu=ACTIVATION_USE_GPU,
     )
@@ -1181,6 +1265,16 @@ def _build_encoder() -> RetinotopicOrientationEncoder:
         color_maximum_hue=MNIST_ORIENTATION_COLOR_MAX_HUE,
         random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
+    )
+
+
+def _build_stimulus_embedding_builder(
+    encoder: RetinotopicOrientationEncoder,
+) -> StimulusEmbeddingBuilder:
+    return StimulusEmbeddingBuilder(
+        code_length=encoder.code_length,
+        spatial_priority_bits=encoder.spatial_code_length,
+        max_density=MNIST_STIMULUS_EMBEDDING_MAX_DENSITY,
     )
 
 
@@ -1421,7 +1515,9 @@ class MnistLayoutRunner:
         self.extractor = MnistSobelAngleMap(
             angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
             grad_threshold=MNIST_GRAD_THRESHOLD,
+            local_orientation_limit=MNIST_LOCAL_ORIENTATION_LIMIT,
         )
+        self._stimulus_embedding_builder = _build_stimulus_embedding_builder(self.encoder)
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1430,6 +1526,8 @@ class MnistLayoutRunner:
         self._checkpoint_store = PipelineCheckpointStore(
             suffix=PIPELINE_CHECKPOINT_SUFFIX,
             version=PIPELINE_CHECKPOINT_VERSION,
+            replace_attempts=PIPELINE_CHECKPOINT_REPLACE_ATTEMPTS,
+            replace_delay=PIPELINE_CHECKPOINT_REPLACE_DELAY,
         )
 
     def _layout_cache_paths(self) -> list[str]:
@@ -1492,11 +1590,49 @@ class MnistLayoutRunner:
                 },
             )
             return layout, tuned_params, total_points, path
+        cloned = self._clone_reference_layout()
+        if cloned is not None:
+            return cloned
         LOGGER.event(
             "layout.cache.miss",
             section=LAYOUT_PARAMETERS,
             data={"count": self.count, "label": self.label},
         )
+        return None
+
+    def _clone_reference_layout(self) -> tuple[Layout, TunedLayoutParams, int, str] | None:
+        if self.count <= MNIST_REFERENCE_LAYOUT_COUNT:
+            return None
+        for source_path in _layout_cache_paths_for_count(MNIST_REFERENCE_LAYOUT_COUNT):
+            metadata = self._load_layout_metadata(source_path)
+            if metadata is None:
+                continue
+            total_points, pair_radius, ready = metadata
+            if not ready or pair_radius is None:
+                continue
+            tuned_params = self._tune_layout(total_points)
+            layout = _load_layout_from_file(
+                source_path,
+                tuned_params,
+                colorizer=self.encoder.colorizer,
+                prepare_compute=False,
+            )
+            if layout is None:
+                continue
+            target_path = _layout_json_path(self.count, pair_radius)
+            layout.save_json(target_path)
+            LOGGER.event(
+                "layout.reference.clone",
+                section=DETECTOR_HIERARCHY,
+                data={
+                    "source": source_path,
+                    "target": target_path,
+                    "reference_images": MNIST_REFERENCE_LAYOUT_COUNT,
+                    "embedding_target": self._activation_samples,
+                    "points": total_points,
+                },
+            )
+            return layout, tuned_params, total_points, target_path
         return None
 
     def _try_load_encoded_payload(
@@ -1616,8 +1752,10 @@ class MnistLayoutRunner:
         stages: dict[str, bool],
         initial_embeddings: Sequence[EmbeddingRecord],
     ) -> list[EmbeddingRecord]:
-        energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
-        engine = _build_activation_engine(layout, energies)
+        engine = None
+        if _structural_diagnostics_enabled():
+            energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
+            engine = _build_activation_engine(layout, energies)
         samples = _collect_samples(
             dataset,
             self._activation_samples,
@@ -1639,12 +1777,19 @@ class MnistLayoutRunner:
         )
         for batch_start in range(start_index, len(samples), ACTIVATION_BATCH_SIZE):
             batch = samples[batch_start : batch_start + ACTIVATION_BATCH_SIZE]
-            results = engine.activate_many(
-                [codes for _, codes in batch],
-                max_workers=ACTIVATION_PARALLEL_WORKERS,
-            )
-            for offset, ((label, codes), result) in enumerate(zip(batch, results)):
+            for offset, (label, codes) in enumerate(batch):
                 index = batch_start + offset
+                structural_result = None
+                if (
+                    engine is not None
+                    and (
+                    index == start_index
+                    or (index + 1) % ACTIVATION_STRUCTURAL_DIAGNOSTIC_EVERY == 0
+                    or index + 1 == len(samples)
+                    )
+                ):
+                    structural_result = engine.activate(codes)
+                classification_embedding = self._stimulus_embedding_builder.build(codes)
                 LOGGER.event(
                     "activation.sample",
                     section=STIMULUS_DETECTION,
@@ -1652,14 +1797,20 @@ class MnistLayoutRunner:
                         "index": index,
                         "sample_label": str(int(label)),
                         "stimuli": len(codes),
-                        "active_detectors": len(result.active_detectors),
-                        "embedding_bits": result.embedding.count(),
+                        "active_detectors": len(structural_result.active_detectors)
+                        if structural_result is not None
+                        else 0,
+                        "structural_embedding_bits": structural_result.embedding.count()
+                        if structural_result is not None
+                        else 0,
+                        "embedding_bits": classification_embedding.count(),
+                        "structural_evaluated": structural_result is not None,
                     },
                 )
                 embeddings.append(
                     EmbeddingRecord(
                         class_label=str(int(label)),
-                        embedding_bits=result.embedding.to01(),
+                        embedding_bits=classification_embedding.to01(),
                     )
                 )
             if (
@@ -1848,7 +1999,9 @@ class MnistDecodeRunner:
         self.extractor = MnistSobelAngleMap(
             angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
             grad_threshold=MNIST_GRAD_THRESHOLD,
+            local_orientation_limit=MNIST_LOCAL_ORIENTATION_LIMIT,
         )
+        self._stimulus_embedding_builder = _build_stimulus_embedding_builder(self.encoder)
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1911,15 +2064,25 @@ class MnistDecodeRunner:
         labeled_embeddings = _embedding_records_to_labeled(embeddings)
         if not labeled_embeddings:
             raise RuntimeError("в раскладке нет базы эмбеддингов")
-        activation_engine = _build_activation_engine(layout, energies)
+        activation_engine = (
+            _build_activation_engine(layout, energies)
+            if _structural_diagnostics_enabled()
+            else None
+        )
+        decoder_parameters = DecoderParameterScaleResolver(
+            reference_embeddings=DECODER_REFERENCE_EMBEDDINGS,
+            base_top_k=DECODER_KNN_TOP_K,
+            base_temperature=DECODER_SOFTMAX_TEMPERATURE,
+            max_temperature=DECODER_SOFTMAX_TEMPERATURE_MAX,
+        ).resolve(len(labeled_embeddings))
         database = EmbeddingDatabase(
             labeled_embeddings,
             DecoderConfig(
                 similarity=DECODER_SIMILARITY,
-                temperature=DECODER_SOFTMAX_TEMPERATURE,
+                temperature=decoder_parameters.temperature,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
-                knn_top_k=DECODER_KNN_TOP_K,
+                knn_top_k=decoder_parameters.knn_top_k,
                 top_k_per_class=DECODER_TOP_K_PER_CLASS,
                 min_similarity=DECODER_MIN_SIMILARITY,
             ),
@@ -1931,6 +2094,8 @@ class MnistDecodeRunner:
             embedding_db=database,
             evaluation_confidence_bins=EVALUATION_CONFIDENCE_BINS,
             evaluation_error_examples=EVALUATION_ERROR_EXAMPLES,
+            stimulus_embedding_builder=self._stimulus_embedding_builder,
+            structural_activation_interval=ACTIVATION_STRUCTURAL_DIAGNOSTIC_EVERY,
         )
         LOGGER.event(
             "decoder.build",
@@ -1965,7 +2130,7 @@ class MnistDecodeRunner:
             embeddings.append(
                 EmbeddingRecord(
                     class_label=str(int(label)),
-                    embedding_bits=result.embedding.to01(),
+                    embedding_bits=self._stimulus_embedding_builder.build(codes).to01(),
                 )
             )
             LOGGER.event(

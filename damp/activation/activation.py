@@ -23,9 +23,11 @@ from damp.article_refs import (
     DETECTOR_INSERTION,
     DETECTOR_PARAMS,
     DETECTOR_RADIUS,
+    DETECTOR_STATISTICAL_SHAPE,
     ENERGY_CALC,
     STIMULUS_DETECTION,
     GPU_IMPLEMENTATION,
+    MORPHOLOGICAL_EMBEDDINGS,
     PARALLEL_PROCESSING,
 )
 from damp.encoding.bitarray import BitArray
@@ -42,6 +44,8 @@ class Detector:
     points_count: int
     output_code: BitArray
     label: str | None = None
+    semi_minor_radius: float | None = None
+    orientation: float = 0.0
 
     def __post_init__(self) -> None:
         if self.radius <= 0:
@@ -52,12 +56,17 @@ class Detector:
             raise ValueError("detector points_count must be positive")
         if len(self.output_code) == 0:
             raise ValueError("detector output_code must be non-empty")
+        minor = self.radius if self.semi_minor_radius is None else self.semi_minor_radius
+        if minor <= 0.0 or minor > self.radius:
+            raise ValueError("detector semi-minor radius must be in (0, radius]")
         LOGGER.event(
             "activation.detector.init",
             section=DETECTOR_PARAMS,
             data={
                 "center": self.center,
                 "receptive_radius": self.radius,
+                "semi_minor_radius": minor,
+                "orientation": self.orientation,
                 "lambda_threshold": self.lambda_threshold,
                 "energy": self.energy,
                 "points_count": self.points_count,
@@ -80,6 +89,7 @@ class ActivationResult:
     activation_matrix: list[list[float]]
     active_detectors: list[ActivatedDetector]
     embedding: BitArray
+    classification_embedding: BitArray | None = None
 
 
 class _ActivationBackend:
@@ -640,6 +650,8 @@ class DetectorCandidate:
     points_count: int
     fill_factor: float
     insertion_density: float
+    semi_minor_radius: float
+    orientation: float
 
 
 @dataclass(frozen=True)
@@ -697,6 +709,47 @@ class DetectorHierarchyScaleResolver:
             },
         )
         return scale
+
+
+class EmbeddingSaturationResolver:
+    """Масштабирует σ и ограничивает плотность морфологического кода (§7.1.12)."""
+
+    def __init__(
+        self,
+        *,
+        output_bits: int,
+        max_density: float,
+        base_active_bits: int,
+    ) -> None:
+        if output_bits <= 0 or base_active_bits <= 0:
+            raise ValueError("embedding saturation sizes must be positive")
+        if not 0.0 < max_density <= 1.0:
+            raise ValueError("max_density must be in (0, 1]")
+        self._output_bits = int(output_bits)
+        self._max_density = float(max_density)
+        self._base_active_bits = int(base_active_bits)
+
+    def resolve(self, scale_factor: float) -> int:
+        if scale_factor <= 0.0:
+            raise ValueError("scale_factor must be positive")
+        density_limit = max(1, int(self._output_bits * self._max_density))
+        saturation_limit = min(
+            density_limit,
+            max(1, int(round(self._base_active_bits / math.sqrt(scale_factor)))),
+        )
+        LOGGER.event(
+            "activation.embedding.saturation.resolve",
+            section=MORPHOLOGICAL_EMBEDDINGS,
+            data={
+                "output_bits": self._output_bits,
+                "scale_factor": scale_factor,
+                "base_active_bits": self._base_active_bits,
+                "saturation_limit": saturation_limit,
+                "max_density": self._max_density,
+                "resolved_density": saturation_limit / self._output_bits,
+            },
+        )
+        return saturation_limit
 
 
 class DetectorLayerConfigFactory:
@@ -775,6 +828,8 @@ class DetectorHierarchyBuilder:
         eta: float | None,
         attempts_without_change: int,
         seed: int,
+        receptive_field_shape: str = "circle",
+        max_axis_ratio: float = 1.0,
     ) -> None:
         if radius_min <= 0:
             raise ValueError("radius_min must be positive")
@@ -791,6 +846,10 @@ class DetectorHierarchyBuilder:
             raise ValueError("invalid detector layer configuration")
         if attempts_without_change <= 0:
             raise ValueError("attempts_without_change must be positive")
+        if receptive_field_shape not in ("circle", "ellipse"):
+            raise ValueError("receptive_field_shape must be circle or ellipse")
+        if max_axis_ratio < 1.0:
+            raise ValueError("max_axis_ratio must be at least 1")
         self._layout = layout
         self._energies = [float(value) for value in energies]
         self._radius_min = int(radius_min)
@@ -802,6 +861,8 @@ class DetectorHierarchyBuilder:
         self._attempts_without_change = int(attempts_without_change)
         self._rng = random.Random(seed)
         self._output_rng = random.Random(seed)
+        self._receptive_field_shape = receptive_field_shape
+        self._max_axis_ratio = float(max_axis_ratio)
         LOGGER.event(
             "activation.detector.builder.init",
             section=DETECTOR_CONSTRUCTION,
@@ -811,6 +872,8 @@ class DetectorHierarchyBuilder:
                 "output_bits": self._output_bits,
                 "attempts_without_change": self._attempts_without_change,
                 "seed": seed,
+                "receptive_field_shape": receptive_field_shape,
+                "max_axis_ratio": max_axis_ratio,
             },
         )
 
@@ -832,6 +895,8 @@ class DetectorHierarchyBuilder:
                         points_count=candidate.points_count,
                         output_code=output_code,
                         label=f"λ={lambda_value:.2f}",
+                        semi_minor_radius=candidate.semi_minor_radius,
+                        orientation=candidate.orientation,
                     )
                 )
             LOGGER.event(
@@ -847,6 +912,10 @@ class DetectorHierarchyBuilder:
                     "fill_max": max((item.fill_factor for item in candidates), default=0.0),
                     "radius_min": min((item.radius for item in candidates), default=0.0),
                     "radius_max": max((item.radius for item in candidates), default=0.0),
+                    "axis_ratio_max": max(
+                        (item.radius / item.semi_minor_radius for item in candidates),
+                        default=1.0,
+                    ),
                 },
             )
         if not detectors:
@@ -930,30 +999,45 @@ class DetectorHierarchyBuilder:
             section=DETECTOR_CENTER,
             data={"center_y": centroid_y, "center_x": centroid_x, "weight_sum": weight_sum},
         )
-        distances = sorted(
-            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
-            for position in cluster_positions
-        )
-        best_radius = 0.0
-        best_fill = -1.0
-        for distance in distances:
-            candidate_radius = max(float(self._radius_min), distance)
-            if candidate_radius > layer.activation_radius:
-                continue
-            points_count = bisect.bisect_right(distances, candidate_radius)
-            if points_count < layer.min_points:
-                continue
-            fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
-            if fill_factor > best_fill:
-                best_fill = fill_factor
-                best_radius = candidate_radius
-        if best_radius <= 0.0:
-            return None
-        included = [
-            position
-            for position in cluster_positions
-            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
-        ]
+        if self._receptive_field_shape == "ellipse":
+            ellipse = self._fit_ellipse(
+                cluster_positions,
+                active,
+                centroid_y=centroid_y,
+                centroid_x=centroid_x,
+                min_points=layer.min_points,
+                max_radius=layer.activation_radius,
+            )
+            if ellipse is None:
+                return None
+            best_radius, semi_minor_radius, orientation, best_fill, included = ellipse
+        else:
+            distances = sorted(
+                math.hypot(position[0] - centroid_y, position[1] - centroid_x)
+                for position in cluster_positions
+            )
+            best_radius = 0.0
+            best_fill = -1.0
+            for distance in distances:
+                candidate_radius = max(float(self._radius_min), distance)
+                if candidate_radius > layer.activation_radius:
+                    continue
+                points_count = bisect.bisect_right(distances, candidate_radius)
+                if points_count < layer.min_points:
+                    continue
+                fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
+                if fill_factor > best_fill:
+                    best_fill = fill_factor
+                    best_radius = candidate_radius
+            if best_radius <= 0.0:
+                return None
+            semi_minor_radius = best_radius
+            orientation = 0.0
+            included = [
+                position
+                for position in cluster_positions
+                if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
+            ]
         detector_energy = sum(active[position][1] for position in included)
         points_count = len(included)
         if detector_energy <= 0.0 or points_count < layer.min_points:
@@ -965,7 +1049,75 @@ class DetectorHierarchyBuilder:
             points_count=points_count,
             fill_factor=best_fill,
             insertion_density=points_count / best_radius,
+            semi_minor_radius=semi_minor_radius,
+            orientation=orientation,
         )
+
+    def _fit_ellipse(
+        self,
+        positions: Sequence[tuple[int, int]],
+        active: dict[tuple[int, int], tuple[int, float]],
+        *,
+        centroid_y: float,
+        centroid_x: float,
+        min_points: int,
+        max_radius: float,
+    ) -> tuple[float, float, float, float, list[tuple[int, int]]] | None:
+        """PCA + Mahalanobis ellipse from §6.4.4."""
+        if np is None or len(positions) < min_points:
+            return None
+        offsets = np.asarray(
+            [(y - centroid_y, x - centroid_x) for y, x in positions],
+            dtype=np.float64,
+        )
+        weights = np.asarray([active[position][1] for position in positions], dtype=np.float64)
+        covariance = (offsets.T * weights) @ offsets / max(float(weights.sum()), 1e-12)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        eigenvalues = np.maximum(eigenvalues, 1e-9)
+        major_index = int(np.argmax(eigenvalues))
+        minor_index = 1 - major_index
+        major_scale = math.sqrt(float(eigenvalues[major_index]))
+        minor_scale = math.sqrt(float(eigenvalues[minor_index]))
+        minor_scale = max(minor_scale, major_scale / self._max_axis_ratio)
+        major_vector = eigenvectors[:, major_index]
+        orientation = math.atan2(float(major_vector[0]), float(major_vector[1]))
+        cos_a = math.cos(orientation)
+        sin_a = math.sin(orientation)
+        normalized_distances: list[tuple[float, tuple[int, int]]] = []
+        for position, (dy, dx) in zip(positions, offsets):
+            major_coordinate = dx * cos_a + dy * sin_a
+            minor_coordinate = -dx * sin_a + dy * cos_a
+            distance = math.sqrt(
+                (major_coordinate / major_scale) ** 2
+                + (minor_coordinate / minor_scale) ** 2
+            )
+            normalized_distances.append((distance, position))
+        normalized_distances.sort(key=lambda item: item[0])
+        best: tuple[float, float, float, list[tuple[int, int]]] | None = None
+        for index, (distance, _) in enumerate(normalized_distances, start=1):
+            if index < min_points:
+                continue
+            major = max(float(self._radius_min), major_scale * distance)
+            minor = max(float(self._radius_min), minor_scale * distance)
+            if major > max_radius:
+                continue
+            fill = index / (math.pi * major * minor)
+            if best is None or fill > best[2]:
+                best = (major, minor, fill, [item[1] for item in normalized_distances[:index]])
+        if best is None:
+            return None
+        LOGGER.event(
+            "activation.detector.ellipse",
+            section=DETECTOR_STATISTICAL_SHAPE,
+            data={
+                "semi_major_radius": best[0],
+                "semi_minor_radius": best[1],
+                "axis_ratio": best[0] / best[1],
+                "orientation": orientation,
+                "points": len(best[3]),
+            },
+        )
+        return best[0], best[1], orientation, best[2], best[3]
 
     def _threshold_similarity(self, similarity: float, lambda_value: float) -> float:
         if similarity <= 0.0:
@@ -1064,12 +1216,24 @@ class ActivationEngine(_ActivationEngineBase):
         coverage: list[tuple[int, ...] | "np.ndarray"] = []
         positions = self._activation_map.positions
         for idx, detector in enumerate(self._detectors):
-            radius_sq = detector.radius * detector.radius
+            minor_radius = (
+                detector.radius
+                if detector.semi_minor_radius is None
+                else detector.semi_minor_radius
+            )
+            cos_a = math.cos(detector.orientation)
+            sin_a = math.sin(detector.orientation)
             covered: list[int] = []
             for point_idx, (y, x) in enumerate(positions):
                 dy = float(y) - float(detector.center[0])
                 dx = float(x) - float(detector.center[1])
-                if dy * dy + dx * dx <= radius_sq:
+                major_coordinate = dx * cos_a + dy * sin_a
+                minor_coordinate = -dx * sin_a + dy * cos_a
+                normalized_distance = (
+                    (major_coordinate / detector.radius) ** 2
+                    + (minor_coordinate / minor_radius) ** 2
+                )
+                if normalized_distance <= 1.0:
                     covered.append(point_idx)
             if np is not None:
                 coverage.append(np.asarray(covered, dtype=np.int32))
@@ -1082,6 +1246,8 @@ class ActivationEngine(_ActivationEngineBase):
                     "detector": idx,
                     "detector_label": "" if detector.label is None else str(detector.label),
                     "receptive_radius": detector.radius,
+                    "semi_minor_radius": minor_radius,
+                    "orientation": detector.orientation,
                     "covered_points": len(covered),
                 },
             )

@@ -12,11 +12,18 @@ from damp.activation import (
     Detector,
     DetectorHierarchyScaleResolver,
     DetectorLayerConfigFactory,
+    EmbeddingSaturationResolver,
 )
-from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding
+from damp.decode import (
+    DecoderConfig,
+    DecoderParameterScaleResolver,
+    EmbeddingDatabase,
+    LabeledEmbedding,
+)
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, EncoderCodeColorizer
 from damp.encoding.orientation_encoder import RetinotopicOrientationEncoder
+from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
 from damp.layout.damp_layout import (
     ContinuityLayoutConfig,
     Layout,
@@ -24,6 +31,7 @@ from damp.layout.damp_layout import (
 )
 from damp.layout.payload import LayoutPayloadBuilder
 from damp.logging import DampLogger, RerunDashboard
+from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from pinwheel_test import (
     PinwheelExperiment,
     PinwheelPositionGenerator,
@@ -51,6 +59,105 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_stimulus_colour_merge_prioritizes_position_and_density(self) -> None:
+        first = BitArray(8)
+        second = BitArray(8)
+        for index in (0, 1, 6):
+            first.set(index)
+        for index in (2, 3, 7):
+            second.set(index)
+        builder = StimulusEmbeddingBuilder(
+            code_length=8,
+            spatial_priority_bits=4,
+            max_density=0.5,
+        )
+        embedding = builder.build((first, second))
+        self.assertEqual(embedding.count(), 4)
+        self.assertTrue(all(embedding[index] for index in range(4)))
+
+    def test_sobel_extractor_preserves_multiple_local_orientations(self) -> None:
+        image = __import__("numpy").zeros((28, 28), dtype="float32")
+        image[0:4, 1:3] = 1.0
+        mean_extractor = MnistSobelAngleMap(grad_threshold=0.01)
+        local_extractor = MnistSobelAngleMap(
+            grad_threshold=0.01,
+            local_orientation_limit=4,
+        )
+        mean_count = len(mean_extractor.extract(image, 0)[0])
+        local_count = len(local_extractor.extract(image, 0)[0])
+        self.assertGreater(local_count, mean_count)
+
+    def test_elliptical_detector_coverage_uses_minor_axis(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code, code]},
+            grid_size=3,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        layout.grid = [[None] * 3 for _ in range(3)]
+        layout._row_occupied = [set() for _ in range(3)]
+        for index, position in enumerate(((1, 1), (2, 1))):
+            y, x = position
+            layout.grid[y][x] = index
+            layout._positions[index] = position
+            layout._pos_y[index] = y
+            layout._pos_x[index] = x
+            layout._row_occupied[y].add(x)
+        detector = Detector(
+            center=(1.0, 1.0),
+            radius=2.0,
+            semi_minor_radius=0.5,
+            orientation=0.0,
+            lambda_threshold=0.5,
+            energy=1.0,
+            points_count=1,
+            output_code=self._single_bit(4, 0),
+        )
+        engine = ActivationEngine(
+            layout,
+            [detector],
+            lambda_threshold=0.0,
+            eta=None,
+            energy_threshold=0.0,
+            detector_threshold=0.0,
+            saturation_limit=4,
+            energy_map=[1.0, 1.0],
+            use_gpu=False,
+        )
+        self.assertEqual(len(engine._coverage[0]), 1)
+
+    def test_decoder_parameters_scale_with_embedding_database(self) -> None:
+        resolver = DecoderParameterScaleResolver(
+            reference_embeddings=100,
+            base_top_k=5,
+            base_temperature=0.05,
+            max_temperature=0.10,
+        )
+        small = resolver.resolve(100)
+        medium = resolver.resolve(200)
+        large = resolver.resolve(1000)
+        self.assertEqual((small.knn_top_k, small.temperature), (5, 0.05))
+        self.assertEqual((medium.knn_top_k, medium.temperature), (5, 0.05))
+        self.assertEqual((large.knn_top_k, large.temperature), (5, 0.05))
+
+    def test_embedding_saturation_scales_but_respects_density_limit(self) -> None:
+        resolver = EmbeddingSaturationResolver(
+            output_bits=2048,
+            max_density=0.25,
+            base_active_bits=125,
+        )
+        self.assertEqual(resolver.resolve(1.0), 125)
+        self.assertEqual(resolver.resolve(72 / 51), 105)
+        self.assertEqual(resolver.resolve(162 / 51), 70)
+        self.assertEqual(resolver.resolve(0.01), 512)
+
     def test_detector_hierarchy_scales_with_layout_extent(self) -> None:
         class SmallLayout:
             width = 51

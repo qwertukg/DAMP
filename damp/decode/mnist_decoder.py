@@ -11,6 +11,7 @@ from damp.article_refs import CODE_SPACE_ACTIVATION, SIMILARITY_DEFINITION, SIMI
 from damp.activation import ActivationEngine, ActivationResult
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import Encoder
+from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.logging import LOGGER
 
@@ -24,6 +25,54 @@ class DecoderConfig:
     knn_top_k: int = 50
     top_k_per_class: int = 0
     min_similarity: float = 0.0
+
+
+@dataclass(frozen=True)
+class ScaledDecoderParameters:
+    knn_top_k: int
+    temperature: float
+
+
+class DecoderParameterScaleResolver:
+    """Сохраняет относительный k-NN охват при росте базы эмбеддингов."""
+
+    def __init__(
+        self,
+        *,
+        reference_embeddings: int,
+        base_top_k: int,
+        base_temperature: float,
+        max_temperature: float,
+    ) -> None:
+        if reference_embeddings <= 0 or base_top_k <= 0:
+            raise ValueError("decoder scale sizes must be positive")
+        if base_temperature <= 0.0 or max_temperature < base_temperature:
+            raise ValueError("invalid decoder temperature range")
+        self._reference_embeddings = int(reference_embeddings)
+        self._base_top_k = int(base_top_k)
+        self._base_temperature = float(base_temperature)
+        self._max_temperature = float(max_temperature)
+
+    def resolve(self, embeddings: int) -> ScaledDecoderParameters:
+        if embeddings <= 0:
+            raise ValueError("embeddings must be positive")
+        scale = embeddings / self._reference_embeddings
+        resolved = ScaledDecoderParameters(
+            knn_top_k=min(embeddings, self._base_top_k),
+            temperature=self._base_temperature,
+        )
+        LOGGER.event(
+            "decoder.parameters.scale.resolve",
+            section=SIMILARITY_MEASURES,
+            data={
+                "embeddings": embeddings,
+                "reference_embeddings": self._reference_embeddings,
+                "scale_factor": scale,
+                "knn_top_k": resolved.knn_top_k,
+                "temperature": resolved.temperature,
+            },
+        )
+        return resolved
 
 
 @dataclass(frozen=True)
@@ -530,10 +579,12 @@ class MnistDecoder:
         *,
         encoder: Encoder,
         extractor: MnistSobelAngleMap,
-        activation_engine: ActivationEngine,
+        activation_engine: ActivationEngine | None,
         embedding_db: EmbeddingDatabase,
         evaluation_confidence_bins: int,
         evaluation_error_examples: int,
+        stimulus_embedding_builder: StimulusEmbeddingBuilder,
+        structural_activation_interval: int,
     ) -> None:
         self._encoder = encoder
         self._extractor = extractor
@@ -541,6 +592,11 @@ class MnistDecoder:
         self._embedding_db = embedding_db
         self._evaluation_confidence_bins = int(evaluation_confidence_bins)
         self._evaluation_error_examples = int(evaluation_error_examples)
+        self._stimulus_embedding_builder = stimulus_embedding_builder
+        if structural_activation_interval <= 0:
+            raise ValueError("structural_activation_interval must be positive")
+        self._structural_activation_interval = int(structural_activation_interval)
+        self._embedding_sequence = 0
         self._last_activation_values: list[float] | None = None
         code_len = getattr(activation_engine, "_code_length", None)
         LOGGER.event(
@@ -587,8 +643,34 @@ class MnistDecoder:
             )
             codes.append(code)
             first = False
-        activation_result = self._activation_engine.activate(codes)
-        self._last_activation_values = list(activation_result.activation_values)
+        classification_embedding = self._stimulus_embedding_builder.build(codes)
+        self._embedding_sequence += 1
+        evaluate_structure = (
+            self._activation_engine is not None
+            and (
+                log_image
+                or self._embedding_sequence == 1
+                or self._embedding_sequence % self._structural_activation_interval == 0
+            )
+        )
+        if evaluate_structure:
+            structural_result = self._activation_engine.activate(codes)
+            activation_result = ActivationResult(
+                activation_values=structural_result.activation_values,
+                activation_matrix=structural_result.activation_matrix,
+                active_detectors=structural_result.active_detectors,
+                embedding=structural_result.embedding,
+                classification_embedding=classification_embedding,
+            )
+            self._last_activation_values = list(activation_result.activation_values)
+        else:
+            activation_result = ActivationResult(
+                activation_values=[],
+                activation_matrix=[],
+                active_detectors=[],
+                embedding=classification_embedding,
+                classification_embedding=classification_embedding,
+            )
         LOGGER.event(
             "decoder.embed",
             section=CODE_SPACE_ACTIVATION,
@@ -596,6 +678,8 @@ class MnistDecoder:
                 "codes": len(codes),
                 "active_detectors": len(activation_result.active_detectors),
                 "embedding_bits": activation_result.embedding.count(),
+                "classification_embedding_bits": classification_embedding.count(),
+                "structural_evaluated": evaluate_structure,
                 "label_hint": label_value,
             },
         )
@@ -610,7 +694,10 @@ class MnistDecoder:
         temperature: float | None = None,
     ) -> PredictionResult:
         activation_result = self.embed_image(image, label_hint=label_hint, log_image=log_image)
-        prediction = self._embedding_db.predict(activation_result.embedding, temperature=temperature)
+        prediction = self._embedding_db.predict(
+            activation_result.classification_embedding or activation_result.embedding,
+            temperature=temperature,
+        )
         LOGGER.event(
             "decoder.predict.image",
             section=STIMULUS_DETECTION,
@@ -666,7 +753,7 @@ class MnistDecoder:
             accuracy = correct / len(results)
         if diagnostics is not None:
             diagnostics.log_summary()
-        if self._last_activation_values is not None:
+        if self._last_activation_values is not None and self._activation_engine is not None:
             self._activation_engine.log_activation_overview(
                 self._last_activation_values
             )
