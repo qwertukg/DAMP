@@ -651,6 +651,54 @@ class DetectorLayerConfig:
     min_points: int
 
 
+@dataclass(frozen=True)
+class DetectorHierarchyScale:
+    """Размеры детекторной иерархии для конкретного Layout (§6.3–6.4)."""
+
+    factor: float
+    radius_max: int
+    max_detectors: int
+
+
+class DetectorHierarchyScaleResolver:
+    """Сохраняет относительный масштаб иерархии при росте Layout."""
+
+    def __init__(
+        self,
+        *,
+        reference_extent: int,
+        base_radius_max: int,
+        base_max_detectors: int,
+    ) -> None:
+        if reference_extent <= 0 or base_radius_max <= 0 or base_max_detectors <= 0:
+            raise ValueError("detector hierarchy scale values must be positive")
+        self._reference_extent = int(reference_extent)
+        self._base_radius_max = int(base_radius_max)
+        self._base_max_detectors = int(base_max_detectors)
+
+    def resolve(self, layout: Layout) -> DetectorHierarchyScale:
+        spatial_extent = max(1, min(int(layout.width), int(layout.height)))
+        factor = spatial_extent / self._reference_extent
+        scale = DetectorHierarchyScale(
+            factor=factor,
+            radius_max=max(1, int(round(self._base_radius_max * factor))),
+            max_detectors=max(1, int(math.ceil(self._base_max_detectors * factor))),
+        )
+        LOGGER.event(
+            "activation.detector.scale.resolve",
+            section=DETECTOR_PARAMS,
+            data={
+                "layout_width": layout.width,
+                "layout_height": layout.height,
+                "reference_extent": self._reference_extent,
+                "scale_factor": scale.factor,
+                "radius_max": scale.radius_max,
+                "max_detectors": scale.max_detectors,
+            },
+        )
+        return scale
+
+
 class DetectorLayerConfigFactory:
     """Масштабирует слои детекторов относительно размера конкретного Layout."""
 

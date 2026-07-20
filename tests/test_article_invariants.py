@@ -7,7 +7,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from damp.activation import ActivationEngine, Detector, DetectorLayerConfigFactory
+from damp.activation import (
+    ActivationEngine,
+    Detector,
+    DetectorHierarchyScaleResolver,
+    DetectorLayerConfigFactory,
+)
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, EncoderCodeColorizer
@@ -27,6 +32,7 @@ from pinwheel_test import (
 )
 from main import (
     ACTIVATION_MAX_EMBEDDING_DENSITY,
+    ACTIVATION_DETECTOR_LAYER_SPECS,
     ACTIVATION_OUTPUT_BITS,
     ACTIVATION_SATURATION_LIMIT,
     LAYOUT_PSEUDO_COLOR_MAX_HUE,
@@ -45,6 +51,35 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_detector_hierarchy_scales_with_layout_extent(self) -> None:
+        class SmallLayout:
+            width = 51
+            height = 51
+
+        class LargeLayout:
+            width = 162
+            height = 162
+
+        resolver = DetectorHierarchyScaleResolver(
+            reference_extent=51,
+            base_radius_max=24,
+            base_max_detectors=256,
+        )
+        small = resolver.resolve(SmallLayout())
+        large = resolver.resolve(LargeLayout())
+        self.assertEqual((small.radius_max, small.max_detectors), (24, 256))
+        self.assertEqual((large.radius_max, large.max_detectors), (76, 814))
+        self.assertGreater(large.factor, small.factor)
+        layers = DetectorLayerConfigFactory(
+            radius_min=1,
+            radius_max=large.radius_max,
+            min_points=3,
+        ).build(LargeLayout(), ACTIVATION_DETECTOR_LAYER_SPECS)
+        self.assertEqual(
+            [layer.activation_radius for layer in layers],
+            [57, 47, 39, 32, 26, 19],
+        )
+
     def test_embedding_density_does_not_exceed_configured_limit(self) -> None:
         self.assertLessEqual(
             ACTIVATION_SATURATION_LIMIT / ACTIVATION_OUTPUT_BITS,

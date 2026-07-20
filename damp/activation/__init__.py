@@ -7,6 +7,8 @@ from .activation import (
     DetectorLayerConfig,
     DetectorLayerConfigFactory,
     DetectorHierarchyBuilder,
+    DetectorHierarchyScale,
+    DetectorHierarchyScaleResolver,
 )
 
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     "DetectorLayerConfig",
     "DetectorLayerConfigFactory",
     "DetectorHierarchyBuilder",
+    "DetectorHierarchyScale",
+    "DetectorHierarchyScaleResolver",
 ]

@@ -27,6 +27,7 @@ from damp.activation import (
     ActivationEngine,
     Detector,
     DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder,
+    DetectorHierarchyScaleResolver,
     DetectorLayerConfigFactory,
 )
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
@@ -87,9 +88,9 @@ EVALUATION_LOG_PATH = "evaluate.log"
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 8
+EMBEDDINGS_VERSION = 9
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 7
+PIPELINE_CHECKPOINT_VERSION = 8
 LAYOUT_CACHE_TAG = "orientation-topology-v2"
 LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
 LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
@@ -229,6 +230,7 @@ ACTIVATION_SATURATION_LIMIT = min(
 ACTIVATION_POINT_ENERGY_RADIUS = 3
 ACTIVATION_DETECTOR_RADIUS_MIN = 1
 ACTIVATION_DETECTOR_RADIUS_MAX = 24
+ACTIVATION_DETECTOR_REFERENCE_EXTENT = 51
 ACTIVATION_DETECTOR_MIN_POINTS = 3
 ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 1000
 ACTIVATION_DETECTOR_SEED = 0
@@ -468,6 +470,7 @@ FILE_LAYOUT_EVENTS = {
     "layout.continuity.start",
     "layout.continuity.sweep",
     "layout.continuity.done",
+    "activation.detector.scale.resolve",
     "activation.detector.layers.resolve",
     "activation.detector.layer",
     "activation.engine.init",
@@ -479,6 +482,7 @@ FILE_LAYOUT_EVENTS = {
 FILE_EVALUATE_EVENTS = {
     "decoder.layout.use",
     "decoder.build",
+    "activation.detector.scale.resolve",
     "activation.detector.layers.resolve",
     "activation.detector.layer",
     "activation.engine.init",
@@ -1008,16 +1012,21 @@ def _build_detectors_from_layout(
     max_detectors: int,
     output_bits: int,
 ) -> list[Detector]:
+    hierarchy_scale = DetectorHierarchyScaleResolver(
+        reference_extent=ACTIVATION_DETECTOR_REFERENCE_EXTENT,
+        base_radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
+        base_max_detectors=max_detectors,
+    ).resolve(layout)
     layer_configs = DetectorLayerConfigFactory(
         radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
-        radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
+        radius_max=hierarchy_scale.radius_max,
         min_points=ACTIVATION_DETECTOR_MIN_POINTS,
     ).build(layout, ACTIVATION_DETECTOR_LAYER_SPECS)
     return ArticleDetectorHierarchyBuilder(
         layout=layout,
         energies=energies,
         radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
-        max_detectors=max_detectors,
+        max_detectors=hierarchy_scale.max_detectors,
         output_bits=output_bits,
         layer_configs=layer_configs,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
