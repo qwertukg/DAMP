@@ -4,6 +4,8 @@ from .activation import (
     ActivationResult,
     ActivatedDetector,
     Detector,
+    DetectorLayerConfig,
+    DetectorLayerConfigFactory,
     DetectorHierarchyBuilder,
 )
 
@@ -13,5 +15,7 @@ __all__ = [
     "ActivationResult",
     "ActivatedDetector",
     "Detector",
+    "DetectorLayerConfig",
+    "DetectorLayerConfigFactory",
     "DetectorHierarchyBuilder",
 ]

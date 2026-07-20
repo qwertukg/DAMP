@@ -313,6 +313,7 @@ class DampLogger:
         event: str,
         *,
         section: str,
+        title: str | None = None,
         data: Mapping[str, Any] | None = None,
         path: str | None = None,
         visuals: Sequence[LogVisual] | None = None,
@@ -325,11 +326,12 @@ class DampLogger:
                 return
         elif force is False:
             return
+        display_name = event if title is None else str(title)
         if data:
             details = " ".join(f"{k}={self._format_value(v)}" for k, v in data.items())
-            message = f"{event} {details}"
+            message = f"{display_name} {details}"
         else:
-            message = event
+            message = display_name
         message = f"{message} [{section}]"
         self._console_log(message)
         self._ensure_rerun()

@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from damp.activation import ActivationEngine, Detector
+from damp.activation import ActivationEngine, Detector, DetectorLayerConfigFactory
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, EncoderCodeColorizer
@@ -42,6 +42,59 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_logger_uses_completion_title_in_console_and_rerun_text(self) -> None:
+        logger = DampLogger(spawn=False)
+        with (
+            patch.object(logger, "_console_log") as console_log,
+            patch("damp.logging.rr.is_enabled", return_value=False),
+        ):
+            logger.event(
+                "pipeline.test.completed",
+                title="ТЕСТИРОВАНИЕ ЗАВЕРШЕНО",
+                section="6.5",
+                data={"elapsed_seconds": 1.25, "average_accuracy": 0.9},
+                force=True,
+            )
+        message = console_log.call_args.args[0]
+        self.assertTrue(message.startswith("ТЕСТИРОВАНИЕ ЗАВЕРШЕНО"))
+        self.assertIn("elapsed_seconds=1.25", message)
+        self.assertIn("average_accuracy=0.9", message)
+
+    def test_detector_layers_resolve_to_mnist_feature_scales(self) -> None:
+        class LayoutExtent:
+            width = 51
+            height = 51
+
+        layers = DetectorLayerConfigFactory(
+            radius_min=1,
+            radius_max=24,
+            min_points=3,
+        ).build(
+            LayoutExtent(),
+            (
+                (0.50, 0.35, 3.50),
+                (0.60, 0.29, 3.20),
+                (0.70, 0.24, 2.65),
+                (0.75, 0.20, 2.40),
+                (0.80, 0.16, 2.00),
+                (0.85, 0.12, 1.30),
+            ),
+        )
+        self.assertEqual(
+            [layer.activation_radius for layer in layers],
+            [18, 15, 12, 10, 8, 6],
+        )
+        self.assertEqual(
+            [layer.min_points for layer in layers],
+            [63, 48, 32, 24, 16, 8],
+        )
+        self.assertTrue(
+            all(
+                left.activation_radius > right.activation_radius
+                for left, right in zip(layers, layers[1:])
+            )
+        )
+
     def test_rerun_event_filter_keeps_only_dashboard_events(self) -> None:
         logger = DampLogger(spawn=False)
         logger._initialized = True

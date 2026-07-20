@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 import concurrent.futures
 import random
@@ -641,6 +642,75 @@ class DetectorCandidate:
     insertion_density: float
 
 
+@dataclass(frozen=True)
+class DetectorLayerConfig:
+    """Параметры одного порогового слоя детекторного пространства (§6.3–6.4)."""
+
+    lambda_threshold: float
+    activation_radius: int
+    min_points: int
+
+
+class DetectorLayerConfigFactory:
+    """Масштабирует слои детекторов относительно размера конкретного Layout."""
+
+    def __init__(self, *, radius_min: int, radius_max: int, min_points: int) -> None:
+        if radius_min <= 0 or radius_max < radius_min:
+            raise ValueError("invalid detector radius range")
+        if min_points <= 0:
+            raise ValueError("min_points must be positive")
+        self._radius_min = int(radius_min)
+        self._radius_max = int(radius_max)
+        self._min_points = int(min_points)
+
+    def build(
+        self,
+        layout: Layout,
+        specs: Sequence[tuple[float, float, float]],
+    ) -> tuple[DetectorLayerConfig, ...]:
+        if not specs:
+            raise ValueError("at least one detector layer specification is required")
+        spatial_extent = max(1, min(layout.width, layout.height))
+        layers: list[DetectorLayerConfig] = []
+        for lambda_threshold, radius_factor, points_per_radius in specs:
+            if not 0.0 < float(radius_factor) <= 1.0:
+                raise ValueError("detector radius factor must be in (0, 1]")
+            if float(points_per_radius) <= 0.0:
+                raise ValueError("points_per_radius must be positive")
+            activation_radius = max(
+                self._radius_min,
+                min(self._radius_max, int(round(spatial_extent * float(radius_factor)))),
+            )
+            required_points = max(
+                self._min_points,
+                int(math.ceil(activation_radius * float(points_per_radius))),
+            )
+            layers.append(
+                DetectorLayerConfig(
+                    lambda_threshold=float(lambda_threshold),
+                    activation_radius=activation_radius,
+                    min_points=required_points,
+                )
+            )
+        LOGGER.event(
+            "activation.detector.layers.resolve",
+            section=DETECTOR_PARAMS,
+            data={
+                "layout_width": layout.width,
+                "layout_height": layout.height,
+                "layers": [
+                    {
+                        "lambda": layer.lambda_threshold,
+                        "activation_radius": layer.activation_radius,
+                        "min_points": layer.min_points,
+                    }
+                    for layer in layers
+                ],
+            },
+        )
+        return tuple(layers)
+
+
 class DetectorHierarchyBuilder:
     """Стохастически строит слои детекторов по §6.3–6.4.5."""
 
@@ -649,37 +719,36 @@ class DetectorHierarchyBuilder:
         *,
         layout: Layout,
         energies: Sequence[float],
-        radius: int,
         radius_min: int,
-        min_points: int,
         max_detectors: int,
         output_bits: int,
-        lambda_levels: Sequence[float],
+        layer_configs: Sequence[DetectorLayerConfig],
         energy_threshold: float,
         eta: float | None,
         attempts_without_change: int,
         seed: int,
     ) -> None:
-        if radius <= 0 or radius_min <= 0 or radius_min > radius:
-            raise ValueError("invalid detector radius range")
-        if min_points <= 0:
-            raise ValueError("min_points must be positive")
+        if radius_min <= 0:
+            raise ValueError("radius_min must be positive")
         if max_detectors <= 0 or output_bits <= 0:
             raise ValueError("detector and output sizes must be positive")
         if len(energies) != len(layout.positions()):
             raise ValueError("energies size must match layout points")
-        if not lambda_levels:
-            raise ValueError("lambda_levels must be non-empty")
+        if not layer_configs:
+            raise ValueError("layer_configs must be non-empty")
+        if any(
+            layer.activation_radius < radius_min or layer.min_points <= 0
+            for layer in layer_configs
+        ):
+            raise ValueError("invalid detector layer configuration")
         if attempts_without_change <= 0:
             raise ValueError("attempts_without_change must be positive")
         self._layout = layout
         self._energies = [float(value) for value in energies]
-        self._radius = int(radius)
         self._radius_min = int(radius_min)
-        self._min_points = int(min_points)
         self._max_detectors = int(max_detectors)
         self._output_bits = int(output_bits)
-        self._lambda_levels = tuple(float(value) for value in lambda_levels)
+        self._layer_configs = tuple(layer_configs)
         self._energy_threshold = float(energy_threshold)
         self._eta = None if eta is None else float(eta)
         self._attempts_without_change = int(attempts_without_change)
@@ -688,7 +757,7 @@ class DetectorHierarchyBuilder:
             "activation.detector.builder.init",
             section=DETECTOR_CONSTRUCTION,
             data={
-                "layers": len(self._lambda_levels),
+                "layers": len(self._layer_configs),
                 "max_detectors": self._max_detectors,
                 "output_bits": self._output_bits,
                 "attempts_without_change": self._attempts_without_change,
@@ -697,10 +766,11 @@ class DetectorHierarchyBuilder:
         )
 
     def build(self) -> list[Detector]:
-        per_layer_limit = max(1, self._max_detectors // len(self._lambda_levels))
+        per_layer_limit = max(1, self._max_detectors // len(self._layer_configs))
         detectors: list[Detector] = []
-        for lambda_value in self._lambda_levels:
-            candidates = self._build_layer(lambda_value, per_layer_limit)
+        for layer in self._layer_configs:
+            lambda_value = layer.lambda_threshold
+            candidates = self._build_layer(layer, per_layer_limit)
             for candidate in candidates:
                 output_code = BitArray(self._output_bits)
                 output_code.set(self._rng.randrange(self._output_bits), 1)
@@ -722,6 +792,8 @@ class DetectorHierarchyBuilder:
                     "lambda": lambda_value,
                     "layer_detectors": len(candidates),
                     "per_layer_limit": per_layer_limit,
+                    "activation_radius": layer.activation_radius,
+                    "min_points": layer.min_points,
                     "fill_min": min((item.fill_factor for item in candidates), default=0.0),
                     "fill_max": max((item.fill_factor for item in candidates), default=0.0),
                     "radius_min": min((item.radius for item in candidates), default=0.0),
@@ -732,13 +804,17 @@ class DetectorHierarchyBuilder:
             raise RuntimeError("не удалось построить ни одного детектора для активации")
         return detectors
 
-    def _build_layer(self, lambda_value: float, limit: int) -> list[DetectorCandidate]:
+    def _build_layer(
+        self,
+        layer: DetectorLayerConfig,
+        limit: int,
+    ) -> list[DetectorCandidate]:
         selected: list[DetectorCandidate] = []
         unchanged = 0
         point_count = len(self._energies)
         while unchanged < self._attempts_without_change:
             center_index = self._rng.randrange(point_count)
-            candidate = self._make_candidate(center_index, lambda_value)
+            candidate = self._make_candidate(center_index, layer)
             if candidate is None:
                 unchanged += 1
                 continue
@@ -759,13 +835,22 @@ class DetectorHierarchyBuilder:
         selected.sort(key=lambda item: item.insertion_density, reverse=True)
         return selected[:limit]
 
-    def _make_candidate(self, center_index: int, lambda_value: float) -> DetectorCandidate | None:
+    def _make_candidate(
+        self,
+        center_index: int,
+        layer: DetectorLayerConfig,
+    ) -> DetectorCandidate | None:
+        lambda_value = layer.lambda_threshold
         if self._energies[center_index] < self._energy_threshold:
             return None
         center_y = self._layout._pos_y[center_index]
         center_x = self._layout._pos_x[center_index]
         active: dict[tuple[int, int], tuple[int, float]] = {}
-        for point_index in self._indices_in_radius(center_y, center_x, self._radius):
+        for point_index in self._indices_in_radius(
+            center_y,
+            center_x,
+            layer.activation_radius,
+        ):
             point_energy = self._energies[point_index]
             if point_energy < self._energy_threshold:
                 continue
@@ -779,7 +864,7 @@ class DetectorHierarchyBuilder:
         if seed not in active:
             return None
         cluster_positions = self._connected_component(seed, active)
-        if len(cluster_positions) < self._min_points:
+        if len(cluster_positions) < layer.min_points:
             return None
         LOGGER.event(
             "activation.detector.cluster",
@@ -804,10 +889,10 @@ class DetectorHierarchyBuilder:
         best_fill = -1.0
         for distance in distances:
             candidate_radius = max(float(self._radius_min), distance)
-            if candidate_radius > self._radius:
+            if candidate_radius > layer.activation_radius:
                 continue
-            points_count = sum(value <= candidate_radius for value in distances)
-            if points_count < self._min_points:
+            points_count = bisect.bisect_right(distances, candidate_radius)
+            if points_count < layer.min_points:
                 continue
             fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
             if fill_factor > best_fill:
@@ -822,7 +907,7 @@ class DetectorHierarchyBuilder:
         ]
         detector_energy = sum(active[position][1] for position in included)
         points_count = len(included)
-        if detector_energy <= 0.0 or points_count < self._min_points:
+        if detector_energy <= 0.0 or points_count < layer.min_points:
             return None
         return DetectorCandidate(
             center=(centroid_y, centroid_x),
@@ -1161,20 +1246,16 @@ class ActivationEngine(_ActivationEngineBase):
         energy_colors = [
             self._value_to_rgba(value * energy_scale) for value in self._energies
         ]
-        detector_mins = [
-            (detector.center[1] - detector.radius, detector.center[0] - detector.radius)
-            for detector in self._detectors
-        ]
-        detector_sizes = [
-            (detector.radius * 2.0, detector.radius * 2.0)
-            for detector in self._detectors
-        ]
         detector_positions = [
             (detector.center[1], detector.center[0]) for detector in self._detectors
         ]
         detector_colors = [
             self._detector_color(detector.lambda_threshold)
             for detector in self._detectors
+        ]
+        receptive_field_colors = [
+            (red, green, blue, 48)
+            for red, green, blue, _ in detector_colors
         ]
         visuals = [
             LOGGER.visual_scalar_map(
@@ -1192,11 +1273,11 @@ class ActivationEngine(_ActivationEngineBase):
                 radii=0.45,
                 static=True,
             ),
-            LOGGER.visual_boxes2d(
+            LOGGER.visual_points2d(
                 "layout/diagnostics/detectors/receptive_fields",
-                detector_mins,
-                detector_sizes,
-                colors=detector_colors,
+                detector_positions,
+                colors=receptive_field_colors,
+                radii=[detector.radius for detector in self._detectors],
                 static=True,
             ),
             LOGGER.visual_points2d(

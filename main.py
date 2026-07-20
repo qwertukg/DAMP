@@ -1,5 +1,6 @@
 import glob
 import math
+import time
 from dataclasses import dataclass
 import json
 import os
@@ -22,7 +23,12 @@ from damp.article_refs import (
     GPU_IMPLEMENTATION,
     PARALLEL_PROCESSING,
 )
-from damp.activation import ActivationEngine, Detector, DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder
+from damp.activation import (
+    ActivationEngine,
+    Detector,
+    DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder,
+    DetectorLayerConfigFactory,
+)
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import (
     EncoderCodeColorizer,
@@ -72,11 +78,16 @@ LOG_INTERVAL_ACTIVATION_VISUAL = 100
 LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
 LOG_INTERVAL_EVALUATION_PROGRESS = 10
 
+LAYOUT_COMPLETION_EVENT = "pipeline.layout.completed"
+LAYOUT_COMPLETION_TITLE = "================ РАСКЛАДКА ЗАВЕРШЕНА ================"
+EVALUATION_COMPLETION_EVENT = "pipeline.evaluation.completed"
+EVALUATION_COMPLETION_TITLE = "================ ТЕСТИРОВАНИЕ ЗАВЕРШЕНО ================"
+
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 4
+EMBEDDINGS_VERSION = 5
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 3
+PIPELINE_CHECKPOINT_VERSION = 4
 LAYOUT_CACHE_TAG = "orientation-topology-v2"
 LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
 LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
@@ -208,15 +219,22 @@ ACTIVATION_ENERGY_THRESHOLD = 0.12
 ACTIVATION_DETECTOR_THRESHOLD = 0.5
 ACTIVATION_SATURATION_LIMIT = 50
 ACTIVATION_POINT_ENERGY_RADIUS = 3
-ACTIVATION_DETECTOR_RADIUS = 6
 ACTIVATION_DETECTOR_RADIUS_MIN = 1
+ACTIVATION_DETECTOR_RADIUS_MAX = 24
 ACTIVATION_DETECTOR_MIN_POINTS = 3
 ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 1000
 ACTIVATION_DETECTOR_SEED = 0
 
 ACTIVATION_MAX_DETECTORS = 256
 ACTIVATION_OUTPUT_BITS = 256
-ACTIVATION_LAMBDA_LEVELS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.85)
+ACTIVATION_DETECTOR_LAYER_SPECS = (
+    (0.50, 0.35, 3.50),
+    (0.60, 0.29, 3.20),
+    (0.70, 0.24, 2.65),
+    (0.75, 0.20, 2.40),
+    (0.80, 0.16, 2.00),
+    (0.85, 0.12, 1.30),
+)
 ACTIVATION_USE_GPU = True
 ACTIVATION_PARALLEL_WORKERS = 4
 ACTIVATION_BATCH_SIZE = 10
@@ -360,6 +378,7 @@ LOG_INTERVALS = {
     "activation.detector.active": LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE,
     "activation.detector.init": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.detector.layer": LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER,
+    "activation.detector.layers.resolve": LOG_INTERVAL_INIT,
     "activation.detector.builder.init": LOG_INTERVAL_INIT,
     "activation.detector.cluster": LOG_INTERVAL_ACTIVATION_DETECTOR_CLUSTER,
     "activation.detector.center": LOG_INTERVAL_ACTIVATION_DETECTOR_CENTER,
@@ -374,6 +393,8 @@ LOG_INTERVALS = {
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
     "decoder.evaluation.sample": LOG_INTERVAL_EVALUATION_PROGRESS,
     "decoder.evaluation.summary": LOG_INTERVAL_INIT,
+    LAYOUT_COMPLETION_EVENT: LOG_INTERVAL_INIT,
+    EVALUATION_COMPLETION_EVENT: LOG_INTERVAL_INIT,
 }
 
 RERUN_LAYOUT_EVENTS = {
@@ -402,11 +423,13 @@ RERUN_LAYOUT_EVENTS = {
     "activation.structure.visual",
     "activation.map.visual",
     "activation.detector.layer",
+    "activation.detector.layers.resolve",
     "activation.engine.init",
     "activation.sample",
     "activation.progress",
     "activation.embedding.save",
     "pipeline.checkpoint.save",
+    LAYOUT_COMPLETION_EVENT,
 }
 
 RERUN_EVALUATE_EVENTS = {
@@ -417,6 +440,7 @@ RERUN_EVALUATE_EVENTS = {
     "decoder.dataset.eval",
     "activation.structure.visual",
     "activation.map.visual",
+    EVALUATION_COMPLETION_EVENT,
 }
 
 LAYOUT_CACHE_PATTERNS = (
@@ -922,20 +946,21 @@ def _build_detectors_from_layout(
     layout: Layout,
     energies: list[float],
     *,
-    radius: int,
     max_detectors: int,
     output_bits: int,
-    lambda_levels: tuple[float, ...],
 ) -> list[Detector]:
+    layer_configs = DetectorLayerConfigFactory(
+        radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
+        radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
+        min_points=ACTIVATION_DETECTOR_MIN_POINTS,
+    ).build(layout, ACTIVATION_DETECTOR_LAYER_SPECS)
     return ArticleDetectorHierarchyBuilder(
         layout=layout,
         energies=energies,
-        radius=radius,
         radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
-        min_points=ACTIVATION_DETECTOR_MIN_POINTS,
         max_detectors=max_detectors,
         output_bits=output_bits,
-        lambda_levels=lambda_levels,
+        layer_configs=layer_configs,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
         eta=ACTIVATION_ETA,
         attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
@@ -947,10 +972,8 @@ def _build_activation_engine(layout: Layout, energies: list[float]) -> Activatio
     detectors = _build_detectors_from_layout(
         layout,
         energies,
-        radius=ACTIVATION_DETECTOR_RADIUS,
         max_detectors=ACTIVATION_MAX_DETECTORS,
         output_bits=ACTIVATION_OUTPUT_BITS,
-        lambda_levels=ACTIVATION_LAMBDA_LEVELS,
     )
     eta_value = ACTIVATION_ETA
     return ActivationEngine(
@@ -1589,6 +1612,7 @@ class MnistLayoutRunner:
         self._embedding_store.save(layout_path, embeddings)
 
     def run(self) -> None:
+        started_at = time.perf_counter()
         cached_layout = self._try_load_cached_layout()
         dataset = self._build_dataset()
         if cached_layout is not None:
@@ -1698,6 +1722,20 @@ class MnistLayoutRunner:
             target_samples=self._activation_samples,
             embeddings=embeddings,
         )
+        elapsed_seconds = time.perf_counter() - started_at
+        LOGGER.event(
+            LAYOUT_COMPLETION_EVENT,
+            title=LAYOUT_COMPLETION_TITLE,
+            section=LAYOUT_SYSTEM,
+            data={
+                "elapsed_seconds": elapsed_seconds,
+                "elapsed_minutes": elapsed_seconds / 60.0,
+                "images": self.count,
+                "embeddings": len(embeddings),
+                "layout_path": layout_path,
+            },
+            force=True,
+        )
 
 
 def _load_image_from_path(path: str) -> "np.ndarray":
@@ -1733,6 +1771,7 @@ class MnistDecodeRunner:
     ) -> None:
         self.count = count
         self.layout_path = layout_path
+        self._logging_profile = logging_profile
         self._decoder: MnistDecoder | None = None
         self._temperature_override: float | None = None
         configure_logging(profile=logging_profile)
@@ -1930,6 +1969,7 @@ class MnistDecodeRunner:
         temperature: float | None = None,
         log_first: bool = False,
     ) -> tuple[list[PredictionResult], float]:
+        started_at = time.perf_counter()
         decoder = self._ensure_decoder()
         dataset = self._build_dataset(train=split == "train")
         images: list["np.ndarray"] = []
@@ -1955,7 +1995,24 @@ class MnistDecodeRunner:
                 "temperature": temperature if temperature is not None else decoder.base_temperature,
             },
         )
-        return results, 0.0 if accuracy is None else accuracy
+        resolved_accuracy = 0.0 if accuracy is None else accuracy
+        if self._logging_profile == "evaluate":
+            elapsed_seconds = time.perf_counter() - started_at
+            LOGGER.event(
+                EVALUATION_COMPLETION_EVENT,
+                title=EVALUATION_COMPLETION_TITLE,
+                section=STIMULUS_DETECTION,
+                data={
+                    "elapsed_seconds": elapsed_seconds,
+                    "elapsed_minutes": elapsed_seconds / 60.0,
+                    "samples": len(results),
+                    "average_accuracy": resolved_accuracy,
+                    "average_accuracy_percent": resolved_accuracy * 100.0,
+                    "split": split,
+                },
+                force=True,
+            )
+        return results, resolved_accuracy
 
     def calibrate_temperature(self, *, split: str, limit: int) -> tuple[float, float]:
         decoder = self._ensure_decoder()
@@ -2092,13 +2149,12 @@ def main() -> None:
             layout_path=args.layout_path,
             logging_profile="evaluate",
         )
-        _, accuracy = decode_runner.predict_dataset(
+        decode_runner.predict_dataset(
             split=args.split,
             limit=args.limit,
             temperature=args.temperature,
             log_first=False,
         )
-        print(f"dataset={args.split} samples={args.limit} accuracy={accuracy:.4f}")
         return
     parser.error(f"unknown command {command}")
 
