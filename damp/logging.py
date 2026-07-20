@@ -201,6 +201,7 @@ class DampLogger:
         self._file_path: str | None = None
         self._file_events: set[str] | None = None
         self._file_lock = threading.Lock()
+        self._worker_silent = False
 
     def _ensure_rerun(self) -> None:
         if not self._initialized:
@@ -337,6 +338,14 @@ class DampLogger:
         self._file_path = resolved_active
         self._file_events = None if events is None else {str(event) for event in events}
 
+    def configure_worker_silent(self) -> None:
+        """Отключает консоль, файлы и Rerun внутри вычислительного subprocess."""
+        self._worker_silent = True
+        self._file_path = None
+        self._file_events = set()
+        self._rerun_events = set()
+        self._dashboard_profile = None
+
     def should_log(self, event: str) -> bool:
         if self._interval_policy is None:
             return True
@@ -355,6 +364,8 @@ class DampLogger:
     ) -> None:
         if not section:
             raise ValueError("section must be provided")
+        if self._worker_silent:
+            return
         if force is None:
             if not self.should_log(event):
                 return

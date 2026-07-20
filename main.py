@@ -26,6 +26,7 @@ from damp.article_refs import (
 from damp.activation import (
     ActivationEngine,
     Detector,
+    DetectorHierarchyCache,
     DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder,
     DetectorHierarchyScale,
     DetectorHierarchyScaleResolver,
@@ -54,6 +55,7 @@ from damp.decode import (
     DecoderConfig,
     DecoderParameterScaleResolver,
     EmbeddingDatabase,
+    EvaluationEmbeddingCache,
     LabeledEmbedding,
     MnistDecoder,
     PredictionResult,
@@ -103,7 +105,7 @@ PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
 PIPELINE_CHECKPOINT_VERSION = 13
 PIPELINE_CHECKPOINT_REPLACE_ATTEMPTS = 8
 PIPELINE_CHECKPOINT_REPLACE_DELAY = 0.1
-LAYOUT_CACHE_TAG = "orientation-topology-v3"
+LAYOUT_CACHE_TAG = "orientation-topology-v5"
 LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
 LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
 LAYOUT_CONTINUITY_PHASE_SUFFIX = ".continuity-phase.json"
@@ -135,6 +137,8 @@ LAYOUT_SHORT_ENERGY_EPS = 1e-6
 LAYOUT_SHORT_WEIGHTED_FIRST = True
 LAYOUT_SHORT_SIMILARITY_CUTOFF = LAYOUT_LAMBDA_THRESHOLD
 LAYOUT_SHORT_PARTITIONS = 8
+LAYOUT_SHORT_PRESELECT_DISJOINT_PAIRS = True
+LAYOUT_SHORT_GPU_BATCH_PAIRS = 256
 
 MPS_HIGH_WATERMARK_RATIO = 0.0
 
@@ -169,7 +173,7 @@ LAYOUT_ADAPTIVE_RADIUS_MIN = 1
 LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
 LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
 LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR = 1.0
-LAYOUT_ENERGY_STABILITY_WINDOW = 20
+LAYOUT_ENERGY_STABILITY_WINDOW = 5
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
 LAYOUT_ENERGY_STABILITY_EVERY = 25
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
@@ -249,6 +253,10 @@ ACTIVATION_DETECTOR_REFERENCE_EXTENT = 51
 ACTIVATION_DETECTOR_MIN_POINTS = 3
 ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 1000
 ACTIVATION_DETECTOR_SEED = 0
+ACTIVATION_DETECTOR_PARALLEL_WORKERS = 3
+ACTIVATION_DETECTOR_PARALLEL_BACKEND = "process"
+ACTIVATION_DETECTOR_CACHE_SUFFIX = ".detectors.json"
+ACTIVATION_DETECTOR_CACHE_VERSION = 1
 ACTIVATION_DETECTOR_SHAPE = "circle"
 ACTIVATION_DETECTOR_MAX_AXIS_RATIO = 3.0
 
@@ -278,6 +286,10 @@ DECODER_SOFTMAX_TEMPERATURE_MAX = 0.10
 DECODER_TOP_K_PER_CLASS = 0
 DECODER_MIN_SIMILARITY = 0.0
 DECODER_DATASET_LIMIT = 64
+DECODER_SIMILARITY_BATCH_SIZE = 128
+DECODER_EVALUATION_WORKERS = 6
+DECODER_EVALUATION_CACHE_PATH = "data/evaluation-embeddings.json"
+DECODER_EVALUATION_CACHE_VERSION = 1
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.01, 0.02, 0.03, 0.05, 0.1)
 EVALUATION_CONFIDENCE_BINS = 10
@@ -1104,24 +1116,41 @@ def _build_detectors_from_layout(
         eta=ACTIVATION_ETA,
         attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
         seed=ACTIVATION_DETECTOR_SEED,
+        parallel_workers=ACTIVATION_DETECTOR_PARALLEL_WORKERS,
+        parallel_backend=ACTIVATION_DETECTOR_PARALLEL_BACKEND,
         receptive_field_shape=ACTIVATION_DETECTOR_SHAPE,
         max_axis_ratio=ACTIVATION_DETECTOR_MAX_AXIS_RATIO,
     ).build()
 
 
-def _build_activation_engine(layout: Layout, energies: list[float]) -> ActivationEngine:
+def _build_activation_engine(
+    layout: Layout,
+    energies: list[float],
+    *,
+    layout_path: str | None = None,
+) -> ActivationEngine:
     hierarchy_scale = DetectorHierarchyScaleResolver(
         reference_extent=ACTIVATION_DETECTOR_REFERENCE_EXTENT,
         base_radius_max=ACTIVATION_DETECTOR_RADIUS_MAX,
         base_max_detectors=ACTIVATION_MAX_DETECTORS,
     ).resolve(layout)
-    detectors = _build_detectors_from_layout(
-        layout,
-        energies,
-        max_detectors=ACTIVATION_MAX_DETECTORS,
-        output_bits=ACTIVATION_OUTPUT_BITS,
-        hierarchy_scale=hierarchy_scale,
+    detector_cache = DetectorHierarchyCache(
+        suffix=ACTIVATION_DETECTOR_CACHE_SUFFIX,
+        version=ACTIVATION_DETECTOR_CACHE_VERSION,
     )
+    detectors = (
+        detector_cache.load(layout_path, layout) if layout_path is not None else None
+    )
+    if detectors is None:
+        detectors = _build_detectors_from_layout(
+            layout,
+            energies,
+            max_detectors=ACTIVATION_MAX_DETECTORS,
+            output_bits=ACTIVATION_OUTPUT_BITS,
+            hierarchy_scale=hierarchy_scale,
+        )
+        if layout_path is not None:
+            detector_cache.save(layout_path, layout, detectors)
     saturation_limit = EmbeddingSaturationResolver(
         output_bits=ACTIVATION_OUTPUT_BITS,
         max_density=ACTIVATION_MAX_EMBEDDING_DENSITY,
@@ -1290,7 +1319,6 @@ def _collect_codes(
         lambda_threshold=None,
         eta=None,
     )
-    total_codes = 0
     found = 0
 
     for img_tensor, digit in dataset:
@@ -1320,9 +1348,9 @@ def _collect_codes(
                 hue=float(encoded_values[0]),
                 code=code,
             )
-            total_codes += 1
             first = False
-    return payload, total_codes
+    unique_payload = payload.deduplicated()
+    return unique_payload, len(unique_payload.records)
 
 
 def _collect_samples(
@@ -1458,6 +1486,8 @@ def _run_layout(
         use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
         similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF,
         partitions=LAYOUT_SHORT_PARTITIONS,
+        preselect_disjoint_pairs=LAYOUT_SHORT_PRESELECT_DISJOINT_PAIRS,
+        tensor_batch_pairs=LAYOUT_SHORT_GPU_BATCH_PAIRS,
     )
     if not (short_ready or continuity_ready):
         layout.run(
@@ -1755,7 +1785,11 @@ class MnistLayoutRunner:
         engine = None
         if _structural_diagnostics_enabled():
             energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
-            engine = _build_activation_engine(layout, energies)
+            engine = _build_activation_engine(
+                layout,
+                energies,
+                layout_path=layout_path,
+            )
         samples = _collect_samples(
             dataset,
             self._activation_samples,
@@ -2007,8 +2041,12 @@ class MnistDecodeRunner:
             version_key=EMBEDDINGS_VERSION_KEY,
             version=EMBEDDINGS_VERSION,
         )
+        self._evaluation_cache = EvaluationEmbeddingCache(
+            path=DECODER_EVALUATION_CACHE_PATH,
+            version=DECODER_EVALUATION_CACHE_VERSION,
+        )
 
-    def _load_layout(self) -> tuple[Layout, str, int]:
+    def _find_layout_file(self) -> tuple[str, int, int | None]:
         candidates: list[str] = []
         if self.layout_path:
             candidates.append(self.layout_path)
@@ -2024,18 +2062,22 @@ class MnistDecodeRunner:
             total_points, pair_radius, ready = metadata
             if not ready:
                 continue
-            tuner = LayoutParameterTuner(
-                empty_ratio=LAYOUT_EMPTY_RATIO,
-                start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
-            )
-            tuned_params = tuner.tune(total_points)
-            layout = _load_layout_from_file(
-                path,
-                tuned_params,
-                colorizer=self.encoder.colorizer,
-            )
-            if layout is None:
-                continue
+            return path, total_points, pair_radius
+        raise RuntimeError("готовая раскладка не найдена; запустите layout")
+
+    def _load_layout(self) -> tuple[Layout, str, int]:
+        path, total_points, pair_radius = self._find_layout_file()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        tuned_params = tuner.tune(total_points)
+        layout = _load_layout_from_file(
+            path,
+            tuned_params,
+            colorizer=self.encoder.colorizer,
+        )
+        if layout is not None:
             LOGGER.event(
                 "decoder.layout.use",
                 section=LAID_OUT_STRUCTURE,
@@ -2047,15 +2089,29 @@ class MnistDecodeRunner:
             )
             self.layout_path = path
             return layout, path, total_points
-        raise RuntimeError("готовая раскладка не найдена; запустите layout")
+        raise RuntimeError("готовая раскладка повреждена; запустите layout повторно")
 
     def _ensure_decoder(self) -> MnistDecoder:
         if self._decoder is not None:
             return self._decoder
-        layout, layout_path, total_points = self._load_layout()
-        energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
+        diagnostics_enabled = _structural_diagnostics_enabled()
+        layout: Layout | None = None
+        energies: list[float] = []
+        if diagnostics_enabled:
+            layout, layout_path, total_points = self._load_layout()
+            energies = _compute_point_energies(
+                layout, ACTIVATION_POINT_ENERGY_RADIUS
+            )
+        else:
+            layout_path, total_points, _ = self._find_layout_file()
+            self.layout_path = layout_path
         embeddings = _load_embeddings_from_file(layout_path)
         if not embeddings:
+            if layout is None:
+                layout, layout_path, total_points = self._load_layout()
+                energies = _compute_point_energies(
+                    layout, ACTIVATION_POINT_ENERGY_RADIUS
+                )
             embeddings = self._build_embeddings_for_layout(
                 layout,
                 layout_path,
@@ -2065,8 +2121,8 @@ class MnistDecodeRunner:
         if not labeled_embeddings:
             raise RuntimeError("в раскладке нет базы эмбеддингов")
         activation_engine = (
-            _build_activation_engine(layout, energies)
-            if _structural_diagnostics_enabled()
+            _build_activation_engine(layout, energies, layout_path=layout_path)
+            if diagnostics_enabled and layout is not None
             else None
         )
         decoder_parameters = DecoderParameterScaleResolver(
@@ -2085,6 +2141,7 @@ class MnistDecodeRunner:
                 knn_top_k=decoder_parameters.knn_top_k,
                 top_k_per_class=DECODER_TOP_K_PER_CLASS,
                 min_similarity=DECODER_MIN_SIMILARITY,
+                similarity_batch_size=DECODER_SIMILARITY_BATCH_SIZE,
             ),
         )
         self._decoder = MnistDecoder(
@@ -2096,6 +2153,7 @@ class MnistDecodeRunner:
             evaluation_error_examples=EVALUATION_ERROR_EXAMPLES,
             stimulus_embedding_builder=self._stimulus_embedding_builder,
             structural_activation_interval=ACTIVATION_STRUCTURAL_DIAGNOSTIC_EVERY,
+            evaluation_workers=DECODER_EVALUATION_WORKERS,
         )
         LOGGER.event(
             "decoder.build",
@@ -2115,7 +2173,7 @@ class MnistDecodeRunner:
         layout_path: str,
         energies: list[float],
     ) -> list[EmbeddingRecord]:
-        engine = _build_activation_engine(layout, energies)
+        engine = _build_activation_engine(layout, energies, layout_path=layout_path)
         dataset = self._build_dataset(train=True)
         samples = _collect_samples(
             dataset,
@@ -2212,11 +2270,38 @@ class MnistDecodeRunner:
                 break
             images.append(img_tensor.squeeze(0).numpy())
             labels.append(int(label))
-        results, accuracy = decoder.predict_batch(
-            images,
+        layout_path = self.layout_path or ""
+        layout_stat = os.stat(layout_path)
+        cache_key = "|".join(
+            (
+                os.path.abspath(layout_path),
+                str(layout_stat.st_size),
+                str(layout_stat.st_mtime_ns),
+                split,
+                str(limit),
+            )
+        )
+        embeddings = self._evaluation_cache.load(
+            key=cache_key,
+            labels=labels,
+            code_length=decoder.embedding_code_length,
+        )
+        if embeddings is None:
+            embeddings = decoder.embed_batch(
+                images,
+                labels=labels,
+                log_first=log_first,
+            )
+            self._evaluation_cache.save(
+                key=cache_key,
+                labels=labels,
+                embeddings=embeddings,
+            )
+        results, accuracy = decoder.predict_embeddings_batch(
+            embeddings,
+            images=images,
             labels=labels,
             temperature=temperature if temperature is not None else self._temperature_override,
-            log_first=log_first,
         )
         LOGGER.event(
             "decoder.dataset.eval",
@@ -2274,12 +2359,14 @@ class MnistDecodeRunner:
                 },
             )
             return best_temp, 0.0
+        embeddings = decoder.embed_batch(images, labels=labels, log_first=False)
+        prepared = decoder.prepare_embeddings_batch(embeddings)
         for candidate in DECODER_CALIBRATION_TEMPERATURES:
-            _, acc = decoder.predict_batch(
-                images,
+            _, acc = decoder.predict_prepared_batch(
+                prepared,
+                images=images,
                 labels=labels,
                 temperature=candidate,
-                log_first=False,
             )
             if acc is None:
                 continue

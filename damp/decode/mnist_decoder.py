@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import math
+import concurrent.futures
+import json
+import os
+import heapq
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Sequence
@@ -25,6 +29,7 @@ class DecoderConfig:
     knn_top_k: int = 50
     top_k_per_class: int = 0
     min_similarity: float = 0.0
+    similarity_batch_size: int = 128
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,94 @@ class PredictionResult:
 class LabeledEmbedding:
     label: int
     embedding: BitArray
+
+
+@dataclass(frozen=True)
+class PreparedEmbeddingNeighbors:
+    neighbors: tuple[tuple[float, int], ...]
+    strategy: str
+
+
+class EvaluationEmbeddingCache:
+    """Хранит эмбеддинги последней выборки без изменения их битового представления."""
+
+    def __init__(self, *, path: str, version: int) -> None:
+        self._path = path
+        self._version = int(version)
+
+    def load(
+        self,
+        *,
+        key: str,
+        labels: Sequence[int],
+        code_length: int,
+    ) -> list[BitArray] | None:
+        try:
+            with open(self._path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if (
+                payload.get("version") != self._version
+                or payload.get("key") != key
+                or payload.get("labels") != [int(label) for label in labels]
+                or payload.get("code_length") != int(code_length)
+            ):
+                raise ValueError("cache metadata mismatch")
+            raw_embeddings = payload.get("embeddings")
+            if not isinstance(raw_embeddings, list):
+                raise ValueError("cache embeddings missing")
+            embeddings = [self._from01(bits, code_length) for bits in raw_embeddings]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            LOGGER.event(
+                "decoder.evaluation.cache.miss",
+                section=CODE_SPACE_ACTIVATION,
+                data={"path": self._path, "key": key},
+            )
+            return None
+        LOGGER.event(
+            "decoder.evaluation.cache.hit",
+            section=CODE_SPACE_ACTIVATION,
+            data={"path": self._path, "key": key, "embeddings": len(embeddings)},
+        )
+        return embeddings
+
+    def save(
+        self,
+        *,
+        key: str,
+        labels: Sequence[int],
+        embeddings: Sequence[BitArray],
+    ) -> None:
+        code_length = len(embeddings[0]) if embeddings else 0
+        payload = {
+            "version": self._version,
+            "key": key,
+            "labels": [int(label) for label in labels],
+            "code_length": code_length,
+            "embeddings": [embedding.to01() for embedding in embeddings],
+        }
+        directory = os.path.dirname(os.path.abspath(self._path))
+        os.makedirs(directory, exist_ok=True)
+        temporary_path = f"{self._path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+        os.replace(temporary_path, self._path)
+        LOGGER.event(
+            "decoder.evaluation.cache.save",
+            section=CODE_SPACE_ACTIVATION,
+            data={"path": self._path, "key": key, "embeddings": len(embeddings)},
+        )
+
+    @staticmethod
+    def _from01(bits: object, code_length: int) -> BitArray:
+        if not isinstance(bits, str) or len(bits) != code_length:
+            raise ValueError("invalid cached embedding")
+        embedding = BitArray(code_length)
+        for index, value in enumerate(bits):
+            if value == "1":
+                embedding.set(index, 1)
+            elif value != "0":
+                raise ValueError("invalid cached bit")
+        return embedding
 
 
 class _EvaluationDiagnostics:
@@ -351,6 +444,8 @@ class EmbeddingDatabase:
             raise ValueError("top_k_per_class must be non-negative")
         if config.min_similarity < 0:
             raise ValueError("min_similarity must be non-negative")
+        if config.similarity_batch_size <= 0:
+            raise ValueError("similarity_batch_size must be positive")
         if config.similarity.lower() not in ("cosine", "cos", "jaccard", "j2"):
             raise ValueError("similarity must be cosine or binary Jaccard/J2")
 
@@ -372,6 +467,27 @@ class EmbeddingDatabase:
             self._items.append((item.label, item.embedding, ones))
             self._by_class[item.label].append((item.embedding, ones))
 
+        code_lengths = {len(item[1]) for item in self._items}
+        if len(code_lengths) != 1:
+            raise ValueError("all database embeddings must have equal length")
+        self._code_length = next(iter(code_lengths))
+        self._matrix = np.empty(
+            (len(self._items), self._code_length), dtype=np.float32
+        )
+        for index, (_, embedding, _) in enumerate(self._items):
+            self._matrix[index] = np.frombuffer(
+                embedding._bits,
+                dtype=np.uint8,
+                count=self._code_length,
+            )
+        self._matrix_t = np.ascontiguousarray(self._matrix.T)
+        self._ones_array = np.asarray(
+            [item[2] for item in self._items], dtype=np.float32
+        )
+        self._labels_array = np.asarray(
+            [item[0] for item in self._items], dtype=np.int32
+        )
+
         LOGGER.event(
             "decoder.base.init",
             section=SIMILARITY_MEASURES,
@@ -383,6 +499,7 @@ class EmbeddingDatabase:
                 "knn_top_k": self._config.knn_top_k,
                 "top_k_per_class": self._config.top_k_per_class,
                 "min_similarity": self._config.min_similarity,
+                "similarity_batch_size": self._config.similarity_batch_size,
             },
         )
 
@@ -553,6 +670,185 @@ class EmbeddingDatabase:
             confidence=confidence,
         )
 
+    def predict_many(
+        self,
+        embeddings: Sequence[BitArray],
+        *,
+        temperature: float | None = None,
+    ) -> list[PredictionResult]:
+        prepared = self.prepare_many(embeddings)
+        return self.predict_prepared(prepared, temperature=temperature)
+
+    def prepare_many(
+        self, embeddings: Sequence[BitArray]
+    ) -> list[PreparedEmbeddingNeighbors]:
+        if not embeddings:
+            return []
+        prepared: list[PreparedEmbeddingNeighbors] = []
+        batch_size = self._config.similarity_batch_size
+        for start in range(0, len(embeddings), batch_size):
+            batch = embeddings[start : start + batch_size]
+            query_matrix = np.empty((len(batch), self._code_length), dtype=np.float32)
+            for row, embedding in enumerate(batch):
+                if len(embedding) != self._code_length:
+                    raise ValueError("embedding sizes must match for similarity")
+                query_matrix[row] = np.frombuffer(
+                    embedding._bits,
+                    dtype=np.uint8,
+                    count=self._code_length,
+                )
+            query_ones = query_matrix.sum(axis=1, dtype=np.float64)
+            common = query_matrix @ self._matrix_t
+            if (self._config.similarity or "").lower() in ("cosine", "cos"):
+                denominator = np.sqrt(
+                    query_ones[:, None]
+                    * self._ones_array.astype(np.float64, copy=False)[None, :]
+                )
+            else:
+                denominator = (
+                    query_ones[:, None]
+                    + self._ones_array.astype(np.float64, copy=False)[None, :]
+                    - common
+                )
+            similarities = np.divide(
+                common,
+                denominator,
+                out=np.zeros_like(common, dtype=np.float64),
+                where=denominator != 0.0,
+            )
+            for row in range(len(batch)):
+                if query_ones[row] <= 0.0:
+                    prepared.append(PreparedEmbeddingNeighbors((), "empty"))
+                    continue
+                neighbors, strategy = self._select_neighbors_vectorized(
+                    similarities[row]
+                )
+                prepared.append(
+                    PreparedEmbeddingNeighbors(tuple(neighbors), strategy)
+                )
+        LOGGER.event(
+            "decoder.base.prepare_many",
+            section=SIMILARITY_DEFINITION,
+            data={
+                "queries": len(embeddings),
+                "memory": len(self._items),
+                "batch_size": batch_size,
+                "similarity": self._config.similarity,
+                "top_k": self._config.knn_top_k,
+            },
+        )
+        return prepared
+
+    def predict_prepared(
+        self,
+        prepared: Sequence[PreparedEmbeddingNeighbors],
+        *,
+        temperature: float | None = None,
+    ) -> list[PredictionResult]:
+        temp = self._config.temperature if temperature is None else float(temperature)
+        if temp <= 0.0:
+            raise ValueError("temperature must be positive")
+        results = [
+            self._uniform_prediction()
+            if item.strategy == "empty"
+            else self._prediction_from_neighbors(
+                item.neighbors,
+                temperature=temp,
+                strategy=item.strategy,
+            )
+            for item in prepared
+        ]
+        LOGGER.event(
+            "decoder.base.predict_many",
+            section=SIMILARITY_DEFINITION,
+            data={
+                "queries": len(prepared),
+                "temperature": temp,
+                "neighbors_reused": True,
+            },
+        )
+        return results
+
+    def _select_neighbors_vectorized(
+        self, similarities: "np.ndarray"
+    ) -> tuple[list[tuple[float, int]], str]:
+        minimum = float(self._config.min_similarity)
+        k_total = min(int(self._config.knn_top_k), len(self._items))
+        k_per_class = int(self._config.top_k_per_class)
+        if k_per_class <= 0:
+            heap: list[tuple[float, int]] = []
+            for similarity, label in zip(similarities, self._labels_array):
+                value = float(similarity)
+                if value <= minimum:
+                    continue
+                pair = (value, int(label))
+                if len(heap) < k_total:
+                    heapq.heappush(heap, pair)
+                elif value > heap[0][0]:
+                    heapq.heapreplace(heap, pair)
+            return heapq.nlargest(len(heap), heap, key=lambda pair: pair[0]), "global_topk"
+
+        heaps_by_class: dict[int, list[tuple[float, int]]] = {
+            label: [] for label in self._expected_classes
+        }
+        for similarity, raw_label in zip(similarities, self._labels_array):
+            value = float(similarity)
+            if value <= minimum:
+                continue
+            label = int(raw_label)
+            heap = heaps_by_class[label]
+            pair = (value, label)
+            if len(heap) < k_per_class:
+                heapq.heappush(heap, pair)
+            elif value > heap[0][0]:
+                heapq.heapreplace(heap, pair)
+        neighbors: list[tuple[float, int]] = []
+        for heap in heaps_by_class.values():
+            neighbors.extend(heap)
+        if len(neighbors) > k_total:
+            neighbors = heapq.nlargest(k_total, neighbors, key=lambda pair: pair[0])
+        return neighbors, "per_class_topk"
+
+    def _uniform_prediction(self) -> PredictionResult:
+        uniform = 1.0 / max(len(self._expected_classes), 1)
+        return PredictionResult(
+            predicted_class=int(self._expected_classes[0])
+            if self._expected_classes
+            else -1,
+            probabilities=[uniform for _ in self._expected_classes],
+            confidence=uniform,
+        )
+
+    def _prediction_from_neighbors(
+        self,
+        neighbors: Sequence[tuple[float, int]],
+        *,
+        temperature: float,
+        strategy: str,
+    ) -> PredictionResult:
+        if not neighbors:
+            return self._uniform_prediction()
+        max_sim = max(sim for sim, _ in neighbors)
+        class_weight = {label: 0.0 for label in self._expected_classes}
+        for similarity, label in neighbors:
+            class_weight[label] += math.exp((similarity - max_sim) / temperature)
+        total = sum(class_weight.values())
+        probabilities = (
+            [class_weight[label] / total for label in self._expected_classes]
+            if total > 0.0
+            else self._uniform_prediction().probabilities
+        )
+        predicted = (
+            self._expected_classes[int(np.argmax(probabilities))]
+            if probabilities
+            else -1
+        )
+        return PredictionResult(
+            predicted_class=int(predicted),
+            probabilities=probabilities,
+            confidence=max(probabilities) if probabilities else 0.0,
+        )
+
     def _similarity_value(self, query: BitArray, query_ones: int, stored: BitArray, stored_ones: int) -> float:
         if len(query) != len(stored):
             raise ValueError("embedding sizes must match for similarity")
@@ -585,6 +881,7 @@ class MnistDecoder:
         evaluation_error_examples: int,
         stimulus_embedding_builder: StimulusEmbeddingBuilder,
         structural_activation_interval: int,
+        evaluation_workers: int = 1,
     ) -> None:
         self._encoder = encoder
         self._extractor = extractor
@@ -596,6 +893,9 @@ class MnistDecoder:
         if structural_activation_interval <= 0:
             raise ValueError("structural_activation_interval must be positive")
         self._structural_activation_interval = int(structural_activation_interval)
+        if evaluation_workers <= 0:
+            raise ValueError("evaluation_workers must be positive")
+        self._evaluation_workers = int(evaluation_workers)
         self._embedding_sequence = 0
         self._last_activation_values: list[float] | None = None
         code_len = getattr(activation_engine, "_code_length", None)
@@ -616,6 +916,10 @@ class MnistDecoder:
     def expected_classes(self) -> Sequence[int]:
         return self._embedding_db.expected_classes
 
+    @property
+    def embedding_code_length(self) -> int:
+        return self._encoder.code_length
+
     def embed_image(
         self,
         image: np.ndarray,
@@ -624,6 +928,25 @@ class MnistDecoder:
         log_image: bool = False,
     ) -> ActivationResult:
         label_value = -1 if label_hint is None else int(label_hint)
+        codes, classification_embedding = self._encode_primary(
+            image,
+            label_value=label_value,
+            log_image=log_image,
+        )
+        return self._finish_embedding(
+            codes,
+            classification_embedding,
+            label_value=label_value,
+            log_image=log_image,
+        )
+
+    def _encode_primary(
+        self,
+        image: np.ndarray,
+        *,
+        label_value: int,
+        log_image: bool,
+    ) -> tuple[list[BitArray], BitArray]:
         measurements_map = self._extractor.extract(image, label=label_value)
         if label_value not in measurements_map:
             raise RuntimeError("не удалось получить измерения для изображения")
@@ -644,6 +967,16 @@ class MnistDecoder:
             codes.append(code)
             first = False
         classification_embedding = self._stimulus_embedding_builder.build(codes)
+        return codes, classification_embedding
+
+    def _finish_embedding(
+        self,
+        codes: Sequence[BitArray],
+        classification_embedding: BitArray,
+        *,
+        label_value: int,
+        log_image: bool,
+    ) -> ActivationResult:
         self._embedding_sequence += 1
         evaluate_structure = (
             self._activation_engine is not None
@@ -685,6 +1018,55 @@ class MnistDecoder:
         )
         return activation_result
 
+    def embed_batch(
+        self,
+        images: Sequence[np.ndarray],
+        labels: Sequence[int] | None = None,
+        *,
+        log_first: bool = False,
+    ) -> list[BitArray]:
+        if not images:
+            return []
+
+        def encode_item(item: tuple[int, np.ndarray]):
+            index, image = item
+            label_value = (
+                int(labels[index])
+                if labels is not None and index < len(labels)
+                else -1
+            )
+            return label_value, self._encode_primary(
+                image,
+                label_value=label_value,
+                log_image=log_first and index == 0,
+            )
+
+        workers = min(self._evaluation_workers, len(images))
+        if workers == 1:
+            encoded = [encode_item(item) for item in enumerate(images)]
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                encoded = list(executor.map(encode_item, enumerate(images)))
+        embeddings: list[BitArray] = []
+        for index, (label_value, (codes, classification_embedding)) in enumerate(encoded):
+            self._finish_embedding(
+                codes,
+                classification_embedding,
+                label_value=label_value,
+                log_image=log_first and index == 0,
+            )
+            embeddings.append(classification_embedding)
+        LOGGER.event(
+            "decoder.embedding.batch",
+            section=CODE_SPACE_ACTIVATION,
+            data={
+                "images": len(images),
+                "workers": workers,
+                "code_length": len(embeddings[0]) if embeddings else 0,
+            },
+        )
+        return embeddings
+
     def predict_image(
         self,
         image: np.ndarray,
@@ -718,7 +1100,47 @@ class MnistDecoder:
         temperature: float | None = None,
         log_first: bool = False,
     ) -> tuple[list[PredictionResult], float | None]:
-        results: list[PredictionResult] = []
+        embeddings = self.embed_batch(images, labels=labels, log_first=log_first)
+        return self.predict_embeddings_batch(
+            embeddings,
+            images=images,
+            labels=labels,
+            temperature=temperature,
+        )
+
+    def predict_embeddings_batch(
+        self,
+        embeddings: Sequence[BitArray],
+        *,
+        images: Sequence[np.ndarray],
+        labels: Sequence[int] | None = None,
+        temperature: float | None = None,
+    ) -> tuple[list[PredictionResult], float | None]:
+        prepared = self.prepare_embeddings_batch(embeddings)
+        return self.predict_prepared_batch(
+            prepared,
+            images=images,
+            labels=labels,
+            temperature=temperature,
+        )
+
+    def prepare_embeddings_batch(
+        self, embeddings: Sequence[BitArray]
+    ) -> list[PreparedEmbeddingNeighbors]:
+        return self._embedding_db.prepare_many(embeddings)
+
+    def predict_prepared_batch(
+        self,
+        prepared: Sequence[PreparedEmbeddingNeighbors],
+        *,
+        images: Sequence[np.ndarray],
+        labels: Sequence[int] | None = None,
+        temperature: float | None = None,
+    ) -> tuple[list[PredictionResult], float | None]:
+        results = self._embedding_db.predict_prepared(
+            prepared,
+            temperature=temperature,
+        )
         correct = 0
         diagnostics = (
             _EvaluationDiagnostics(
@@ -729,15 +1151,7 @@ class MnistDecoder:
             if labels is not None
             else None
         )
-        for idx, image in enumerate(images):
-            label_hint = labels[idx] if labels and idx < len(labels) else None
-            prediction = self.predict_image(
-                image,
-                label_hint=label_hint,
-                log_image=log_first and idx == 0,
-                temperature=temperature,
-            )
-            results.append(prediction)
+        for idx, (image, prediction) in enumerate(zip(images, results)):
             if labels and idx < len(labels):
                 if int(labels[idx]) == prediction.predicted_class:
                     correct += 1

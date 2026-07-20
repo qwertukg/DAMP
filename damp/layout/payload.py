@@ -6,7 +6,7 @@ import json
 import os
 from typing import Dict, List, Mapping, Sequence
 
-from damp.article_refs import LAID_OUT_STRUCTURE
+from damp.article_refs import LAID_OUT_STRUCTURE, SPACE_FILLING
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 
@@ -105,6 +105,44 @@ class LayoutPayloadBuilder:
         )
         self._records.append(record)
         return record
+
+    def deduplicated(self) -> "LayoutPayloadBuilder":
+        """Возвращает инъективное множество точных битовых кодов (§7.1.6)."""
+        result = LayoutPayloadBuilder(
+            similarity=self._similarity,
+            lambda_threshold=self._lambda_threshold,
+            eta=self._eta,
+        )
+        seen: set[str] = set()
+        label_conflicts = 0
+        first_labels: dict[str, str] = {}
+        for record in self._records:
+            key = record.code.to01()
+            if key in seen:
+                if first_labels[key] != record.label:
+                    label_conflicts += 1
+                continue
+            seen.add(key)
+            first_labels[key] = record.label
+            result.add_code(label=record.label, hue=record.hue, code=record.code)
+
+        raw_points = len(self._records)
+        unique_points = len(result._records)
+        removed_points = raw_points - unique_points
+        LOGGER.event(
+            "layout.codes.deduplicate",
+            section=SPACE_FILLING,
+            data={
+                "raw_points": raw_points,
+                "unique_points": unique_points,
+                "removed_points": removed_points,
+                "removed_ratio": (
+                    float(removed_points) / float(raw_points) if raw_points else 0.0
+                ),
+                "label_conflicts": label_conflicts,
+            },
+        )
+        return result
 
     def codes_by_hue(self) -> Dict[float, List[LayoutEncodedCode]]:
         grouped: Dict[float, List[LayoutEncodedCode]] = defaultdict(list)

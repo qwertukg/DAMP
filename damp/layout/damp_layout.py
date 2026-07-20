@@ -67,6 +67,8 @@ class ShortLayoutOptimConfig:
     use_weighted_first_point: bool = True
     similarity_cutoff: float | None = None
     partitions: int = 1
+    preselect_disjoint_pairs: bool = False
+    tensor_batch_pairs: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1463,6 +1465,7 @@ class Layout:
         self._short_energy_last_step: int = -1
         self._short_energy_radius: int | None = None
         self._short_energy_eps: float = 1e-6
+        self._last_evaluated_pairs = 0
         self._place_points()
 
         self._long_swap_radius_sum = 0.0
@@ -1671,6 +1674,8 @@ class Layout:
                 raise ValueError("short energy_max_points must be positive when set")
             if short_optim.partitions <= 0:
                 raise ValueError("short partitions must be positive")
+            if short_optim.tensor_batch_pairs is not None and short_optim.tensor_batch_pairs <= 0:
+                raise ValueError("short tensor_batch_pairs must be positive when set")
 
         effective_energy_radius = energy_radius
         if effective_energy_radius is None:
@@ -1723,15 +1728,19 @@ class Layout:
         )
         energy_monitor: _EnergyStabilityMonitor | None = None
         if energy_stability_window is not None:
-            energy_monitor = _EnergyStabilityMonitor(
-                window=energy_stability_window,
-                threshold=energy_stability_delta,
-            )
+            energy_measurements = ((steps - 1) // energy_stability_every) + 1
+            reachable_window = min(energy_stability_window, max(0, energy_measurements - 1))
+            if reachable_window > 0:
+                energy_monitor = _EnergyStabilityMonitor(
+                    window=reachable_window,
+                    threshold=energy_stability_delta,
+                )
             LOGGER.event(
                 "layout.run.energy_stability",
                 section=QUALITY_ASSESS,
                 data={
-                    "window": energy_stability_window,
+                    "window_requested": energy_stability_window,
+                    "window": reachable_window,
                     "delta": energy_stability_delta,
                     "every": energy_stability_every,
                     "max_points": energy_stability_max_points,
@@ -1775,6 +1784,8 @@ class Layout:
                     use_weighted_first_point=True,
                     similarity_cutoff=self._lambda,
                     partitions=1,
+                    preselect_disjoint_pairs=False,
+                    tensor_batch_pairs=None,
                 )
             elif short_config.similarity_cutoff is None:
                 short_config = ShortLayoutOptimConfig(
@@ -1785,6 +1796,8 @@ class Layout:
                     use_weighted_first_point=short_config.use_weighted_first_point,
                     similarity_cutoff=self._lambda,
                     partitions=short_config.partitions,
+                    preselect_disjoint_pairs=short_config.preselect_disjoint_pairs,
+                    tensor_batch_pairs=short_config.tensor_batch_pairs,
                 )
             LOGGER.event(
                 "layout.short.optim_config",
@@ -1799,6 +1812,10 @@ class Layout:
                     "similarity_cutoff": short_config.similarity_cutoff,
                     "weighted_first": short_config.use_weighted_first_point,
                     "partitions": short_config.partitions,
+                    "preselect_disjoint_pairs": short_config.preselect_disjoint_pairs,
+                    "tensor_batch_pairs": -1
+                    if short_config.tensor_batch_pairs is None
+                    else short_config.tensor_batch_pairs,
                 },
             )
         total_swaps = 0
@@ -1822,10 +1839,11 @@ class Layout:
             steps_executed = step + 1
             current_step = step + step_offset
             if swap_monitor is not None:
+                evaluated_pairs = max(1, self._last_evaluated_pairs)
                 should_stop_swaps, swap_ratio, avg_ratio = swap_monitor.update(
-                    swaps, pairs_per_step
+                    swaps, evaluated_pairs
                 )
-                avg_swaps_window = avg_ratio * pairs_per_step
+                avg_swaps_window = avg_ratio * evaluated_pairs
                 log_swap_ratio = LOGGER.should_log("layout.run.progress")
                 swap_visuals = (
                     LOGGER.visual_scalars(
@@ -1848,6 +1866,7 @@ class Layout:
                         "step": current_step,
                         "mode": mode,
                         "accepted_swaps": swaps,
+                        "evaluated_pairs": evaluated_pairs,
                         "swap_ratio": swap_ratio,
                         "avg_ratio": avg_ratio,
                         "avg_swaps": avg_swaps_window,
@@ -2234,10 +2253,15 @@ class Layout:
         else:
             pairs = [self._sample_pair(pair_radius) for _ in range(pairs_per_step)]
 
+        if mode == "short" and short_config is not None and short_config.preselect_disjoint_pairs:
+            pairs = self._preselect_disjoint_short_pairs(pairs)
+        self._last_evaluated_pairs = len(pairs)
+
         if mode == "short":
             tensor_swaps = self._evaluate_pairs_short_tensor(
                 pairs,
                 local_radius=local_radius,
+                batch_pairs=None if short_config is None else short_config.tensor_batch_pairs,
             )
             if tensor_swaps is not None:
                 return self._apply_tracked_swaps(tensor_swaps, mode=mode)
@@ -2343,6 +2367,48 @@ class Layout:
                 if should_swap:
                     swaps_with_delta.append(((y1, x1, y2, x2), delta))
         return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
+
+    def _preselect_disjoint_short_pairs(
+        self,
+        pairs: Sequence[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        """До расчёта энергии оставляет приоритетные пары без общих ячеек (§5.9.1)."""
+        if not pairs:
+            return []
+
+        weights = self._short_energy_weights
+
+        def priority(pair: tuple[int, int, int, int]) -> float:
+            y1, x1, y2, x2 = pair
+            total = 0.0
+            for y, x in ((y1, x1), (y2, x2)):
+                idx = self.grid[y][x]
+                if idx is not None and weights is not None:
+                    total += weights[idx]
+            return total
+
+        ordered = sorted(pairs, key=priority, reverse=True)
+        used: set[tuple[int, int]] = set()
+        selected: list[tuple[int, int, int, int]] = []
+        for pair in ordered:
+            y1, x1, y2, x2 = pair
+            first = (y1, x1)
+            second = (y2, x2)
+            if first in used or second in used:
+                continue
+            selected.append(pair)
+            used.add(first)
+            used.add(second)
+        LOGGER.event(
+            "layout.short.pairs.preselect",
+            section=OPTIM_PAIR_SELECTION,
+            data={
+                "candidates": len(pairs),
+                "selected": len(selected),
+                "removed_conflicts": len(pairs) - len(selected),
+            },
+        )
+        return selected
 
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
@@ -2886,7 +2952,13 @@ class Layout:
         pos_x = self._pos_x
         sim_lambda = self._sim_lambda_idx
         if use_subset:
-            indices = self._rng.sample(range(self._point_count), max_points)  # type: ignore[arg-type]
+            # Один и тот же равномерный срез делает изменение энергии между
+            # шагами измеримым и пригодным для ранней остановки (§5.8).
+            sample_size = int(max_points)
+            indices = [
+                min(self._point_count - 1, (offset * self._point_count) // sample_size)
+                for offset in range(sample_size)
+            ]
         else:
             indices = range(self._point_count)
 
@@ -3031,7 +3103,9 @@ class Layout:
         else:
             indices = range(self._point_count)
 
-        energies = [0.0 for _ in range(self._point_count)]
+        # Неизмеренные точки нельзя считать нулевой энергией: после -log это
+        # ошибочно превращало их в главные дефекты (§5.9.3).
+        energies = [math.nan for _ in range(self._point_count)]
         for idx in indices:
             cy = self._pos_y[idx]
             cx = self._pos_x[idx]
@@ -3096,12 +3170,15 @@ class Layout:
                 },
             )
             return
-        emax = max(energies)
+        measured = [energy for energy in energies if math.isfinite(energy)]
+        emax = max(measured) if measured else 0.0
         if emax <= 0.0:
             weights = [0.0 for _ in energies]
         else:
             weights = [
-                max(0.0, -math.log(max(config.energy_eps, energy / emax)))
+                0.0
+                if not math.isfinite(energy)
+                else max(0.0, -math.log(max(config.energy_eps, energy / emax)))
                 for energy in energies
             ]
         self._short_energy_weights = weights
@@ -3115,6 +3192,7 @@ class Layout:
                 "recalc_every": config.energy_recalc_every,
                 "max_points": -1 if config.energy_max_points is None else config.energy_max_points,
                 "weighted": config.use_weighted_first_point,
+                "measured_points": len(measured),
             },
         )
 
@@ -3417,10 +3495,44 @@ class Layout:
         pairs: Sequence[tuple[int, int, int, int]],
         *,
         local_radius: int | None,
+        batch_pairs: int | None = None,
     ) -> list[tuple[tuple[int, int, int, int], float]] | None:
         tensor_engine = self._tensor_engine if self._use_gpu else None
         if tensor_engine is None:
             return None
+        if batch_pairs is not None and len(pairs) > batch_pairs:
+            # Соседние по карте пары используют компактное общее окружение.
+            ordered = sorted(
+                pairs,
+                key=lambda pair: (
+                    (pair[0] + pair[2]) // 2,
+                    (pair[1] + pair[3]) // 2,
+                ),
+            )
+            swaps: list[tuple[tuple[int, int, int, int], float]] = []
+            max_subset = 0
+            for start in range(0, len(ordered), batch_pairs):
+                batch = ordered[start : start + batch_pairs]
+                result = self._evaluate_pairs_short_tensor(
+                    batch,
+                    local_radius=local_radius,
+                    batch_pairs=None,
+                )
+                if result is None:
+                    return None
+                swaps.extend(result)
+                max_subset = max(max_subset, len(self._short_subset_indices))
+            LOGGER.event(
+                "layout.energy.short.tensor.batches",
+                section=GPU_IMPLEMENTATION,
+                data={
+                    "pairs": len(ordered),
+                    "batch_pairs": batch_pairs,
+                    "batches": int(math.ceil(len(ordered) / batch_pairs)),
+                    "max_subset_points": max_subset,
+                },
+            )
+            return swaps
         prepared: list[_ShortPair] = []
         for y1, x1, y2, x2 in pairs:
             idx_a = self.grid[y1][x1]
@@ -4056,8 +4168,11 @@ class Layout:
             if mode == "long":
                 self._register_long_swap_radius(y1, x1, y2, x2)
         if applied:
-            self._short_energy_weights = None
-            self._short_energy_last_step = -1
+            # В short-фазе веса намеренно живут energy_recalc_every шагов.
+            # Иначе каждый успешный шаг заново вычисляет до max_points энергий.
+            if mode == "long":
+                self._short_energy_weights = None
+                self._short_energy_last_step = -1
             self._gpu_positions_dirty = True
         return applied
 

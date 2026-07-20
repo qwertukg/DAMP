@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import bisect
+import copy
 import math
 import concurrent.futures
+import json
+import os
 import random
 import threading
 from dataclasses import dataclass
@@ -12,6 +15,11 @@ try:
     import numpy as np
 except Exception:
     np = None  # type: ignore[assignment]
+
+try:
+    from scipy import ndimage as scipy_ndimage
+except Exception:
+    scipy_ndimage = None  # type: ignore[assignment]
 
 from damp.article_refs import (
     CODE_SPACE_ACTIVATION,
@@ -33,6 +41,12 @@ from damp.article_refs import (
 from damp.encoding.bitarray import BitArray
 from damp.layout.damp_layout import Layout
 from damp.logging import LOGGER
+
+
+def _configure_detector_process_worker() -> None:
+    """Не даёт subprocess подключаться к родительскому Rerun gRPC (§5.10)."""
+    os.environ["RERUN"] = "off"
+    LOGGER.configure_worker_silent()
 
 
 @dataclass(frozen=True)
@@ -75,6 +89,107 @@ class Detector:
             },
         )
 
+
+class DetectorHierarchyCache:
+    """Сохраняет неизменную детекторную иерархию рядом с Layout (§5.14, §6.2)."""
+
+    def __init__(self, *, suffix: str, version: int) -> None:
+        if not suffix or version <= 0:
+            raise ValueError("invalid detector cache settings")
+        self._suffix = str(suffix)
+        self._version = int(version)
+
+    def path_for(self, layout_path: str) -> str:
+        return f"{layout_path}{self._suffix}"
+
+    def load(self, layout_path: str, layout: Layout) -> list[Detector] | None:
+        path = self.path_for(layout_path)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                payload = json.load(fp)
+            if (
+                int(payload.get("version", -1)) != self._version
+                or int(payload.get("points", -1)) != len(layout.positions())
+                or int(payload.get("width", -1)) != layout.width
+                or int(payload.get("height", -1)) != layout.height
+            ):
+                return None
+            detectors: list[Detector] = []
+            for item in payload.get("detectors", []):
+                value = str(item["output_code"])
+                output_code = BitArray(len(value))
+                for index, bit in enumerate(value):
+                    if bit == "1":
+                        output_code.set(index)
+                    elif bit != "0":
+                        raise ValueError("detector output code must be binary")
+                detectors.append(
+                    Detector(
+                        center=(float(item["center_y"]), float(item["center_x"])),
+                        radius=float(item["radius"]),
+                        lambda_threshold=float(item["lambda_threshold"]),
+                        energy=float(item["energy"]),
+                        points_count=int(item["points_count"]),
+                        output_code=output_code,
+                        label=None if item.get("label") is None else str(item["label"]),
+                        semi_minor_radius=(
+                            None
+                            if item.get("semi_minor_radius") is None
+                            else float(item["semi_minor_radius"])
+                        ),
+                        orientation=float(item["orientation"]),
+                    )
+                )
+        except Exception as exc:
+            LOGGER.event(
+                "activation.detector.cache.error",
+                section=DETECTOR_HIERARCHY,
+                data={"path": path, "stage": "load", "error": str(exc)},
+            )
+            return None
+        if not detectors:
+            return None
+        LOGGER.event(
+            "activation.detector.cache.load",
+            section=DETECTOR_HIERARCHY,
+            data={"path": path, "detectors": len(detectors)},
+        )
+        return detectors
+
+    def save(self, layout_path: str, layout: Layout, detectors: Sequence[Detector]) -> None:
+        path = self.path_for(layout_path)
+        payload = {
+            "version": self._version,
+            "points": len(layout.positions()),
+            "width": layout.width,
+            "height": layout.height,
+            "detectors": [
+                {
+                    "center_y": detector.center[0],
+                    "center_x": detector.center[1],
+                    "radius": detector.radius,
+                    "lambda_threshold": detector.lambda_threshold,
+                    "energy": detector.energy,
+                    "points_count": detector.points_count,
+                    "output_code": detector.output_code.to01(),
+                    "label": detector.label,
+                    "semi_minor_radius": detector.semi_minor_radius,
+                    "orientation": detector.orientation,
+                }
+                for detector in detectors
+            ],
+        }
+        temporary_path = f"{path}.tmp"
+        with open(temporary_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=True, indent=2)
+        os.replace(temporary_path, path)
+        LOGGER.event(
+            "activation.detector.cache.save",
+            section=DETECTOR_HIERARCHY,
+            data={"path": path, "detectors": len(detectors)},
+        )
 
 @dataclass(frozen=True)
 class ActivatedDetector:
@@ -545,6 +660,9 @@ class _ActivationEngineBase:
         self._energies = self._prepare_energy_map(energy_map)
         self._energies_array = np.asarray(self._energies, dtype=np.float32) if np is not None else None
         self._coverage = self._precompute_coverage()
+        self._coverage_point_indices, self._coverage_detector_indices = (
+            self._build_sparse_coverage()
+        )
         self._code_length = self._resolve_code_length()
         self._activation_sequence = 0
         self._activation_sequence_lock = threading.Lock()
@@ -661,6 +779,46 @@ class DetectorLayerConfig:
     lambda_threshold: float
     activation_radius: int
     min_points: int
+
+
+class _DetectorSpatialIndex:
+    """Пространственный индекс кандидатов для точной проверки перекрытий (§6.4.5)."""
+
+    def __init__(self, cell_size: float) -> None:
+        if cell_size <= 0.0:
+            raise ValueError("cell_size must be positive")
+        self._cell_size = float(cell_size)
+        self._cells: dict[tuple[int, int], set[DetectorCandidate]] = {}
+
+    def _keys(self, candidate: DetectorCandidate):
+        center_y, center_x = candidate.center
+        radius = candidate.radius
+        y_min = math.floor((center_y - radius) / self._cell_size)
+        y_max = math.floor((center_y + radius) / self._cell_size)
+        x_min = math.floor((center_x - radius) / self._cell_size)
+        x_max = math.floor((center_x + radius) / self._cell_size)
+        for cell_y in range(y_min, y_max + 1):
+            for cell_x in range(x_min, x_max + 1):
+                yield cell_y, cell_x
+
+    def add(self, candidate: DetectorCandidate) -> None:
+        for key in self._keys(candidate):
+            self._cells.setdefault(key, set()).add(candidate)
+
+    def discard(self, candidate: DetectorCandidate) -> None:
+        for key in self._keys(candidate):
+            bucket = self._cells.get(key)
+            if bucket is None:
+                continue
+            bucket.discard(candidate)
+            if not bucket:
+                del self._cells[key]
+
+    def candidates(self, candidate: DetectorCandidate) -> set[DetectorCandidate]:
+        nearby: set[DetectorCandidate] = set()
+        for key in self._keys(candidate):
+            nearby.update(self._cells.get(key, ()))
+        return nearby
 
 
 @dataclass(frozen=True)
@@ -828,6 +986,8 @@ class DetectorHierarchyBuilder:
         eta: float | None,
         attempts_without_change: int,
         seed: int,
+        parallel_workers: int = 1,
+        parallel_backend: str = "thread",
         receptive_field_shape: str = "circle",
         max_axis_ratio: float = 1.0,
     ) -> None:
@@ -846,12 +1006,42 @@ class DetectorHierarchyBuilder:
             raise ValueError("invalid detector layer configuration")
         if attempts_without_change <= 0:
             raise ValueError("attempts_without_change must be positive")
+        if parallel_workers <= 0:
+            raise ValueError("parallel_workers must be positive")
+        if parallel_backend not in ("thread", "process"):
+            raise ValueError("parallel_backend must be thread or process")
         if receptive_field_shape not in ("circle", "ellipse"):
             raise ValueError("receptive_field_shape must be circle or ellipse")
         if max_axis_ratio < 1.0:
             raise ValueError("max_axis_ratio must be at least 1")
         self._layout = layout
         self._energies = [float(value) for value in energies]
+        self._energies_array = (
+            np.asarray(self._energies, dtype=np.float32) if np is not None else None
+        )
+        code_matrix = getattr(layout, "_code_matrix", None)
+        ones_array = getattr(layout, "_ones_array", None)
+        self._packed_codes = (
+            np.packbits(code_matrix, axis=1, bitorder="little")
+            if np is not None and code_matrix is not None
+            else None
+        )
+        self._code_ones = (
+            np.asarray(ones_array, dtype=np.float32)
+            if np is not None and ones_array is not None
+            else None
+        )
+        self._popcount_lut = (
+            np.asarray([value.bit_count() for value in range(256)], dtype=np.uint8)
+            if np is not None
+            else None
+        )
+        self._position_y = (
+            np.asarray(layout._pos_y, dtype=np.int32) if np is not None else None
+        )
+        self._position_x = (
+            np.asarray(layout._pos_x, dtype=np.int32) if np is not None else None
+        )
         self._radius_min = int(radius_min)
         self._max_detectors = int(max_detectors)
         self._output_bits = int(output_bits)
@@ -859,8 +1049,10 @@ class DetectorHierarchyBuilder:
         self._energy_threshold = float(energy_threshold)
         self._eta = None if eta is None else float(eta)
         self._attempts_without_change = int(attempts_without_change)
-        self._rng = random.Random(seed)
+        self._seed = int(seed)
         self._output_rng = random.Random(seed)
+        self._parallel_workers = int(parallel_workers)
+        self._parallel_backend = str(parallel_backend)
         self._receptive_field_shape = receptive_field_shape
         self._max_axis_ratio = float(max_axis_ratio)
         LOGGER.event(
@@ -872,17 +1064,72 @@ class DetectorHierarchyBuilder:
                 "output_bits": self._output_bits,
                 "attempts_without_change": self._attempts_without_change,
                 "seed": seed,
+                "parallel_workers": self._parallel_workers,
+                "parallel_backend": self._parallel_backend,
                 "receptive_field_shape": receptive_field_shape,
                 "max_axis_ratio": max_axis_ratio,
             },
         )
 
+    def __getstate__(self) -> dict[str, object]:
+        """Исключает непиклируемые GPU-контексты при запуске process workers (§5.10)."""
+        state = dict(self.__dict__)
+        layout = copy.copy(self._layout)
+        layout._gpu_engine = None
+        layout._tensor_engine = None
+        state["_layout"] = layout
+        return state
+
     def build(self) -> list[Detector]:
         per_layer_limit = max(1, self._max_detectors // len(self._layer_configs))
         detectors: list[Detector] = []
-        for layer in self._layer_configs:
+        workers = min(self._parallel_workers, len(self._layer_configs))
+        LOGGER.event(
+            "activation.detector.layers.parallel",
+            section=PARALLEL_PROCESSING,
+            data={
+                "layers": len(self._layer_configs),
+                "workers": workers,
+                "backend": self._parallel_backend,
+            },
+        )
+        if workers == 1:
+            layer_candidates = [
+                self._build_layer(
+                    layer,
+                    per_layer_limit,
+                    random.Random(self._seed + layer_index * 1_000_003),
+                )
+                for layer_index, layer in enumerate(self._layer_configs)
+            ]
+        else:
+            try:
+                layer_candidates = self._build_layers_parallel(
+                    per_layer_limit,
+                    workers=workers,
+                    use_processes=self._parallel_backend == "process",
+                )
+            except Exception as exc:
+                if self._parallel_backend != "process":
+                    raise
+                LOGGER.event(
+                    "activation.detector.layers.fallback",
+                    section=PARALLEL_PROCESSING,
+                    data={
+                        "failed_backend": "process",
+                        "fallback_backend": "thread",
+                        "workers": workers,
+                        "error": str(exc),
+                    },
+                )
+                layer_candidates = self._build_layers_parallel(
+                    per_layer_limit,
+                    workers=workers,
+                    use_processes=False,
+                )
+
+        for layer, candidates in zip(self._layer_configs, layer_candidates):
             lambda_value = layer.lambda_threshold
-            candidates = self._build_layer(layer, per_layer_limit)
             for candidate in candidates:
                 output_code = BitArray(self._output_bits)
                 output_code.set(self._output_rng.randrange(self._output_bits), 1)
@@ -922,35 +1169,90 @@ class DetectorHierarchyBuilder:
             raise RuntimeError("не удалось построить ни одного детектора для активации")
         return detectors
 
+    def _build_layers_parallel(
+        self,
+        per_layer_limit: int,
+        *,
+        workers: int,
+        use_processes: bool,
+    ) -> list[list[DetectorCandidate]]:
+        executor_class = (
+            concurrent.futures.ProcessPoolExecutor
+            if use_processes
+            else concurrent.futures.ThreadPoolExecutor
+        )
+        executor_kwargs: dict[str, object] = {"max_workers": workers}
+        if use_processes:
+            executor_kwargs["initializer"] = _configure_detector_process_worker
+        with executor_class(**executor_kwargs) as executor:
+            futures = [
+                executor.submit(
+                    self._build_layer,
+                    layer,
+                    per_layer_limit,
+                    random.Random(self._seed + layer_index * 1_000_003),
+                )
+                for layer_index, layer in enumerate(self._layer_configs)
+            ]
+            return [future.result() for future in futures]
+
     def _build_layer(
         self,
         layer: DetectorLayerConfig,
         limit: int,
+        rng: random.Random,
     ) -> list[DetectorCandidate]:
         selected: list[DetectorCandidate] = []
+        spatial_index = _DetectorSpatialIndex(layer.activation_radius)
+        candidate_cache: dict[int, DetectorCandidate | None] = {}
+        cache_hits = 0
         unchanged = 0
         point_count = len(self._energies)
         while unchanged < self._attempts_without_change:
-            center_index = self._rng.randrange(point_count)
-            candidate = self._make_candidate(center_index, layer)
+            center_index = rng.randrange(point_count)
+            if center_index in candidate_cache:
+                candidate = candidate_cache[center_index]
+                cache_hits += 1
+            else:
+                candidate = self._make_candidate(center_index, layer)
+                candidate_cache[center_index] = candidate
             if candidate is None:
                 unchanged += 1
                 continue
-            overlaps = [item for item in selected if self._overlaps(candidate, item)]
+            overlaps = [
+                item
+                for item in spatial_index.candidates(candidate)
+                if self._overlaps(candidate, item)
+            ]
             if overlaps:
                 if any(item.insertion_density >= candidate.insertion_density for item in overlaps):
                     unchanged += 1
                     continue
-                selected = [item for item in selected if item not in overlaps]
+                overlap_set = set(overlaps)
+                for item in overlaps:
+                    spatial_index.discard(item)
+                selected = [item for item in selected if item not in overlap_set]
                 selected.append(candidate)
+                spatial_index.add(candidate)
                 unchanged = 0
                 continue
             if len(selected) < limit:
                 selected.append(candidate)
+                spatial_index.add(candidate)
                 unchanged = 0
             else:
                 unchanged += 1
         selected.sort(key=lambda item: item.insertion_density, reverse=True)
+        LOGGER.event(
+            "activation.detector.candidate_cache",
+            section=DETECTOR_CONSTRUCTION,
+            data={
+                "lambda": layer.lambda_threshold,
+                "unique_centers": len(candidate_cache),
+                "cache_hits": cache_hits,
+                "selected": len(selected),
+            },
+        )
         return selected[:limit]
 
     def _make_candidate(
@@ -963,25 +1265,20 @@ class DetectorHierarchyBuilder:
             return None
         center_y = self._layout._pos_y[center_index]
         center_x = self._layout._pos_x[center_index]
-        active: dict[tuple[int, int], tuple[int, float]] = {}
-        for point_index in self._indices_in_radius(
+        indices = self._indices_in_radius(
             center_y,
             center_x,
             layer.activation_radius,
-        ):
-            point_energy = self._energies[point_index]
-            if point_energy < self._energy_threshold:
-                continue
-            similarity = self._layout._similarity_value(center_index, point_index)
-            activation = self._threshold_similarity(similarity, lambda_value)
-            if activation <= 0.0:
-                continue
-            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
-            active[position] = (point_index, activation * point_energy)
+        )
         seed = (center_y, center_x)
-        if seed not in active:
-            return None
-        cluster_positions = self._connected_component(seed, active)
+        active, cluster_positions = self._active_cluster(
+            center_index,
+            indices,
+            lambda_value,
+            center_y=center_y,
+            center_x=center_x,
+            radius=layer.activation_radius,
+        )
         if len(cluster_positions) < layer.min_points:
             return None
         LOGGER.event(
@@ -1051,6 +1348,136 @@ class DetectorHierarchyBuilder:
             insertion_density=points_count / best_radius,
             semi_minor_radius=semi_minor_radius,
             orientation=orientation,
+        )
+
+    def _active_cluster(
+        self,
+        center_index: int,
+        indices: Sequence[int],
+        lambda_value: float,
+        *,
+        center_y: int,
+        center_x: int,
+        radius: int,
+    ) -> tuple[
+        dict[tuple[int, int], tuple[int, float]],
+        list[tuple[int, int]],
+    ]:
+        if (
+            np is None
+            or scipy_ndimage is None
+            or self._energies_array is None
+            or self._position_y is None
+            or self._position_x is None
+            or not indices
+        ):
+            active = self._active_points(center_index, indices, lambda_value)
+            seed = (center_y, center_x)
+            if seed not in active:
+                return active, []
+            return active, self._connected_component(seed, active)
+
+        index_array = np.asarray(indices, dtype=np.int32)
+        energy_values = self._energies_array[index_array]
+        similarities = self._packed_similarity(center_index, index_array)
+        if self._eta is None:
+            activations = np.where(similarities >= lambda_value, similarities, 0.0)
+        else:
+            activations = similarities / (
+                1.0 + np.exp(-self._eta * (similarities - lambda_value))
+            )
+            activations = np.where(similarities > 0.0, activations, 0.0)
+        valid = (energy_values >= self._energy_threshold) & (activations > 0.0)
+        active_indices = index_array[valid]
+        if active_indices.size == 0 or not bool(np.any(active_indices == center_index)):
+            return {}, []
+        active_weights = (activations[valid] * energy_values[valid]).astype(np.float64)
+        local_y = self._position_y[active_indices] - center_y + radius
+        local_x = self._position_x[active_indices] - center_x + radius
+        active_mask = np.zeros((2 * radius + 1, 2 * radius + 1), dtype=np.uint8)
+        active_mask[local_y, local_x] = 1
+        labels, _ = scipy_ndimage.label(
+            active_mask,
+            structure=np.ones((3, 3), dtype=np.uint8),
+        )
+        seed_label = int(labels[radius, radius])
+        if seed_label == 0:
+            return {}, []
+        component = labels[local_y, local_x] == seed_label
+        component_indices = active_indices[component]
+        component_weights = active_weights[component]
+        active: dict[tuple[int, int], tuple[int, float]] = {}
+        cluster_positions: list[tuple[int, int]] = []
+        for point_index, weight in zip(component_indices, component_weights):
+            idx = int(point_index)
+            position = (int(self._position_y[idx]), int(self._position_x[idx]))
+            active[position] = (idx, float(weight))
+            cluster_positions.append(position)
+        return active, cluster_positions
+
+    def _active_points(
+        self,
+        center_index: int,
+        indices: Sequence[int],
+        lambda_value: float,
+    ) -> dict[tuple[int, int], tuple[int, float]]:
+        active: dict[tuple[int, int], tuple[int, float]] = {}
+        if np is not None and self._energies_array is not None and indices:
+            index_array = np.asarray(indices, dtype=np.int32)
+            energy_values = self._energies_array[index_array]
+            similarities = self._packed_similarity(center_index, index_array)
+            if self._eta is None:
+                activations = np.where(similarities >= lambda_value, similarities, 0.0)
+            else:
+                activations = similarities / (
+                    1.0 + np.exp(-self._eta * (similarities - lambda_value))
+                )
+                activations = np.where(similarities > 0.0, activations, 0.0)
+            mask = (energy_values >= self._energy_threshold) & (activations > 0.0)
+            for point_index, activation, point_energy in zip(
+                index_array[mask], activations[mask], energy_values[mask]
+            ):
+                idx = int(point_index)
+                position = (self._layout._pos_y[idx], self._layout._pos_x[idx])
+                active[position] = (idx, float(activation * point_energy))
+            return active
+
+        for point_index in indices:
+            point_energy = self._energies[point_index]
+            if point_energy < self._energy_threshold:
+                continue
+            similarity = self._layout._similarity_value(center_index, point_index)
+            activation = self._threshold_similarity(similarity, lambda_value)
+            if activation <= 0.0:
+                continue
+            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
+            active[position] = (point_index, activation * point_energy)
+        return active
+
+    def _packed_similarity(self, center_index: int, indices: "np.ndarray"):
+        if (
+            np is None
+            or self._packed_codes is None
+            or self._code_ones is None
+            or self._popcount_lut is None
+        ):
+            return self._layout._similarity_block(
+                [center_index], [int(index) for index in indices]
+            )[0]
+        common = self._popcount_lut[
+            np.bitwise_and(self._packed_codes[indices], self._packed_codes[center_index])
+        ].sum(axis=1, dtype=np.int32).astype(np.float32)
+        ones_center = float(self._code_ones[center_index])
+        ones_other = self._code_ones[indices]
+        if getattr(self._layout, "_similarity", "jaccard") == "cosine":
+            denominator = np.sqrt(ones_center * ones_other)
+        else:
+            denominator = ones_center + ones_other - common
+        return np.divide(
+            common,
+            denominator,
+            out=np.zeros_like(common, dtype=np.float32),
+            where=denominator != 0.0,
         )
 
     def _fit_ellipse(
@@ -1214,7 +1641,6 @@ class ActivationEngine(_ActivationEngineBase):
 
     def _precompute_coverage(self) -> list[tuple[int, ...]]:
         coverage: list[tuple[int, ...] | "np.ndarray"] = []
-        positions = self._activation_map.positions
         for idx, detector in enumerate(self._detectors):
             minor_radius = (
                 detector.radius
@@ -1224,17 +1650,29 @@ class ActivationEngine(_ActivationEngineBase):
             cos_a = math.cos(detector.orientation)
             sin_a = math.sin(detector.orientation)
             covered: list[int] = []
-            for point_idx, (y, x) in enumerate(positions):
-                dy = float(y) - float(detector.center[0])
-                dx = float(x) - float(detector.center[1])
-                major_coordinate = dx * cos_a + dy * sin_a
-                minor_coordinate = -dx * sin_a + dy * cos_a
-                normalized_distance = (
-                    (major_coordinate / detector.radius) ** 2
-                    + (minor_coordinate / minor_radius) ** 2
-                )
-                if normalized_distance <= 1.0:
-                    covered.append(point_idx)
+            center_y, center_x = detector.center
+            radius = detector.radius
+            y_min = max(0, int(math.floor(center_y - radius)))
+            y_max = min(self._layout.height - 1, int(math.ceil(center_y + radius)))
+            x_min = max(0, int(math.floor(center_x - radius)))
+            x_max = min(self._layout.width - 1, int(math.ceil(center_x + radius)))
+            for y in range(y_min, y_max + 1):
+                for x in self._layout._row_occupied[y]:
+                    if x < x_min or x > x_max:
+                        continue
+                    point_idx = self._layout.grid[y][x]
+                    if point_idx is None:
+                        continue
+                    dy = float(y) - float(detector.center[0])
+                    dx = float(x) - float(detector.center[1])
+                    major_coordinate = dx * cos_a + dy * sin_a
+                    minor_coordinate = -dx * sin_a + dy * cos_a
+                    normalized_distance = (
+                        (major_coordinate / detector.radius) ** 2
+                        + (minor_coordinate / minor_radius) ** 2
+                    )
+                    if normalized_distance <= 1.0:
+                        covered.append(point_idx)
             if np is not None:
                 coverage.append(np.asarray(covered, dtype=np.int32))
             else:
@@ -1253,12 +1691,65 @@ class ActivationEngine(_ActivationEngineBase):
             )
         return coverage
 
+    def _build_sparse_coverage(self):
+        if np is None:
+            return None, None
+        point_parts: list["np.ndarray"] = []
+        detector_parts: list["np.ndarray"] = []
+        for detector_index, indices in enumerate(self._coverage):
+            if len(indices):
+                points = np.asarray(indices, dtype=np.int32)
+                point_parts.append(points)
+                detector_parts.append(
+                    np.full(points.shape, detector_index, dtype=np.int32)
+                )
+        point_indices = (
+            np.concatenate(point_parts) if point_parts else np.empty(0, dtype=np.int32)
+        )
+        detector_indices = (
+            np.concatenate(detector_parts)
+            if detector_parts
+            else np.empty(0, dtype=np.int32)
+        )
+        LOGGER.event(
+            "activation.detector.coverage_sparse",
+            section=PARALLEL_PROCESSING,
+            data={
+                "detectors": len(self._detectors),
+                "points": self._activation_map.point_count,
+                "covered_entries": len(point_indices),
+                "memory_bytes": int(point_indices.nbytes + detector_indices.nbytes),
+            },
+        )
+        return point_indices, detector_indices
+
     def _evaluate_detectors(self, activation_values: Sequence[float]) -> list[ActivatedDetector]:
         if len(activation_values) != self._activation_map.point_count:
             raise ValueError("activation size must match number of layout points")
         active: list[ActivatedDetector] = []
         activation_np = np.asarray(activation_values, dtype=np.float32) if np is not None else None
         energies_np = self._energies_array if np is not None else None
+        detector_energy_sums = None
+        detector_point_counts = None
+        if (
+            np is not None
+            and activation_np is not None
+            and energies_np is not None
+            and self._coverage_point_indices is not None
+            and self._coverage_detector_indices is not None
+        ):
+            valid_points = (energies_np >= self._energy_threshold) & (activation_np > 0.0)
+            weighted_points = np.where(valid_points, activation_np * energies_np, 0.0)
+            detector_energy_sums = np.bincount(
+                self._coverage_detector_indices,
+                weights=weighted_points[self._coverage_point_indices],
+                minlength=len(self._detectors),
+            )
+            detector_point_counts = np.bincount(
+                self._coverage_detector_indices,
+                weights=valid_points[self._coverage_point_indices].astype(np.float32),
+                minlength=len(self._detectors),
+            )
         for idx, detector in enumerate(self._detectors):
             indices_obj = self._coverage[idx]
             index_array: "np.ndarray | None"
@@ -1298,6 +1789,12 @@ class ActivationEngine(_ActivationEngineBase):
             energy_sum = 0.0
             points_used = 0
             if (
+                detector_energy_sums is not None
+                and detector_point_counts is not None
+            ):
+                energy_sum = float(detector_energy_sums[idx])
+                points_used = int(round(float(detector_point_counts[idx])))
+            elif (
                 np is not None
                 and activation_np is not None
                 and energies_np is not None

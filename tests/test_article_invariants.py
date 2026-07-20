@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import math
 import os
+import pickle
 import random
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 from damp.activation import (
     ActivationEngine,
     Detector,
+    DetectorHierarchyCache,
+    DetectorHierarchyBuilder,
+    DetectorLayerConfig,
     DetectorHierarchyScaleResolver,
     DetectorLayerConfigFactory,
     EmbeddingSaturationResolver,
@@ -18,6 +23,7 @@ from damp.decode import (
     DecoderConfig,
     DecoderParameterScaleResolver,
     EmbeddingDatabase,
+    EvaluationEmbeddingCache,
     LabeledEmbedding,
 )
 from damp.encoding.bitarray import BitArray
@@ -27,6 +33,7 @@ from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
 from damp.layout.damp_layout import (
     ContinuityLayoutConfig,
     Layout,
+    ShortLayoutOptimConfig,
     _WeightedIndexSampler,
 )
 from damp.layout.payload import LayoutPayloadBuilder
@@ -523,6 +530,30 @@ class ArticleInvariantTests(unittest.TestCase):
         self.assertEqual(restored.records[0].hue, 42.0)
         self.assertEqual(restored.records[0].code.to01(), payload.records[0].code.to01())
 
+    def test_layout_payload_deduplicates_exact_codes(self) -> None:
+        payload = LayoutPayloadBuilder(
+            similarity="cosine",
+            lambda_threshold=0.65,
+            eta=10.0,
+        )
+        first = self._single_bit(12, 5)
+        duplicate = self._single_bit(12, 5)
+        distinct = self._single_bit(12, 6)
+        payload.add_code(label=3, hue=42.0, code=first)
+        payload.add_code(label=8, hue=99.0, code=duplicate)
+        payload.add_code(label=4, hue=84.0, code=distinct)
+
+        deduplicated = payload.deduplicated()
+
+        self.assertEqual(len(payload.records), 3)
+        self.assertEqual(len(deduplicated.records), 2)
+        self.assertEqual(deduplicated.records[0].label, "3")
+        self.assertEqual(deduplicated.records[0].hue, 42.0)
+        self.assertEqual(
+            [record.code.to01() for record in deduplicated.records],
+            [first.to01(), distinct.to01()],
+        )
+
     def test_point_energy_uses_euclidean_distance(self) -> None:
         code = self._single_bit(8, 0)
         layout = Layout(
@@ -547,6 +578,53 @@ class ArticleInvariantTests(unittest.TestCase):
             layout._row_occupied[0].add(x)
         energy = layout._compute_point_energies(3)[0]
         self.assertTrue(math.isclose(energy, 1.5, rel_tol=2e-6))
+
+    def test_unmeasured_point_energy_has_zero_sampling_weight(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code, code, code]},
+            grid_size=3,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        config = ShortLayoutOptimConfig(energy_radius=1, energy_max_points=2)
+        with patch.object(
+            layout,
+            "_compute_point_energies",
+            return_value=[1.0, math.nan, 0.5],
+        ):
+            layout._ensure_short_energy_weights(step_index=0, config=config)
+        self.assertEqual(layout._short_energy_weights[1], 0.0)
+        self.assertGreater(layout._short_energy_weights[2], 0.0)
+
+    def test_short_pair_preselection_removes_endpoint_conflicts(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code, code, code, code]},
+            grid_size=2,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        selected = layout._preselect_disjoint_short_pairs(
+            [
+                (0, 0, 0, 1),
+                (0, 0, 1, 0),
+                (1, 0, 1, 1),
+            ]
+        )
+        self.assertEqual(selected, [(0, 0, 0, 1), (1, 0, 1, 1)])
 
     def test_detector_activation_ratio_is_not_clipped(self) -> None:
         stimulus = self._single_bit(8, 0)
@@ -585,6 +663,163 @@ class ArticleInvariantTests(unittest.TestCase):
         result = engine.activate([stimulus])
         self.assertGreater(result.active_detectors[0].activation_level, 1.0)
 
+    def test_detector_hierarchy_cache_round_trip(self) -> None:
+        stimulus = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [stimulus]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        detector = Detector(
+            center=(0.0, 0.0),
+            radius=1.0,
+            lambda_threshold=0.5,
+            energy=1.0,
+            points_count=1,
+            output_code=self._single_bit(8, 3),
+            label="cached",
+            semi_minor_radius=0.5,
+            orientation=0.25,
+        )
+        cache = DetectorHierarchyCache(suffix=".detectors.json", version=1)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "layout.json")
+            cache.save(path, layout, [detector])
+            restored = cache.load(path, layout)
+        self.assertIsNotNone(restored)
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0].output_code.to01(), detector.output_code.to01())
+        self.assertEqual(restored[0].label, "cached")
+
+    def test_vectorized_detector_candidates_match_scalar_similarity(self) -> None:
+        codes = [self._single_bit(8, index) for index in range(4)]
+        codes[1].set(0)
+        layout = Layout(
+            {0.0: codes},
+            grid_size=2,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        energies = [1.0, 0.8, 0.6, 0.4]
+        builder = DetectorHierarchyBuilder(
+            layout=layout,
+            energies=energies,
+            radius_min=1,
+            max_detectors=4,
+            output_bits=8,
+            layer_configs=(DetectorLayerConfig(0.2, 2, 1),),
+            energy_threshold=0.0,
+            eta=None,
+            attempts_without_change=5,
+            seed=0,
+        )
+        indices = list(range(4))
+        active = builder._active_points(0, indices, 0.2)
+        expected = {}
+        for point_index in indices:
+            similarity = layout._similarity_value(0, point_index)
+            activation = builder._threshold_similarity(similarity, 0.2)
+            if activation > 0.0:
+                position = (layout._pos_y[point_index], layout._pos_x[point_index])
+                expected[position] = activation * energies[point_index]
+        self.assertEqual(set(active), set(expected))
+        for position, value in expected.items():
+            self.assertTrue(math.isclose(active[position][1], value, rel_tol=1e-6))
+
+    def test_detector_layers_are_deterministic_when_parallel(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code for _ in range(9)]},
+            grid_size=3,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        configs = (
+            DetectorLayerConfig(0.5, 2, 1),
+            DetectorLayerConfig(0.7, 1, 1),
+        )
+
+        def build(workers: int, backend: str = "thread"):
+            return DetectorHierarchyBuilder(
+                layout=layout,
+                energies=[1.0] * 9,
+                radius_min=1,
+                max_detectors=4,
+                output_bits=8,
+                layer_configs=configs,
+                energy_threshold=0.0,
+                eta=None,
+                attempts_without_change=5,
+                seed=7,
+                parallel_workers=workers,
+                parallel_backend=backend,
+            ).build()
+
+        sequential = build(1)
+        parallel = build(2)
+        process_parallel = build(2, "process")
+        self.assertEqual(
+            [(item.center, item.radius, item.lambda_threshold) for item in sequential],
+            [(item.center, item.radius, item.lambda_threshold) for item in parallel],
+        )
+        self.assertEqual(
+            [(item.center, item.radius, item.lambda_threshold) for item in sequential],
+            [(item.center, item.radius, item.lambda_threshold) for item in process_parallel],
+        )
+
+    def test_detector_builder_process_state_excludes_gpu_contexts(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        layout._gpu_engine = threading.Lock()
+        layout._tensor_engine = threading.Lock()
+        builder = DetectorHierarchyBuilder(
+            layout=layout,
+            energies=[1.0],
+            radius_min=1,
+            max_detectors=1,
+            output_bits=8,
+            layer_configs=(DetectorLayerConfig(0.5, 1, 1),),
+            energy_threshold=0.0,
+            eta=None,
+            attempts_without_change=1,
+            seed=0,
+            parallel_workers=1,
+            parallel_backend="process",
+        )
+        restored = pickle.loads(pickle.dumps(builder))
+        self.assertIsNone(restored._layout._gpu_engine)
+        self.assertIsNone(restored._layout._tensor_engine)
+
     def test_binary_j2_equals_jaccard(self) -> None:
         stored = self._single_bit(4, 0)
         query = BitArray(4)
@@ -601,6 +836,70 @@ class ArticleInvariantTests(unittest.TestCase):
             ),
         )
         self.assertEqual(database._similarity_value(query, 2, stored, 1), 0.5)
+
+    def test_vectorized_decoder_matches_scalar_predictions(self) -> None:
+        rng = random.Random(17)
+        stored: list[LabeledEmbedding] = []
+        for index in range(40):
+            embedding = BitArray(64)
+            for bit in rng.sample(range(64), 12):
+                embedding.set(bit)
+            stored.append(LabeledEmbedding(index % 4, embedding))
+        database = EmbeddingDatabase(
+            stored,
+            DecoderConfig(
+                similarity="j2",
+                temperature=0.35,
+                min_confidence=0.0,
+                expected_classes=(0, 1, 2, 3),
+                knn_top_k=9,
+                similarity_batch_size=3,
+            ),
+        )
+        queries = [item.embedding for item in stored[3:13]]
+        scalar = [database.predict(query) for query in queries]
+        vectorized = database.predict_many(queries)
+        self.assertEqual(
+            [result.predicted_class for result in scalar],
+            [result.predicted_class for result in vectorized],
+        )
+        self.assertEqual(scalar, vectorized)
+
+    def test_prepared_neighbors_are_reusable_for_temperature(self) -> None:
+        stored = [
+            LabeledEmbedding(label=index % 2, embedding=self._single_bit(8, index))
+            for index in range(4)
+        ]
+        database = EmbeddingDatabase(
+            stored,
+            DecoderConfig("j2", 0.35, 0.0, (0, 1), knn_top_k=3),
+        )
+        queries = [stored[0].embedding, stored[1].embedding]
+        prepared = database.prepare_many(queries)
+        for temperature in (0.1, 0.35, 1.0):
+            direct = database.predict_many(queries, temperature=temperature)
+            reused = database.predict_prepared(prepared, temperature=temperature)
+            self.assertEqual(direct, reused)
+
+    def test_evaluation_embedding_cache_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = EvaluationEmbeddingCache(
+                path=os.path.join(directory, "evaluation.json"),
+                version=1,
+            )
+            embeddings = [self._single_bit(8, 1), self._single_bit(8, 6)]
+            cache.save(key="layout|test|2", labels=(3, 7), embeddings=embeddings)
+            restored = cache.load(
+                key="layout|test|2", labels=(3, 7), code_length=8
+            )
+            self.assertIsNotNone(restored)
+            self.assertEqual(
+                [embedding.to01() for embedding in embeddings],
+                [embedding.to01() for embedding in restored or ()],
+            )
+            self.assertIsNone(
+                cache.load(key="other", labels=(3, 7), code_length=8)
+            )
 
     def test_pseudocolour_uses_bit_order(self) -> None:
         red = Encoder.color_from_code(
@@ -650,6 +949,37 @@ class ArticleInvariantTests(unittest.TestCase):
                     log_visuals=False,
                 )
                 self.assertEqual(layout.last_steps, 3)
+
+    def test_energy_stability_window_is_clamped_to_available_measurements(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        layout.step = lambda **_: 0  # type: ignore[method-assign]
+        layout.average_local_energy = lambda *_, **__: 1.0  # type: ignore[method-assign]
+        layout.run(
+            steps=3,
+            pairs_per_step=1,
+            pair_radius=1,
+            mode="short",
+            local_radius=1,
+            min_swap_ratio=0.0,
+            energy_radius=1,
+            energy_stability_window=20,
+            energy_stability_delta=0.001,
+            energy_stability_every=1,
+            log_visuals=False,
+        )
+        self.assertEqual(layout.last_steps, 3)
 
     def test_pinwheel_surface_is_nine_positions_times_angles(self) -> None:
         surface = RetinotopicAngleSurface()
