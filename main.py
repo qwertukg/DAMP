@@ -144,6 +144,7 @@ MPS_HIGH_WATERMARK_RATIO = 0.0
 
 ENCODER_LOG_EVERY = 50
 ENCODER_RANDOM_SEED = 0
+ENCODER_CODE_CACHE_SIZE = 65536
 MNIST_ANGLE_IN_DEGREES = True
 MNIST_GRAD_THRESHOLD = 0.05
 MNIST_LOCAL_ORIENTATION_LIMIT = 4
@@ -288,8 +289,18 @@ DECODER_MIN_SIMILARITY = 0.0
 DECODER_DATASET_LIMIT = 64
 DECODER_SIMILARITY_BATCH_SIZE = 128
 DECODER_EVALUATION_WORKERS = 6
+DECODER_EVALUATION_BACKEND = "process"
+DECODER_EVALUATION_CHUNKS_PER_WORKER = 4
+DECODER_EVALUATION_PROCESS_MIN_SAMPLES = 256
 DECODER_EVALUATION_CACHE_PATH = "data/evaluation-embeddings.json"
-DECODER_EVALUATION_CACHE_VERSION = 1
+DECODER_EVALUATION_CACHE_VERSION = 5
+TEST_UI_DEFAULT_COUNT = 60000
+TEST_UI_CANVAS_SIZE = 280
+TEST_UI_OUTPUT_SIZE = 28
+TEST_UI_DIGIT_BOX_SIZE = 20
+TEST_UI_BRUSH_WIDTH = 22
+TEST_UI_WINDOW_WIDTH = 760
+TEST_UI_WINDOW_HEIGHT = 520
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.01, 0.02, 0.03, 0.05, 0.1)
 EVALUATION_CONFIDENCE_BINS = 10
@@ -340,6 +351,7 @@ LOG_INTERVALS = {
     "pinwheel.topology.solve": LOG_INTERVAL_INIT,
     "orientation.encoder.init": LOG_INTERVAL_INIT,
     "orientation.encoder.code": LOG_INTERVAL_ENCODER_ENCODE,
+    "orientation.encoder.batch": LOG_INTERVAL_ENCODER_ENCODE,
     "orientation.encoder.input": LOG_INTERVAL_ENCODER_ENCODE,
     "encoder.code.color": LOG_INTERVAL_ENCODER_ENCODE,
     "encoder.code.color_component": LOG_INTERVAL_ENCODER_ENCODE,
@@ -414,6 +426,7 @@ LOG_INTERVALS = {
     "sobel_map.patch.metrics": LOG_INTERVAL_SOBEL_PATCH,
     "sobel_map.patch_coords": LOG_INTERVAL_SOBEL_IMAGE,
     "sobel_map.patch_grid": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.extract.batch": LOG_INTERVAL_SOBEL_IMAGE,
     "activation.backend": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.backend.gpu_unavailable": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.backend.gpu_fallback": LOG_INTERVAL_ACTIVATION_INIT,
@@ -1294,6 +1307,7 @@ def _build_encoder() -> RetinotopicOrientationEncoder:
         color_maximum_hue=MNIST_ORIENTATION_COLOR_MAX_HUE,
         random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
+        cache_size=ENCODER_CODE_CACHE_SIZE,
     )
 
 
@@ -2154,6 +2168,9 @@ class MnistDecodeRunner:
             stimulus_embedding_builder=self._stimulus_embedding_builder,
             structural_activation_interval=ACTIVATION_STRUCTURAL_DIAGNOSTIC_EVERY,
             evaluation_workers=DECODER_EVALUATION_WORKERS,
+            evaluation_backend=DECODER_EVALUATION_BACKEND,
+            evaluation_chunks_per_worker=DECODER_EVALUATION_CHUNKS_PER_WORKER,
+            evaluation_process_min_samples=DECODER_EVALUATION_PROCESS_MIN_SAMPLES,
         )
         LOGGER.event(
             "decoder.build",

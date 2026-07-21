@@ -68,12 +68,88 @@ class MnistSobelAngleMap:
             img = img / 255.0
             normalized = True
 
+        gx_values, gy_values = self._all_patch_vectors(img)
+        return self._format_result(
+            gx_values,
+            gy_values,
+            label=int(label),
+            normalized=normalized,
+            image_shape=img.shape,
+        )
+
+    def extract_many(
+        self,
+        images: Union[np.ndarray, "np.typing.ArrayLike"],
+        labels: List[int],
+    ) -> List[ResultMap]:
+        batch = np.asarray(images, dtype=np.float32)
+        if batch.ndim != 3 or batch.shape[1:] != self.EXPECTED_SHAPE:
+            raise ValueError(
+                f"Ожидаю пакет MNIST Nx{self.EXPECTED_SIDE}x{self.EXPECTED_SIDE}, "
+                f"получил {batch.shape}"
+            )
+        if len(labels) != len(batch):
+            raise ValueError("number of labels must match image batch")
+        normalized_mask = np.max(batch, axis=(1, 2)) > 1.5
+        if np.any(normalized_mask):
+            batch = batch.copy()
+            batch[normalized_mask] /= 255.0
+        gx_values, gy_values = self._all_patch_vectors(batch)
+        results = [
+            self._format_result(
+                gx_values[index],
+                gy_values[index],
+                label=int(labels[index]),
+                normalized=bool(normalized_mask[index]),
+                image_shape=self.EXPECTED_SHAPE,
+            )
+            for index in range(len(batch))
+        ]
+        LOGGER.event(
+            "sobel_map.extract.batch",
+            section=SLIDING_WINDOW,
+            data={"images": len(batch), "patches_per_image": self.PATCHES_TOTAL},
+        )
+        return results
+
+    @classmethod
+    def _all_patch_vectors(
+        cls, images: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        single = images.ndim == 2
+        batch = images[None, ...] if single else images
+        patches = batch.reshape(
+            len(batch), cls.GRID_SIZE, cls.PATCH_SIZE,
+            cls.GRID_SIZE, cls.PATCH_SIZE,
+        ).transpose(0, 1, 3, 2, 4)
+        windows = np.lib.stride_tricks.sliding_window_view(
+            patches, (3, 3), axis=(-2, -1)
+        )
+        leading_shape = windows.shape[:-2]
+        gx_products = np.ascontiguousarray(windows * cls.KX).reshape(*leading_shape, 9)
+        gy_products = np.ascontiguousarray(windows * cls.KY).reshape(*leading_shape, 9)
+        gx = np.sum(gx_products, axis=-1, dtype=np.float32)
+        gy = np.sum(gy_products, axis=-1, dtype=np.float32)
+        gx = gx.reshape(len(batch), cls.GRID_SIZE, cls.GRID_SIZE, 4)
+        gy = gy.reshape(len(batch), cls.GRID_SIZE, cls.GRID_SIZE, 4)
+        return (gx[0], gy[0]) if single else (gx, gy)
+
+    def _format_result(
+        self,
+        gx_values: np.ndarray,
+        gy_values: np.ndarray,
+        *,
+        label: int,
+        normalized: bool,
+        image_shape: tuple[int, int],
+    ) -> ResultMap:
+
         LOGGER.event(
             "sobel_map.patch_grid",
             section=SLIDING_WINDOW,
             data={
-                "label": int(label),
-                "image_shape": img.shape,
+                "label": label,
+                "image_shape": image_shape,
                 "patch_size": self.PATCH_SIZE,
                 "grid_size": self.GRID_SIZE,
                 "patches_total": self.PATCHES_TOTAL,
@@ -90,22 +166,41 @@ class MnistSobelAngleMap:
         )
 
         out: List[AngleTriplet] = []
-
         for by in range(self.GRID_SIZE):
-            y0 = by * self.PATCH_SIZE
             for bx in range(self.GRID_SIZE):
+                y0 = by * self.PATCH_SIZE
                 x0 = bx * self.PATCH_SIZE
-                patch = img[y0:y0 + self.PATCH_SIZE, x0:x0 + self.PATCH_SIZE]
-
-                vectors = self._selected_vectors(patch)
+                gx_patch = gx_values[by, bx]
+                gy_patch = gy_values[by, bx]
+                magnitudes = np.hypot(gx_patch, gy_patch)
+                if self.local_orientation_limit is None:
+                    gx = float(np.mean(gx_patch))
+                    gy = float(np.mean(gy_patch))
+                    magnitude = float(np.hypot(gx, gy))
+                    vectors = (
+                        [(magnitude, gx, gy)]
+                        if magnitude > self.grad_threshold
+                        else []
+                    )
+                else:
+                    order = np.argsort(-magnitudes, kind="stable")
+                    vectors = [
+                        (
+                            float(magnitudes[index]),
+                            float(gx_patch[index]),
+                            float(gy_patch[index]),
+                        )
+                        for index in order
+                        if magnitudes[index] > self.grad_threshold
+                    ][: self.local_orientation_limit]
                 mean_gx = float(np.mean([item[1] for item in vectors])) if vectors else 0.0
                 mean_gy = float(np.mean([item[2] for item in vectors])) if vectors else 0.0
                 mag = max((item[0] for item in vectors), default=0.0)
                 kept = bool(vectors)
-                LOGGER.event(
+                LOGGER.event_lazy(
                     "sobel_map.patch.metrics",
                     section=SLIDING_WINDOW,
-                    data={
+                    data=lambda: {
                         "x": bx,
                         "y": by,
                         "x0": x0,
@@ -125,10 +220,10 @@ class MnistSobelAngleMap:
                     angle = float(np.arctan2(gy, gx))
                     if self.angle_in_degrees:
                         angle = float(np.degrees(angle))
-                    LOGGER.event(
+                    LOGGER.event_lazy(
                         "sobel_map.patch.angle",
                         section=CYCLIC_COORDS,
-                        data={
+                        data=lambda: {
                             "x": bx,
                             "y": by,
                             "angle": angle,
@@ -141,7 +236,7 @@ class MnistSobelAngleMap:
             "sobel_map.extract",
             section=CYCLIC_COORDS,
             data={
-                "label": int(label),
+                "label": label,
                 "normalized": normalized,
                 "patch_size": self.PATCH_SIZE,
                 "grid_size": self.GRID_SIZE,
@@ -149,7 +244,7 @@ class MnistSobelAngleMap:
                 "patches_kept": len(out),
             },
         )
-        return {int(label): out}
+        return {label: out}
 
 
     @classmethod

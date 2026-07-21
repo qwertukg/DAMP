@@ -30,9 +30,8 @@ class StimulusEmbeddingBuilder:
         for code in codes:
             if len(code) != self._code_length:
                 raise ValueError("all stimulus codes must have the configured length")
-            for index, bit in enumerate(code):
-                if bit:
-                    frequencies[index] += 1
+            for index in code.active_indices():
+                frequencies[index] += 1
         active = [index for index, frequency in enumerate(frequencies) if frequency > 0]
         active.sort(
             key=lambda index: (
@@ -42,9 +41,7 @@ class StimulusEmbeddingBuilder:
             )
         )
         selected = active[: self._saturation_limit]
-        embedding = BitArray(self._code_length)
-        for index in selected:
-            embedding.set(index)
+        embedding = BitArray.from_indices(self._code_length, selected)
         LOGGER.event(
             "encoder.stimulus.color_merge",
             section=COLOR_MERGE,

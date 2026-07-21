@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import OrderedDict
 import math
 from typing import Sequence
 
@@ -47,6 +48,7 @@ class RetinotopicOrientationEncoder:
         color_maximum_hue: float,
         color_angle_start: int,
         color_angle_length: int,
+        cache_size: int = 0,
     ) -> None:
         self.topology = topology
         self._spatial_encoder = spatial_encoder
@@ -68,6 +70,10 @@ class RetinotopicOrientationEncoder:
             self._coordinate_key(chart.center_x, chart.center_y): index
             for index, chart in enumerate(topology.charts)
         }
+        self._cache_size = max(0, int(cache_size))
+        self._code_cache: OrderedDict[
+            tuple[int, float], tuple[OrientationEncoding, BitArray]
+        ] = OrderedDict()
         LOGGER.event(
             "orientation.encoder.init",
             section=MULTI_DIM_CODES,
@@ -78,6 +84,7 @@ class RetinotopicOrientationEncoder:
                 "code_length": self.code_length,
                 "angle_period": self._angle_period,
                 "orientation_not_direction": True,
+                "cache_size": self._cache_size,
             },
         )
 
@@ -92,18 +99,6 @@ class RetinotopicOrientationEncoder:
     @staticmethod
     def _coordinate_key(x: float, y: float) -> tuple[float, float]:
         return round(float(x), 12), round(float(y), 12)
-
-    @staticmethod
-    def _concatenate(first: BitArray, second: BitArray) -> BitArray:
-        code = BitArray(len(first) + len(second))
-        for index, bit in enumerate(first):
-            if bit:
-                code.set(index)
-        offset = len(first)
-        for index, bit in enumerate(second):
-            if bit:
-                code.set(offset + index)
-        return code
 
     def center_index(self, x: float, y: float) -> int:
         key = self._coordinate_key(x, y)
@@ -142,30 +137,51 @@ class RetinotopicOrientationEncoder:
         )
 
     def encode_descriptor(self, descriptor: OrientationEncoding) -> BitArray:
-        _, spatial = self._spatial_encoder.encode(
+        _, spatial_indices = self._spatial_encoder.encode_indices(
             descriptor.position_x, descriptor.position_y
         )
-        _, angular = self._angle_encoder.encode(descriptor.encoded_angle)
-        code = self._concatenate(spatial, angular)
-        LOGGER.event(
+        _, angular_indices = self._angle_encoder.encode_indices(
+            descriptor.encoded_angle
+        )
+        code = BitArray.from_indices(
+            self.code_length,
+            (
+                *spatial_indices,
+                *(self._spatial_code_length + index for index in angular_indices),
+            ),
+        )
+        LOGGER.event_lazy(
             "orientation.encoder.code",
             section=MULTI_DIM_CODES,
-            data={
+            data=lambda: {
                 "position": descriptor.center_index,
                 "source_angle": descriptor.source_angle,
                 "encoded_angle": descriptor.encoded_angle,
                 "chirality": descriptor.chirality,
                 "phase": descriptor.phase,
-                "active_spatial_bits": spatial.count(),
-                "active_angular_bits": angular.count(),
+                "active_spatial_bits": len(spatial_indices),
+                "active_angular_bits": len(angular_indices),
                 "active_bits": code.count(),
             },
         )
         return code
 
     def encode_at(self, angle: float, *, center_index: int) -> tuple[OrientationEncoding, BitArray]:
+        source_angle = self._angle_minimum + (
+            (float(angle) - self._angle_minimum) % self._angle_period
+        )
+        cache_key = (int(center_index), source_angle)
+        cached = self._code_cache.get(cache_key)
+        if cached is not None:
+            self._code_cache.move_to_end(cache_key)
+            return cached
         descriptor = self.describe(angle, center_index=center_index)
-        return descriptor, self.encode_descriptor(descriptor)
+        result = descriptor, self.encode_descriptor(descriptor)
+        if self._cache_size > 0:
+            self._code_cache[cache_key] = result
+            if len(self._code_cache) > self._cache_size:
+                self._code_cache.popitem(last=False)
+        return result
 
     def encode_sample(self, sample: object) -> BitArray:
         angle = float(getattr(sample, "angle"))
@@ -189,12 +205,28 @@ class RetinotopicOrientationEncoder:
         )
         return (descriptor.encoded_angle, float(x), float(y)), code
 
+    def encode_many(
+        self, measurements: Sequence[tuple[float, int, int]]
+    ) -> list[tuple[tuple[float, ...], BitArray]]:
+        encoded: list[tuple[tuple[float, ...], BitArray]] = []
+        for angle, x, y in measurements:
+            encoded.append(self.encode(float(angle), float(x), float(y)))
+        LOGGER.event(
+            "orientation.encoder.batch",
+            section=MULTI_DIM_CODES,
+            data={
+                "measurements": len(measurements),
+                "cache_entries": len(self._code_cache),
+            },
+        )
+        return encoded
+
     def active_component_counts(self, descriptor: OrientationEncoding) -> tuple[int, int]:
-        _, spatial = self._spatial_encoder.encode(
+        _, spatial = self._spatial_encoder.encode_indices(
             descriptor.position_x, descriptor.position_y
         )
-        _, angular = self._angle_encoder.encode(descriptor.encoded_angle)
-        return spatial.count(), angular.count()
+        _, angular = self._angle_encoder.encode_indices(descriptor.encoded_angle)
+        return len(spatial), len(angular)
 
     def active_sample_component_counts(self, sample: object) -> tuple[int, int]:
         descriptor = self.describe(
@@ -222,6 +254,7 @@ class RetinotopicOrientationEncoderFactory:
         color_maximum_hue: float,
         random_seed: int,
         log_every: int,
+        cache_size: int = 0,
         topology: ContinuousPinwheelTopology | None = None,
     ) -> RetinotopicOrientationEncoder:
         if not centers:
@@ -269,4 +302,5 @@ class RetinotopicOrientationEncoderFactory:
             color_maximum_hue=color_maximum_hue,
             color_angle_start=color_angle_start,
             color_angle_length=angle_layers[-1][0],
+            cache_size=cache_size,
         )

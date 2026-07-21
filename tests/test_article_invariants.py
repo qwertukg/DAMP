@@ -7,6 +7,7 @@ import random
 import tempfile
 import threading
 import unittest
+from itertools import product
 from unittest.mock import patch
 
 from damp.activation import (
@@ -66,6 +67,78 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_sparse_bitarray_index_matches_dense_state(self) -> None:
+        first = BitArray.from_indices(16, (1, 3, 7, 7))
+        second = BitArray.from_indices(16, (3, 4, 7, 12))
+        self.assertEqual(first.count(), 3)
+        self.assertEqual(tuple(sorted(first.active_indices())), (1, 3, 7))
+        self.assertEqual(first.common(second), 2)
+        first.set(3, 0)
+        self.assertEqual(first.count(), 2)
+        self.assertEqual(first.to01(), "0100000100000000")
+
+    def test_indexed_orientation_encoder_matches_detector_scan(self) -> None:
+        encoder = _build_encoder()
+        rng = random.Random(31)
+        for _ in range(200):
+            angle = rng.uniform(-360.0, 540.0)
+            x = rng.randrange(7)
+            y = rng.randrange(7)
+            descriptor = encoder.describe(
+                angle, center_index=encoder.center_index(x, y)
+            )
+            _, spatial = encoder._spatial_encoder.encode_indices(
+                descriptor.position_x, descriptor.position_y
+            )
+            brute_spatial: list[int] = []
+            for layer in encoder._spatial_encoder._joint_layer_indices:
+                active_by_dimension = [
+                    tuple(
+                        index
+                        for index, window in enumerate(fields)
+                        if window.is_active(value)
+                    )
+                    for fields, value in zip(
+                        layer.fields_by_dimension,
+                        (descriptor.position_x, descriptor.position_y),
+                    )
+                ]
+                for indices in product(*active_by_dimension):
+                    brute_spatial.append(
+                        layer.offset
+                        + sum(
+                            index * stride
+                            for index, stride in zip(indices, layer.strides)
+                        )
+                    )
+            self.assertEqual(spatial, tuple(sorted(brute_spatial)))
+            _, angular = encoder._angle_encoder.encode_indices(
+                descriptor.encoded_angle
+            )
+            brute_angular = tuple(
+                window.detector_index
+                for window in encoder._angle_encoder.detectors
+                if window.is_active(descriptor.encoded_angle)
+            )
+            self.assertEqual(angular, brute_angular)
+
+    def test_vectorized_sobel_matches_original_patch_reduction(self) -> None:
+        rng = __import__("numpy").random.default_rng(13)
+        image = rng.random((28, 28), dtype="float32")
+        extractor = MnistSobelAngleMap(
+            grad_threshold=0.05,
+            local_orientation_limit=4,
+        )
+        gx_values, gy_values = extractor._all_patch_vectors(image)
+        for y in range(7):
+            for x in range(7):
+                reference = extractor._sobel_vectors_on_4x4(
+                    image[y * 4 : y * 4 + 4, x * 4 : x * 4 + 4]
+                )
+                for index, (_, gx, gy) in enumerate(reference):
+                    self.assertEqual(gx, float(gx_values[y, x, index]))
+                    self.assertEqual(gy, float(gy_values[y, x, index]))
+
     def test_stimulus_colour_merge_prioritizes_position_and_density(self) -> None:
         first = BitArray(8)
         second = BitArray(8)

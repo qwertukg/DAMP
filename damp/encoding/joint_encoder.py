@@ -8,7 +8,13 @@ from typing import Sequence, Tuple
 
 from damp.article_refs import CYCLIC_COORDS, MULTI_DIM_CODES, SPARSE_BIT_VECTORS, WIDE_DETECTORS
 from damp.encoding.bitarray import BitArray
-from damp.encoding.damp_encoder import DetectorWindow, Detectors, Dimension, Encoder
+from damp.encoding.damp_encoder import (
+    DetectorLayerWindowIndex,
+    DetectorWindow,
+    Detectors,
+    Dimension,
+    Encoder,
+)
 from damp.logging import LOGGER
 
 
@@ -42,6 +48,7 @@ class JointDetectorLayerIndex:
 
     offset: int
     fields_by_dimension: tuple[tuple[DetectorWindow, ...], ...]
+    search_by_dimension: tuple[DetectorLayerWindowIndex, ...]
     strides: tuple[int, ...]
     detector_count: int
 
@@ -84,6 +91,10 @@ class JointEncoder(Encoder):
                     offset=layer_offset,
                     fields_by_dimension=tuple(
                         tuple(fields) for fields in fields_by_dimension
+                    ),
+                    search_by_dimension=tuple(
+                        DetectorLayerWindowIndex(tuple(fields))
+                        for fields in fields_by_dimension
                     ),
                     strides=tuple(
                         math.prod(counts[index + 1 :])
@@ -128,6 +139,34 @@ class JointEncoder(Encoder):
             section=MULTI_DIM_CODES,
             data={"values": values},
         )
+        normalized_values, active_indices = self.encode_indices(*values)
+        LOGGER.event(
+            "encoder.joint.normalized",
+            section=CYCLIC_COORDS,
+            data={"values": normalized_values},
+        )
+        code = BitArray.from_indices(self.code_length, active_indices)
+        self._log_counter += 1
+        LOGGER.event_lazy(
+            "encoder.joint.code",
+            section=SPARSE_BIT_VECTORS,
+            data=lambda: {
+                "code_length": self.code_length,
+                "active_bits": code.count(),
+                "code": code,
+                "joint_detectors": len(self._joint_detectors),
+            },
+        )
+        LOGGER.event_lazy(
+            "encoder.joint.detectors",
+            section=WIDE_DETECTORS,
+            data=lambda: {"active": code.count(), "total": self.code_length},
+        )
+        return normalized_values, code
+
+    def encode_indices(self, *values: float) -> tuple[tuple[float, ...], tuple[int, ...]]:
+        if len(values) != len(self.dimensions):
+            raise ValueError("number of values must match number of dimensions")
         normalized_values: list[float] = []
         for value, dimension in zip(values, self.dimensions):
             normalized = float(value)
@@ -141,21 +180,12 @@ class JointEncoder(Encoder):
                     f"[{dimension.min_value}, {dimension.max_value}]"
                 )
             normalized_values.append(normalized)
-        LOGGER.event(
-            "encoder.joint.normalized",
-            section=CYCLIC_COORDS,
-            data={"values": normalized_values},
-        )
-        code = BitArray(self.code_length)
+        active_bits: set[int] = set()
         for layer in self._joint_layer_indices:
             active_by_dimension = [
-                tuple(
-                    index
-                    for index, receptive_field in enumerate(fields)
-                    if receptive_field.is_active(value)
-                )
-                for fields, value in zip(
-                    layer.fields_by_dimension,
+                search.active_local_indices(value)
+                for search, value in zip(
+                    layer.search_by_dimension,
                     normalized_values,
                 )
             ]
@@ -166,21 +196,5 @@ class JointEncoder(Encoder):
                     index * stride
                     for index, stride in zip(active_indices, layer.strides)
                 )
-                code.set(self._bit_map[detector_index], 1)
-        self._log_counter += 1
-        LOGGER.event(
-            "encoder.joint.code",
-            section=SPARSE_BIT_VECTORS,
-            data={
-                "code_length": self.code_length,
-                "active_bits": code.count(),
-                "code": code,
-                "joint_detectors": len(self._joint_detectors),
-            },
-        )
-        LOGGER.event(
-            "encoder.joint.detectors",
-            section=WIDE_DETECTORS,
-            data={"active": code.count(), "total": self.code_length},
-        )
-        return tuple(normalized_values), code
+                active_bits.add(self._bit_map[detector_index])
+        return tuple(normalized_values), tuple(sorted(active_bits))

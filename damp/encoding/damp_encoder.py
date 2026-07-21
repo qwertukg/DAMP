@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import colorsys
+import math
 import random
 from typing import List, Optional, Sequence, Tuple
 
@@ -110,6 +111,45 @@ class DetectorWindow:
         return (self.center - self.half_width) <= value <= (self.center + self.half_width)
 
 
+@dataclass(frozen=True)
+class DetectorLayerWindowIndex:
+    """Индекс равномерного слоя широких детекторов с исходной нумерацией битов."""
+
+    windows: tuple[DetectorWindow, ...]
+
+    def active_local_indices(self, value: float) -> tuple[int, ...]:
+        count = len(self.windows)
+        if count == 0:
+            return ()
+        first = self.windows[0]
+        if count == 1:
+            return (0,) if first.is_active(value) else ()
+        step = self.windows[1].center - first.center
+        if step <= 0.0:
+            return tuple(
+                index for index, window in enumerate(self.windows)
+                if window.is_active(value)
+            )
+        half_width = first.half_width
+        if first.closed:
+            if half_width >= first.period / 2.0:
+                return tuple(range(count))
+            nearest = int(math.floor((value - first.center) / step + 0.5))
+            reach = int(math.ceil(half_width / step)) + 1
+            candidates = {
+                (nearest + offset) % count
+                for offset in range(-reach, reach + 1)
+            }
+        else:
+            low = int(math.floor((value - half_width - first.center) / step)) - 1
+            high = int(math.ceil((value + half_width - first.center) / step)) + 1
+            candidates = range(max(0, low), min(count - 1, high) + 1)
+        return tuple(
+            index for index in sorted(candidates)
+            if self.windows[index].is_active(value)
+        )
+
+
 class Encoder:
     def __init__(
         self,
@@ -126,9 +166,11 @@ class Encoder:
         self._log_counter = 0
         self.detectors: List[DetectorWindow] = []
         self._detectors_by_dimension: List[List[DetectorWindow]] = []
+        self._layer_indices_by_dimension: list[list[DetectorLayerWindowIndex]] = []
         next_index = 0
         for dim_index, dim in enumerate(self.dimensions):
             detectors_for_dim: List[DetectorWindow] = []
+            indices_for_dim: list[DetectorLayerWindowIndex] = []
             for layer_index, layer in enumerate(dim.detector_layers):
                 windows = self._build_layer_detectors(
                     dim=dim,
@@ -138,9 +180,11 @@ class Encoder:
                     start_index=next_index,
                 )
                 detectors_for_dim.extend(windows)
+                indices_for_dim.append(DetectorLayerWindowIndex(tuple(windows)))
                 self.detectors.extend(windows)
                 next_index += len(windows)
             self._detectors_by_dimension.append(detectors_for_dim)
+            self._layer_indices_by_dimension.append(indices_for_dim)
         self.code_length = len(self.detectors)
         self._bit_map = list(range(self.code_length))
         self._random_bit = False
@@ -217,24 +261,8 @@ class Encoder:
             section=MULTI_DIM_CODES,
             data={"values": values},
         )
-        bit_array = BitArray(self.code_length)
-        normalized_values: List[float] = []
-        for dim_index, (value, dim) in enumerate(zip(values, self.dimensions)):
-            v = float(value)
-            if dim.closed:
-                if dim.period <= 0:
-                    raise ValueError("closed dimension period must be positive")
-                v = ((v - dim.min_value) % dim.period) + dim.min_value
-            else:
-                if not (dim.min_value <= v <= dim.max_value):
-                    raise ValueError(
-                        f"value {v} is outside the open dimension range "
-                        f"[{dim.min_value}, {dim.max_value}]"
-                    )
-            normalized_values.append(v)
-            for detector in self._detectors_by_dimension[dim_index]:
-                if detector.is_active(v):
-                    bit_array.set(self._bit_map[detector.detector_index], 1)
+        normalized_values, active_indices = self.encode_indices(*values)
+        bit_array = BitArray.from_indices(self.code_length, active_indices)
         LOGGER.event(
             "encoder.encode.normalized",
             section=CYCLIC_COORDS,
@@ -321,7 +349,31 @@ class Encoder:
             },
             visuals=code_visuals if code_visuals else None,
         )
-        return tuple(normalized_values), bit_array
+        return normalized_values, bit_array
+
+    def encode_indices(self, *values: float) -> tuple[tuple[float, ...], tuple[int, ...]]:
+        if len(values) != len(self.dimensions):
+            raise ValueError("number of values must match number of dimensions")
+        normalized_values: List[float] = []
+        active_indices: set[int] = set()
+        for dim_index, (value, dim) in enumerate(zip(values, self.dimensions)):
+            v = float(value)
+            if dim.closed:
+                if dim.period <= 0:
+                    raise ValueError("closed dimension period must be positive")
+                v = ((v - dim.min_value) % dim.period) + dim.min_value
+            else:
+                if not (dim.min_value <= v <= dim.max_value):
+                    raise ValueError(
+                        f"value {v} is outside the open dimension range "
+                        f"[{dim.min_value}, {dim.max_value}]"
+                    )
+            normalized_values.append(v)
+            for layer_index in self._layer_indices_by_dimension[dim_index]:
+                for local_index in layer_index.active_local_indices(v):
+                    detector = layer_index.windows[local_index]
+                    active_indices.add(self._bit_map[detector.detector_index])
+        return tuple(normalized_values), tuple(sorted(active_indices))
 
     def _build_layer_detectors(
         self,

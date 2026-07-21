@@ -181,6 +181,42 @@ class EvaluationEmbeddingCache:
         return embedding
 
 
+class DecoderEncodingWorker:
+    """Изолированный OOP-worker Sobel + Encoder для пакетной оценки."""
+
+    _encoder: Encoder | None = None
+    _extractor: MnistSobelAngleMap | None = None
+    _embedding_builder: StimulusEmbeddingBuilder | None = None
+
+    @classmethod
+    def configure(
+        cls,
+        encoder: Encoder,
+        extractor: MnistSobelAngleMap,
+        embedding_builder: StimulusEmbeddingBuilder,
+    ) -> None:
+        LOGGER.configure_worker_silent()
+        cls._encoder = encoder
+        cls._extractor = extractor
+        cls._embedding_builder = embedding_builder
+
+    @classmethod
+    def encode(
+        cls, task: tuple[Sequence[tuple[float, int, int]], int, bool]
+    ) -> tuple[int, BitArray, list[BitArray] | None]:
+        measurements, _label, return_codes = task
+        if cls._encoder is None or cls._embedding_builder is None:
+            raise RuntimeError("decoder encoding worker is not configured")
+        if not measurements:
+            raise RuntimeError("у изображения нет активных измерений")
+        codes = [code for _, code in cls._encoder.encode_many(measurements)]
+        return (
+            len(codes),
+            cls._embedding_builder.build(codes),
+            codes if return_codes else None,
+        )
+
+
 class _EvaluationDiagnostics:
     """Собирает диагностические представления классификации (§6.5)."""
 
@@ -882,6 +918,9 @@ class MnistDecoder:
         stimulus_embedding_builder: StimulusEmbeddingBuilder,
         structural_activation_interval: int,
         evaluation_workers: int = 1,
+        evaluation_backend: str = "thread",
+        evaluation_chunks_per_worker: int = 1,
+        evaluation_process_min_samples: int = 1,
     ) -> None:
         self._encoder = encoder
         self._extractor = extractor
@@ -896,6 +935,15 @@ class MnistDecoder:
         if evaluation_workers <= 0:
             raise ValueError("evaluation_workers must be positive")
         self._evaluation_workers = int(evaluation_workers)
+        if evaluation_backend not in ("thread", "process"):
+            raise ValueError("evaluation_backend must be thread or process")
+        self._evaluation_backend = evaluation_backend
+        if evaluation_chunks_per_worker <= 0:
+            raise ValueError("evaluation_chunks_per_worker must be positive")
+        self._evaluation_chunks_per_worker = int(evaluation_chunks_per_worker)
+        if evaluation_process_min_samples <= 0:
+            raise ValueError("evaluation_process_min_samples must be positive")
+        self._evaluation_process_min_samples = int(evaluation_process_min_samples)
         self._embedding_sequence = 0
         self._last_activation_values: list[float] | None = None
         code_len = getattr(activation_engine, "_code_length", None)
@@ -946,26 +994,17 @@ class MnistDecoder:
         *,
         label_value: int,
         log_image: bool,
+        measurements: Sequence[tuple[float, int, int]] | None = None,
     ) -> tuple[list[BitArray], BitArray]:
-        measurements_map = self._extractor.extract(image, label=label_value)
-        if label_value not in measurements_map:
-            raise RuntimeError("не удалось получить измерения для изображения")
-        measurements = measurements_map[label_value]
+        if measurements is None:
+            measurements_map = self._extractor.extract(image, label=label_value)
+            if label_value not in measurements_map:
+                raise RuntimeError("не удалось получить измерения для изображения")
+            measurements = measurements_map[label_value]
         if not measurements:
             raise RuntimeError("у изображения нет активных измерений")
-        codes: list[BitArray] = []
-        first = True
-        for (angle, x, y) in measurements:
-            _, code = self._encoder.encode(
-                float(angle),
-                float(x),
-                float(y),
-                log_image=image if log_image and first else None,
-                log_label=label_value if log_image and first else None,
-                log_measurements=measurements if log_image and first else None,
-            )
-            codes.append(code)
-            first = False
+        encoded = self._encoder.encode_many(measurements)
+        codes = [code for _, code in encoded]
         classification_embedding = self._stimulus_embedding_builder.build(codes)
         return codes, classification_embedding
 
@@ -976,6 +1015,7 @@ class MnistDecoder:
         *,
         label_value: int,
         log_image: bool,
+        codes_count: int | None = None,
     ) -> ActivationResult:
         self._embedding_sequence += 1
         evaluate_structure = (
@@ -1008,7 +1048,7 @@ class MnistDecoder:
             "decoder.embed",
             section=CODE_SPACE_ACTIVATION,
             data={
-                "codes": len(codes),
+                "codes": len(codes) if codes_count is None else codes_count,
                 "active_detectors": len(activation_result.active_detectors),
                 "embedding_bits": activation_result.embedding.count(),
                 "classification_embedding_bits": classification_embedding.count(),
@@ -1028,32 +1068,106 @@ class MnistDecoder:
         if not images:
             return []
 
+        resolved_labels = [
+            int(labels[index])
+            if labels is not None and index < len(labels)
+            else -1
+            for index in range(len(images))
+        ]
+        measurement_maps = self._extractor.extract_many(
+            np.stack(images), resolved_labels
+        )
+
         def encode_item(item: tuple[int, np.ndarray]):
             index, image = item
-            label_value = (
-                int(labels[index])
-                if labels is not None and index < len(labels)
-                else -1
-            )
+            label_value = resolved_labels[index]
             return label_value, self._encode_primary(
                 image,
                 label_value=label_value,
                 log_image=log_first and index == 0,
+                measurements=measurement_maps[index][label_value],
             )
 
         workers = min(self._evaluation_workers, len(images))
-        if workers == 1:
-            encoded = [encode_item(item) for item in enumerate(images)]
+        use_processes = (
+            workers > 1
+            and self._evaluation_backend == "process"
+            and len(images) >= self._evaluation_process_min_samples
+        )
+        if use_processes:
+            tasks = [
+                (
+                    measurement_maps[index][resolved_labels[index]],
+                    resolved_labels[index],
+                    bool(
+                        (log_first and index == 0)
+                        or self._embedding_sequence + index + 1 == 1
+                        or (
+                            self._activation_engine is not None
+                            and (self._embedding_sequence + index + 1)
+                            % self._structural_activation_interval
+                            == 0
+                        )
+                    ),
+                )
+                for index in range(len(images))
+            ]
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=DecoderEncodingWorker.configure,
+                initargs=(
+                    self._encoder,
+                    self._extractor,
+                    self._stimulus_embedding_builder,
+                ),
+            ) as executor:
+                chunk_size = max(
+                    1,
+                    len(tasks)
+                    // (workers * self._evaluation_chunks_per_worker),
+                )
+                processed = list(
+                    executor.map(
+                        DecoderEncodingWorker.encode,
+                        tasks,
+                        chunksize=chunk_size,
+                    )
+                )
+            encoded = [
+                (
+                    tasks[index][1],
+                    codes or (),
+                    embedding,
+                    codes_count,
+                )
+                for index, (codes_count, embedding, codes) in enumerate(processed)
+            ]
+        elif workers == 1:
+            sequential = [encode_item(item) for item in enumerate(images)]
+            encoded = [
+                (label, codes, embedding, None)
+                for label, (codes, embedding) in sequential
+            ]
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                encoded = list(executor.map(encode_item, enumerate(images)))
+                threaded = list(executor.map(encode_item, enumerate(images)))
+            encoded = [
+                (label, codes, embedding, None)
+                for label, (codes, embedding) in threaded
+            ]
         embeddings: list[BitArray] = []
-        for index, (label_value, (codes, classification_embedding)) in enumerate(encoded):
+        for index, (
+            label_value,
+            codes,
+            classification_embedding,
+            codes_count,
+        ) in enumerate(encoded):
             self._finish_embedding(
                 codes,
                 classification_embedding,
                 label_value=label_value,
                 log_image=log_first and index == 0,
+                codes_count=codes_count,
             )
             embeddings.append(classification_embedding)
         LOGGER.event(
@@ -1062,6 +1176,7 @@ class MnistDecoder:
             data={
                 "images": len(images),
                 "workers": workers,
+                "backend": "process" if use_processes else "thread",
                 "code_length": len(embeddings[0]) if embeddings else 0,
             },
         )

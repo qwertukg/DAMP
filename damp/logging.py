@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import os
 import sys
 import threading
-from typing import Any, Collection, Mapping, Sequence
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 import rerun as rr
 
@@ -418,6 +418,29 @@ class DampLogger:
                     rr.set_time(visual.timeline, sequence=visual.time)
                 rr.log(visual.path, visual.payload, static=visual.static)
         rr.reset_time()
+
+    def event_lazy(
+        self,
+        event: str,
+        *,
+        section: str,
+        data: Callable[[], Mapping[str, Any] | None],
+        title: str | None = None,
+        path: str | None = None,
+        visuals: Callable[[], Sequence[LogVisual] | None] | None = None,
+    ) -> None:
+        """Проверяет интервал до вычисления метрик и подготовки визуализаций."""
+        if self._worker_silent or not self.should_log(event):
+            return
+        self.event(
+            event,
+            section=section,
+            title=title,
+            data=data(),
+            path=path,
+            visuals=visuals() if visuals is not None else None,
+            force=True,
+        )
 
     def visual_image(
         self,
