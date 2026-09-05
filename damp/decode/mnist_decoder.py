@@ -12,7 +12,7 @@ from typing import Sequence
 import numpy as np
 
 from damp.article_refs import CODE_SPACE_ACTIVATION, SIMILARITY_DEFINITION, SIMILARITY_MEASURES, STIMULUS_DETECTION
-from damp.activation import ActivationEngine, ActivationResult
+from damp.activation import ActivationEngine, ActivationResult, DetectorSpaceCascade
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import Encoder
 from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
@@ -775,6 +775,10 @@ class EmbeddingDatabase:
         )
         return prepared
 
+    @property
+    def code_length(self) -> int:
+        return self._code_length
+
     def predict_prepared(
         self,
         prepared: Sequence[PreparedEmbeddingNeighbors],
@@ -912,6 +916,7 @@ class MnistDecoder:
         encoder: Encoder,
         extractor: MnistSobelAngleMap,
         activation_engine: ActivationEngine | None,
+        detector_space_cascade: DetectorSpaceCascade | None = None,
         embedding_db: EmbeddingDatabase,
         evaluation_confidence_bins: int,
         evaluation_error_examples: int,
@@ -925,6 +930,7 @@ class MnistDecoder:
         self._encoder = encoder
         self._extractor = extractor
         self._activation_engine = activation_engine
+        self._detector_space_cascade = detector_space_cascade
         self._embedding_db = embedding_db
         self._evaluation_confidence_bins = int(evaluation_confidence_bins)
         self._evaluation_error_examples = int(evaluation_error_examples)
@@ -946,7 +952,7 @@ class MnistDecoder:
         self._evaluation_process_min_samples = int(evaluation_process_min_samples)
         self._embedding_sequence = 0
         self._last_activation_values: list[float] | None = None
-        code_len = getattr(activation_engine, "_code_length", None)
+        code_len = self._embedding_db.code_length
         LOGGER.event(
             "decoder.init",
             section=CODE_SPACE_ACTIVATION,
@@ -966,7 +972,7 @@ class MnistDecoder:
 
     @property
     def embedding_code_length(self) -> int:
-        return self._encoder.code_length
+        return self._embedding_db.code_length
 
     def embed_image(
         self,
@@ -1018,16 +1024,10 @@ class MnistDecoder:
         codes_count: int | None = None,
     ) -> ActivationResult:
         self._embedding_sequence += 1
-        evaluate_structure = (
-            self._activation_engine is not None
-            and (
-                log_image
-                or self._embedding_sequence == 1
-                or self._embedding_sequence % self._structural_activation_interval == 0
-            )
-        )
-        if evaluate_structure:
-            structural_result = self._activation_engine.activate(codes)
+        if self._detector_space_cascade is not None:
+            cascade_result = self._detector_space_cascade.activate(codes)
+            structural_result = cascade_result.levels[-1]
+            classification_embedding = cascade_result.embedding
             activation_result = ActivationResult(
                 activation_values=structural_result.activation_values,
                 activation_matrix=structural_result.activation_matrix,
@@ -1036,14 +1036,34 @@ class MnistDecoder:
                 classification_embedding=classification_embedding,
             )
             self._last_activation_values = list(activation_result.activation_values)
+            evaluate_structure = True
         else:
-            activation_result = ActivationResult(
-                activation_values=[],
-                activation_matrix=[],
-                active_detectors=[],
-                embedding=classification_embedding,
-                classification_embedding=classification_embedding,
+            evaluate_structure = (
+                self._activation_engine is not None
+                and (
+                    log_image
+                    or self._embedding_sequence == 1
+                    or self._embedding_sequence % self._structural_activation_interval == 0
+                )
             )
+            if evaluate_structure:
+                structural_result = self._activation_engine.activate(codes)
+                activation_result = ActivationResult(
+                    activation_values=structural_result.activation_values,
+                    activation_matrix=structural_result.activation_matrix,
+                    active_detectors=structural_result.active_detectors,
+                    embedding=structural_result.embedding,
+                    classification_embedding=classification_embedding,
+                )
+                self._last_activation_values = list(activation_result.activation_values)
+            else:
+                activation_result = ActivationResult(
+                    activation_values=[],
+                    activation_matrix=[],
+                    active_detectors=[],
+                    embedding=classification_embedding,
+                    classification_embedding=classification_embedding,
+                )
         LOGGER.event(
             "decoder.embed",
             section=CODE_SPACE_ACTIVATION,
@@ -1100,6 +1120,8 @@ class MnistDecoder:
                     measurement_maps[index][resolved_labels[index]],
                     resolved_labels[index],
                     bool(
+                        self._detector_space_cascade is not None
+                        or
                         (log_first and index == 0)
                         or self._embedding_sequence + index + 1 == 1
                         or (
@@ -1162,14 +1184,17 @@ class MnistDecoder:
             classification_embedding,
             codes_count,
         ) in enumerate(encoded):
-            self._finish_embedding(
+            activation_result = self._finish_embedding(
                 codes,
                 classification_embedding,
                 label_value=label_value,
                 log_image=log_first and index == 0,
                 codes_count=codes_count,
             )
-            embeddings.append(classification_embedding)
+            embeddings.append(
+                activation_result.classification_embedding
+                or activation_result.embedding
+            )
         LOGGER.event(
             "decoder.embedding.batch",
             section=CODE_SPACE_ACTIVATION,

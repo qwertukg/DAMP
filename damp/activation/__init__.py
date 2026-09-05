@@ -12,6 +12,15 @@ from .activation import (
     DetectorHierarchyScale,
     DetectorHierarchyScaleResolver,
 )
+from .detector_space import (
+    CorticalOrientationPreferenceMap,
+    DetectorSpace,
+    DetectorSpaceCascade,
+    DetectorSpaceCascadeResult,
+    OrientationPreferenceHueResolver,
+    StructuralEmbeddingColorizer,
+    StructuralEmbeddingHueResolver,
+)
 
 __all__ = [
     "ActivationEngine",
@@ -26,4 +35,11 @@ __all__ = [
     "DetectorHierarchyBuilder",
     "DetectorHierarchyScale",
     "DetectorHierarchyScaleResolver",
+    "CorticalOrientationPreferenceMap",
+    "DetectorSpace",
+    "DetectorSpaceCascade",
+    "DetectorSpaceCascadeResult",
+    "OrientationPreferenceHueResolver",
+    "StructuralEmbeddingColorizer",
+    "StructuralEmbeddingHueResolver",
 ]

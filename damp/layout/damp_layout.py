@@ -78,6 +78,7 @@ class ContinuityLayoutConfig:
     candidates_per_point: int
     min_gain: float = 1e-6
     stall_sweeps: int = 3
+    stall_max_swaps: int = 0
     cyclic_period: float | None = None
     cyclic_weight: float = 0.0
     cyclic_sharp_threshold: float | None = None
@@ -93,6 +94,8 @@ class ContinuityLayoutConfig:
             raise ValueError("min_gain must be non-negative")
         if self.stall_sweeps <= 0:
             raise ValueError("stall_sweeps must be positive")
+        if self.stall_max_swaps < 0:
+            raise ValueError("stall_max_swaps must be non-negative")
         if self.cyclic_period is not None and self.cyclic_period <= 0.0:
             raise ValueError("cyclic_period must be positive when set")
         if self.cyclic_weight < 0.0:
@@ -102,6 +105,393 @@ class ContinuityLayoutConfig:
                 raise ValueError("cyclic_period is required for a sharp threshold")
             if not 0.0 < self.cyclic_sharp_threshold < self.cyclic_period / 2.0:
                 raise ValueError("cyclic_sharp_threshold must be in (0, period/2)")
+
+
+@dataclass(frozen=True)
+class LayoutRunReport:
+    mode: str
+    final_step: int
+    steps: int
+    pair_radius: int
+    swap_ratio: float
+    average_swap_ratio: float
+    energy: float | None
+    energy_max_relative_delta: float | None
+    converged: bool
+    convergence_limit_reached: bool
+
+
+@dataclass(frozen=True)
+class LongPhaseQualityConfig:
+    cyclic_period: float
+    sharp_delta: float
+    noise_delta: float
+    neighbour_coherence_min: float
+    max_local_discontinuity_ratio: float
+    max_spatial_noise_ratio: float
+    pinwheel_winding_min: float
+    pinwheel_max_turn_delta: float
+    pinwheel_exclusion_radius: int
+    minimum_neighbours: int
+
+    def __post_init__(self) -> None:
+        if self.cyclic_period <= 0.0:
+            raise ValueError("cyclic_period must be positive")
+        if not 0.0 < self.sharp_delta < self.cyclic_period / 2.0:
+            raise ValueError("sharp_delta must be in (0, cyclic_period/2)")
+        if not 0.0 < self.noise_delta < self.cyclic_period / 2.0:
+            raise ValueError("noise_delta must be in (0, cyclic_period/2)")
+        if not 0.0 <= self.neighbour_coherence_min <= 1.0:
+            raise ValueError("neighbour_coherence_min must be in [0, 1]")
+        if not 0.0 <= self.max_local_discontinuity_ratio <= 1.0:
+            raise ValueError("max_local_discontinuity_ratio must be in [0, 1]")
+        if not 0.0 <= self.max_spatial_noise_ratio <= 1.0:
+            raise ValueError("max_spatial_noise_ratio must be in [0, 1]")
+        if not 0.0 < self.pinwheel_winding_min <= 1.0:
+            raise ValueError("pinwheel_winding_min must be in (0, 1]")
+        if not 0.0 < self.pinwheel_max_turn_delta < self.cyclic_period / 2.0:
+            raise ValueError("pinwheel_max_turn_delta must be in (0, period/2)")
+        if self.pinwheel_exclusion_radius < 0:
+            raise ValueError("pinwheel_exclusion_radius must be non-negative")
+        if self.minimum_neighbours <= 0:
+            raise ValueError("minimum_neighbours must be positive")
+
+
+@dataclass(frozen=True)
+class LongPhaseQualityReport:
+    accepted: bool
+    dynamics_converged: bool
+    step: int
+    radius: int
+    swap_ratio: float
+    average_swap_ratio: float
+    energy: float | None
+    energy_max_relative_delta: float | None
+    local_edges: int
+    sharp_edges: int
+    local_discontinuity_ratio: float
+    evaluated_points: int
+    noisy_points: int
+    spatial_noise_ratio: float
+    pinwheel_cores: int
+
+
+class LongPhaseQualityEvaluator:
+    """Проверяет динамику и локальную непрерывность до short-фазы (§5.6, §5.8, §5.13.2)."""
+
+    def __init__(self, config: LongPhaseQualityConfig) -> None:
+        self._config = config
+
+    def evaluate(
+        self,
+        layout: "Layout",
+        run_report: LayoutRunReport | None,
+    ) -> LongPhaseQualityReport:
+        pinwheel_mask, pinwheel_cores = self._pinwheel_mask(layout)
+        local_edges, sharp_edges = self._edge_discontinuities(layout, pinwheel_mask)
+        local_ratio = sharp_edges / local_edges if local_edges else 0.0
+        evaluated_points, noisy_points = self._spatial_noise(layout, pinwheel_mask)
+        noise_ratio = noisy_points / evaluated_points if evaluated_points else 0.0
+        dynamics_converged = bool(
+            run_report is not None
+            and run_report.mode == "long"
+            and run_report.converged
+            and not run_report.convergence_limit_reached
+        )
+        accepted = (
+            dynamics_converged
+            and local_ratio <= self._config.max_local_discontinuity_ratio
+            and noise_ratio <= self._config.max_spatial_noise_ratio
+        )
+        return LongPhaseQualityReport(
+            accepted=accepted,
+            dynamics_converged=dynamics_converged,
+            step=0 if run_report is None else run_report.final_step,
+            radius=0 if run_report is None else run_report.pair_radius,
+            swap_ratio=1.0 if run_report is None else run_report.swap_ratio,
+            average_swap_ratio=1.0 if run_report is None else run_report.average_swap_ratio,
+            energy=None if run_report is None else run_report.energy,
+            energy_max_relative_delta=None
+            if run_report is None
+            else run_report.energy_max_relative_delta,
+            local_edges=local_edges,
+            sharp_edges=sharp_edges,
+            local_discontinuity_ratio=local_ratio,
+            evaluated_points=evaluated_points,
+            noisy_points=noisy_points,
+            spatial_noise_ratio=noise_ratio,
+            pinwheel_cores=pinwheel_cores,
+        )
+
+    def _pinwheel_mask(self, layout: "Layout") -> tuple[set[tuple[int, int]], int]:
+        period = self._config.cyclic_period
+        cores: list[tuple[int, int]] = []
+        for y in range(layout.height - 1):
+            for x in range(layout.width - 1):
+                indices = (
+                    layout.grid[y][x],
+                    layout.grid[y][x + 1],
+                    layout.grid[y + 1][x + 1],
+                    layout.grid[y + 1][x],
+                )
+                if any(index is None for index in indices):
+                    continue
+                hues = [layout._points[int(index)].hue for index in indices]
+                turns = [
+                    self._signed_delta(hues[(index + 1) % 4], hues[index], period)
+                    for index in range(4)
+                ]
+                winding = sum(turns)
+                same_direction = all(turn > 0.0 for turn in turns) or all(
+                    turn < 0.0 for turn in turns
+                )
+                smooth_turns = max(abs(turn) for turn in turns) <= (
+                    self._config.pinwheel_max_turn_delta
+                )
+                if (
+                    abs(winding) >= period * self._config.pinwheel_winding_min
+                    and same_direction
+                    and smooth_turns
+                ):
+                    cores.append((y, x))
+        mask: set[tuple[int, int]] = set()
+        radius = self._config.pinwheel_exclusion_radius
+        for core_y, core_x in cores:
+            for y in range(max(0, core_y - radius), min(layout.height, core_y + radius + 2)):
+                for x in range(max(0, core_x - radius), min(layout.width, core_x + radius + 2)):
+                    mask.add((y, x))
+        return mask, len(cores)
+
+    def _edge_discontinuities(
+        self,
+        layout: "Layout",
+        pinwheel_mask: set[tuple[int, int]],
+    ) -> tuple[int, int]:
+        local_edges = 0
+        sharp_edges = 0
+        for index, (y, x) in enumerate(layout._positions):
+            for neighbour_y, neighbour_x in layout._grid_neighbour_cache[y * layout.width + x]:
+                neighbour = layout.grid[neighbour_y][neighbour_x]
+                if neighbour is None or int(neighbour) <= index:
+                    continue
+                if (y, x) in pinwheel_mask or (neighbour_y, neighbour_x) in pinwheel_mask:
+                    continue
+                local_edges += 1
+                delta = self._cyclic_delta(
+                    layout._points[index].hue,
+                    layout._points[int(neighbour)].hue,
+                    self._config.cyclic_period,
+                )
+                if delta >= self._config.sharp_delta:
+                    sharp_edges += 1
+        return local_edges, sharp_edges
+
+    def _spatial_noise(
+        self,
+        layout: "Layout",
+        pinwheel_mask: set[tuple[int, int]],
+    ) -> tuple[int, int]:
+        period = self._config.cyclic_period
+        evaluated = 0
+        noisy = 0
+        for index, (y, x) in enumerate(layout._positions):
+            if (y, x) in pinwheel_mask:
+                continue
+            neighbours = [
+                int(layout.grid[neighbour_y][neighbour_x])
+                for neighbour_y, neighbour_x in layout._grid_neighbour_cache[y * layout.width + x]
+                if layout.grid[neighbour_y][neighbour_x] is not None
+                and (neighbour_y, neighbour_x) not in pinwheel_mask
+            ]
+            if len(neighbours) < self._config.minimum_neighbours:
+                continue
+            angles = [
+                2.0 * math.pi * layout._points[neighbour].hue / period
+                for neighbour in neighbours
+            ]
+            sin_mean = sum(math.sin(angle) for angle in angles) / len(angles)
+            cos_mean = sum(math.cos(angle) for angle in angles) / len(angles)
+            coherence = math.hypot(sin_mean, cos_mean)
+            evaluated += 1
+            if coherence < self._config.neighbour_coherence_min:
+                noisy += 1
+                continue
+            mean_hue = (math.atan2(sin_mean, cos_mean) % (2.0 * math.pi)) * period / (
+                2.0 * math.pi
+            )
+            if (
+                self._cyclic_delta(layout._points[index].hue, mean_hue, period)
+                >= self._config.noise_delta
+            ):
+                noisy += 1
+        return evaluated, noisy
+
+    @staticmethod
+    def _signed_delta(value: float, reference: float, period: float) -> float:
+        return (value - reference + period / 2.0) % period - period / 2.0
+
+    @classmethod
+    def _cyclic_delta(cls, first: float, second: float, period: float) -> float:
+        return abs(cls._signed_delta(first, second, period))
+
+
+@dataclass(frozen=True)
+class StructuralLongPhaseQualityConfig:
+    local_similarity_gain_min: float
+    max_local_discontinuity_ratio: float
+    max_spatial_noise_ratio: float
+    global_sample_size: int
+    minimum_neighbours: int
+
+    def __post_init__(self) -> None:
+        if self.local_similarity_gain_min <= 1.0:
+            raise ValueError("local_similarity_gain_min must be greater than one")
+        if not 0.0 <= self.max_local_discontinuity_ratio <= 1.0:
+            raise ValueError("max_local_discontinuity_ratio must be in [0, 1]")
+        if not 0.0 <= self.max_spatial_noise_ratio <= 1.0:
+            raise ValueError("max_spatial_noise_ratio must be in [0, 1]")
+        if self.global_sample_size <= 0 or self.minimum_neighbours <= 0:
+            raise ValueError("structural quality sample sizes must be positive")
+
+
+class StructuralLongPhaseQualityEvaluator:
+    """Проверяет C2 по топологии многопризнаковых кодов, а не по ложному hue (§5.8, §5.13)."""
+
+    def __init__(self, config: StructuralLongPhaseQualityConfig) -> None:
+        self._config = config
+
+    def evaluate(
+        self,
+        layout: "Layout",
+        run_report: LayoutRunReport | None,
+    ) -> LongPhaseQualityReport:
+        baselines = self._global_similarity_baselines(layout)
+        local_edges, sharp_edges = self._edge_discontinuities(layout, baselines)
+        evaluated_points, noisy_points = self._spatial_noise(layout, baselines)
+        local_ratio = sharp_edges / local_edges if local_edges else 0.0
+        noise_ratio = noisy_points / evaluated_points if evaluated_points else 0.0
+        dynamics_converged = bool(
+            run_report is not None
+            and run_report.mode == "long"
+            and run_report.converged
+            and not run_report.convergence_limit_reached
+        )
+        accepted = (
+            dynamics_converged
+            and local_ratio <= self._config.max_local_discontinuity_ratio
+            and noise_ratio <= self._config.max_spatial_noise_ratio
+        )
+        return LongPhaseQualityReport(
+            accepted=accepted,
+            dynamics_converged=dynamics_converged,
+            step=0 if run_report is None else run_report.final_step,
+            radius=0 if run_report is None else run_report.pair_radius,
+            swap_ratio=1.0 if run_report is None else run_report.swap_ratio,
+            average_swap_ratio=1.0 if run_report is None else run_report.average_swap_ratio,
+            energy=None if run_report is None else run_report.energy,
+            energy_max_relative_delta=None
+            if run_report is None
+            else run_report.energy_max_relative_delta,
+            local_edges=local_edges,
+            sharp_edges=sharp_edges,
+            local_discontinuity_ratio=local_ratio,
+            evaluated_points=evaluated_points,
+            noisy_points=noisy_points,
+            spatial_noise_ratio=noise_ratio,
+            pinwheel_cores=0,
+        )
+
+    def _global_similarity_baselines(self, layout: "Layout") -> list[float | None]:
+        count = len(layout._points)
+        baselines: list[float | None] = [None] * count
+        non_empty = [index for index, point in enumerate(layout._points) if point.ones > 0]
+        if len(non_empty) <= 1:
+            return baselines
+        sample_size = min(self._config.global_sample_size, len(non_empty) - 1)
+        stride = 37
+        while math.gcd(stride, len(non_empty)) != 1:
+            stride += 1
+        for offset, index in enumerate(non_empty):
+            samples: list[float] = []
+            cursor = (offset * 977 + 37) % len(non_empty)
+            while len(samples) < sample_size:
+                other = non_empty[cursor]
+                cursor = (cursor + stride) % len(non_empty)
+                if other == index:
+                    continue
+                samples.append(
+                    _similarity_base_points(
+                        layout._points[index],
+                        layout._points[other],
+                        layout._similarity,
+                    )
+                )
+            baselines[index] = sum(samples) / len(samples)
+        return baselines
+
+    def _edge_discontinuities(
+        self,
+        layout: "Layout",
+        baselines: Sequence[float | None],
+    ) -> tuple[int, int]:
+        edges = 0
+        sharp = 0
+        gain = self._config.local_similarity_gain_min
+        for index, (y, x) in enumerate(layout._positions):
+            baseline = baselines[index]
+            if baseline is None:
+                continue
+            for neighbour_y, neighbour_x in layout._grid_neighbour_cache[
+                y * layout.width + x
+            ]:
+                neighbour = layout.grid[neighbour_y][neighbour_x]
+                if neighbour is None or int(neighbour) <= index:
+                    continue
+                neighbour_index = int(neighbour)
+                neighbour_baseline = baselines[neighbour_index]
+                if neighbour_baseline is None:
+                    continue
+                similarity = _similarity_base_points(
+                    layout._points[index],
+                    layout._points[neighbour_index],
+                    layout._similarity,
+                )
+                threshold = gain * math.sqrt(baseline * neighbour_baseline)
+                edges += 1
+                if similarity < threshold:
+                    sharp += 1
+        return edges, sharp
+
+    def _spatial_noise(
+        self,
+        layout: "Layout",
+        baselines: Sequence[float | None],
+    ) -> tuple[int, int]:
+        evaluated = 0
+        noisy = 0
+        for index, (y, x) in enumerate(layout._positions):
+            baseline = baselines[index]
+            if baseline is None:
+                continue
+            similarities = [
+                _similarity_base_points(
+                    layout._points[index],
+                    layout._points[int(neighbour)],
+                    layout._similarity,
+                )
+                for neighbour_y, neighbour_x in layout._grid_neighbour_cache[
+                    y * layout.width + x
+                ]
+                if (neighbour := layout.grid[neighbour_y][neighbour_x]) is not None
+                and baselines[int(neighbour)] is not None
+            ]
+            if len(similarities) < self._config.minimum_neighbours:
+                continue
+            evaluated += 1
+            local_similarity = sum(similarities) / len(similarities)
+            if local_similarity < baseline * self._config.local_similarity_gain_min:
+                noisy += 1
+        return evaluated, noisy
 
 
 class _WeightedIndexSampler:
@@ -251,7 +641,10 @@ class _GpuLayoutEngine:
         uniform sampler2D pos_tex;
         uniform sampler2D pair_idx_tex;
         uniform sampler2D pair_pos_tex;
+        uniform sampler2D eval_idx_tex;
         uniform int point_count;
+        uniform int eval_count;
+        uniform int use_eval_subset;
         uniform int mode;
         uniform float radius;
         uniform int use_radius_override;
@@ -302,7 +695,11 @@ class _GpuLayoutEngine:
                 radius_sq = rad * rad;
             }
 
-            for (int idx = 0; idx < point_count; idx++) {
+            int loop_count = use_eval_subset == 1 ? eval_count : point_count;
+            for (int eval_offset = 0; eval_offset < loop_count; eval_offset++) {
+                int idx = use_eval_subset == 1
+                    ? int(texelFetch(eval_idx_tex, ivec2(eval_offset, 0), 0).r)
+                    : eval_offset;
                 if (idx == idx_a || idx == idx_b) {
                     continue;
                 }
@@ -439,6 +836,8 @@ class _GpuLayoutEngine:
         self._pair_pos_tex = None
         self._pair_out_tex = None
         self._pair_fbo = None
+        self._eval_idx_tex = None
+        self._eval_capacity = 0
 
         self._avg_out_tex = None
         self._avg_fbo = None
@@ -507,10 +906,10 @@ class _GpuLayoutEngine:
     def has_similarity(self) -> bool:
         return self._sim_tex is not None
 
-    def build_similarity_matrix(self) -> list[list[float]] | None:
+    def prepare_similarity_texture(self) -> bool:
         point_count = self._point_count
         if point_count == 0:
-            return []
+            return False
 
         codes_tex = self._ctx.texture(
             (self._code_len, point_count),
@@ -541,10 +940,18 @@ class _GpuLayoutEngine:
         self._sim_fbo.use()
         self._ctx.viewport = (0, 0, point_count, point_count)
         self._sim_vao.render(mode=self._gl.TRIANGLES, vertices=3)
+        codes_tex.release()
+        ones_tex.release()
+        return True
 
+    def build_similarity_matrix(self) -> list[list[float]] | None:
+        if not self.prepare_similarity_texture():
+            return []
+
+        assert self._sim_tex is not None
         data = self._sim_tex.read()
         sim_matrix = self._np.frombuffer(data, dtype=self._np.float32).reshape(
-            (point_count, point_count)
+            (self._point_count, self._point_count)
         )
         return sim_matrix.tolist()
 
@@ -597,6 +1004,7 @@ class _GpuLayoutEngine:
         lambda_threshold: float,
         eta: float | None,
         distance_eps: float,
+        eval_indices: Sequence[int] | None = None,
     ) -> list[tuple[float, float]] | None:
         if self._sim_tex is None:
             return None
@@ -626,16 +1034,37 @@ class _GpuLayoutEngine:
         self._pair_pos_tex.write(
             pos_data.tobytes(), viewport=(0, 0, pair_count, 1)
         )
+        eval_count = 0
+        if eval_indices:
+            eval_count = len(eval_indices)
+            if eval_count > self._eval_capacity:
+                self._eval_capacity = max(eval_count, self._eval_capacity * 2 or 1)
+                if self._eval_idx_tex is not None:
+                    self._eval_idx_tex.release()
+                self._eval_idx_tex = self._ctx.texture(
+                    (self._eval_capacity, 1), 1, dtype="f4"
+                )
+                self._eval_idx_tex.filter = (self._gl.NEAREST, self._gl.NEAREST)
+            assert self._eval_idx_tex is not None
+            eval_data = self._np.asarray(eval_indices, dtype=self._np.float32)
+            self._eval_idx_tex.write(
+                eval_data.tobytes(), viewport=(0, 0, eval_count, 1)
+            )
 
         self._sim_tex.use(location=0)
         self._pos_tex.use(location=1)
         self._pair_idx_tex.use(location=2)
         self._pair_pos_tex.use(location=3)
+        if self._eval_idx_tex is not None:
+            self._eval_idx_tex.use(location=4)
         self._pair_prog["sim_tex"].value = 0
         self._pair_prog["pos_tex"].value = 1
         self._pair_prog["pair_idx_tex"].value = 2
         self._pair_prog["pair_pos_tex"].value = 3
+        self._pair_prog["eval_idx_tex"].value = 4
         self._pair_prog["point_count"].value = self._point_count
+        self._pair_prog["eval_count"].value = eval_count
+        self._pair_prog["use_eval_subset"].value = 1 if eval_count > 0 else 0
         self._pair_prog["mode"].value = 0 if mode == "long" else 1
         self._pair_prog["use_radius_override"].value = (
             1 if local_radius is not None else 0
@@ -704,6 +1133,7 @@ class _GpuLayoutEngine:
 @dataclass(frozen=True)
 class _TensorEnergyBatch:
     energies: list[tuple[float, float]]
+    diagnostic_indices: list[int]
     contrib_points: list[int]
     s1_min: list[float]
     s1_max: list[float]
@@ -737,7 +1167,15 @@ class _TensorLayoutEngine:
         self._torch = torch_mod
         self._device = device
         self._similarity = similarity
-        self._codes = self._torch.as_tensor(code_matrix, dtype=self._torch.float32, device=device)
+        device_type = getattr(device, "type", str(device)).lower()
+        self._code_dtype = (
+            self._torch.float16 if device_type == "cuda" else self._torch.float32
+        )
+        self._codes = self._torch.as_tensor(
+            code_matrix,
+            dtype=self._code_dtype,
+            device=device,
+        )
         self._ones = self._torch.as_tensor(ones, dtype=self._torch.float32, device=device)
         self._point_count = code_matrix.shape[0]
         self._subset_indices: tuple[int, ...] | None = None
@@ -801,7 +1239,11 @@ class _TensorLayoutEngine:
         LOGGER.event(
             "layout.gpu.tensor.enabled",
             section=GPU_IMPLEMENTATION,
-            data={"device": str(device), "similarity": similarity},
+            data={
+                "device": str(device),
+                "similarity": similarity,
+                "code_dtype": str(engine._code_dtype),
+            },
         )
         return engine
 
@@ -888,7 +1330,9 @@ class _TensorLayoutEngine:
             raise RuntimeError("subset is not prepared")
         rows = self._codes[self._torch.as_tensor(row_indices, device=self._device)]
         cols = self._codes[self._subset_tensor].T
-        common = rows @ cols
+        # Бинарные скалярные произведения до 2048 точны в FP16; дальнейшие
+        # нормализация и порог §5.4 выполняются в FP32.
+        common = (rows @ cols).to(dtype=self._torch.float32)
         ones_rows = self._ones[self._torch.as_tensor(row_indices, device=self._device)]
         ones_cols = self._ones[self._subset_tensor]
         if self._similarity == "cosine":
@@ -902,6 +1346,15 @@ class _TensorLayoutEngine:
         sim = self._apply_lambda_tensor(sim, self._lambda or 0.0, self._eta)
         return sim
 
+    def ensure_similarity_rows(self, row_indices: Sequence[int]) -> None:
+        missing = [index for index in row_indices if index not in self._sim_cache]
+        if not missing:
+            return
+        with self._torch.no_grad():
+            sim = self._similarity_block_tensor(missing)
+            for index, row in zip(missing, sim):
+                self._sim_cache[index] = row
+
     def similarity_block(
         self,
         row_indices: Sequence[int],
@@ -912,9 +1365,11 @@ class _TensorLayoutEngine:
         if not self.ensure_subset(subset_indices, lambda_threshold, eta):
             return None
         with self._torch.no_grad():
-            sim = self._similarity_block_tensor(row_indices)
-            for idx, row in zip(row_indices, sim):
-                self._sim_cache[idx] = row
+            self.ensure_similarity_rows(row_indices)
+            sim = self._torch.stack(
+                [self._sim_cache[index] for index in row_indices],
+                dim=0,
+            )
             return sim.cpu().numpy().astype("float32", copy=False)
 
     def _get_sim_row(
@@ -948,6 +1403,7 @@ class _TensorLayoutEngine:
         pos_x: Sequence[int],
         sim_lookup: Mapping[int, "numpy.ndarray"],
         distance_eps: float,
+        diagnostic_indices: Sequence[int] = (),
     ) -> _TensorEnergyBatch | None:
         if self._subset_tensor is None or not pairs:
             return None
@@ -1032,7 +1488,19 @@ class _TensorLayoutEngine:
             energy_c = torch.sum(s1 * dist1 + s2 * dist2, dim=1)
             energy_s = torch.sum(s2 * dist1 + s1 * dist2, dim=1)
 
-            contrib_mask = (s1 > 0.0) | (s2 > 0.0)
+            valid_diagnostic_indices = [
+                index for index in diagnostic_indices if 0 <= index < len(pairs)
+            ]
+            diag_index_tensor = torch.as_tensor(
+                valid_diagnostic_indices,
+                dtype=torch.long,
+                device=device,
+            )
+            diag_s1 = s1[diag_index_tensor]
+            diag_s2 = s2[diag_index_tensor]
+            diag_dist1 = dist1[diag_index_tensor]
+            diag_dist2 = dist2[diag_index_tensor]
+            contrib_mask = (diag_s1 > 0.0) | (diag_s2 > 0.0)
             contrib_counts = torch.sum(contrib_mask, dim=1)
 
             def _masked_min(values: "Any") -> "Any":
@@ -1047,16 +1515,22 @@ class _TensorLayoutEngine:
                 maxs = torch.max(masked, dim=1).values
                 return torch.where(contrib_counts > 0, maxs, torch.zeros_like(maxs))
 
-            s1_sum = torch.sum(torch.where(contrib_mask, s1, torch.zeros_like(s1)), dim=1)
-            s2_sum = torch.sum(torch.where(contrib_mask, s2, torch.zeros_like(s2)), dim=1)
-            s1_min = _masked_min(s1)
-            s1_max = _masked_max(s1)
-            s2_min = _masked_min(s2)
-            s2_max = _masked_max(s2)
-            d1_min = _masked_min(dist1)
-            d1_max = _masked_max(dist1)
-            d2_min = _masked_min(dist2)
-            d2_max = _masked_max(dist2)
+            s1_sum = torch.sum(
+                torch.where(contrib_mask, diag_s1, torch.zeros_like(diag_s1)),
+                dim=1,
+            )
+            s2_sum = torch.sum(
+                torch.where(contrib_mask, diag_s2, torch.zeros_like(diag_s2)),
+                dim=1,
+            )
+            s1_min = _masked_min(diag_s1)
+            s1_max = _masked_max(diag_s1)
+            s2_min = _masked_min(diag_s2)
+            s2_max = _masked_max(diag_s2)
+            d1_min = _masked_min(diag_dist1)
+            d1_max = _masked_max(diag_dist1)
+            d2_min = _masked_min(diag_dist2)
+            d2_max = _masked_max(diag_dist2)
 
             energies = list(
                 zip(
@@ -1066,6 +1540,7 @@ class _TensorLayoutEngine:
             )
             return _TensorEnergyBatch(
                 energies=energies,
+                diagnostic_indices=valid_diagnostic_indices,
                 contrib_points=[int(v) for v in contrib_counts.detach().cpu().tolist()],
                 s1_min=[float(v) for v in s1_min.detach().cpu().tolist()],
                 s1_max=[float(v) for v in s1_max.detach().cpu().tolist()],
@@ -1261,7 +1736,8 @@ class _EnergyStabilityMonitor:
     def update(self, energy: float) -> tuple[bool, float | None, float]:
         diff = None
         if self.last_energy is not None:
-            diff = abs(energy - self.last_energy)
+            scale = max(abs(self.last_energy), abs(energy), 1e-12)
+            diff = abs(energy - self.last_energy) / scale
             self.history.append(diff)
         self.last_energy = energy
         if len(self.history) < self.history.maxlen:
@@ -1290,6 +1766,33 @@ class _SwapStallMonitor:
         if len(self.history) < self.history.maxlen:
             return False, ratio, average
         return average <= self.min_ratio, ratio, average
+
+    def reset(self) -> None:
+        self.history.clear()
+
+
+@dataclass
+class _PhaseConvergenceState:
+    require_swap_stability: bool
+    require_energy_stability: bool
+    swap_stable: bool = False
+    energy_stable: bool = False
+
+    def reset(self) -> None:
+        self.swap_stable = False
+        self.energy_stable = False
+
+    def update_swaps(self, stable: bool) -> None:
+        self.swap_stable = stable
+
+    def update_energy(self, stable: bool) -> None:
+        self.energy_stable = stable
+
+    @property
+    def converged(self) -> bool:
+        swaps_ready = not self.require_swap_stability or self.swap_stable
+        energy_ready = not self.require_energy_stability or self.energy_stable
+        return swaps_ready and energy_ready
 
 
 class Layout:
@@ -1350,9 +1853,11 @@ class Layout:
             raise ValueError("long_subset_size must be positive when set")
         self._long_subset_refresh = max(1, int(long_subset_refresh))
         self._colorizer = colorizer
+        self._colors_rgb_cache: tuple[tuple[int, int, int], ...] | None = None
         self._long_subset_indices: list[int] = []
         self._long_subset_last_step: int = 0
         self._long_step_counter: int = 0
+        self._long_subset_frozen = False
         self._subset_similarity_cache: dict[int, "numpy.ndarray"] = {}
         self._short_subset_indices: tuple[int, ...] | None = None
         self._short_similarity_cache: dict[int, "numpy.ndarray"] = {}
@@ -1506,6 +2011,7 @@ class Layout:
                 data={"status": "cpu"},
             )
         self.last_steps = 0
+        self.last_run_report: LayoutRunReport | None = None
         self._sim_base: list[list[float]] | None = None
         if precompute_similarity and self._point_count <= max_precompute:
             self._build_similarity_cache()
@@ -1530,6 +2036,7 @@ class Layout:
         self._codes = replacement_codes
         self._points = replacement_points
         self._colorizer = colorizer
+        self._colors_rgb_cache = None
         self._labels = [self._format_label(point.label) for point in self._points]
         self._values = [point.code.to01() for point in self._points]
         self._code_ints = [
@@ -1627,6 +2134,8 @@ class Layout:
         adaptive_params: AdaptiveLayoutConfig | None = None,
         short_optim: ShortLayoutOptimConfig | None = None,
         save_on_stop_path: str | None = None,
+        converge_at_min_radius: bool = False,
+        max_convergence_steps: int = 0,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
@@ -1654,6 +2163,12 @@ class Layout:
             raise ValueError("energy_stability_every must be positive")
         if energy_stability_max_points is not None and energy_stability_max_points <= 0:
             raise ValueError("energy_stability_max_points must be positive when set")
+        if max_convergence_steps < 0:
+            raise ValueError("max_convergence_steps must be non-negative")
+        if converge_at_min_radius and adaptive_params is None:
+            raise ValueError("adaptive_params are required for min-radius convergence")
+        if converge_at_min_radius and max_convergence_steps <= 0:
+            raise ValueError("max_convergence_steps must be positive for convergence")
         if adaptive_params is not None:
             if adaptive_params.start_radius <= 0:
                 raise ValueError("adaptive start_radius must be positive")
@@ -1717,6 +2232,8 @@ class Layout:
                 "log_every": log_every,
                 "log_visuals": log_visuals,
                 "step_offset": step_offset,
+                "converge_at_min_radius": converge_at_min_radius,
+                "max_convergence_steps": max_convergence_steps,
             },
         )
         LOGGER.event(
@@ -1728,7 +2245,12 @@ class Layout:
         )
         energy_monitor: _EnergyStabilityMonitor | None = None
         if energy_stability_window is not None:
-            energy_measurements = ((steps - 1) // energy_stability_every) + 1
+            monitored_steps = steps + (
+                max_convergence_steps if converge_at_min_radius else 0
+            )
+            energy_measurements = (
+                ((monitored_steps - 1) // energy_stability_every) + 1
+            )
             reachable_window = min(energy_stability_window, max(0, energy_measurements - 1))
             if reachable_window > 0:
                 energy_monitor = _EnergyStabilityMonitor(
@@ -1758,6 +2280,10 @@ class Layout:
                     "pairs_per_step": pairs_per_step,
                 },
             )
+        convergence_state = _PhaseConvergenceState(
+            require_swap_stability=swap_monitor is not None,
+            require_energy_stability=energy_monitor is not None,
+        )
         adaptive_state: _AdaptiveLayoutState | None = None
         if adaptive_params is not None:
             adaptive_state = _AdaptiveLayoutState(adaptive_params, steps)
@@ -1820,13 +2346,64 @@ class Layout:
             )
         total_swaps = 0
         steps_executed = 0
+        final_swap_ratio = 1.0
+        final_average_swap_ratio = 1.0
+        final_energy_max_delta: float | None = None
+        converged = False
+        convergence_limit_reached = False
+        maximum_steps = steps + (
+            max_convergence_steps if converge_at_min_radius else 0
+        )
+        convergence_extension_logged = False
+        if mode == "long":
+            self._long_subset_frozen = False
 
-        for step in range(steps):
+        for step in range(maximum_steps):
             effective_pair_radius = (
                 adaptive_state.radius_for_step(step)
                 if adaptive_state is not None
                 else resolved_pair_radius
             )
+            convergence_eligible = (
+                not converge_at_min_radius
+                or (
+                    adaptive_params is not None
+                    and effective_pair_radius <= adaptive_params.end_radius
+                    and step >= steps - 1
+                )
+            )
+            if (
+                converge_at_min_radius
+                and step >= steps
+                and not convergence_extension_logged
+            ):
+                convergence_extension_logged = True
+                LOGGER.event(
+                    "layout.run.convergence.extend",
+                    section=OPTIM_PAIR_SELECTION,
+                    data={
+                        "mode": mode,
+                        "planned_steps": steps,
+                        "pair_radius": effective_pair_radius,
+                        "max_convergence_steps": max_convergence_steps,
+                    },
+                )
+            if (
+                mode == "long"
+                and converge_at_min_radius
+                and step >= steps - 1
+                and not self._long_subset_frozen
+            ):
+                self._long_subset_frozen = True
+                LOGGER.event(
+                    "layout.energy.subset.freeze",
+                    section=OPTIM_SUBSET,
+                    data={
+                        "planned_steps": steps,
+                        "step": step + step_offset,
+                        "selected": len(self._long_subset_indices),
+                    },
+                )
             swaps = self.step(
                 pairs_per_step=pairs_per_step,
                 pair_radius=effective_pair_radius,
@@ -1838,12 +2415,17 @@ class Layout:
             total_swaps += swaps
             steps_executed = step + 1
             current_step = step + step_offset
+            if swaps > 0:
+                convergence_state.update_energy(False)
             if swap_monitor is not None:
                 evaluated_pairs = max(1, self._last_evaluated_pairs)
                 should_stop_swaps, swap_ratio, avg_ratio = swap_monitor.update(
                     swaps, evaluated_pairs
                 )
+                convergence_state.update_swaps(should_stop_swaps)
                 avg_swaps_window = avg_ratio * evaluated_pairs
+                final_swap_ratio = swap_ratio
+                final_average_swap_ratio = avg_ratio
                 log_swap_ratio = LOGGER.should_log("layout.run.progress")
                 swap_visuals = (
                     LOGGER.visual_scalars(
@@ -1876,7 +2458,10 @@ class Layout:
                     visuals=swap_visuals,
                     force=log_swap_ratio,
                 )
-                if should_stop_swaps:
+                if (
+                    should_stop_swaps
+                    and not convergence_state.require_energy_stability
+                ):
                     LOGGER.event(
                         "layout.run.swap_stability.stop",
                         section=OPTIM_PAIR_SELECTION,
@@ -1965,7 +2550,7 @@ class Layout:
                     visuals=energy_visuals,
                     force=log_energy_progress,
                 )
-            if adaptive_state is not None:
+            if adaptive_state is not None and step < steps:
                 new_lambda, swap_ratio = adaptive_state.update_after_step(
                     step=step, swaps=swaps, current_lambda=self._lambda
                 )
@@ -2010,7 +2595,12 @@ class Layout:
                 should_stop, energy_diff, max_delta = energy_monitor.update(
                     energy_for_stability
                 )
-                if should_stop:
+                final_energy_max_delta = max_delta
+                convergence_state.update_energy(should_stop)
+                if (
+                    should_stop
+                    and not convergence_state.require_swap_stability
+                ):
                     LOGGER.event(
                         "layout.run.energy_stability.stop",
                         section=QUALITY_ASSESS,
@@ -2039,10 +2629,76 @@ class Layout:
                             mode=mode,
                         )
                     break
+            if (
+                convergence_eligible
+                and convergence_state.require_swap_stability
+                and convergence_state.require_energy_stability
+                and convergence_state.converged
+            ):
+                LOGGER.event(
+                    "layout.run.convergence.stop",
+                    section=QUALITY_ASSESS,
+                    data={
+                        "step": current_step,
+                        "mode": mode,
+                        "swap_stable": convergence_state.swap_stable,
+                        "energy_stable": convergence_state.energy_stable,
+                        "total_swaps": total_swaps,
+                    },
+                )
+                converged = True
+                if mode == "long":
+                    self._log_layout_state(
+                        path=log_path,
+                        step=current_step,
+                        mode=mode,
+                        log_visuals=log_visuals,
+                        force=True,
+                    )
+                    self._save_on_stop(
+                        path=save_on_stop_path,
+                        reason="joint_convergence",
+                        step=current_step,
+                        mode=mode,
+                    )
+                break
+
+        else:
+            if converge_at_min_radius:
+                convergence_limit_reached = True
+                LOGGER.event(
+                    "layout.run.convergence.limit",
+                    section=OPTIM_PAIR_SELECTION,
+                    data={
+                        "mode": mode,
+                        "planned_steps": steps,
+                        "max_convergence_steps": max_convergence_steps,
+                        "steps": steps_executed,
+                        "pair_radius": effective_pair_radius,
+                        "total_swaps": total_swaps,
+                    },
+                )
 
         self.last_steps = steps_executed
         avg_swaps = (total_swaps / steps_executed) if steps_executed else 0.0
         final_step = step_offset + max(steps_executed - 1, 0)
+        final_pair_radius = (
+            adaptive_state.radius_for_step(max(0, steps_executed - 1))
+            if adaptive_state is not None
+            else resolved_pair_radius
+        )
+        self.last_run_report = LayoutRunReport(
+            mode=mode,
+            final_step=final_step,
+            steps=steps_executed,
+            pair_radius=final_pair_radius,
+            swap_ratio=final_swap_ratio,
+            average_swap_ratio=final_average_swap_ratio,
+            energy=self._last_energy_value,
+            energy_max_relative_delta=final_energy_max_delta,
+            converged=converged,
+            convergence_limit_reached=convergence_limit_reached,
+        )
         self._log_layout_state(
             path=log_path,
             step=final_step,
@@ -2266,11 +2922,17 @@ class Layout:
             if tensor_swaps is not None:
                 return self._apply_tracked_swaps(tensor_swaps, mode=mode)
 
+        long_step_advanced = False
         if (
             self._gpu_engine is not None
             and self._ensure_gpu_similarity()
             and self._ensure_gpu_positions()
         ):
+            gpu_eval_indices: Sequence[int] | None = None
+            if mode == "long":
+                self._long_step_counter += 1
+                long_step_advanced = True
+                gpu_eval_indices = self._ensure_long_subset(self._long_step_counter)
             pair_data: list[tuple[int, int, int, int, int, int]] = []
             swap_coords: list[tuple[int, int, int, int]] = []
             for y1, x1, y2, x2 in pairs:
@@ -2306,6 +2968,7 @@ class Layout:
                         lambda_threshold=self._lambda,
                         eta=self._eta,
                         distance_eps=self._distance_eps,
+                        eval_indices=gpu_eval_indices,
                     )
                 else:
                     energies = []
@@ -2339,7 +3002,10 @@ class Layout:
                 pair_data.append((y1, x1, y2, x2, idx_a, idx_b))
                 swap_coords.append((y1, x1, y2, x2))
             if pair_data:
-                energies = self._calculate_far_energies(pair_data)
+                energies = self._calculate_far_energies(
+                    pair_data,
+                    advance_step=not long_step_advanced,
+                )
             else:
                 energies = []
             for (y1, x1, y2, x2), (energy_c, energy_s) in zip(
@@ -2468,17 +3134,10 @@ class Layout:
         second: int,
         config: ContinuityLayoutConfig,
     ) -> float:
-        if self._sim_base is None:
-            score = self._sim_lambda_idx(first, second)
-        else:
-            low, high = (first, second) if first <= second else (second, first)
-            cache_key = low * self._point_count + high
-            cached = self._continuity_score_cache.get(cache_key)
-            if cached is None:
-                score = self._sim_lambda_idx(first, second)
-                self._continuity_score_cache[cache_key] = score
-            else:
-                score = cached
+        # _sim_lambda_idx уже читает готовую матрицу за O(1), когда она есть.
+        # Кэш случайных candidate-пар почти не переиспользуется и на 10k точек
+        # разрастался до миллионов записей.
+        score = self._sim_lambda_idx(first, second)
         if config.cyclic_period is None or config.cyclic_weight <= 0.0:
             return score
         delta = abs(self._points[first].hue - self._points[second].hue)
@@ -2578,7 +3237,7 @@ class Layout:
         occupied = list(self._positions)
         self._continuity_score_cache.clear()
         total_swaps = 0
-        stalled = 0
+        improvement_history: deque[int] = deque(maxlen=config.stall_sweeps)
         LOGGER.event(
             "layout.continuity.start",
             section=ENERGY_SHORT,
@@ -2588,6 +3247,7 @@ class Layout:
                 "candidates_per_point": config.candidates_per_point,
                 "min_gain": config.min_gain,
                 "stall_sweeps": config.stall_sweeps,
+                "stall_max_swaps": config.stall_max_swaps,
                 "cyclic_period": config.cyclic_period,
                 "cyclic_weight": config.cyclic_weight,
                 "cyclic_sharp_threshold": config.cyclic_sharp_threshold,
@@ -2659,12 +3319,12 @@ class Layout:
                     timeline="continuity_sweep",
                 ),
             )
-            if swaps == 0:
-                stalled += 1
-                if stalled >= config.stall_sweeps:
-                    break
-            else:
-                stalled = 0
+            improvement_history.append(swaps)
+            if (
+                len(improvement_history) == improvement_history.maxlen
+                and sum(improvement_history) <= config.stall_max_swaps
+            ):
+                break
         LOGGER.event(
             "layout.continuity.done",
             section=MAPPING_CONTINUITY,
@@ -2734,6 +3394,20 @@ class Layout:
                 "seed": self._seed,
                 "rng_state": self._rng.getstate(),
                 "last_steps": self.last_steps,
+                "last_run_report": None
+                if self.last_run_report is None
+                else {
+                    "mode": self.last_run_report.mode,
+                    "final_step": self.last_run_report.final_step,
+                    "steps": self.last_run_report.steps,
+                    "pair_radius": self.last_run_report.pair_radius,
+                    "swap_ratio": self.last_run_report.swap_ratio,
+                    "average_swap_ratio": self.last_run_report.average_swap_ratio,
+                    "energy": self.last_run_report.energy,
+                    "energy_max_relative_delta": self.last_run_report.energy_max_relative_delta,
+                    "converged": self.last_run_report.converged,
+                    "convergence_limit_reached": self.last_run_report.convergence_limit_reached,
+                },
                 "long_step_counter": self._long_step_counter,
                 "code_signature": self._code_signature(),
                 "layout": points_payload,
@@ -2835,6 +3509,29 @@ class Layout:
             if rng_state is not None:
                 self._rng.setstate(self._nested_tuple(rng_state))
             self.last_steps = int(payload.get("last_steps", 0))
+            run_report = payload.get("last_run_report")
+            self.last_run_report = (
+                None
+                if not isinstance(run_report, dict)
+                else LayoutRunReport(
+                    mode=str(run_report["mode"]),
+                    final_step=int(run_report["final_step"]),
+                    steps=int(run_report["steps"]),
+                    pair_radius=int(run_report["pair_radius"]),
+                    swap_ratio=float(run_report["swap_ratio"]),
+                    average_swap_ratio=float(run_report["average_swap_ratio"]),
+                    energy=None
+                    if run_report.get("energy") is None
+                    else float(run_report["energy"]),
+                    energy_max_relative_delta=None
+                    if run_report.get("energy_max_relative_delta") is None
+                    else float(run_report["energy_max_relative_delta"]),
+                    converged=bool(run_report["converged"]),
+                    convergence_limit_reached=bool(
+                        run_report["convergence_limit_reached"]
+                    ),
+                )
+            )
             self._long_step_counter = int(payload.get("long_step_counter", 0))
             self._gpu_positions_dirty = True
         except Exception as exc:
@@ -2858,7 +3555,14 @@ class Layout:
         return value
 
     def colors_rgb(self) -> list[tuple[int, int, int]]:
-        return [self._code_to_rgb(point.code) for point in self._points]
+        if self._colors_rgb_cache is None:
+            color_hue = getattr(self._colorizer, "color_hue", None)
+            if callable(color_hue):
+                colors = [color_hue(point.hue) for point in self._points]
+            else:
+                colors = [self._code_to_rgb(point.code) for point in self._points]
+            self._colors_rgb_cache = tuple(colors)
+        return list(self._colors_rgb_cache)
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
         colors = self.colors_rgb()
@@ -3060,6 +3764,18 @@ class Layout:
         y_max_bound = (self.height - 1) if bounds is None else bounds[1]
         x_min_bound = 0 if bounds is None else bounds[2]
         x_max_bound = (self.width - 1) if bounds is None else bounds[3]
+        # Случайная плитка разбиения может состоять из единственной клетки.
+        # В ней нет второй точки, поэтому локальный цикл никогда не завершится.
+        if (
+            y_min_bound == y_max_bound
+            and x_min_bound == x_max_bound
+            and y_min_bound == y1
+            and x_min_bound == x1
+        ):
+            y_min_bound = 0
+            y_max_bound = self.height - 1
+            x_min_bound = 0
+            x_max_bound = self.width - 1
         if radius is None:
             while True:
                 y2 = self._rng.randint(y_min_bound, y_max_bound)
@@ -3591,7 +4307,21 @@ class Layout:
                 if idx is not None
             }
         )
-        missing = [idx for idx in unique_indices if idx not in self._short_similarity_cache]
+        tensor_rows_ready = False
+        try:
+            tensor_engine.ensure_similarity_rows(unique_indices)
+            tensor_rows_ready = True
+        except Exception as exc:
+            LOGGER.event(
+                "layout.gpu.tensor.short.sim_failed",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc), "retry": False, "stage": "gpu_cache"},
+            )
+        missing = (
+            []
+            if tensor_rows_ready
+            else [idx for idx in unique_indices if idx not in self._short_similarity_cache]
+        )
         if missing:
             missing_matrix: "numpy.ndarray | None"
             try:
@@ -3871,7 +4601,25 @@ class Layout:
         if not unique_indices:
             return [(0.0, 0.0) for _ in pairs]
 
-        missing = [idx for idx in unique_indices if idx not in self._subset_similarity_cache]
+        tensor_rows_ready = False
+        if tensor_ready and tensor_engine is not None:
+            try:
+                tensor_engine.ensure_similarity_rows(unique_indices)
+                tensor_rows_ready = True
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.gpu.tensor.disabled",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc), "stage": "gpu_cache"},
+                )
+                tensor_ready = False
+                tensor_engine = None
+                self._tensor_engine = None
+        missing = (
+            []
+            if tensor_rows_ready
+            else [idx for idx in unique_indices if idx not in self._subset_similarity_cache]
+        )
         if missing:
             missing_matrix: "np.ndarray | None" = None
             if tensor_ready and tensor_engine is not None:
@@ -3900,6 +4648,11 @@ class Layout:
 
         if tensor_ready and tensor_engine is not None:
             try:
+                diagnostic_indices = [
+                    pair_index
+                    for pair_index in range(batch_size)
+                    if LOGGER.should_log("layout.energy.long.pair")
+                ]
                 tensor_batch = tensor_engine.pair_energies(
                     pairs,
                     eval_indices,
@@ -3907,6 +4660,7 @@ class Layout:
                     self._pos_x,
                     sim_lookup,
                     self._distance_eps,
+                    diagnostic_indices=diagnostic_indices,
                 )
             except Exception as exc:
                 LOGGER.event(
@@ -3928,10 +4682,17 @@ class Layout:
                     },
                 )
                 gpu_results: list[tuple[float, float]] = []
+                diagnostic_positions = {
+                    pair_index: diagnostic_index
+                    for diagnostic_index, pair_index in enumerate(
+                        tensor_batch.diagnostic_indices
+                    )
+                }
                 for pair_idx, (y1, x1, y2, x2, idx_a, idx_b) in enumerate(pairs):
                     energy_c, energy_s = tensor_batch.energies[pair_idx]
                     gpu_results.append((float(energy_c), float(energy_s)))
-                    if not LOGGER.should_log("layout.energy.long.pair"):
+                    diagnostic_index = diagnostic_positions.get(pair_idx)
+                    if diagnostic_index is None:
                         continue
                     ones_a = 0 if idx_a is None else self._points[idx_a].ones
                     ones_b = 0 if idx_b is None else self._points[idx_b].ones
@@ -3950,17 +4711,19 @@ class Layout:
                             "ones_b": ones_b,
                             "phi_c": float(energy_c),
                             "phi_s": float(energy_s),
-                            "s1_sum": tensor_batch.s1_sum[pair_idx],
-                            "s2_sum": tensor_batch.s2_sum[pair_idx],
-                            "s1_min": tensor_batch.s1_min[pair_idx],
-                            "s1_max": tensor_batch.s1_max[pair_idx],
-                            "s2_min": tensor_batch.s2_min[pair_idx],
-                            "s2_max": tensor_batch.s2_max[pair_idx],
-                            "d1_min": tensor_batch.d1_min[pair_idx],
-                            "d1_max": tensor_batch.d1_max[pair_idx],
-                            "d2_min": tensor_batch.d2_min[pair_idx],
-                            "d2_max": tensor_batch.d2_max[pair_idx],
-                            "contrib_points": tensor_batch.contrib_points[pair_idx],
+                            "s1_sum": tensor_batch.s1_sum[diagnostic_index],
+                            "s2_sum": tensor_batch.s2_sum[diagnostic_index],
+                            "s1_min": tensor_batch.s1_min[diagnostic_index],
+                            "s1_max": tensor_batch.s1_max[diagnostic_index],
+                            "s2_min": tensor_batch.s2_min[diagnostic_index],
+                            "s2_max": tensor_batch.s2_max[diagnostic_index],
+                            "d1_min": tensor_batch.d1_min[diagnostic_index],
+                            "d1_max": tensor_batch.d1_max[diagnostic_index],
+                            "d2_min": tensor_batch.d2_min[diagnostic_index],
+                            "d2_max": tensor_batch.d2_max[diagnostic_index],
+                            "contrib_points": tensor_batch.contrib_points[
+                                diagnostic_index
+                            ],
                             "points_total": self._point_count,
                             "eval_points": len(eval_indices),
                         },
@@ -4130,7 +4893,11 @@ class Layout:
     ) -> int:
         used: set[tuple[int, int]] = set()
         swaps: list[tuple[int, int, int, int]] = []
-        for (y1, x1, y2, x2), delta in swaps_with_delta:
+        for (y1, x1, y2, x2), delta in sorted(
+            swaps_with_delta,
+            key=lambda item: item[1],
+            reverse=True,
+        ):
             if (y1, x1) in used or (y2, x2) in used:
                 continue
             swaps.append((y1, x1, y2, x2))
@@ -4397,15 +5164,20 @@ class Layout:
                 self._gpu_engine = None
                 return False
         try:
-            sim_base = self._gpu_engine.build_similarity_matrix()
+            ready = self._gpu_engine.prepare_similarity_texture()
         except Exception:
             self._gpu_engine = None
             return False
-        if sim_base is None:
-            return False
-        if self._sim_base is None:
-            self._sim_base = sim_base
-        return True
+        if ready:
+            LOGGER.event(
+                "layout.gpu.similarity.texture",
+                section=GPU_IMPLEMENTATION,
+                data={
+                    "points": self._point_count,
+                    "cpu_copy": False,
+                },
+            )
+        return ready
 
     def _ensure_gpu_positions(self) -> bool:
         if self._gpu_engine is None:
@@ -4489,7 +5261,7 @@ class Layout:
             return self._long_subset_indices
 
         need_refresh = not self._long_subset_indices
-        if step is not None:
+        if step is not None and not self._long_subset_frozen:
             need_refresh = need_refresh or (step - self._long_subset_last_step) >= self._long_subset_refresh
         if need_refresh:
             self._long_subset_indices = self._rng.sample(

@@ -8,11 +8,17 @@ import tempfile
 import threading
 import unittest
 from itertools import product
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from damp.activation import (
     ActivationEngine,
+    ActivationResult,
     Detector,
+    DetectorSpace,
+    DetectorSpaceCascade,
+    OrientationPreferenceHueResolver,
+    StructuralEmbeddingColorizer,
+    StructuralEmbeddingHueResolver,
     DetectorHierarchyCache,
     DetectorHierarchyBuilder,
     DetectorLayerConfig,
@@ -20,6 +26,7 @@ from damp.activation import (
     DetectorLayerConfigFactory,
     EmbeddingSaturationResolver,
 )
+from damp.activation.activation import _LocalEnergyLayoutOverlay
 from damp.decode import (
     DecoderConfig,
     DecoderParameterScaleResolver,
@@ -31,9 +38,14 @@ from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, EncoderCodeColorizer
 from damp.encoding.orientation_encoder import RetinotopicOrientationEncoder
 from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
+from damp.encoding.frequency_pruner import SparseCodeFrequencyPruner
 from damp.layout.damp_layout import (
+    AdaptiveLayoutConfig,
     ContinuityLayoutConfig,
     Layout,
+    LayoutRunReport,
+    LongPhaseQualityConfig,
+    LongPhaseQualityEvaluator,
     ShortLayoutOptimConfig,
     _WeightedIndexSampler,
 )
@@ -67,6 +79,162 @@ from main import (
 
 
 class ArticleInvariantTests(unittest.TestCase):
+    def test_frequency_pruner_removes_ubiquitous_embedding_bits(self) -> None:
+        codes = (
+            BitArray.from_indices(8, (0, 1)),
+            BitArray.from_indices(8, (0, 1)),
+            BitArray.from_indices(8, (0, 2)),
+            BitArray.from_indices(8, (0, 3)),
+        )
+
+        pruner = SparseCodeFrequencyPruner.fit(
+            codes,
+            max_document_frequency=0.75,
+        )
+
+        self.assertEqual(pruner.kept_indices, frozenset((1, 2, 3)))
+        self.assertEqual(pruner.transform(codes[0]).to01(), "01000000")
+
+    def test_detector_space_applies_input_frequency_pruner(self) -> None:
+        codes = (
+            BitArray.from_indices(8, (0, 1)),
+            BitArray.from_indices(8, (0, 2)),
+        )
+        pruner = SparseCodeFrequencyPruner.fit(
+            codes,
+            max_document_frequency=0.75,
+        )
+        engine = Mock()
+        embedding = BitArray.from_indices(8, (4,))
+        engine.activate.return_value = ActivationResult([], [], [], embedding)
+
+        result = DetectorSpace(2, engine, input_pruner=pruner).activate(
+            (codes[0],)
+        )
+
+        resolved = engine.activate.call_args.args[0][0]
+        self.assertEqual(resolved.to01(), "01000000")
+        self.assertEqual(result.embedding.to01(), embedding.to01())
+
+    def test_local_energy_overlay_preserves_layout_colors_and_uses_alpha(self) -> None:
+        class LayoutView:
+            height = 1
+            width = 3
+
+            @staticmethod
+            def positions() -> list[tuple[int, int]]:
+                return [(0, 0), (0, 1), (0, 2)]
+
+            @staticmethod
+            def colors_rgb() -> list[tuple[int, int, int]]:
+                return [(10, 20, 30), (40, 50, 60), (70, 80, 90)]
+
+        image = _LocalEnergyLayoutOverlay().render(  # type: ignore[arg-type]
+            LayoutView(),
+            (0.0, 1.0, 2.0),
+        )
+
+        self.assertEqual(image[0, 0].tolist(), [10, 20, 30, 0])
+        self.assertEqual(image[0, 1].tolist(), [40, 50, 60, 128])
+        self.assertEqual(image[0, 2].tolist(), [70, 80, 90, 255])
+
+    def test_orientation_preference_comes_from_probe_responses(self) -> None:
+        probes = (
+            (0.0, BitArray.from_indices(8, (0, 1))),
+            (45.0, BitArray.from_indices(8, (2, 3))),
+            (90.0, BitArray.from_indices(8, (4, 5))),
+            (135.0, BitArray.from_indices(8, (6, 7))),
+        )
+        resolver = OrientationPreferenceHueResolver(
+            probes=probes,
+            orientation_period=180.0,
+            minimum=0.0,
+            maximum=360.0,
+            temperature=0.01,
+        )
+
+        self.assertAlmostEqual(
+            resolver.resolve(BitArray.from_indices(8, (2, 3))),
+            90.0,
+            places=3,
+        )
+
+    def test_structural_hue_uses_detector_receptive_field_topology(self) -> None:
+        layout = Mock()
+        layout.positions.return_value = [(0, 0), (0, 10)]
+        layout.hues.return_value = [30.0, 210.0]
+        first_output = BitArray.from_indices(8, (1,))
+        second_output = BitArray.from_indices(8, (6,))
+        detectors = (
+            Detector((0.0, 0.0), 1.0, 0.5, 1.0, 1, first_output),
+            Detector((0.0, 10.0), 1.0, 0.5, 1.0, 1, second_output),
+        )
+        resolver = StructuralEmbeddingHueResolver.from_detector_space(
+            layout=layout,
+            detectors=detectors,
+            minimum=0.0,
+            maximum=360.0,
+        )
+
+        self.assertAlmostEqual(
+            resolver.resolve(BitArray.from_indices(8, (1,))),
+            180.0,
+        )
+        self.assertAlmostEqual(
+            resolver.resolve(BitArray.from_indices(8, (6,))),
+            0.0,
+        )
+        self.assertEqual(
+            StructuralEmbeddingColorizer(resolver).color(
+                BitArray.from_indices(8, (1,))
+            ),
+            (0, 255, 255),
+        )
+
+    def test_detector_space_two_consumes_space_one_embedding(self) -> None:
+        primary = BitArray.from_indices(8, (0, 1))
+        first_embedding = BitArray.from_indices(8, (2, 3))
+        second_embedding = BitArray.from_indices(8, (4, 5))
+        first_engine = Mock()
+        second_engine = Mock()
+        first_engine.activate.return_value = ActivationResult(
+            [], [], [], first_embedding
+        )
+        second_engine.activate.return_value = ActivationResult(
+            [], [], [], second_embedding
+        )
+        cascade = DetectorSpaceCascade(
+            (DetectorSpace(1, first_engine), DetectorSpace(2, second_engine))
+        )
+
+        result = cascade.activate((primary,))
+
+        first_engine.activate.assert_called_once_with((primary,))
+        second_engine.activate.assert_called_once_with((first_embedding,))
+        self.assertEqual(result.embedding.to01(), second_embedding.to01())
+
+    def test_short_partition_single_cell_falls_back_to_global_grid(self) -> None:
+        layout = Layout(
+            {
+                0.0: [
+                    BitArray.from_indices(8, (0,)),
+                    BitArray.from_indices(8, (1,)),
+                ]
+            },
+            grid_size=2,
+            empty_ratio=0.0,
+            similarity="jaccard",
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(0.0, 360.0),
+        )
+        y, x = layout.positions()[0]
+        sampled = layout._sample_nearby_position(
+            y, x, 1, bounds=(y, y, x, x)
+        )
+        self.assertNotEqual(sampled, (y, x))
+
     def test_sparse_bitarray_index_matches_dense_state(self) -> None:
         first = BitArray.from_indices(16, (1, 3, 7, 7))
         second = BitArray.from_indices(16, (3, 4, 7, 12))
@@ -1053,6 +1221,281 @@ class ArticleInvariantTests(unittest.TestCase):
             log_visuals=False,
         )
         self.assertEqual(layout.last_steps, 3)
+
+    def test_layout_extends_at_minimum_radius_until_swap_stability(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+
+        def fake_step(*, step_index: int, **_) -> int:
+            layout._last_evaluated_pairs = 1
+            return 1 if step_index < 3 else 0
+
+        layout.step = fake_step  # type: ignore[method-assign]
+        layout.run(
+            steps=3,
+            pairs_per_step=1,
+            pair_radius=3,
+            mode="long",
+            min_swap_ratio=0.1,
+            min_swap_window=2,
+            log_visuals=False,
+            adaptive_params=AdaptiveLayoutConfig(start_radius=3, end_radius=1),
+            converge_at_min_radius=True,
+            max_convergence_steps=10,
+        )
+        self.assertEqual(layout.last_steps, 5)
+
+    def test_energy_stability_uses_relative_change(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        energies = iter((1000.0, 1000.05, 1000.10))
+        layout.step = lambda **_: 0  # type: ignore[method-assign]
+        layout.average_local_energy = (  # type: ignore[method-assign]
+            lambda *_, **__: next(energies)
+        )
+        layout.run(
+            steps=10,
+            pairs_per_step=1,
+            pair_radius=1,
+            mode="long",
+            min_swap_ratio=0.0,
+            energy_radius=1,
+            energy_stability_window=2,
+            energy_stability_delta=0.0001,
+            energy_stability_every=1,
+            log_visuals=False,
+        )
+        self.assertEqual(layout.last_steps, 3)
+
+    def test_minimum_radius_requires_swap_and_energy_stability(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        energies = iter((1.0, 0.9, 0.8, 0.7, 0.7, 0.7, 0.7))
+
+        def fake_step(*, step_index: int, **_) -> int:
+            layout._last_evaluated_pairs = 1
+            return 1 if step_index < 3 else 0
+
+        layout.step = fake_step  # type: ignore[method-assign]
+        layout.average_local_energy = (  # type: ignore[method-assign]
+            lambda *_, **__: next(energies)
+        )
+        layout.run(
+            steps=3,
+            pairs_per_step=1,
+            pair_radius=3,
+            mode="long",
+            min_swap_ratio=0.1,
+            min_swap_window=2,
+            energy_radius=1,
+            energy_stability_window=2,
+            energy_stability_delta=0.001,
+            energy_stability_every=1,
+            log_visuals=False,
+            adaptive_params=AdaptiveLayoutConfig(start_radius=3, end_radius=1),
+            converge_at_min_radius=True,
+            max_convergence_steps=10,
+        )
+        self.assertEqual(layout.last_steps, 6)
+
+    def test_swap_invalidates_previous_energy_stability(self) -> None:
+        code = self._single_bit(8, 0)
+        layout = Layout(
+            {0.0: [code]},
+            grid_size=1,
+            empty_ratio=0.0,
+            lambda_threshold=0.0,
+            eta=None,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        swaps = (1, 1, 0, 1, 1, 0, 0)
+
+        def fake_step(*, step_index: int, **_) -> int:
+            layout._last_evaluated_pairs = 1
+            return swaps[step_index]
+
+        layout.step = fake_step  # type: ignore[method-assign]
+        layout.average_local_energy = (  # type: ignore[method-assign]
+            lambda *_, **__: 1.0
+        )
+        layout.run(
+            steps=2,
+            pairs_per_step=1,
+            pair_radius=2,
+            mode="long",
+            min_swap_ratio=0.5,
+            min_swap_window=1,
+            energy_radius=1,
+            energy_stability_window=1,
+            energy_stability_delta=0.001,
+            energy_stability_every=3,
+            log_visuals=False,
+            adaptive_params=AdaptiveLayoutConfig(start_radius=2, end_radius=1),
+            converge_at_min_radius=True,
+            max_convergence_steps=10,
+        )
+        self.assertEqual(layout.last_steps, 7)
+
+    @staticmethod
+    def _long_quality_config() -> LongPhaseQualityConfig:
+        return LongPhaseQualityConfig(
+            cyclic_period=360.0,
+            sharp_delta=45.0,
+            noise_delta=60.0,
+            neighbour_coherence_min=0.6,
+            max_local_discontinuity_ratio=0.3,
+            max_spatial_noise_ratio=0.15,
+            pinwheel_winding_min=0.75,
+            pinwheel_max_turn_delta=120.0,
+            pinwheel_exclusion_radius=0,
+            minimum_neighbours=3,
+        )
+
+    @staticmethod
+    def _converged_long_report() -> LayoutRunReport:
+        return LayoutRunReport(
+            mode="long",
+            final_step=5000,
+            steps=5000,
+            pair_radius=1,
+            swap_ratio=0.0,
+            average_swap_ratio=0.0,
+            energy=0.5,
+            energy_max_relative_delta=0.0,
+            converged=True,
+            convergence_limit_reached=False,
+        )
+
+    def test_long_quality_excludes_true_pinwheel_winding(self) -> None:
+        codes = {
+            hue: [self._single_bit(8, index)]
+            for index, hue in enumerate((0.0, 90.0, 180.0, 270.0))
+        }
+        layout = Layout(
+            codes,
+            grid_size=2,
+            empty_ratio=0.0,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        layout.grid = [[0, 1], [3, 2]]
+        layout._positions = [(0, 0), (0, 1), (1, 1), (1, 0)]
+        report = LongPhaseQualityEvaluator(self._long_quality_config()).evaluate(
+            layout,
+            self._converged_long_report(),
+        )
+        self.assertTrue(report.accepted)
+        self.assertEqual(report.pinwheel_cores, 1)
+        self.assertEqual(report.spatial_noise_ratio, 0.0)
+
+    def test_long_quality_rejects_isolated_spatial_noise(self) -> None:
+        hues = (0.0, 0.0, 0.0, 0.0, 120.0, 0.0, 0.0, 0.0, 0.0)
+        codes: dict[float, list[BitArray]] = {}
+        for index, hue in enumerate(hues):
+            codes.setdefault(hue, []).append(self._single_bit(16, index))
+        layout = Layout(
+            codes,
+            grid_size=3,
+            empty_ratio=0.0,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        zero_indices = [
+            index for index, point in enumerate(layout._points) if point.hue == 0.0
+        ]
+        noisy_index = next(
+            index for index, point in enumerate(layout._points) if point.hue == 120.0
+        )
+        ordered = zero_indices[:4] + [noisy_index] + zero_indices[4:]
+        layout.grid = [ordered[row * 3 : row * 3 + 3] for row in range(3)]
+        layout._positions = [(-1, -1)] * len(ordered)
+        for y, row in enumerate(layout.grid):
+            for x, index in enumerate(row):
+                layout._positions[index] = (y, x)
+        report = LongPhaseQualityEvaluator(self._long_quality_config()).evaluate(
+            layout,
+            self._converged_long_report(),
+        )
+        self.assertFalse(report.accepted)
+        self.assertEqual(report.pinwheel_cores, 0)
+        self.assertGreater(report.local_discontinuity_ratio, 0.3)
+
+    def test_long_quality_counts_incoherent_neighbourhood_as_noise(self) -> None:
+        hues = (0.0, 120.0, 240.0, 120.0, 0.0, 240.0, 240.0, 120.0, 0.0)
+        codes: dict[float, list[BitArray]] = {}
+        for index, hue in enumerate(hues):
+            codes.setdefault(hue, []).append(self._single_bit(16, index))
+        layout = Layout(
+            codes,
+            grid_size=3,
+            empty_ratio=0.0,
+            use_gpu=False,
+            colorizer=EncoderCodeColorizer(
+                LAYOUT_PSEUDO_COLOR_MIN_HUE,
+                LAYOUT_PSEUDO_COLOR_MAX_HUE,
+            ),
+        )
+        indices_by_hue: dict[float, list[int]] = {}
+        for index, point in enumerate(layout._points):
+            indices_by_hue.setdefault(point.hue, []).append(index)
+        ordered = [
+            indices_by_hue[hue].pop()
+            for hue in hues
+        ]
+        layout.grid = [ordered[row * 3 : row * 3 + 3] for row in range(3)]
+        layout._positions = [(-1, -1)] * len(ordered)
+        for y, row in enumerate(layout.grid):
+            for x, index in enumerate(row):
+                layout._positions[index] = (y, x)
+        report = LongPhaseQualityEvaluator(self._long_quality_config()).evaluate(
+            layout,
+            self._converged_long_report(),
+        )
+        self.assertFalse(report.accepted)
+        self.assertGreater(report.spatial_noise_ratio, 0.15)
 
     def test_pinwheel_surface_is_nine_positions_times_angles(self) -> None:
         surface = RetinotopicAngleSurface()

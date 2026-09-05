@@ -628,6 +628,31 @@ class ActivationMap:
         )
 
 
+class _LocalEnergyLayoutOverlay:
+    """Накладывает локальную энергию прозрачностью на цвета Layout (§5.8, §6.2)."""
+
+    def render(
+        self,
+        layout: Layout,
+        energies: Sequence[float],
+    ):
+        if np is None:
+            raise RuntimeError("numpy is required for local energy visualization")
+        positions = layout.positions()
+        colors = layout.colors_rgb()
+        if len(energies) != len(positions) or len(colors) != len(positions):
+            raise ValueError("local energy overlay must match layout points")
+
+        image = np.zeros((layout.height, layout.width, 4), dtype=np.uint8)
+        energy_max = max((max(0.0, float(value)) for value in energies), default=0.0)
+        energy_scale = 1.0 / energy_max if energy_max > 0.0 else 0.0
+        for (y, x), color, energy in zip(positions, colors, energies):
+            normalized = max(0.0, min(1.0, float(energy) * energy_scale))
+            image[y, x, :3] = color
+            image[y, x, 3] = int(round(normalized * 255.0))
+        return image
+
+
 class _ActivationEngineBase:
     def __init__(
         self,
@@ -678,6 +703,14 @@ class _ActivationEngineBase:
             },
         )
         self._log_structure_overview()
+
+    @property
+    def layout(self) -> Layout:
+        return self._layout
+
+    @property
+    def detectors(self) -> tuple[Detector, ...]:
+        return tuple(self._detectors)
 
     def activate(self, stimuli: Sequence[BitArray]) -> ActivationResult:
         activation_values = self._activation_map.compute(stimuli)
@@ -1952,12 +1985,11 @@ class ActivationEngine(_ActivationEngineBase):
 
     def _log_structure_overview(self) -> None:
         positions = self._activation_map.positions
-        point_positions = [(x + 0.5, y + 0.5) for y, x in positions]
         energy_max = max(self._energies, default=0.0)
-        energy_scale = 1.0 / energy_max if energy_max > 0.0 else 0.0
-        energy_colors = [
-            self._value_to_rgba(value * energy_scale) for value in self._energies
-        ]
+        energy_overlay = _LocalEnergyLayoutOverlay().render(
+            self._layout,
+            self._energies,
+        )
         detector_positions = [
             (detector.center[1], detector.center[0]) for detector in self._detectors
         ]
@@ -1970,19 +2002,9 @@ class ActivationEngine(_ActivationEngineBase):
             for red, green, blue, _ in detector_colors
         ]
         visuals = [
-            LOGGER.visual_scalar_map(
+            LOGGER.visual_image(
                 "layout/diagnostics/local_energy/map",
-                self._energies,
-                positions,
-                height=self._activation_map.height,
-                width=self._activation_map.width,
-                static=True,
-            ),
-            LOGGER.visual_points2d(
-                "layout/diagnostics/local_energy/points",
-                point_positions,
-                colors=energy_colors,
-                radii=0.45,
+                energy_overlay,
                 static=True,
             ),
             LOGGER.visual_points2d(
@@ -2008,6 +2030,7 @@ class ActivationEngine(_ActivationEngineBase):
                 "detectors": len(self._detectors),
                 "energy_min": min(self._energies, default=0.0),
                 "energy_max": energy_max,
+                "energy_visual": "layout_rgba_alpha",
                 "radius_min": min(
                     (detector.radius for detector in self._detectors), default=0.0
                 ),

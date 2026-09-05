@@ -15,6 +15,7 @@ from main import (
     LAYOUT_ADAPTIVE_SWAP_TRIGGER,
     LAYOUT_CONTINUITY_MIN_GAIN,
     LAYOUT_CONTINUITY_STALL_SWEEPS,
+    LAYOUT_CONVERGENCE_MAX_EXTRA_STEPS,
     LAYOUT_ENERGY_STABILITY_DELTA,
     LAYOUT_ENERGY_STABILITY_EVERY,
     LAYOUT_ENERGY_STABILITY_MAX_POINTS,
@@ -564,6 +565,8 @@ class PinwheelExperiment:
                 energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
                 energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
                 log_visuals=LAYOUT_LOG_VISUALS,
+                converge_at_min_radius=True,
+                max_convergence_steps=LAYOUT_CONVERGENCE_MAX_EXTRA_STEPS,
             )
             step_offset = 1 + layout.last_steps
             layout.save_json(self._long_layout_path)
@@ -602,6 +605,8 @@ class PinwheelExperiment:
             adaptive_params=self._adaptive_config(short_radius),
             short_optim=short_optim,
             log_visuals=LAYOUT_LOG_VISUALS,
+            converge_at_min_radius=True,
+            max_convergence_steps=LAYOUT_CONVERGENCE_MAX_EXTRA_STEPS,
         )
         layout.run_continuity_relaxation(
             ContinuityLayoutConfig(
