@@ -583,13 +583,13 @@ class ArticleInvariantTests(unittest.TestCase):
         _, last = encoder.encode(359.0)
         self.assertGreater(first.common(last), 0)
 
-    def test_main_uses_shared_axial_orientation_encoder(self) -> None:
+    def test_main_uses_shared_direction_encoder(self) -> None:
         encoder = _build_encoder()
         self.assertIsInstance(encoder, RetinotopicOrientationEncoder)
         values_zero, code_zero = encoder.encode(0.0, 3.0, 3.0)
         values_half_turn, code_half_turn = encoder.encode(180.0, 3.0, 3.0)
-        self.assertTrue(math.isclose(values_zero[0], values_half_turn[0]))
-        self.assertEqual(code_zero.to01(), code_half_turn.to01())
+        self.assertAlmostEqual((values_half_turn[0] - values_zero[0]) % 360.0, 180.0)
+        self.assertNotEqual(code_zero.to01(), code_half_turn.to01())
         descriptor = encoder.describe(45.0, center_index=24)
         spatial_bits, angular_bits = encoder.active_component_counts(descriptor)
         self.assertGreater(spatial_bits, angular_bits)

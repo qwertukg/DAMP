@@ -10,7 +10,7 @@ from damp.logging import LOGGER
 
 @dataclass(frozen=True)
 class PinwheelChart:
-    """Локальная карта одной сингулярности осевой ориентации."""
+    """Локальная карта одной угловой сингулярности."""
 
     center_x: float
     center_y: float
@@ -22,9 +22,9 @@ class PinwheelChart:
 class ContinuousPinwheelTopology:
     """Непрерывное поле ориентаций с произвольными центрами пинвилов.
 
-    Ориентация является осевой величиной с периодом 180 градусов. Поэтому
-    половина суммы полярных аргументов остаётся непрерывной при пересечении
-    ветви ``atan2``: скачок 360 градусов превращается в полный период 180.
+    Полярные аргументы масштабируются к заданному периоду: 180 градусов для
+    осевой ориентации или 360 для направления. Скачок ветви ``atan2`` становится
+    полным периодом, сохраняя непрерывность циклической величины.
     """
 
     def __init__(
@@ -204,12 +204,12 @@ class ContinuousPinwheelTopology:
             midpoint_x = (first_x + second_x) / 2.0
             midpoint_y = (first_y + second_y) / 2.0
             first_angle = (
-                math.degrees(math.atan2(midpoint_y - first_y, midpoint_x - first_x))
-                / 2.0
+                math.atan2(midpoint_y - first_y, midpoint_x - first_x)
+                * period / math.tau
             ) % period
             second_angle = (
-                math.degrees(math.atan2(midpoint_y - second_y, midpoint_x - second_x))
-                / 2.0
+                math.atan2(midpoint_y - second_y, midpoint_x - second_x)
+                * period / math.tau
             ) % period
             # desired: phase[second] = phase[first] + delta (mod period)
             delta = (
@@ -276,7 +276,7 @@ class ContinuousPinwheelTopology:
             dy = float(y) - center_y
             if abs(dx) <= 1e-15 and abs(dy) <= 1e-15:
                 raise ValueError("orientation is undefined at a pinwheel center")
-            phase += 0.5 * self._chiralities[index] * math.degrees(math.atan2(dy, dx))
+            phase += self._chiralities[index] * math.atan2(dy, dx) * self._period / math.tau
         orientation = phase % self._period
         LOGGER.event(
             "pinwheel.topology.orientation",

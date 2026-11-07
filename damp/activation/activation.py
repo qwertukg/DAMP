@@ -920,7 +920,10 @@ class EmbeddingSaturationResolver:
         self._max_density = float(max_density)
         self._base_active_bits = int(base_active_bits)
 
-    def resolve(self, scale_factor: float) -> int:
+    def resolve(
+        self, scale_factor: float, *, detector_count: int | None = None,
+        active_fraction: float | None = None,
+    ) -> int:
         if scale_factor <= 0.0:
             raise ValueError("scale_factor must be positive")
         density_limit = max(1, int(self._output_bits * self._max_density))
@@ -928,6 +931,12 @@ class EmbeddingSaturationResolver:
             density_limit,
             max(1, int(round(self._base_active_bits / math.sqrt(scale_factor)))),
         )
+        if active_fraction is not None:
+            if not 0.0 < active_fraction <= 1.0 or detector_count is None or detector_count <= 0:
+                raise ValueError("active_fraction requires a positive detector count and must be in (0, 1]")
+            # §7.1.12: динамический mu_c должен отбирать сильнейшие отклики,
+            # даже когда малая карта имеет меньше детекторов, чем общий бюджет σ.
+            saturation_limit = min(saturation_limit, max(1, math.ceil(detector_count * active_fraction)))
         LOGGER.event(
             "activation.embedding.saturation.resolve",
             section=MORPHOLOGICAL_EMBEDDINGS,
@@ -938,6 +947,8 @@ class EmbeddingSaturationResolver:
                 "saturation_limit": saturation_limit,
                 "max_density": self._max_density,
                 "resolved_density": saturation_limit / self._output_bits,
+                "detector_count": detector_count,
+                "active_fraction": active_fraction,
             },
         )
         return saturation_limit

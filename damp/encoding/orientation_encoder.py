@@ -34,7 +34,7 @@ class OrientationEncoding:
 
 
 class RetinotopicOrientationEncoder:
-    """Общий Encoder позиции и осевой ориентации для MNIST и pinwheel-теста."""
+    """Общий Encoder позиции и циклического угла для MNIST и pinwheel-теста."""
 
     def __init__(
         self,
@@ -83,7 +83,8 @@ class RetinotopicOrientationEncoder:
                 "angular_bits": angle_encoder.code_length,
                 "code_length": self.code_length,
                 "angle_period": self._angle_period,
-                "orientation_not_direction": True,
+                "color_angle_start": color_angle_start,
+                "color_angle_length": color_angle_length,
                 "cache_size": self._cache_size,
             },
         )
@@ -291,7 +292,9 @@ class RetinotopicOrientationEncoderFactory:
             random_seed=random_seed,
             log_every=log_every,
         )
-        color_angle_start = sum(count for count, _ in angle_layers[:-1])
+        # Цвет сохраняет угловое разрешение при любом порядке масштабов (§5.14).
+        color_layer_index = max(range(len(angle_layers)), key=lambda index: angle_layers[index][0])
+        color_angle_start = sum(count for count, _ in angle_layers[:color_layer_index])
         return RetinotopicOrientationEncoder(
             resolved_topology,
             spatial_encoder,
@@ -301,6 +304,6 @@ class RetinotopicOrientationEncoderFactory:
             color_minimum_hue=color_minimum_hue,
             color_maximum_hue=color_maximum_hue,
             color_angle_start=color_angle_start,
-            color_angle_length=angle_layers[-1][0],
+            color_angle_length=angle_layers[color_layer_index][0],
             cache_size=cache_size,
         )

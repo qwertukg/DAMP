@@ -1,0 +1,84 @@
+<div id="damp-position-overlay">
+  <h2>Три слоя детекторов на изображении 28×28</h2>
+  <div class="viz-row" id="po-controls">
+    <label class="form-check"><input class="form-check-input" type="checkbox" data-layer="0" checked><span class="form-check-label"><i class="po-swatch" style="background:var(--viz-series-1)"></i>7×7 · 12 активных</span></label>
+    <label class="form-check"><input class="form-check-input" type="checkbox" data-layer="1" checked><span class="form-check-label"><i class="po-swatch" style="background:var(--viz-series-2)"></i>14×14 · 9 активных</span></label>
+    <label class="form-check"><input class="form-check-input" type="checkbox" data-layer="2" checked><span class="form-check-label"><i class="po-swatch" style="background:var(--viz-series-3)"></i>28×28 · 4 активных</span></label>
+  </div>
+  <div class="text-small">Угол 90° · участок (1, 1) · яркие контуры — активные области</div>
+  <div id="po-plot"></div>
+  <div class="viz-row text-small"><span>＋ Центр исходного участка</span><span>◆ Вход позиционных детекторов</span></div>
+  <div id="po-detail" class="text-small tabular-nums" aria-live="polite"></div>
+</div>
+<style>
+#damp-position-overlay{color:var(--foreground)}
+#damp-position-overlay .po-swatch{display:inline-block;width:12px;height:12px;margin-right:5px;vertical-align:middle}
+#damp-position-overlay .po-svg{display:block;width:100%}
+#damp-position-overlay .po-svg text{fill:var(--foreground);font-size:12px}
+</style>
+<script id="po-data" type="application/json">{"layers":[{"count":7,"offset":0,"centers":[0.75,1.5,2.25,3.0,3.75,4.5,5.25],"half":1.5},{"count":14,"offset":49,"centers":[0.015306122448979553,0.4744897959183674,0.9336734693877552,1.3928571428571432,1.852040816326531,2.3112244897959187,2.770408163265307,3.2295918367346945,3.6887755102040822,4.14795918367347,4.607142857142858,5.066326530612246,5.525510204081634,5.984693877551021],"half":0.7653061224489796},{"count":28,"offset":245,"centers":[-0.4322033898305085,-0.17796610169491528,0.07627118644067793,0.33050847457627114,0.5847457627118644,0.8389830508474576,1.0932203389830508,1.347457627118644,1.6016949152542372,1.8559322033898307,2.1101694915254234,2.3644067796610164,2.61864406779661,2.8728813559322033,3.1271186440677963,3.3813559322033893,3.6355932203389827,3.889830508474576,4.1440677966101696,4.398305084745762,4.6525423728813555,4.906779661016949,5.1610169491525415,5.415254237288135,5.669491525423728,5.923728813559322,6.177966101694915,6.432203389830508],"half":0.3177966101694915}],"active":[0,1,2,3,7,8,9,10,392,393,14,15,16,17,420,421,65,66,67,79,80,81,93,94,95],"x":1.0,"y":1.5}</script>
+<script>
+(() => {
+  const root=document.getElementById('damp-position-overlay');
+  const data=JSON.parse(document.getElementById('po-data').textContent);
+  const NS='http://www.w3.org/2000/svg';
+  const el=(tag,attrs={},text)=>{const n=document.createElementNS(NS,tag);Object.entries(attrs).forEach(([k,v])=>n.setAttribute(k,v));if(text!==undefined)n.textContent=text;return n;};
+  const put=(parent,tag,attrs,text)=>{const n=el(tag,attrs,text);parent.appendChild(n);return n;};
+  class PositionOverlay {
+    constructor(){
+      this.host=root.querySelector('#po-plot');
+      this.active=new Set(data.active);
+      this.controls=[...root.querySelectorAll('input[data-layer]')];
+      this.controls.forEach(input=>input.addEventListener('change',()=>this.draw()));
+      this.observer=new ResizeObserver(()=>this.draw());this.observer.observe(this.host);
+    }
+    draw(){
+      const width=this.host.clientWidth;if(width<1)return;
+      const left=58,top=20,size=width-left-20,height=size+top+58;
+      const x=v=>left+size*v/28,y=v=>top+size*v/28;
+      const svg=el('svg',{class:'po-svg',viewBox:`0 0 ${width} ${height}`,width,height,role:'img','aria-label':'Все три слоя позиционных детекторов, наложенные на сетку 28 на 28 пикселей. Активны 12, 9 и 4 детектора.'});
+      put(svg,'title',{},'Позиционные детекторы для углопозиции (90°, 1, 1)');
+      put(svg,'desc',{},'Один мелкий квадрат сетки — один пиксель. Позиция участка показана в его центре: (6, 6) пикселей. После преобразования пинвила вход детекторов — (6, 8) пикселей. Границы детекторов обрезаны по краю изображения.');
+      const defs=put(svg,'defs',{}),clip=put(defs,'clipPath',{id:'po-clip'});
+      put(clip,'rect',{x:left,y:top,width:size,height:size});
+      const plot=put(svg,'g',{'clip-path':'url(#po-clip)'});
+      for(let v=0;v<=28;v++){
+        const strong=v%4===0;
+        put(plot,'path',{d:`M${x(v)} ${top}V${top+size} M${left} ${y(v)}H${left+size}`,fill:'none',stroke:'var(--foreground)','stroke-opacity':strong?.18:.08,'stroke-width':strong?.8:.5});
+      }
+      const enabled=this.controls.map(input=>input.checked), activeFields=[];
+      let visibleActive=0;
+      data.layers.forEach((layer,i)=>{
+        if(!enabled[i])return;
+        const color=`var(--viz-series-${i+1})`;
+        const group=put(plot,'g',{'data-layer-group':i});
+        layer.centers.forEach((cx,ix)=>layer.centers.forEach((cy,iy)=>{
+          const bit=layer.offset+ix*layer.count+iy;
+          const attrs={x:x(4*(cx-layer.half)+2),y:y(4*(cy-layer.half)+2),width:size*(8*layer.half)/28,height:size*(8*layer.half)/28};
+          put(group,'rect',{...attrs,fill:'none',stroke:color,'stroke-width':.5,'stroke-opacity':.055});
+          if(this.active.has(bit)){activeFields.push({attrs,color,bit,layer:i});visibleActive++;}
+        }));
+      });
+      activeFields.forEach(({attrs,color,bit,layer})=>{
+        put(plot,'rect',{...attrs,fill:color,'fill-opacity':.022,stroke:color,'stroke-width':1.5,'stroke-opacity':.9,'data-active-bit':bit,'data-layer':layer});
+      });
+      // Центры участков MNIST: pixel = 4 * patch + 2.
+      const sx=x(6),sy=y(6),px=x(4*data.x+2),py=y(4*data.y+2);
+      put(plot,'line',{x1:sx,y1:sy,x2:px,y2:py,stroke:'var(--foreground)','stroke-width':1.5});
+      put(plot,'path',{d:`M${sx-6} ${sy}h12 M${sx} ${sy-6}v12`,stroke:'var(--foreground)','stroke-width':2});
+      put(plot,'path',{d:`M${px} ${py-7}l7 7 -7 7 -7 -7Z`,fill:'var(--foreground)',stroke:'var(--background)','stroke-width':1.5});
+      put(svg,'rect',{x:left,y:top,width:size,height:size,fill:'none',stroke:'var(--border)','data-chart-frame':''});
+      const ticks=width<450?[0,8,16,28]:[0,4,8,12,16,20,24,28];
+      ticks.forEach(v=>{
+        put(svg,'text',{x:x(v),y:top+size+20,'text-anchor':v===0?'start':v===28?'end':'middle'},String(v));
+        put(svg,'text',{x:left-12,y:y(v)+4,'text-anchor':'end'},String(v));
+      });
+      put(svg,'text',{x:left+size/2,y:height-7,'text-anchor':'middle',class:'axis-title','data-axis':'x'},'X · пиксели');
+      put(svg,'text',{x:16,y:top+size/2,'text-anchor':'middle',transform:`rotate(-90 16 ${top+size/2})`,class:'axis-title','data-axis':'y'},'Y · пиксели');
+      this.host.replaceChildren(svg);
+      root.querySelector('#po-detail').textContent=`Показано активных: ${visibleActive}/25 · клетка 1×1 пиксель · сторона области: 12 / 6,122 / 2,542 пикселя`;
+    }
+  }
+  new PositionOverlay();
+})();
+</script>

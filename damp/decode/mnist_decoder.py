@@ -13,6 +13,7 @@ import numpy as np
 
 from damp.article_refs import CODE_SPACE_ACTIVATION, SIMILARITY_DEFINITION, SIMILARITY_MEASURES, STIMULUS_DETECTION
 from damp.activation import ActivationEngine, ActivationResult, DetectorSpaceCascade
+from damp.activation.spatial_hierarchy import SpatialDetectorHierarchy
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import Encoder
 from damp.encoding.stimulus_embedding import StimulusEmbeddingBuilder
@@ -917,6 +918,7 @@ class MnistDecoder:
         extractor: MnistSobelAngleMap,
         activation_engine: ActivationEngine | None,
         detector_space_cascade: DetectorSpaceCascade | None = None,
+        spatial_hierarchy: SpatialDetectorHierarchy | None = None,
         embedding_db: EmbeddingDatabase,
         evaluation_confidence_bins: int,
         evaluation_error_examples: int,
@@ -931,6 +933,7 @@ class MnistDecoder:
         self._extractor = extractor
         self._activation_engine = activation_engine
         self._detector_space_cascade = detector_space_cascade
+        self._spatial_hierarchy = spatial_hierarchy
         self._embedding_db = embedding_db
         self._evaluation_confidence_bins = int(evaluation_confidence_bins)
         self._evaluation_error_examples = int(evaluation_error_examples)
@@ -982,6 +985,9 @@ class MnistDecoder:
         log_image: bool = False,
     ) -> ActivationResult:
         label_value = -1 if label_hint is None else int(label_hint)
+        if self._spatial_hierarchy is not None:
+            measurements = self._extractor.extract(image, label=label_value)[label_value]
+            return self._embed_spatial(measurements)
         codes, classification_embedding = self._encode_primary(
             image,
             label_value=label_value,
@@ -992,6 +998,20 @@ class MnistDecoder:
             classification_embedding,
             label_value=label_value,
             log_image=log_image,
+        )
+
+    def _embed_spatial(self, measurements: Sequence[tuple[float, int, int]]) -> ActivationResult:
+        if self._spatial_hierarchy is None:
+            raise RuntimeError("spatial hierarchy is not configured")
+        result = self._spatial_hierarchy.activate_measurements(measurements)
+        self._embedding_sequence += 1
+        activation = result.activation
+        self._last_activation_values = list(activation.activation_values)
+        return ActivationResult(
+            activation_values=activation.activation_values,
+            activation_matrix=activation.activation_matrix,
+            active_detectors=activation.active_detectors,
+            embedding=result.embedding, classification_embedding=result.embedding,
         )
 
     def _encode_primary(
@@ -1097,6 +1117,17 @@ class MnistDecoder:
         measurement_maps = self._extractor.extract_many(
             np.stack(images), resolved_labels
         )
+        if self._spatial_hierarchy is not None:
+            embeddings = [
+                self._embed_spatial(measurements[label]).embedding
+                for measurements, label in zip(measurement_maps, resolved_labels)
+            ]
+            LOGGER.event(
+                "decoder.embedding.batch", section=CODE_SPACE_ACTIVATION,
+                data={"images": len(embeddings), "levels": len(self._spatial_hierarchy.spaces),
+                      "code_length": self.embedding_code_length},
+            )
+            return embeddings
 
         def encode_item(item: tuple[int, np.ndarray]):
             index, image = item

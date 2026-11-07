@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import bisect
 import concurrent.futures
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from collections import deque
 import hashlib
 from itertools import accumulate
@@ -355,7 +355,7 @@ class StructuralLongPhaseQualityConfig:
 
 
 class StructuralLongPhaseQualityEvaluator:
-    """Проверяет C2 по топологии многопризнаковых кодов, а не по ложному hue (§5.8, §5.13)."""
+    """Проверяет сходимость long; локальный порядок C2 диагностирует для short (§5.5.2, §5.8)."""
 
     def __init__(self, config: StructuralLongPhaseQualityConfig) -> None:
         self._config = config
@@ -376,13 +376,35 @@ class StructuralLongPhaseQualityEvaluator:
             and run_report.converged
             and not run_report.convergence_limit_reached
         )
-        accepted = (
-            dynamics_converged
-            and local_ratio <= self._config.max_local_discontinuity_ratio
+        local_quality_accepted = (
+            local_ratio <= self._config.max_local_discontinuity_ratio
             and noise_ratio <= self._config.max_spatial_noise_ratio
         )
+        # §5.5.2: локальный порядок дорабатывает short-фаза. Для структурных
+        # кодов границы кластеров допустимы, а заданный прирост сходства к
+        # глобальному среднему может быть недостижим даже при лучшей раскладке.
+        # Эти эвристики не доказывают отсутствие дальнего порядка (§5.8).
+        LOGGER.event(
+            "layout.long.quality.structural",
+            section=ENERGY_SHORT,
+            data={
+                "dynamics_converged": dynamics_converged,
+                "local_quality_accepted": local_quality_accepted,
+                "local_discontinuity_ratio": local_ratio,
+                "max_local_discontinuity_ratio": self._config.max_local_discontinuity_ratio,
+                "spatial_noise_ratio": noise_ratio,
+                "max_spatial_noise_ratio": self._config.max_spatial_noise_ratio,
+                "local_similarity_gain_min": self._config.local_similarity_gain_min,
+                "message": (
+                    "C2: long сошлась; локальные метрики диагностические, переход к short"
+                    if dynamics_converged
+                    else "C2: сходимость long не подтверждена, переход к short запрещён"
+                ),
+            },
+            force=True,
+        )
         return LongPhaseQualityReport(
-            accepted=accepted,
+            accepted=dynamics_converged,
             dynamics_converged=dynamics_converged,
             step=0 if run_report is None else run_report.final_step,
             radius=0 if run_report is None else run_report.pair_radius,
@@ -2012,6 +2034,7 @@ class Layout:
             )
         self.last_steps = 0
         self.last_run_report: LayoutRunReport | None = None
+        self.phase_reports: dict[str, LayoutRunReport] = {}
         self._sim_base: list[list[float]] | None = None
         if precompute_similarity and self._point_count <= max_precompute:
             self._build_similarity_cache()
@@ -2136,6 +2159,7 @@ class Layout:
         save_on_stop_path: str | None = None,
         converge_at_min_radius: bool = False,
         max_convergence_steps: int = 0,
+        convergence_limit_multiplier: int | None = None,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
@@ -2165,6 +2189,11 @@ class Layout:
             raise ValueError("energy_stability_max_points must be positive when set")
         if max_convergence_steps < 0:
             raise ValueError("max_convergence_steps must be non-negative")
+        if convergence_limit_multiplier is not None:
+            if convergence_limit_multiplier <= 1 or not converge_at_min_radius:
+                raise ValueError("limit multiplier requires convergence and must exceed one")
+            if not (min_swap_window and min_swap_ratio > 0 and energy_stability_window):
+                raise ValueError("automatic extension requires swap and energy monitoring")
         if converge_at_min_radius and adaptive_params is None:
             raise ValueError("adaptive_params are required for min-radius convergence")
         if converge_at_min_radius and max_convergence_steps <= 0:
@@ -2234,6 +2263,7 @@ class Layout:
                 "step_offset": step_offset,
                 "converge_at_min_radius": converge_at_min_radius,
                 "max_convergence_steps": max_convergence_steps,
+                "convergence_limit_multiplier": convergence_limit_multiplier,
             },
         )
         LOGGER.event(
@@ -2358,7 +2388,8 @@ class Layout:
         if mode == "long":
             self._long_subset_frozen = False
 
-        for step in range(maximum_steps):
+        while steps_executed < maximum_steps:
+            step = steps_executed
             effective_pair_radius = (
                 adaptive_state.radius_for_step(step)
                 if adaptive_state is not None
@@ -2663,6 +2694,20 @@ class Layout:
                     )
                 break
 
+            if steps_executed == maximum_steps and convergence_limit_multiplier is not None:
+                previous_limit = maximum_steps
+                maximum_steps *= convergence_limit_multiplier
+                LOGGER.event(
+                    "layout.run.convergence.limit.increase",
+                    section=QUALITY_ASSESS,
+                    data={"mode": mode, "steps": steps_executed,
+                          "previous_limit": previous_limit, "new_limit": maximum_steps,
+                          "multiplier": convergence_limit_multiplier,
+                          "swap_stable": convergence_state.swap_stable,
+                          "energy_stable": convergence_state.energy_stable},
+                    force=True,
+                )
+
         else:
             if converge_at_min_radius:
                 convergence_limit_reached = True
@@ -2699,6 +2744,7 @@ class Layout:
             converged=converged,
             convergence_limit_reached=convergence_limit_reached,
         )
+        self.phase_reports[mode] = self.last_run_report
         self._log_layout_state(
             path=log_path,
             step=final_step,
@@ -2727,6 +2773,41 @@ class Layout:
             ),
         )
         return total_swaps
+
+    def save_image(self, path: str) -> None:
+        from PIL import Image
+
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        Image.fromarray(self.render_image()).save(path)
+        LOGGER.event(
+            "layout.visual.save", section=LAID_OUT_STRUCTURE,
+            data={"image": path, "points": self._point_count}, force=True,
+        )
+
+    def has_converged_phases(self, *modes: str) -> bool:
+        reports = dict(self.phase_reports)
+        if self.last_run_report is not None:
+            reports[self.last_run_report.mode] = self.last_run_report
+        return all(
+            mode in reports and reports[mode].converged
+            and not reports[mode].convergence_limit_reached
+            for mode in modes
+        )
+
+    def require_convergence(self, mode: str, checkpoint_path: str) -> None:
+        if not self.has_converged_phases(mode):
+            self.save_json(checkpoint_path)
+            LOGGER.event(
+                "layout.run.convergence.block_next_phase", section=QUALITY_ASSESS,
+                data={"mode": mode, "checkpoint": checkpoint_path}, force=True,
+            )
+            raise RuntimeError(
+                f"Фаза {mode} не сошлась; checkpoint сохранён: {checkpoint_path}"
+            )
+        if self.last_run_report is not None and self.last_run_report.mode == mode:
+            self.phase_reports[mode] = self.last_run_report
 
     def _save_on_stop(self, *, path: str | None, reason: str, step: int, mode: str) -> None:
         if mode != "long" or path is None:
@@ -3394,6 +3475,7 @@ class Layout:
                 "seed": self._seed,
                 "rng_state": self._rng.getstate(),
                 "last_steps": self.last_steps,
+                "phase_reports": {mode: asdict(report) for mode, report in self.phase_reports.items()},
                 "last_run_report": None
                 if self.last_run_report is None
                 else {
@@ -3509,6 +3591,10 @@ class Layout:
             if rng_state is not None:
                 self._rng.setstate(self._nested_tuple(rng_state))
             self.last_steps = int(payload.get("last_steps", 0))
+            self.phase_reports = {
+                mode: LayoutRunReport(**report)
+                for mode, report in payload.get("phase_reports", {}).items()
+            }
             run_report = payload.get("last_run_report")
             self.last_run_report = (
                 None

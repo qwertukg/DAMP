@@ -4,15 +4,13 @@ import time
 from dataclasses import dataclass
 import json
 import os
+import hashlib
 from collections import OrderedDict
 from typing import ClassVar, Sequence
 import argparse
 
 from damp.article_refs import (
-    CODE_SPACE_ACTIVATION,
-    DETECTOR_CONSTRUCTION,
     DETECTOR_HIERARCHY,
-    DETECTOR_RADIUS,
     DETECTOR_INSERTION,
     ENERGY_CALC,
     LAYOUT_PARAMETERS,
@@ -27,9 +25,7 @@ from damp.article_refs import (
 )
 from damp.activation import (
     ActivationEngine,
-    CorticalOrientationPreferenceMap,
     DetectorSpace,
-    DetectorSpaceCascade,
     Detector,
     DetectorHierarchyCache,
     DetectorHierarchyBuilder as ArticleDetectorHierarchyBuilder,
@@ -37,8 +33,6 @@ from damp.activation import (
     DetectorHierarchyScaleResolver,
     DetectorLayerConfigFactory,
     EmbeddingSaturationResolver,
-    OrientationPreferenceHueResolver,
-    StructuralEmbeddingColorizer,
 )
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.encoding.damp_encoder import (
@@ -61,6 +55,12 @@ from damp.layout.damp_layout import (
 )
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
 from damp.encoding.bitarray import BitArray
+from damp.encoding.damp_encoder import Detectors, OpenedDimension
+from damp.encoding.joint_encoder import JointEncoder, JointDetectorLayer
+from damp.encoding.spatial_composition import (
+    LocalOrientationWindowEncoder, SpatialCompositionEncoder,
+)
+from damp.activation.spatial_hierarchy import SpatialDetectorHierarchy
 from damp.logging import LOGGER
 from damp.decode import (
     DecoderConfig,
@@ -111,45 +111,34 @@ EVALUATION_LOG_PATH = "evaluate.log"
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 14
-DETECTOR_SPACE_1_EMBEDDINGS_JSON_KEY = "detector_space_1_embeddings"
-DETECTOR_SPACE_1_EMBEDDINGS_VERSION_KEY = "detector_space_1_embeddings_version"
-DETECTOR_SPACE_1_EMBEDDINGS_VERSION = 1
-DETECTOR_SPACE_COUNT = 2
-DETECTOR_SPACE_2_LAYOUT_SUFFIX = ".space-2-topology-v10.json"
-DETECTOR_SPACE_2_IMAGE_SUFFIX = ".space-2.png"
-DETECTOR_SPACE_2_OUTPUT_LAYOUT_SUFFIX = ".c2-preference-map-v3.json"
-DETECTOR_SPACE_2_OUTPUT_IMAGE_SUFFIX = ".c2-layout.png"
-DETECTOR_SPACE_HUE_MIN = 0.0
-DETECTOR_SPACE_HUE_MAX = 360.0
-DETECTOR_SPACE_SMALL_LAYOUT_POINTS = 100
-DETECTOR_SPACE_ORIENTATION_PROBE_STEP = 5
-DETECTOR_SPACE_ORIENTATION_PROBE_TEMPERATURE = 0.02
-DETECTOR_SPACE_ORIENTATION_SHARP_THRESHOLD = 30.0
-DETECTOR_SPACE_ORIENTATION_PROBE_RADIUS = 1
-DETECTOR_SPACE_ORIENTATION_CONTINUITY_WEIGHT = 1.0
-DETECTOR_SPACE_ORIENTATION_CONTINUITY_SWEEPS = 60
-DETECTOR_SPACE_ORIENTATION_KERNEL_SIGMA_FACTOR = 0.65
-DETECTOR_SPACE_ORIENTATION_MIN_SELECTIVITY = 0.0
-DETECTOR_SPACE_2_LONG_QUALITY_CYCLIC_PERIOD = 360.0
-DETECTOR_SPACE_2_LONG_QUALITY_SHARP_DELTA = 45.0
-DETECTOR_SPACE_2_LONG_QUALITY_NOISE_DELTA = 60.0
-DETECTOR_SPACE_2_LONG_QUALITY_NEIGHBOUR_COHERENCE_MIN = 0.6
+EMBEDDINGS_VERSION = 19
+DETECTOR_SPACE_COUNT = 3
+HIERARCHY_VERSION = 5
+HIERARCHY_MAP_DIRECTORY_TEMPLATE = "data/hierarchy-{count}-maps-direction-v5-strict-v2"
+HIERARCHY_WINDOW_SIZE = 3
+HIERARCHY_WINDOW_STRIDE = 2
+HIERARCHY_POSITION_LAYERS = (((2, 2), (0.50, 0.50)), ((3, 3), (0.50, 0.50)))
+HIERARCHY_MAX_BIT_DOCUMENT_FREQUENCY = 0.95
+HIERARCHY_COMPOSITION_ACTIVE_FRACTION = 0.25
+HIERARCHY_PARTS_SUFFIX = ".parts-hierarchy-v1.json"
+HIERARCHY_COMPOSITIONS_SUFFIX = ".compositions-hierarchy-v1.json"
+HIERARCHY_MANIFEST_SUFFIX = ".hierarchy-v1.json"
+HIERARCHY_LOCAL_CODES_SUFFIX = ".local-codes-v1.json"
+HIERARCHY_LONG_STEPS_MAX = 1000
+HIERARCHY_LONG_PAIRS_MAX = 4000
+HIERARCHY_SHORT_PAIRS_MAX = 400
+HIERARCHY_CONTINUITY_SWEEPS = 100
 DETECTOR_SPACE_2_LONG_QUALITY_MAX_DISCONTINUITY_RATIO = 0.3
 DETECTOR_SPACE_2_LONG_QUALITY_MAX_SPATIAL_NOISE_RATIO = 0.15
-DETECTOR_SPACE_2_LONG_QUALITY_PINWHEEL_WINDING_MIN = 0.75
-DETECTOR_SPACE_2_LONG_QUALITY_PINWHEEL_MAX_TURN_DELTA = 120.0
-DETECTOR_SPACE_2_LONG_QUALITY_PINWHEEL_EXCLUSION_RADIUS = 2
 DETECTOR_SPACE_2_LONG_QUALITY_MINIMUM_NEIGHBOURS = 3
 DETECTOR_SPACE_2_LONG_QUALITY_LOCAL_SIMILARITY_GAIN_MIN = 1.5
 DETECTOR_SPACE_2_LONG_QUALITY_GLOBAL_SAMPLE_SIZE = 64
 DETECTOR_SPACE_2_LONG_ENERGY_STABILITY_DELTA = 0.00025
-DETECTOR_SPACE_1_MAX_BIT_DOCUMENT_FREQUENCY = 0.15
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 13
+PIPELINE_CHECKPOINT_VERSION = 17
 PIPELINE_CHECKPOINT_REPLACE_ATTEMPTS = 8
 PIPELINE_CHECKPOINT_REPLACE_DELAY = 0.1
-LAYOUT_CACHE_TAG = "orientation-topology-v6"
+LAYOUT_CACHE_TAG = "direction-absolute-hierarchy-v5-strict-v2"
 LAYOUT_LONG_PHASE_SUFFIX = ".long-phase.json"
 LAYOUT_SHORT_PHASE_SUFFIX = ".short-phase.json"
 LAYOUT_CONTINUITY_PHASE_SUFFIX = ".continuity-phase.json"
@@ -195,7 +184,7 @@ MNIST_LOCAL_ORIENTATION_LIMIT = 4
 MNIST_STIMULUS_EMBEDDING_MAX_DENSITY = 0.25
 MNIST_REFERENCE_LAYOUT_COUNT = 100
 MNIST_ORIENTATION_MIN = 0.0
-MNIST_ORIENTATION_MAX = 180.0
+MNIST_ORIENTATION_MAX = 360.0
 MNIST_ORIENTATION_COLOR_MAX_HUE = 360.0
 MNIST_POSITION_MIN = 0.0
 MNIST_POSITION_MAX = 6.0
@@ -208,7 +197,12 @@ MNIST_ORIENTATION_SPATIAL_JOINT_LAYERS = (
     ((14, 14), (0.70, 0.70)),
     ((28, 28), (0.60, 0.60)),
 )
-MNIST_ORIENTATION_ANGLE_LAYERS = ((180, 0.50),)
+MNIST_ORIENTATION_ANGLE_LAYERS = (
+    (360, 0.25),  # узкие: ширина 4/3°, шаг 1°
+    (72, 0.25),   # средние: ширина 20/3°, шаг 5°
+    (12, 0.25),   # широкие: ширина 40°, шаг 30°
+    (4, 0.25),    # самые широкие: ширина 120°, шаг 90°
+)
 MNIST_ORIENTATION_SMOOTH_DELTA = 15.0
 LAYOUT_LOG_EVERY_LONG = 150
 LAYOUT_LOG_EVERY_SHORT = 50
@@ -224,7 +218,8 @@ LAYOUT_ENERGY_STABILITY_EVERY = 25
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 512
 LAYOUT_MIN_SWAP_RATIO = 0.001
 LAYOUT_MIN_SWAP_WINDOW = 50
-LAYOUT_CONVERGENCE_MAX_EXTRA_STEPS = 5000
+LAYOUT_CONVERGENCE_INITIAL_LIMIT = 100000
+LAYOUT_CONVERGENCE_LIMIT_MULTIPLIER = 10
 LAYOUT_CONTINUITY_SWEEPS = 500
 LAYOUT_CONTINUITY_DEFECT_POINTS = 192
 LAYOUT_CONTINUITY_CANDIDATES = 128
@@ -281,6 +276,23 @@ PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
 PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
 PINWHEEL_LONG_LAYOUT_PATH = "pinwheel_test.long.checkpoint.json"
 PINWHEEL_RESUME_LONG_CHECKPOINT = True
+
+# Центры звёздочек map.png в пикселях; координаты Y направлены вниз.
+# Единый масштаб по ширине сохраняет геометрию исходной карты (§4.6).
+PINWHEEL_MAP_SOURCE_PATH = "map.png"
+PINWHEEL_MAP_BOUNDS_PX = (131, 36, 825, 589)
+PINWHEEL_MAP_CENTERS_PX = (
+    (794, 80), (449, 130), (315, 188), (583, 195),
+    (450, 229), (687, 237), (200, 280), (335, 289),
+    (618, 310), (520, 321), (408, 353), (662, 402),
+    (317, 422), (358, 433), (235, 435), (658, 467),
+    (411, 504), (151, 526), (185, 531), (353, 564),
+)
+PINWHEEL_MAP_OUTPUT_PATH = "pinwheel_map_test.png"
+PINWHEEL_MAP_LAYOUT_PATH = "pinwheel_map_test.json"
+PINWHEEL_MAP_LONG_LAYOUT_PATH = "pinwheel_map_test.long.checkpoint.json"
+PINWHEEL_MAP_REPORT_PATH = "pinwheel_map_test.report.json"
+PINWHEEL_MAP_LOG_PATH = "pinwheel_map_test.log"
 
 ACTIVATION_LAMBDA_THRESHOLD = 0.55
 ACTIVATION_ETA = 10.0
@@ -339,7 +351,7 @@ DECODER_EVALUATION_BACKEND = "process"
 DECODER_EVALUATION_CHUNKS_PER_WORKER = 4
 DECODER_EVALUATION_PROCESS_MIN_SAMPLES = 256
 DECODER_EVALUATION_CACHE_PATH = "data/evaluation-embeddings.json"
-DECODER_EVALUATION_CACHE_VERSION = 5
+DECODER_EVALUATION_CACHE_VERSION = 6
 TEST_UI_DEFAULT_COUNT = 60000
 TEST_UI_CANVAS_SIZE = 280
 TEST_UI_OUTPUT_SIZE = 28
@@ -374,6 +386,12 @@ LAYOUT_TUNE_SHORT_RADIUS_FACTOR = 0.05
 LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR = 0.04
 LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR = 30
 LOG_INTERVALS = {
+    "hierarchy.window.encode": LOG_INTERVAL_ENCODER_IMAGE,
+    "hierarchy.composition.binding": LOG_INTERVAL_ENCODER_IMAGE,
+    "hierarchy.local.encode": LOG_INTERVAL_ENCODER_IMAGE,
+    "hierarchy.parts.encode": LOG_INTERVAL_ENCODER_IMAGE,
+    "hierarchy.image.encode": LOG_INTERVAL_ENCODER_IMAGE,
+    "activation.detector_space": LOG_INTERVAL_ENCODER_IMAGE,
     "detectors.init": LOG_INTERVAL_INIT,
     "dimension.closed": LOG_INTERVAL_INIT,
     "dimension.init": LOG_INTERVAL_INIT,
@@ -506,6 +524,18 @@ LOG_INTERVALS = {
 }
 
 RERUN_LAYOUT_EVENTS = {
+    "hierarchy.windows.init",
+    "hierarchy.window.encode",
+    "hierarchy.composition.init",
+    "hierarchy.composition.binding",
+    "hierarchy.composition.encode",
+    "hierarchy.local.encode",
+    "hierarchy.parts.encode",
+    "hierarchy.image.encode",
+    "hierarchy.training.samples",
+    "hierarchy.training.completed",
+    "hierarchy.checkpoint.save",
+    "layout.long.quality.structural",
     "mnist.codes",
     "mnist.encoding.skip",
     "layout.cache.hit",
@@ -544,6 +574,15 @@ RERUN_LAYOUT_EVENTS = {
 }
 
 RERUN_EVALUATE_EVENTS = {
+    "hierarchy.model.load",
+    "hierarchy.windows.init",
+    "hierarchy.window.encode",
+    "hierarchy.composition.init",
+    "hierarchy.composition.binding",
+    "hierarchy.composition.encode",
+    "hierarchy.local.encode",
+    "hierarchy.parts.encode",
+    "hierarchy.image.encode",
     "decoder.layout.use",
     "decoder.build",
     "decoder.parameters.scale.resolve",
@@ -556,6 +595,13 @@ RERUN_EVALUATE_EVENTS = {
 }
 
 FILE_LAYOUT_EVENTS = {
+    "hierarchy.training.samples",
+    "hierarchy.training.completed",
+    "hierarchy.local.encode",
+    "hierarchy.parts.encode",
+    "hierarchy.composition.encode",
+    "hierarchy.checkpoint.save",
+    "layout.long.quality.structural",
     "mnist.codes",
     "layout.cache.hit",
     "layout.cache.miss",
@@ -1085,16 +1131,8 @@ def _layout_json_path(count: int, pair_radius: int | None) -> str:
     return f"data/layout-{count}-{suffix}-{LAYOUT_CACHE_TAG}.json"
 
 
-def _detector_space_2_layout_path(primary_layout_path: str) -> str:
-    if not primary_layout_path:
-        raise ValueError("primary layout path must be provided")
-    return f"{primary_layout_path}{DETECTOR_SPACE_2_LAYOUT_SUFFIX}"
 
 
-def _detector_space_2_output_layout_path(primary_layout_path: str) -> str:
-    if not primary_layout_path:
-        raise ValueError("primary layout path must be provided")
-    return f"{primary_layout_path}{DETECTOR_SPACE_2_OUTPUT_LAYOUT_SUFFIX}"
 
 
 def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> int:
@@ -1208,6 +1246,7 @@ def _build_activation_engine(
     energies: list[float],
     *,
     layout_path: str | None = None,
+    active_detector_fraction: float | None = None,
 ) -> ActivationEngine:
     hierarchy_scale = DetectorHierarchyScaleResolver(
         reference_extent=ACTIVATION_DETECTOR_REFERENCE_EXTENT,
@@ -1235,7 +1274,10 @@ def _build_activation_engine(
         output_bits=ACTIVATION_OUTPUT_BITS,
         max_density=ACTIVATION_MAX_EMBEDDING_DENSITY,
         base_active_bits=ACTIVATION_TARGET_ACTIVE_BITS,
-    ).resolve(hierarchy_scale.factor)
+    ).resolve(
+        hierarchy_scale.factor, detector_count=len(detectors),
+        active_fraction=active_detector_fraction,
+    )
     return ActivationEngine(
         layout=layout,
         detectors=detectors,
@@ -1260,6 +1302,13 @@ def _load_layout_from_file(
         return None
     with open(path, "r", encoding="utf-8") as fp:
         data = json.load(fp)
+    phase_reports = data.get("phase_reports", {})
+    if not all(
+        phase_reports.get(mode, {}).get("converged") is True
+        and phase_reports.get(mode, {}).get("convergence_limit_reached") is False
+        for mode in ("long", "short")
+    ):
+        return None
     points_payload = data.get("layout", [])
     width = data.get("width")
     height = data.get("height")
@@ -1340,6 +1389,8 @@ def _load_layout_from_file(
     layout._pos_y = [p[0] for p in positions]
     layout._pos_x = [p[1] for p in positions]
     layout.pair_radius = pair_radius_saved
+    if not layout.restore_positions_json(path):
+        return None
     LOGGER.event(
         "layout.load.cache",
         section=LAID_OUT_STRUCTURE,
@@ -1387,6 +1438,35 @@ def _build_stimulus_embedding_builder(
     )
 
 
+def _build_window_encoder(encoder: RetinotopicOrientationEncoder) -> LocalOrientationWindowEncoder:
+    return LocalOrientationWindowEncoder(
+        encoder, grid_size=MNIST_POSITION_GRID_SIZE,
+        window_size=HIERARCHY_WINDOW_SIZE, stride=HIERARCHY_WINDOW_STRIDE,
+    )
+
+
+def _build_composition_encoder(
+    feature_pruner: SparseCodeFrequencyPruner | None = None,
+) -> SpatialCompositionEncoder:
+    dimensions = [
+        OpenedDimension(
+            name, (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
+            [Detectors(counts[axis], overlaps[axis])
+             for counts, overlaps in HIERARCHY_POSITION_LAYERS],
+        )
+        for axis, name in enumerate(("x", "y"))
+    ]
+    return SpatialCompositionEncoder(
+        JointEncoder(
+            *dimensions,
+            joint_layers=[JointDetectorLayer(counts, overlaps)
+                          for counts, overlaps in HIERARCHY_POSITION_LAYERS],
+            random_seed=ENCODER_RANDOM_SEED, log_every=ENCODER_LOG_EVERY,
+        ),
+        feature_bits=ACTIVATION_OUTPUT_BITS, feature_pruner=feature_pruner,
+    )
+
+
 def _collect_codes(
     dataset,
     label: int | None,
@@ -1400,6 +1480,7 @@ def _collect_codes(
         eta=None,
     )
     found = 0
+    window_encoder = _build_window_encoder(encoder)
 
     for img_tensor, digit in dataset:
         if label is not None and int(digit) != label:
@@ -1409,7 +1490,11 @@ def _collect_codes(
             break
         img = img_tensor.squeeze(0).numpy()
         digit_values = extractor.extract(img, digit)
-        measurements = digit_values[int(digit)]
+        measurements = [
+            measurement
+            for window in window_encoder.encode(digit_values[int(digit)])
+            for measurement in window.measurements
+        ]
         first = True
         for (a, x, y) in measurements:
             log_image = img if first else None
@@ -1433,42 +1518,6 @@ def _collect_codes(
     return unique_payload, len(unique_payload.records)
 
 
-def _collect_samples(
-    dataset,
-    sample_count: int,
-    encoder: RetinotopicOrientationEncoder,
-    extractor: MnistSobelAngleMap,
-    *,
-    label: int | None,
-) -> list[tuple[int, list[BitArray]]]:
-    samples: list[tuple[int, list[BitArray]]] = []
-    for img_tensor, digit in dataset:
-        if label is not None and int(digit) != label:
-            continue
-        img = img_tensor.squeeze(0).numpy()
-        digit_values = extractor.extract(img, digit)
-        measurements = digit_values[int(digit)]
-        codes: list[BitArray] = []
-        first = True
-        for (a, x, y) in measurements:
-            log_image = img if first else None
-            log_label = int(digit) if first else None
-            log_measurements = measurements if first else None
-            _, code = encoder.encode(
-                float(a),
-                float(x),
-                float(y),
-                log_image=log_image,
-                log_label=log_label,
-                log_measurements=log_measurements,
-            )
-            codes.append(code)
-            first = False
-        if codes:
-            samples.append((int(digit), codes))
-        if len(samples) >= sample_count:
-            break
-    return samples
 
 def _run_layout(
     codes: dict[float, list],
@@ -1513,14 +1562,24 @@ def _run_layout(
     long_checkpoint_path = f"{resolved_layout_path}{LAYOUT_LONG_PHASE_SUFFIX}"
     short_checkpoint_path = f"{resolved_layout_path}{LAYOUT_SHORT_PHASE_SUFFIX}"
     continuity_checkpoint_path = f"{resolved_layout_path}{LAYOUT_CONTINUITY_PHASE_SUFFIX}"
-    continuity_ready = layout.restore_positions_json(continuity_checkpoint_path)
+    continuity_ready = (
+        layout.restore_positions_json(continuity_checkpoint_path)
+        and layout.has_converged_phases("long", "short")
+    )
     short_ready = False
     long_ready = False
     if not continuity_ready:
-        short_ready = layout.restore_positions_json(short_checkpoint_path)
-    if not continuity_ready and not short_ready:
-        long_ready = layout.restore_positions_json(long_checkpoint_path)
+        short_loaded = layout.restore_positions_json(short_checkpoint_path)
+        short_ready = short_loaded and layout.has_converged_phases("long", "short")
+        long_ready = short_loaded and layout.has_converged_phases("long")
+    if not continuity_ready and not long_ready:
+        long_ready = (
+            layout.restore_positions_json(long_checkpoint_path)
+            and layout.has_converged_phases("long")
+        )
     step_offset = 1
+    if layout.last_run_report is not None:
+        step_offset = layout.last_run_report.final_step + 1
     long_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
@@ -1549,10 +1608,14 @@ def _run_layout(
             log_visuals=LAYOUT_LOG_VISUALS,
             adaptive_params=adaptive_long,
             converge_at_min_radius=True,
-            max_convergence_steps=LAYOUT_CONVERGENCE_MAX_EXTRA_STEPS,
+            max_convergence_steps=max(1, LAYOUT_CONVERGENCE_INITIAL_LIMIT - run_params.long_steps),
+            convergence_limit_multiplier=LAYOUT_CONVERGENCE_LIMIT_MULTIPLIER,
             save_on_stop_path=long_checkpoint_path,
         )
+        layout.require_convergence("long", long_checkpoint_path)
         layout.save_json(long_checkpoint_path)
+    if not (short_ready or continuity_ready):
+        layout.require_convergence("long", long_checkpoint_path)
     if long_quality_evaluator is not None and not (short_ready or continuity_ready):
         quality = long_quality_evaluator.evaluate(layout, layout.last_run_report)
         quality_data = {
@@ -1610,10 +1673,11 @@ def _run_layout(
                 force=True,
             )
             raise RuntimeError(
-                "C2 long не сошлась или содержит пространственную рябь; "
+                "Дальняя фаза не прошла проверку завершения; "
                 f"checkpoint сохранён: {long_checkpoint_path}"
             )
-    step_offset += layout.last_steps
+    if layout.last_run_report is not None:
+        step_offset = layout.last_run_report.final_step + 1
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
         max(
@@ -1661,8 +1725,10 @@ def _run_layout(
             adaptive_params=adaptive_short,
             short_optim=short_optim,
             converge_at_min_radius=True,
-            max_convergence_steps=LAYOUT_CONVERGENCE_MAX_EXTRA_STEPS,
+            max_convergence_steps=max(1, LAYOUT_CONVERGENCE_INITIAL_LIMIT - run_params.short_steps),
+            convergence_limit_multiplier=LAYOUT_CONVERGENCE_LIMIT_MULTIPLIER,
         )
+        layout.require_convergence("short", short_checkpoint_path)
         layout.save_json(short_checkpoint_path)
     if not continuity_ready:
         layout.run_continuity_relaxation(
@@ -1682,488 +1748,235 @@ def _run_layout(
     return layout
 
 
-class DetectorSpace2Pipeline:
-    """Строит второй последовательный Layout из эмбеддингов первого (§6.2, §6.6)."""
+class SpatialHierarchyPipeline:
+    """Обучает пространства деталей и их композиций только на train (§6.2, §6.6)."""
 
     def __init__(
-        self,
-        *,
-        sample_count: int,
-        encoder: RetinotopicOrientationEncoder,
-        extractor: MnistSobelAngleMap,
-        checkpoint_store: PipelineCheckpointStore,
-        final_embedding_store: EmbeddingStore,
+        self, *, train_count: int, sample_count: int,
+        encoder: RetinotopicOrientationEncoder, extractor: MnistSobelAngleMap,
+        checkpoint_store: PipelineCheckpointStore, final_embedding_store: EmbeddingStore,
     ) -> None:
-        self._sample_count = int(sample_count)
+        self._train_count = train_count
+        self._sample_count = sample_count
         self._encoder = encoder
         self._extractor = extractor
         self._checkpoint_store = checkpoint_store
-        self._final_embedding_store = final_embedding_store
-        self._space_1_store = EmbeddingStore(
-            DETECTOR_SPACE_1_EMBEDDINGS_JSON_KEY,
-            version_key=DETECTOR_SPACE_1_EMBEDDINGS_VERSION_KEY,
-            version=DETECTOR_SPACE_1_EMBEDDINGS_VERSION,
-        )
-    @staticmethod
-    def _bit_array(value: str) -> BitArray:
-        result = BitArray(len(value))
-        for index, bit in enumerate(value):
-            if bit == "1":
-                result.set(index)
-            elif bit != "0":
-                raise ValueError("embedding must be a binary string")
-        return result
+        self._embedding_store = final_embedding_store
+        self._window_encoder = _build_window_encoder(encoder)
 
     @staticmethod
-    def _bounded_layout_params(
-        params: TunedLayoutParams, point_count: int
-    ) -> TunedLayoutParams:
-        # С повторениями нельзя получить больше различных пар, чем C(n, 2).
-        unique_pairs = max(1, point_count * max(0, point_count - 1) // 2)
-        useful_steps = max(1, point_count)
-        short_pairs = min(params.short_pairs_per_step, unique_pairs)
-        if point_count < DETECTOR_SPACE_SMALL_LAYOUT_POINTS:
-            short_pairs = min(short_pairs, max(1, point_count // 2))
-        return TunedLayoutParams(
-            long_pairs_per_step=min(params.long_pairs_per_step, unique_pairs),
-            long_steps=min(params.long_steps, useful_steps),
+    def config() -> dict[str, object]:
+        # JSON-normalизация нужна для точного сравнения после загрузки manifest.
+        return json.loads(json.dumps({
+            "version": HIERARCHY_VERSION, "levels": DETECTOR_SPACE_COUNT,
+            "convergence_initial_limit": LAYOUT_CONVERGENCE_INITIAL_LIMIT,
+            "convergence_limit_multiplier": LAYOUT_CONVERGENCE_LIMIT_MULTIPLIER,
+            "require_phase_convergence": True,
+            "grid_size": MNIST_POSITION_GRID_SIZE,
+            "window_size": HIERARCHY_WINDOW_SIZE, "stride": HIERARCHY_WINDOW_STRIDE,
+            "position_layers": HIERARCHY_POSITION_LAYERS,
+            "feature_bits": ACTIVATION_OUTPUT_BITS,
+            "max_document_frequency": HIERARCHY_MAX_BIT_DOCUMENT_FREQUENCY,
+            "composition_active_fraction": HIERARCHY_COMPOSITION_ACTIVE_FRACTION,
+            "prune_compositions": True,
+            "gradient_threshold": MNIST_GRAD_THRESHOLD,
+            "orientation_limit": MNIST_LOCAL_ORIENTATION_LIMIT,
+            "angle_range": (MNIST_ORIENTATION_MIN, MNIST_ORIENTATION_MAX),
+            "angle_layers": MNIST_ORIENTATION_ANGLE_LAYERS,
+            "detector_layers": ACTIVATION_DETECTOR_LAYER_SPECS,
+            "detector_threshold": ACTIVATION_DETECTOR_THRESHOLD,
+            "activation_threshold": ACTIVATION_LAMBDA_THRESHOLD,
+            "target_active_bits": ACTIVATION_TARGET_ACTIVE_BITS,
+        }))
+
+    @classmethod
+    def load_manifest(cls, primary_path: str) -> dict[str, object]:
+        path = primary_path + HIERARCHY_MANIFEST_SUFFIX
+        if not os.path.exists(path):
+            raise RuntimeError("трёхуровневая модель не найдена; запустите layout")
+        with open(path, encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        if manifest.get("config") != cls.config() or manifest.get("split") != "train":
+            raise RuntimeError("параметры иерархии изменились; повторно запустите layout")
+        if len(manifest.get("layouts", [])) != DETECTOR_SPACE_COUNT:
+            raise RuntimeError("manifest должен содержать три раскладки")
+        LOGGER.event(
+            "hierarchy.model.load", section=DETECTOR_HIERARCHY,
+            data={"path": path, "train_images": manifest["train_images"],
+                  "levels": len(manifest["layouts"])},
+        )
+        return manifest
+
+    @staticmethod
+    def _pruner(indices: Sequence[int]) -> SparseCodeFrequencyPruner:
+        return SparseCodeFrequencyPruner(ACTIVATION_OUTPUT_BITS, frozenset(indices))
+
+    @staticmethod
+    def _write_json(path: str, payload: object) -> None:
+        temporary_path = path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=True, indent=2)
+        os.replace(temporary_path, path)
+        LOGGER.event("hierarchy.checkpoint.save", section=DETECTOR_HIERARCHY, data={"path": path})
+
+    def _samples(self, dataset, label: int | None):
+        if not getattr(dataset, "train", False):
+            raise ValueError("hierarchy fitting requires the MNIST training split")
+        samples = []
+        for index, (image, digit) in enumerate(dataset):
+            if label is not None and int(digit) != label:
+                continue
+            measurements = self._extractor.extract(image.squeeze(0).numpy(), int(digit))[int(digit)]
+            samples.append((index, int(digit), measurements))
+            if len(samples) == max(self._train_count, self._sample_count):
+                break
+        if len(samples) < max(self._train_count, self._sample_count):
+            raise ValueError("training corpus contains fewer images than requested")
+        LOGGER.event(
+            "hierarchy.training.samples", section=DETECTOR_HIERARCHY,
+            data={"split": "train", "layout_images": self._train_count,
+                  "embedding_images": self._sample_count,
+                  "layout_source_indices": [index for index, _, _ in samples[:self._train_count]]},
+        )
+        return samples
+
+    def _layout(self, codes: Sequence[BitArray], primary_path: str, suffix: str, tune_layout):
+        payload = LayoutPayloadBuilder(
+            similarity=LAYOUT_SIMILARITY, lambda_threshold=LAYOUT_LAMBDA_THRESHOLD, eta=LAYOUT_ETA,
+        )
+        for code in codes:
+            if code.count():
+                # Класс цифры не участвует ни в раскладке, ни в её раскраске.
+                payload.add_code(label="", hue=0.0, code=code)
+        payload = payload.deduplicated()
+        if not payload.records:
+            raise RuntimeError("иерархия потеряла все активные признаки до раскладки")
+        layout_config = self.config()
+        # Этот параметр меняет лишь выход C3, а не входы или координаты Layout.
+        layout_config.pop("composition_active_fraction")
+        layout_config.pop("prune_compositions")
+        digest = hashlib.sha256(json.dumps(layout_config, sort_keys=True).encode())
+        for record in payload.records:
+            digest.update(record.code.to01().encode())
+        path = f"{primary_path}.{digest.hexdigest()}{suffix}"
+        params = tune_layout(len(payload.records))
+        params = TunedLayoutParams(
+            long_pairs_per_step=min(params.long_pairs_per_step, HIERARCHY_LONG_PAIRS_MAX),
+            long_steps=min(params.long_steps, HIERARCHY_LONG_STEPS_MAX),
             long_subset_size=params.long_subset_size,
             long_subset_refresh=params.long_subset_refresh,
-            short_pairs_per_step=short_pairs,
-            short_steps=min(params.short_steps, useful_steps),
-            short_local_radius=params.short_local_radius,
+            short_pairs_per_step=min(params.short_pairs_per_step, HIERARCHY_SHORT_PAIRS_MAX),
+            short_steps=params.short_steps, short_local_radius=params.short_local_radius,
             short_energy_radius=params.short_energy_radius,
             short_energy_recalc_every=params.short_energy_recalc_every,
         )
-
-    def _space_1_embeddings(
-        self,
-        *,
-        primary_layout: Layout,
-        primary_layout_path: str,
-        dataset,
-        label: int | None,
-        engine: ActivationEngine,
-    ) -> list[EmbeddingRecord]:
-        cached = self._space_1_store.load(primary_layout_path)
-        if len(cached) >= self._sample_count:
-            return cached[: self._sample_count]
-        samples = _collect_samples(
-            dataset,
-            self._sample_count,
-            self._encoder,
-            self._extractor,
-            label=label,
-        )
-        records = list(cached[: len(samples)])
-        for index in range(len(records), len(samples)):
-            sample_label, codes = samples[index]
-            result = engine.activate(codes)
-            records.append(
-                EmbeddingRecord(
-                    class_label=str(sample_label),
-                    embedding_bits=result.embedding.to01(),
-                )
-            )
-            LOGGER.event(
-                "activation.detector_space.training",
-                section=DETECTOR_HIERARCHY,
-                data={
-                    "space": 1,
-                    "index": index,
-                    "target": len(samples),
-                    "input_codes": len(codes),
-                    "output_bits": result.embedding.count(),
-                },
-            )
-            if (
-                len(records) % ACTIVATION_CHECKPOINT_EVERY == 0
-                or len(records) == len(samples)
-            ):
-                self._space_1_store.save(primary_layout_path, records)
-        return records
-
-    def _space_2_layout(
-        self,
-        *,
-        primary_layout_path: str,
-        space_1_embeddings: Sequence[EmbeddingRecord],
-        hue_resolver: OrientationPreferenceHueResolver,
-        input_pruner: SparseCodeFrequencyPruner,
-        tune_layout,
-    ) -> tuple[Layout, str]:
-        path = _detector_space_2_layout_path(primary_layout_path)
-        colorizer = EncoderCodeColorizer(
-            LAYOUT_PSEUDO_COLOR_MIN_HUE,
-            LAYOUT_PSEUDO_COLOR_MAX_HUE,
-        )
-        payload = LayoutPayloadBuilder(
-            similarity=LAYOUT_SIMILARITY,
-            lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
-            eta=LAYOUT_ETA,
-        )
-        for record in space_1_embeddings:
-            code = input_pruner.transform(
-                self._bit_array(record.embedding_bits)
-            )
-            payload.add_code(
-                label=record.class_label,
-                hue=hue_resolver.resolve(code),
-                code=code,
-            )
-        unique_payload = payload.deduplicated()
-        if not unique_payload.records:
-            raise RuntimeError("пространство детекторов 2 не получило входных кодов")
-        params = self._bounded_layout_params(
-            tune_layout(len(unique_payload.records)),
-            len(unique_payload.records),
-        )
-        cached = _load_layout_from_file(
-            path,
-            params,
-            colorizer=colorizer,
-        )
-        if cached is not None:
-            return cached, path
-        unique_payload.save_base(path)
+        if not os.path.exists(path):
+            payload.save_base(path)
         layout = _run_layout(
-            unique_payload.codes_by_hue(),
-            params,
-            count=self._sample_count,
-            total_codes=len(unique_payload.records),
-            colorizer=colorizer,
-            layout_path=path,
-            cyclic_period=None,
-            cyclic_sharp_threshold=None,
-            use_gpu=len(unique_payload.records) >= DETECTOR_SPACE_SMALL_LAYOUT_POINTS,
-            long_energy_stability_delta=(
-                DETECTOR_SPACE_2_LONG_ENERGY_STABILITY_DELTA
-            ),
+            payload.codes_by_hue(), params, count=self._train_count,
+            total_codes=len(payload.records), colorizer=LAYOUT_COLORIZER,
+            layout_path=path, cyclic_period=None, cyclic_sharp_threshold=None,
+            continuity_sweeps=HIERARCHY_CONTINUITY_SWEEPS,
+            long_energy_stability_delta=DETECTOR_SPACE_2_LONG_ENERGY_STABILITY_DELTA,
             long_quality_evaluator=StructuralLongPhaseQualityEvaluator(
                 StructuralLongPhaseQualityConfig(
-                    local_similarity_gain_min=(
-                        DETECTOR_SPACE_2_LONG_QUALITY_LOCAL_SIMILARITY_GAIN_MIN
-                    ),
-                    max_local_discontinuity_ratio=(
-                        DETECTOR_SPACE_2_LONG_QUALITY_MAX_DISCONTINUITY_RATIO
-                    ),
-                    max_spatial_noise_ratio=(
-                        DETECTOR_SPACE_2_LONG_QUALITY_MAX_SPATIAL_NOISE_RATIO
-                    ),
-                    global_sample_size=(
-                        DETECTOR_SPACE_2_LONG_QUALITY_GLOBAL_SAMPLE_SIZE
-                    ),
-                    minimum_neighbours=(
-                        DETECTOR_SPACE_2_LONG_QUALITY_MINIMUM_NEIGHBOURS
-                    ),
+                    local_similarity_gain_min=DETECTOR_SPACE_2_LONG_QUALITY_LOCAL_SIMILARITY_GAIN_MIN,
+                    max_local_discontinuity_ratio=DETECTOR_SPACE_2_LONG_QUALITY_MAX_DISCONTINUITY_RATIO,
+                    max_spatial_noise_ratio=DETECTOR_SPACE_2_LONG_QUALITY_MAX_SPATIAL_NOISE_RATIO,
+                    global_sample_size=DETECTOR_SPACE_2_LONG_QUALITY_GLOBAL_SAMPLE_SIZE,
+                    minimum_neighbours=DETECTOR_SPACE_2_LONG_QUALITY_MINIMUM_NEIGHBOURS,
                 )
             ),
         )
         layout.save_json(path)
+        level = 2 if suffix == HIERARCHY_PARTS_SUFFIX else 3
+        layout.save_image(f"{path}.png")
+        layout.save_image(os.path.join(
+            HIERARCHY_MAP_DIRECTORY_TEMPLATE.format(count=self._train_count), f"level-{level}.png",
+        ))
         return layout, path
 
-    def _space_2_embeddings(
-        self,
-        *,
-        layout: Layout,
-        layout_path: str,
-        space_1_embeddings: Sequence[EmbeddingRecord],
-        engine: ActivationEngine,
-        input_pruner: SparseCodeFrequencyPruner,
-    ) -> list[EmbeddingRecord]:
-        cached = self._final_embedding_store.load(layout_path)
-        if len(cached) >= len(space_1_embeddings):
-            return cached[: len(space_1_embeddings)]
-        checkpoint = self._checkpoint_store.load(layout_path)
-        checkpoint_records = self._checkpoint_store.records(checkpoint)
-        records = (
-            checkpoint_records
-            if len(checkpoint_records) > len(cached)
-            else list(cached)
-        )
-        records = records[: len(space_1_embeddings)]
-        stages = dict(checkpoint.get("stages", {}))
-        stages["space_2_layout"] = True
-        for index in range(len(records), len(space_1_embeddings)):
-            source = space_1_embeddings[index]
-            input_code = input_pruner.transform(
-                self._bit_array(source.embedding_bits)
-            )
-            result = engine.activate((input_code,))
-            records.append(
-                EmbeddingRecord(
-                    class_label=source.class_label,
-                    embedding_bits=result.embedding.to01(),
-                )
-            )
-            LOGGER.event(
-                "activation.detector_space.training",
-                section=DETECTOR_HIERARCHY,
-                data={
-                    "space": 2,
-                    "index": index,
-                    "target": len(space_1_embeddings),
-                    "input_codes": 1,
-                    "input_bits": input_code.count(),
-                    "output_bits": result.embedding.count(),
-                },
-            )
-            if (
-                len(records) % ACTIVATION_CHECKPOINT_EVERY == 0
-                or len(records) == len(space_1_embeddings)
-            ):
-                self._checkpoint_store.save(
-                    layout_path,
-                    stages=stages,
-                    target_samples=len(space_1_embeddings),
-                    embeddings=records,
-                )
-        self._final_embedding_store.save(layout_path, records)
-        return records
-
-    def _space_2_output_layout(
-        self,
-        *,
-        primary_layout_path: str,
-        orientation_probes: Sequence[tuple[float, BitArray]],
-        hue_resolver: OrientationPreferenceHueResolver,
-        tune_layout,
-    ) -> tuple[Layout, str]:
-        """Раскладывает локальные C2-отклики для карты предпочтений (§6.2, §6.5)."""
-        path = _detector_space_2_output_layout_path(primary_layout_path)
-        colorizer = StructuralEmbeddingColorizer(hue_resolver)
-        payload = LayoutPayloadBuilder(
-            similarity=LAYOUT_SIMILARITY,
-            lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
-            eta=LAYOUT_ETA,
-        )
-        for _, code in orientation_probes:
-            payload.add_code(
-                label="orientation-probe",
-                hue=hue_resolver.resolve(code),
-                code=code,
-            )
-        unique_payload = payload.deduplicated()
-        if not unique_payload.records:
-            raise RuntimeError("C2 не содержит кодов для контрольной раскладки")
-        params = self._bounded_layout_params(
-            tune_layout(len(unique_payload.records)),
-            len(unique_payload.records),
-        )
-        cached = _load_layout_from_file(path, params, colorizer=colorizer)
-        if cached is not None:
-            return cached, path
-        unique_payload.save_base(path)
-        layout = _run_layout(
-            unique_payload.codes_by_hue(),
-            params,
-            count=self._sample_count,
-            total_codes=len(unique_payload.records),
-            colorizer=colorizer,
-            layout_path=path,
-            cyclic_period=DETECTOR_SPACE_HUE_MAX - DETECTOR_SPACE_HUE_MIN,
-            cyclic_sharp_threshold=DETECTOR_SPACE_ORIENTATION_SHARP_THRESHOLD,
-            cyclic_weight=DETECTOR_SPACE_ORIENTATION_CONTINUITY_WEIGHT,
-            continuity_sweeps=DETECTOR_SPACE_ORIENTATION_CONTINUITY_SWEEPS,
-            use_gpu=len(unique_payload.records) >= DETECTOR_SPACE_SMALL_LAYOUT_POINTS,
-        )
-        layout.save_json(path)
-        LOGGER.event(
-            "activation.detector_space.output_layout",
-            section=DETECTOR_HIERARCHY,
-            data={
-                "space": 2,
-                "codes": len(unique_payload.records),
-                "orientation_probes": len(orientation_probes),
-                "path": path,
-            },
-        )
-        return layout, path
-
-    def _space_1_orientation_probes(
-        self,
-        engine: ActivationEngine,
-    ) -> tuple[tuple[float, BitArray], ...]:
-        probes: list[tuple[float, BitArray]] = []
-        positions = len(self._encoder.topology.charts)
-        grid_size = int(round(math.sqrt(positions)))
-        if grid_size * grid_size != positions:
-            raise ValueError("orientation probe positions must form a square grid")
-        for center_index in range(positions):
-            center_y, center_x = divmod(center_index, grid_size)
-            local_positions = tuple(
-                y * grid_size + x
-                for y in range(
-                    max(0, center_y - DETECTOR_SPACE_ORIENTATION_PROBE_RADIUS),
-                    min(grid_size, center_y + DETECTOR_SPACE_ORIENTATION_PROBE_RADIUS + 1),
-                )
-                for x in range(
-                    max(0, center_x - DETECTOR_SPACE_ORIENTATION_PROBE_RADIUS),
-                    min(grid_size, center_x + DETECTOR_SPACE_ORIENTATION_PROBE_RADIUS + 1),
-                )
-            )
-            for angle in range(
-                int(MNIST_ORIENTATION_MIN),
-                int(MNIST_ORIENTATION_MAX),
-                DETECTOR_SPACE_ORIENTATION_PROBE_STEP,
-            ):
-                stimuli = tuple(
-                    self._encoder.encode_at(float(angle), center_index=index)[1]
-                    for index in local_positions
-                )
-                embedding = engine.activate(stimuli).embedding
-                if embedding.count() > 0:
-                    probes.append((float(angle), embedding))
-        LOGGER.event(
-            "activation.detector_space.orientation_probes",
-            section=STIMULUS_DETECTION,
-            data={
-                "space": 1,
-                "probes": len(probes),
-                "probe_centers": positions,
-                "probe_radius": DETECTOR_SPACE_ORIENTATION_PROBE_RADIUS,
-            },
-        )
-        return tuple(probes)
-
     @staticmethod
-    def _next_orientation_probes(
-        probes: Sequence[tuple[float, BitArray]],
-        engine: ActivationEngine,
-    ) -> tuple[tuple[float, BitArray], ...]:
-        resolved: list[tuple[float, BitArray]] = []
-        for angle, code in probes:
-            embedding = engine.activate((code,)).embedding
-            if embedding.count() > 0:
-                resolved.append((angle, embedding))
-        result = tuple(resolved)
-        LOGGER.event(
-            "activation.detector_space.orientation_probes",
-            section=STIMULUS_DETECTION,
-            data={"space": 2, "probes": len(result), "positions_per_probe": 1},
-        )
-        return result
-
-    @staticmethod
-    def _orientation_resolver(
-        probes: Sequence[tuple[float, BitArray]],
-    ) -> OrientationPreferenceHueResolver:
-        return OrientationPreferenceHueResolver(
-            probes=probes,
-            orientation_period=MNIST_ORIENTATION_MAX - MNIST_ORIENTATION_MIN,
-            minimum=DETECTOR_SPACE_HUE_MIN,
-            maximum=DETECTOR_SPACE_HUE_MAX,
-            temperature=DETECTOR_SPACE_ORIENTATION_PROBE_TEMPERATURE,
+    def _space(index: int, layout: Layout, path: str, pruner=None) -> DetectorSpace:
+        return DetectorSpace(
+            index,
+            _build_activation_engine(
+                layout, _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS),
+                layout_path=path,
+                active_detector_fraction=(
+                    HIERARCHY_COMPOSITION_ACTIVE_FRACTION if index == DETECTOR_SPACE_COUNT else None
+                ),
+            ),
+            input_pruner=pruner,
         )
 
-    def build(
-        self,
-        *,
-        primary_layout: Layout,
-        primary_layout_path: str,
-        dataset,
-        label: int | None,
-        tune_layout,
-    ) -> tuple[Layout, str, list[EmbeddingRecord], Layout, str, object]:
-        space_1_engine = _build_activation_engine(
-            primary_layout,
-            _compute_point_energies(
-                primary_layout, ACTIVATION_POINT_ENERGY_RADIUS
-            ),
-            layout_path=primary_layout_path,
+    def build(self, *, primary_layout: Layout, primary_layout_path: str, dataset,
+              label: int | None, tune_layout):
+        samples = self._samples(dataset, label)
+        space_1 = self._space(1, primary_layout, primary_layout_path)
+        local = [
+            SpatialDetectorHierarchy.encode_local(measurements, self._window_encoder, space_1)
+            for _, _, measurements in samples
+        ]
+        training_local = [feature.code for features in local[:self._train_count] for feature in features]
+        pruner_1 = SparseCodeFrequencyPruner.fit(
+            training_local, max_document_frequency=HIERARCHY_MAX_BIT_DOCUMENT_FREQUENCY,
         )
-        space_1_probes = self._space_1_orientation_probes(space_1_engine)
-        space_1 = self._space_1_embeddings(
-            primary_layout=primary_layout,
-            primary_layout_path=primary_layout_path,
-            dataset=dataset,
-            label=label,
-            engine=space_1_engine,
+        layout_2, path_2 = self._layout(
+            pruner_1.transform_many(training_local), primary_layout_path, HIERARCHY_PARTS_SUFFIX, tune_layout,
         )
-        space_1_codes = tuple(
-            self._bit_array(record.embedding_bits)
-            for record in space_1
+        space_2 = self._space(2, layout_2, path_2, pruner_1)
+        parts = [SpatialDetectorHierarchy.recognize_parts(features, space_2) for features in local]
+        training_parts = [feature.code for features in parts[:self._train_count] for feature in features]
+        pruner_2 = SparseCodeFrequencyPruner.fit(
+            training_parts, max_document_frequency=HIERARCHY_MAX_BIT_DOCUMENT_FREQUENCY,
         )
-        space_1_pruner = SparseCodeFrequencyPruner.fit(
-            space_1_codes,
-            max_document_frequency=(
-                DETECTOR_SPACE_1_MAX_BIT_DOCUMENT_FREQUENCY
-            ),
+        composition_encoder = _build_composition_encoder(pruner_2)
+        compositions = [composition_encoder.build(features) for features in parts]
+        pruner_3 = SparseCodeFrequencyPruner.fit(
+            compositions[:self._train_count],
+            max_document_frequency=HIERARCHY_MAX_BIT_DOCUMENT_FREQUENCY,
         )
-        pruned_space_1_probes = tuple(
-            (angle, space_1_pruner.transform(code))
-            for angle, code in space_1_probes
+        layout_3, path_3 = self._layout(
+            pruner_3.transform_many(compositions[:self._train_count]),
+            primary_layout_path, HIERARCHY_COMPOSITIONS_SUFFIX, tune_layout,
         )
-        pruned_space_1_probes = tuple(
-            (angle, code)
-            for angle, code in pruned_space_1_probes
-            if code.count() > 0
-        )
-        if not pruned_space_1_probes:
-            raise RuntimeError(
-                "frequency pruning removed every C1 orientation probe"
-            )
-        space_1_hue_resolver = self._orientation_resolver(
-            pruned_space_1_probes
-        )
-        space_2_layout, space_2_path = self._space_2_layout(
-            primary_layout_path=primary_layout_path,
-            space_1_embeddings=space_1,
-            hue_resolver=space_1_hue_resolver,
-            input_pruner=space_1_pruner,
-            tune_layout=tune_layout,
-        )
-        space_2_engine = _build_activation_engine(
-            space_2_layout,
-            _compute_point_energies(
-                space_2_layout, ACTIVATION_POINT_ENERGY_RADIUS
-            ),
-            layout_path=space_2_path,
-        )
-        final_embeddings = self._space_2_embeddings(
-            layout=space_2_layout,
-            layout_path=space_2_path,
-            space_1_embeddings=space_1,
-            engine=space_2_engine,
-            input_pruner=space_1_pruner,
-        )
-        preference_map = CorticalOrientationPreferenceMap(
-            orientation_period=MNIST_ORIENTATION_MAX - MNIST_ORIENTATION_MIN,
-            hue_minimum=DETECTOR_SPACE_HUE_MIN,
-            hue_maximum=DETECTOR_SPACE_HUE_MAX,
-            kernel_sigma_factor=DETECTOR_SPACE_ORIENTATION_KERNEL_SIGMA_FACTOR,
-            minimum_selectivity=DETECTOR_SPACE_ORIENTATION_MIN_SELECTIVITY,
-        )
-        space_2_probes, orientation_map_image = preference_map.calibrate_and_render(
-            engine=space_2_engine,
-            probes=pruned_space_1_probes,
-        )
-        space_2_hue_resolver = self._orientation_resolver(space_2_probes)
-        output_layout, output_layout_path = self._space_2_output_layout(
-            primary_layout_path=primary_layout_path,
-            orientation_probes=space_2_probes,
-            hue_resolver=space_2_hue_resolver,
-            tune_layout=tune_layout,
-        )
+        space_3 = self._space(3, layout_3, path_3, pruner_3)
+        records = [
+            EmbeddingRecord(str(digit), space_3.activate((code,)).embedding.to01())
+            for (_, digit, _), code in zip(samples[:self._sample_count], compositions)
+        ]
+        self._embedding_store.save(path_3, records)
+        self._write_json(primary_layout_path + HIERARCHY_LOCAL_CODES_SUFFIX, [
+            {"source_index": index, "class": digit,
+             "windows": [{"x": feature.x, "y": feature.y,
+                          "c1_bits": sorted(feature.code.active_indices()),
+                          "c2_bits": sorted(part.code.active_indices())}
+                         for feature, part in zip(features, image_parts)]}
+            for (index, digit, _), features, image_parts in zip(samples[:self._train_count], local, parts)
+        ])
+        self._write_json(primary_layout_path + HIERARCHY_MANIFEST_SUFFIX, {
+            "config": self.config(), "split": "train", "train_images": self._train_count,
+            "embedding_images": self._sample_count,
+            "source_indices": [index for index, _, _ in samples[:self._train_count]],
+            "layouts": [primary_layout_path, path_2, path_3],
+            "c1_kept_indices": sorted(pruner_1.kept_indices),
+            "c2_kept_indices": sorted(pruner_2.kept_indices),
+            "c3_kept_indices": sorted(pruner_3.kept_indices),
+            "local_windows": len(training_local),
+            "unique_local_codes": len({tuple(sorted(code.active_indices())) for code in training_local}),
+            "unique_part_codes": len({tuple(sorted(code.active_indices())) for code in training_parts}),
+            "unique_compositions": len({tuple(sorted(code.active_indices())) for code in compositions[:self._train_count]}),
+            "unique_embeddings": len({record.embedding_bits for record in records}),
+        })
         LOGGER.event(
-            "activation.detector_space.pipeline",
-            section=DETECTOR_HIERARCHY,
-            data={
-                "spaces": DETECTOR_SPACE_COUNT,
-                "samples": len(final_embeddings),
-                "space_1_layout": primary_layout_path,
-                "space_2_layout": space_2_path,
-                "space_2_output_layout": output_layout_path,
-            },
+            "hierarchy.training.completed", section=DETECTOR_HIERARCHY,
+            data={"levels": DETECTOR_SPACE_COUNT, "train_images": self._train_count,
+                  "local_windows": len(training_local), "parts_points": len(layout_2._points),
+                  "composition_points": len(layout_3._points), "embeddings": len(records)},
+            force=True,
         )
-        return (
-            space_2_layout,
-            space_2_path,
-            final_embeddings,
-            output_layout,
-            output_layout_path,
-            orientation_map_image,
-        )
+        return layout_2, path_2, layout_3, path_3, records
 
 
 class MnistLayoutRunner:
@@ -2175,6 +1988,8 @@ class MnistLayoutRunner:
         activation_samples: int | None = None,
     ) -> None:
         self.count = count
+        if count <= 0:
+            raise ValueError("count must be positive")
         self.label = label
         resolved_activation_samples = count if activation_samples is None else int(activation_samples)
         if resolved_activation_samples <= 0:
@@ -2261,9 +2076,6 @@ class MnistLayoutRunner:
                 },
             )
             return layout, tuned_params, total_points, path
-        cloned = self._clone_reference_layout()
-        if cloned is not None:
-            return cloned
         LOGGER.event(
             "layout.cache.miss",
             section=LAYOUT_PARAMETERS,
@@ -2271,40 +2083,6 @@ class MnistLayoutRunner:
         )
         return None
 
-    def _clone_reference_layout(self) -> tuple[Layout, TunedLayoutParams, int, str] | None:
-        if self.count <= MNIST_REFERENCE_LAYOUT_COUNT:
-            return None
-        for source_path in _layout_cache_paths_for_count(MNIST_REFERENCE_LAYOUT_COUNT):
-            metadata = self._load_layout_metadata(source_path)
-            if metadata is None:
-                continue
-            total_points, pair_radius, ready = metadata
-            if not ready or pair_radius is None:
-                continue
-            tuned_params = self._tune_layout(total_points)
-            layout = _load_layout_from_file(
-                source_path,
-                tuned_params,
-                colorizer=self.encoder.colorizer,
-                prepare_compute=False,
-            )
-            if layout is None:
-                continue
-            target_path = _layout_json_path(self.count, pair_radius)
-            layout.save_json(target_path)
-            LOGGER.event(
-                "layout.reference.clone",
-                section=DETECTOR_HIERARCHY,
-                data={
-                    "source": source_path,
-                    "target": target_path,
-                    "reference_images": MNIST_REFERENCE_LAYOUT_COUNT,
-                    "embedding_target": self._activation_samples,
-                    "points": total_points,
-                },
-            )
-            return layout, tuned_params, total_points, target_path
-        return None
 
     def _try_load_encoded_payload(
         self,
@@ -2396,127 +2174,19 @@ class MnistLayoutRunner:
         save_json: bool = True,
         image_path: str | None = None,
     ) -> None:
-        from PIL import Image
-
         resolved_layout_path = layout_path or _layout_json_path(self.count, layout.pair_radius)
         if save_json:
             layout.save_json(resolved_layout_path)
-        image = layout.render_image()
         suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
         filename = image_path or f"data/{self.count}-{suffix}.png"
-        Image.fromarray(image).save(filename)
-        LOGGER.event(
-            "layout.visual.from_json",
-            section=LAID_OUT_STRUCTURE,
-            data={
-                "path": resolved_layout_path,
-                "image": filename,
-                "points": len(layout.positions()),
-            },
-        )
+        layout.save_image(filename)
+        layout.save_image(os.path.join(
+            HIERARCHY_MAP_DIRECTORY_TEMPLATE.format(count=self.count), "level-1.png",
+        ))
 
 
-    @staticmethod
-    def _export_orientation_preference_map(image, path: str) -> None:
-        from PIL import Image
 
-        Image.fromarray(image).save(path)
-        LOGGER.event(
-            "activation.detector_space.orientation_map.export",
-            section=DETECTOR_HIERARCHY,
-            data={"space": 2, "image": path},
-        )
 
-    def _run_activation(
-        self,
-        layout: Layout,
-        dataset,
-        *,
-        layout_path: str,
-        stages: dict[str, bool],
-        initial_embeddings: Sequence[EmbeddingRecord],
-    ) -> list[EmbeddingRecord]:
-        engine = None
-        if _structural_diagnostics_enabled():
-            energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
-            engine = _build_activation_engine(
-                layout,
-                energies,
-                layout_path=layout_path,
-            )
-        samples = _collect_samples(
-            dataset,
-            self._activation_samples,
-            self.encoder,
-            self.extractor,
-            label=self.label,
-        )
-        embeddings = list(initial_embeddings[: len(samples)])
-        start_index = len(embeddings)
-        LOGGER.event(
-            "activation.resume",
-            section=PARALLEL_PROCESSING,
-            data={
-                "completed": start_index,
-                "target": len(samples),
-                "workers": ACTIVATION_PARALLEL_WORKERS,
-                "batch_size": ACTIVATION_BATCH_SIZE,
-            },
-        )
-        for batch_start in range(start_index, len(samples), ACTIVATION_BATCH_SIZE):
-            batch = samples[batch_start : batch_start + ACTIVATION_BATCH_SIZE]
-            for offset, (label, codes) in enumerate(batch):
-                index = batch_start + offset
-                structural_result = None
-                if (
-                    engine is not None
-                    and (
-                    index == start_index
-                    or (index + 1) % ACTIVATION_STRUCTURAL_DIAGNOSTIC_EVERY == 0
-                    or index + 1 == len(samples)
-                    )
-                ):
-                    structural_result = engine.activate(codes)
-                classification_embedding = self._stimulus_embedding_builder.build(codes)
-                LOGGER.event(
-                    "activation.sample",
-                    section=STIMULUS_DETECTION,
-                    data={
-                        "index": index,
-                        "sample_label": str(int(label)),
-                        "stimuli": len(codes),
-                        "active_detectors": len(structural_result.active_detectors)
-                        if structural_result is not None
-                        else 0,
-                        "structural_embedding_bits": structural_result.embedding.count()
-                        if structural_result is not None
-                        else 0,
-                        "embedding_bits": classification_embedding.count(),
-                        "structural_evaluated": structural_result is not None,
-                    },
-                )
-                embeddings.append(
-                    EmbeddingRecord(
-                        class_label=str(int(label)),
-                        embedding_bits=classification_embedding.to01(),
-                    )
-                )
-            if (
-                len(embeddings) % ACTIVATION_CHECKPOINT_EVERY == 0
-                or len(embeddings) == len(samples)
-            ):
-                self._checkpoint_store.save(
-                    layout_path,
-                    stages=stages,
-                    target_samples=self._activation_samples,
-                    embeddings=embeddings,
-                )
-        return embeddings
-
-    def _save_embeddings(self, layout_path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
-        if not layout_path:
-            raise ValueError("layout_path must be provided to save embeddings")
-        self._embedding_store.save(layout_path, embeddings)
 
     def run(self) -> None:
         started_at = time.perf_counter()
@@ -2586,7 +2256,8 @@ class MnistLayoutRunner:
             embeddings=checkpoint_embeddings,
         )
         self._export_layout(layout, layout_path=layout_path, save_json=save_json)
-        detector_pipeline = DetectorSpace2Pipeline(
+        detector_pipeline = SpatialHierarchyPipeline(
+            train_count=self.count,
             sample_count=self._activation_samples,
             encoder=self.encoder,
             extractor=self.extractor,
@@ -2596,10 +2267,9 @@ class MnistLayoutRunner:
         (
             space_2_layout,
             space_2_path,
+            space_3_layout,
+            space_3_path,
             embeddings,
-            space_2_output_layout,
-            space_2_output_path,
-            orientation_map_image,
         ) = detector_pipeline.build(
             primary_layout=layout,
             primary_layout_path=layout_path,
@@ -2607,24 +2277,9 @@ class MnistLayoutRunner:
             label=self.label,
             tune_layout=self._tune_layout,
         )
-        self._export_layout(
-            space_2_layout,
-            layout_path=space_2_path,
-            save_json=True,
-            image_path=f"{layout_path}{DETECTOR_SPACE_2_IMAGE_SUFFIX}",
-        )
-        self._export_layout(
-            space_2_output_layout,
-            layout_path=space_2_output_path,
-            save_json=True,
-            image_path=f"{layout_path}{DETECTOR_SPACE_2_OUTPUT_IMAGE_SUFFIX}",
-        )
-        self._export_orientation_preference_map(
-            orientation_map_image,
-            f"{layout_path}{DETECTOR_SPACE_2_OUTPUT_IMAGE_SUFFIX}",
-        )
         stages["activation"] = True
         stages["detector_space_2"] = True
+        stages["detector_space_3"] = True
         stages["export"] = True
         self._checkpoint_store.save(
             layout_path,
@@ -2644,7 +2299,7 @@ class MnistLayoutRunner:
                 "embeddings": len(embeddings),
                 "layout_path": layout_path,
                 "detector_space_2_layout_path": space_2_path,
-                "detector_space_2_output_layout_path": space_2_output_path,
+                "detector_space_3_layout_path": space_3_path,
             },
             force=True,
         )
@@ -2754,61 +2409,41 @@ class MnistDecodeRunner:
         if self._decoder is not None:
             return self._decoder
         layout, layout_path, total_points = self._load_layout()
-        space_2_path = _detector_space_2_layout_path(layout_path)
-        space_2_metadata = _load_layout_metadata_from_path(space_2_path)
-        if space_2_metadata is None or not space_2_metadata[2]:
-            raise RuntimeError(
-                "пространство детекторов 2 не найдено; повторно запустите layout"
-            )
-        space_2_points, _, _ = space_2_metadata
-        space_2_params = LayoutParameterTuner(
-            empty_ratio=LAYOUT_EMPTY_RATIO,
-            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
-        ).tune(space_2_points)
-        space_2_layout = _load_layout_from_file(
-            space_2_path,
-            space_2_params,
-            colorizer=EncoderCodeColorizer(
-                min_hue=DETECTOR_SPACE_HUE_MIN,
-                max_hue=DETECTOR_SPACE_HUE_MAX,
-            ),
+        manifest = SpatialHierarchyPipeline.load_manifest(layout_path)
+        paths = manifest["layouts"]
+        layouts = [layout]
+        for path in paths[1:]:
+            metadata = _load_layout_metadata_from_path(path)
+            if metadata is None or not metadata[2]:
+                raise RuntimeError("одна из трёх раскладок не готова; повторно запустите layout")
+            params = LayoutParameterTuner().tune(metadata[0])
+            loaded = _load_layout_from_file(path, params, colorizer=LAYOUT_COLORIZER)
+            if loaded is None:
+                raise RuntimeError(f"повреждена раскладка иерархии: {path}")
+            layouts.append(loaded)
+        pruner_1 = SpatialHierarchyPipeline._pruner(manifest["c1_kept_indices"])
+        pruner_2 = SpatialHierarchyPipeline._pruner(manifest["c2_kept_indices"])
+        composition_encoder = _build_composition_encoder(pruner_2)
+        pruner_3 = SparseCodeFrequencyPruner(
+            composition_encoder.code_length, frozenset(manifest["c3_kept_indices"]),
         )
-        if space_2_layout is None:
-            raise RuntimeError("раскладка пространства детекторов 2 повреждена")
-        embeddings = _load_embeddings_from_file(space_2_path)
-        if not embeddings:
-            raise RuntimeError(
-                "в пространстве детекторов 2 нет базы эмбеддингов; повторно запустите layout"
+        spaces = [
+            SpatialHierarchyPipeline._space(
+                index, level_layout, path,
+                pruner_1 if index == 2 else pruner_3 if index == 3 else None,
             )
+            for index, (level_layout, path) in enumerate(zip(layouts, paths), start=1)
+        ]
+        spatial_hierarchy = SpatialDetectorHierarchy(
+            window_encoder=_build_window_encoder(self.encoder),
+            composition_encoder=composition_encoder, spaces=spaces,
+        )
+        embeddings = _load_embeddings_from_file(paths[-1])
         labeled_embeddings = _embedding_records_to_labeled(embeddings)
         if not labeled_embeddings:
-            raise RuntimeError("в раскладке нет базы эмбеддингов")
-        space_1_engine = _build_activation_engine(
-            layout,
-            _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS),
-            layout_path=layout_path,
-        )
-        space_2_engine = _build_activation_engine(
-            space_2_layout,
-            _compute_point_energies(
-                space_2_layout, ACTIVATION_POINT_ENERGY_RADIUS
-            ),
-            layout_path=space_2_path,
-        )
-        space_1_pruner = SparseCodeFrequencyPruner.from_kept_codes(
-            tuple(point.code for point in space_2_layout._points)
-        )
-        detector_space_cascade = DetectorSpaceCascade(
-            (
-                DetectorSpace(1, space_1_engine),
-                DetectorSpace(
-                    2,
-                    space_2_engine,
-                    input_pruner=space_1_pruner,
-                ),
-            )
-        )
-        self.layout_path = space_2_path
+            raise RuntimeError("в третьем уровне нет базы эмбеддингов; запустите layout")
+        self.layout_path = paths[-1]
+
         decoder_parameters = DecoderParameterScaleResolver(
             reference_embeddings=DECODER_REFERENCE_EMBEDDINGS,
             base_top_k=DECODER_KNN_TOP_K,
@@ -2832,7 +2467,7 @@ class MnistDecodeRunner:
             encoder=self.encoder,
             extractor=self.extractor,
             activation_engine=None,
-            detector_space_cascade=detector_space_cascade,
+            spatial_hierarchy=spatial_hierarchy,
             embedding_db=database,
             evaluation_confidence_bins=EVALUATION_CONFIDENCE_BINS,
             evaluation_error_examples=EVALUATION_ERROR_EXAMPLES,
@@ -2848,61 +2483,16 @@ class MnistDecodeRunner:
             section=STIMULUS_DETECTION,
             data={
                 "layout_path": layout_path,
-                "detector_space_2_layout_path": space_2_path,
+                "hierarchy_layouts": paths,
                 "embeddings": len(labeled_embeddings),
                 "points": total_points,
-                "detector_space_2_points": space_2_points,
+                "hierarchy_points": [len(item._points) for item in layouts],
                 "detector_spaces": DETECTOR_SPACE_COUNT,
                 "temperature": self._decoder.base_temperature,
             },
         )
         return self._decoder
 
-    def _build_embeddings_for_layout(
-        self,
-        layout: Layout,
-        layout_path: str,
-        energies: list[float],
-    ) -> list[EmbeddingRecord]:
-        engine = _build_activation_engine(layout, energies, layout_path=layout_path)
-        dataset = self._build_dataset(train=True)
-        samples = _collect_samples(
-            dataset,
-            DECODER_DATASET_LIMIT,
-            self.encoder,
-            self.extractor,
-            label=None,
-        )
-        embeddings: list[EmbeddingRecord] = []
-        for idx, (label, codes) in enumerate(samples):
-            result = engine.activate(codes)
-            embeddings.append(
-                EmbeddingRecord(
-                    class_label=str(int(label)),
-                    embedding_bits=self._stimulus_embedding_builder.build(codes).to01(),
-                )
-            )
-            LOGGER.event(
-                "decoder.base.generate",
-                section=DETECTOR_INSERTION,
-                data={
-                    "index": idx,
-                    "label": int(label),
-                    "stimuli": len(codes),
-                    "bits": result.embedding.count(),
-                },
-            )
-        self._embedding_store.save(layout_path, embeddings)
-        LOGGER.event(
-            "decoder.base.generated",
-            section=DETECTOR_INSERTION,
-            data={
-                "embeddings": len(embeddings),
-                "classes": len({int(item.class_label) for item in embeddings}),
-                "path": layout_path,
-            },
-        )
-        return embeddings
 
     def predict_image(
         self,
