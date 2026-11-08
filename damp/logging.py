@@ -43,6 +43,58 @@ class LogIntervalPolicy:
         self._counters.clear()
 
 
+class RerunViewerBlueprint:
+    """Панели окна Rerun для DAMP: ход раскладки всегда на первом плане.
+
+    Rerun запоминает расположение панелей для каждого приложения и восстанавливает его при следующем
+    открытии; если в прошлой сессии панели закрыли или они ссылаются на сущности, которых больше нет,
+    окно выглядит пустым. Поэтому логгер отправляет эту раскладку при открытии окна и делает её активной.
+    Пути сущностей совпадают с теми, куда пишут Layout, ActivationEngine и DetectorLayerView.
+    """
+
+    LAYOUT_MAP = "/layout/angle"
+    LAYOUT_CODE_MAP = "/layout/image"
+    SWAP_RATIO = "/layout/swap_ratio"
+    AVERAGE_ENERGY = "/layout/energy/long"
+    TEXT_LOG = f"/{LOG_PATH}"
+
+    @classmethod
+    def build(cls):
+        import rerun.blueprint as rrb
+
+        progress = rrb.Spatial2DView(name="Ход раскладки: по углу (рис. 16)", origin=cls.LAYOUT_MAP)
+        results = rrb.Tabs(
+            rrb.Spatial2DView(name="Ход раскладки: псевдоцвета (§5.14)", origin=cls.LAYOUT_CODE_MAP),
+            rrb.Spatial2DView(
+                name="Итог: псевдоцвета (§5.14)", contents=["/layout/final/image", "/layout/final/points"]
+            ),
+            rrb.Spatial2DView(
+                name="Итог: по углу (рис. 16)",
+                contents=["/layout/final/component_image", "/layout/final/component_points"],
+            ),
+            rrb.Spatial2DView(
+                name="Итог: энергия (рис. 18)", contents=["/layout/final/energy_image", "/layout/final/energy_points"]
+            ),
+            rrb.Spatial2DView(name="Активация", origin="/activation/map"),
+            rrb.Spatial2DView(name="Энергия точек", origin="/activation/energy"),
+            rrb.Spatial2DView(name="Детекторы кодера", origin="/encoder/detectors"),
+        )
+        charts = rrb.Vertical(
+            rrb.TimeSeriesView(name="Доля обменов (§5.6)", origin=cls.SWAP_RATIO),
+            rrb.TimeSeriesView(name="Качество Ē (§5.8)", origin=cls.AVERAGE_ENERGY),
+            rrb.TextLogView(name="Лог", origin=cls.TEXT_LOG),
+            row_shares=[1, 1, 2],
+        )
+        return rrb.Blueprint(
+            rrb.Horizontal(
+                rrb.Vertical(progress, results, row_shares=[3, 2]),
+                charts,
+                column_shares=[3, 2],
+            ),
+            rrb.SelectionPanel(state="collapsed"),
+        )
+
+
 class DampLogger:
     def __init__(self, app_id: str = "damp", base_path: str = LOG_PATH, *, spawn: bool = True) -> None:
         self._app_id = app_id
@@ -60,6 +112,14 @@ class DampLogger:
         if self._spawn and not self._spawned and rr.is_enabled():
             rr.spawn()
             self._spawned = True
+            self._send_blueprint()
+
+    def _send_blueprint(self) -> None:
+        """Делает раскладку панелей DAMP активной, перекрывая сохранённую в окне с прошлых сессий."""
+        try:
+            rr.send_blueprint(RerunViewerBlueprint.build(), make_active=True, make_default=True)
+        except Exception as exc:  # окно всё равно получает данные, просто с панелями по умолчанию
+            self._console_log(f"rerun.blueprint.error error={exc!r}")
 
     def _console_log(self, message: str) -> None:
         stream = sys.stdout

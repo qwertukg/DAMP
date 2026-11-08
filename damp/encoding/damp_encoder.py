@@ -29,6 +29,8 @@ from damp.logging import LOGGER
 # Сдвиг каждого слоя на свою долю шага: слои не выстраиваются в начале
 # координат, и плотность кода не зависит от положения стимула (Angle-Encoder).
 GOLDEN_RATIO_FRACTION = (math.sqrt(5.0) - 1.0) / 2.0
+# §2: «bit vectors work well when no more than 25% of bits are set to 1».
+_MAX_SPARSE_DENSITY = 0.25
 
 
 @dataclass(frozen=True)
@@ -111,6 +113,7 @@ class Dimension:
         detector_layers: Sequence[Detectors],
         closed: bool,
         code_length: int,
+        edge_detectors: bool = False,
     ) -> None:
         self.title = str(title)
         if len(size) != 2:
@@ -127,6 +130,9 @@ class Dimension:
             raise ValueError("code_length must give every detector layer at least one bit (colour band, §3.2)")
         self.detector_layers = list(detector_layers)
         self.closed = bool(closed)
+        # Только для отрезка: True — детекторы заходят за концы (схема Angle-Encoder), False — ровно count
+        # детекторов слоя внутри отрезка (§4.2.1 не требует детекторов за краями).
+        self.edge_detectors = bool(edge_detectors) and not self.closed
         self.code_length = int(code_length)
         self.period = self.max_value - self.min_value
         layers = [(layer.count, layer.overlap) for layer in self.detector_layers]
@@ -140,6 +146,7 @@ class Dimension:
                 "closed": self.closed,
                 "period": self.period,
                 "code_length": self.code_length,
+                "edge_detectors": self.edge_detectors,
                 "layer_specs": layers,
             },
         )
@@ -191,7 +198,8 @@ class ClosedDimension(Dimension):
 
 
 class OpenedDimension(Dimension):
-    """Отрезок: детекторы заходят за концы, чтобы края покрывались как середина (§4.2)."""
+    """Отрезок (§4.2). edge_detectors=True — детекторы заходят за концы, чтобы края покрывались как
+    середина (схема Angle-Encoder); False — в слое ровно count детекторов внутри отрезка."""
 
     def __init__(
         self,
@@ -200,6 +208,7 @@ class OpenedDimension(Dimension):
         detector_layers: Sequence[Detectors],
         *,
         code_length: int,
+        edge_detectors: bool = True,
     ) -> None:
         super().__init__(
             title=title,
@@ -207,6 +216,7 @@ class OpenedDimension(Dimension):
             detector_layers=detector_layers,
             closed=False,
             code_length=code_length,
+            edge_detectors=edge_detectors,
         )
 
 
@@ -264,11 +274,12 @@ class _DimensionIndex:
 class Encoder:
     """Широкие детекторы со случайными битами, как в Angle-Encoder (§4.1–§4.6).
 
-    Каждая координата получает собственный сегмент кода фиксированной длины,
-    а итоговый код является конкатенацией сегментов (§2.2.3). Каждому детектору
-    назначается один случайный бит своего сегмента (§4.2.1); несколько
-    детекторов могут разделять бит, такие коллизии допускаются статьёй и
-    логируются как паразитные биты.
+    §2.2.3 оставляет выбор: коды координат можно склеить (конкатенация — у каждой координаты свой
+    сегмент, длина кода растёт) или слить в общий код той же длины (shared_code=True: биты всех
+    координат объединяются операцией OR, §2.2.1; растут плотность и вероятность коллизий). Каждому
+    детектору назначается один случайный бит цветовой полосы своего слоя (§3.2, §4.2.1); несколько
+    детекторов, в том числе разных координат, могут разделять бит — такие коллизии допускаются
+    статьёй и логируются как паразитные биты.
     """
 
     def __init__(
@@ -277,9 +288,13 @@ class Encoder:
         random_seed: Optional[int] = None,
         log_every: Optional[int] = None,
         layer_phase: bool = True,
+        shared_code: bool = False,
     ) -> None:
         if not dimensions:
             raise ValueError("at least one dimension is required")
+        self.shared_code = bool(shared_code)
+        if self.shared_code and len({dim.code_length for dim in dimensions}) != 1:
+            raise ValueError("shared code: all dimensions must have the same code_length (§2.2.3)")
         self.dimensions = list(dimensions)
         self.random_seed = random_seed
         self._rng = random.Random(random_seed)
@@ -322,8 +337,10 @@ class Encoder:
                 )
             )
             self._log_dimension_bits(dim_index, dim, detectors_for_dim)
-            offset += dim.code_length
-        self.code_length = offset
+            if not self.shared_code:
+                offset += dim.code_length
+        # Общий код — длина одной координаты (все пишут в одни и те же биты); конкатенация — сумма сегментов.
+        self.code_length = self.dimensions[0].code_length if self.shared_code else offset
         dim_summaries = []
         for dim in self.dimensions:
             status = "closed" if dim.closed else "open"
@@ -343,15 +360,30 @@ class Encoder:
                 "dims": dim_summaries,
             },
         )
+        expected_density = self.expected_density()
         LOGGER.event(
             "encoder.code_length",
             section=CONCATENATION,
             data={
+                "mode": "merge" if self.shared_code else "concatenation",
                 "code_length": self.code_length,
                 "segments": self._segments,
-                "expected_density": self.expected_density(),
+                "expected_density": expected_density,
+                "note": "§2.2.3: слияние сохраняет длину, но повышает плотность и коллизии (OR, §2.2.1); "
+                "конкатенация сохраняет коды координат, но удлиняет код",
             },
         )
+        if expected_density > _MAX_SPARSE_DENSITY:
+            LOGGER.event(
+                "encoder.density.warning",
+                section=SPARSE_BIT_VECTORS,
+                data={
+                    "expected_density": expected_density,
+                    "max_density": _MAX_SPARSE_DENSITY,
+                    "note": "битовые векторы хорошо работают при плотности не выше 25% (§2); при высокой "
+                    "насыщенности вместо OR нужен colour merge (§2.2.1, §3.3)",
+                },
+            )
         LOGGER.event(
             "encoder.detectors",
             section=WIDE_DETECTORS,
@@ -382,13 +414,19 @@ class Encoder:
                 dim.min_value + ((index + phase) * step) % dim.period
                 for index in range(count)
             ]
-        else:
+        elif dim.edge_detectors:
             # Как в LinearEncoder: детекторы, заходящие за концы отрезка,
             # сохраняются, чтобы края покрывались так же плотно, как середина.
             half_steps = width / 2.0 / step
             first = int(math.floor(-half_steps - phase)) + 1
             last = int(math.ceil(count + half_steps - phase)) - 1
             centers = [dim.min_value + (index + phase) * step for index in range(first, last + 1)]
+        else:
+            # Ровно count детекторов внутри отрезка, по центру своих шагов: поле шире шага (перекрытие),
+            # поэтому концы отрезка покрыты при любом перекрытии; сдвиг фазы слоя здесь не применяется —
+            # при сдвиге больше полуширины поля начало или конец отрезка остались бы непокрытыми.
+            phase = 0.5
+            centers = [dim.min_value + (index + phase) * step for index in range(count)]
         half_width = width / 2.0
         LOGGER.event(
             "encoder.layer",
@@ -490,15 +528,21 @@ class Encoder:
         return expected_bits / dim.code_length
 
     def expected_density(self) -> float:
-        expected_bits = sum(
-            self.expected_dimension_density(dim) * dim.code_length for dim in self.dimensions
-        )
-        return expected_bits / self.code_length
+        """Ожидаемая плотность кода (§2, §4.2.1): бит не установлен, если его не поставил ни один слой ни одной
+        координаты; в общем коде полосы разных координат накладываются друг на друга."""
+        unset = np.ones(self.code_length, dtype=np.float64)
+        for (offset, _), dim in zip(self._segments, self.dimensions):
+            for layer_index, layer in enumerate(dim.detector_layers):
+                start, length = dim.layer_band(layer_index)
+                active_detectors = 1.0 / (1.0 - layer.overlap)
+                unset[offset + start: offset + start + length] *= (1.0 - 1.0 / length) ** active_detectors
+        return float(1.0 - unset.mean())
 
     @property
     def signature(self) -> str:
         """Отпечаток конфигурации кодера: геометрия слоёв и назначенные биты."""
         digest = hashlib.sha256()
+        digest.update(f"shared={self.shared_code}|".encode())
         for dim in self.dimensions:
             digest.update(
                 f"{dim.title}|{dim.min_value}|{dim.max_value}|{dim.closed}|{dim.code_length}|".encode()
@@ -540,7 +584,6 @@ class Encoder:
         """
         index = dimension if isinstance(dimension, int) else [d.title for d in self.dimensions].index(dimension)
         dim = self.dimensions[index]
-        mids = [(d.min_value + d.max_value) / 2.0 for d in self.dimensions]
         span = dim.period if dim.closed else dim.max_value - dim.min_value
         if step is not None:
             # Шаг сетки стимулов: профиль считается на тех же расстояниях, что встречаются в данных.
@@ -553,14 +596,11 @@ class Encoder:
             grid = [dim.min_value + span * k / samples for k in range(samples)]
         else:
             grid = [dim.min_value + span * k / (samples - 1) for k in range(samples)]
-        offset, length = self.segment(index)
         codes = []
         for value in grid:
-            values = list(mids)
-            values[index] = value
-            # Сравниваются только биты сегмента координаты: биты остальных координат
-            # постоянны и лишь поднимают пол сходства, скрывая плоский хвост профиля.
-            codes.append({bit for bit in self.encode_indices(*values)[1] if offset <= bit < offset + length})
+            # Сравниваются только биты детекторов этой координаты: биты остальных координат
+            # постоянны и лишь поднимают пол сходства, скрывая плоский хвост профиля (и в общем коде тоже).
+            codes.append(set(self.dimension_bits(index, value)))
         step = span / samples if dim.closed else span / (samples - 1)
         buckets: dict[int, list[float]] = {}
         for i in range(len(grid)):
@@ -627,22 +667,35 @@ class Encoder:
         if len(values) != len(self.dimensions):
             raise ValueError("number of values must match number of dimensions")
         normalized_values: List[float] = []
-        active: list[int] = []
-        shared_bits = 0
+        bit_hits: dict[int, int] = {}
         for value, dim, index in zip(values, self.dimensions, self._indices):
-            v = float(value)
-            if dim.closed:
-                v = ((v - dim.min_value) % dim.period) + dim.min_value
-            elif not (dim.min_value <= v <= dim.max_value):
-                raise ValueError(
-                    f"value {v} is outside the open dimension range "
-                    f"[{dim.min_value}, {dim.max_value}]"
-                )
+            v = self._normalize_value(dim, value)
             normalized_values.append(v)
             bits, hits = index.active_bits(v)
-            active.extend(int(bit) for bit in bits)
-            shared_bits += int(np.count_nonzero(hits > 1))
-        return tuple(normalized_values), tuple(sorted(active)), shared_bits
+            for bit, count in zip(bits, hits):
+                bit_hits[int(bit)] = bit_hits.get(int(bit), 0) + int(count)
+        # OR кодов координат (§2.2.1); бит, который поставили несколько детекторов, — паразитный (§4.2.1).
+        shared_bits = sum(1 for count in bit_hits.values() if count > 1)
+        return tuple(normalized_values), tuple(sorted(bit_hits)), shared_bits
+
+    @staticmethod
+    def _normalize_value(dim: "Dimension", value: float) -> float:
+        v = float(value)
+        if dim.closed:
+            return ((v - dim.min_value) % dim.period) + dim.min_value
+        if not (dim.min_value <= v <= dim.max_value):
+            raise ValueError(
+                f"value {v} is outside the open dimension range "
+                f"[{dim.min_value}, {dim.max_value}]"
+            )
+        return v
+
+    def dimension_bits(self, dimension: int | str, value: float) -> tuple[int, ...]:
+        """Биты, которые ставят детекторы одной координаты при данном значении (её собственный код)."""
+        index = dimension if isinstance(dimension, int) else [d.title for d in self.dimensions].index(dimension)
+        dim = self.dimensions[index]
+        bits, _ = self._indices[index].active_bits(self._normalize_value(dim, value))
+        return tuple(int(bit) for bit in bits)
 
     def encode(
         self,

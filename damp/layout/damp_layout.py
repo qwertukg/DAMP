@@ -1404,9 +1404,12 @@ class Layout:
         long_kernel: str = "distance",
         long_kernel_radius_min: int = 3,
         long_kernel_width: float = 0.5,
+        component_period: float | None = None,
     ) -> None:
         if not codes:
             raise ValueError("codes must be non-empty")
+        if component_period is not None and component_period <= 0.0:
+            raise ValueError("component_period must be positive when set")
         if long_kernel not in _LONG_KERNELS:
             raise ValueError("long_kernel must be 'distance' or 'gauss'")
         if long_kernel_radius_min <= 0:
@@ -1455,6 +1458,9 @@ class Layout:
         self._long_kernel = long_kernel
         self._long_kernel_radius_min = int(long_kernel_radius_min)
         self._long_kernel_width = float(long_kernel_width)
+        # Период известной компоненты стимула (угол) для диагностической раскраски хода раскладки (рис. 16);
+        # в самой раскладке компонента не участвует.
+        self._component_period = None if component_period is None else float(component_period)
         self._lambda = lambda_threshold
         self._eta = eta
         self._colorizer = colorizer or EncoderCodeColorizer(
@@ -2199,6 +2205,13 @@ class Layout:
                     radii=0.5,
                 ),
             ]
+            if self._component_period is not None:
+                # Та же карта, раскрашенная по углу стимула, как в pinwheel-тесте (рис. 16, §5.13.2).
+                component_colors = self.component_colors_rgb(period=self._component_period)
+                visuals += [
+                    LOGGER.visual_image(f"{path}/angle", self._build_image(component_colors)),
+                    LOGGER.visual_points2d(f"{path}/angle", positions, colors=component_colors, radii=0.5),
+                ]
         energy_radius: int | None = None
         energy_value: float | None = None
         energy_source: str | None = None

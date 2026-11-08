@@ -277,6 +277,7 @@ class PinwheelExperiment:
             long_kernel=LAYOUT_LONG_KERNEL,
             long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
             long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
+            component_period=MNIST_ANGLE_MAX - MNIST_ANGLE_MIN,
         )
 
     def run(self, *, save: bool = True) -> tuple[Layout, PinwheelQuality]:

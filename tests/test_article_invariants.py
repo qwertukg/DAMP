@@ -71,6 +71,53 @@ class EncoderInvariantTests(unittest.TestCase):
         bits = [window.bit for window in encoder.detectors if window.dimension_index == 0]
         self.assertNotEqual(bits, sorted(bits), "биты назначаются случайно, а не по порядку")
 
+    def test_shared_code_merges_dimension_codes_without_concatenation(self) -> None:
+        """§2.2.3, §2.2.1: общий код той же длины — OR кодов координат; коллизии между координатами учитываются."""
+        layers = geometric_detector_layers(layers_count=4, widest_detectors=2, narrowest_detectors=20, overlap=0.5)
+        encoder = Encoder(
+            ClosedDimension("Angle", (0.0, 360.0), layers, code_length=64),
+            OpenedDimension("X", (0.0, 6.0), layers, code_length=64),
+            random_seed=0,
+            shared_code=True,
+        )
+        self.assertEqual(encoder.code_length, 64)
+        self.assertEqual(encoder.segment("Angle"), (0, 64))
+        self.assertEqual(encoder.segment("X"), (0, 64))
+        self.assertTrue(all(0 <= window.bit < 64 for window in encoder.detectors))
+        measured = []
+        for angle in range(0, 360, 15):
+            for x in (0.0, 2.5, 6.0):
+                _, indices, parasitic = encoder.encode_indices(float(angle), x)
+                union = set(encoder.dimension_bits("Angle", angle)) | set(encoder.dimension_bits("X", x))
+                self.assertEqual(set(indices), union, "код — OR кодов координат (§2.2.1)")
+                self.assertEqual(len(indices), len(set(indices)))
+                measured.append(len(indices) / 64)
+        self.assertAlmostEqual(sum(measured) / len(measured), encoder.expected_density(), delta=0.06)
+        with self.assertRaises(ValueError):
+            Encoder(ClosedDimension("Angle", (0.0, 360.0), layers, code_length=64),
+                    OpenedDimension("X", (0.0, 6.0), layers, code_length=32), shared_code=True)
+
+    def test_detector_view_shows_layers_overlap_and_wraps_closed_fields(self) -> None:
+        """§4.1, §4.2.1: картинка детекторов — слои, дорожки перекрытия, поле через границу периода (§4.4)."""
+        from damp.encoding.detector_view import DetectorLayerView
+
+        angle_layers = geometric_detector_layers(layers_count=3, widest_detectors=2, narrowest_detectors=12, overlap=0.4)
+        x_layers = geometric_detector_layers(layers_count=3, widest_detectors=2, narrowest_detectors=8, overlap=0.8)
+        angle = ClosedDimension("Angle", (0.0, 360.0), angle_layers, code_length=48)
+        x = OpenedDimension("X", (0.0, 6.0), x_layers, code_length=48)
+        encoder = Encoder(angle, x, random_seed=0, shared_code=True)
+        view = DetectorLayerView(encoder, min_hue=0.0, max_hue=300.0, inactive_alpha=0.3, dpi=40, width_inches=8.0)
+        image = view.render((10.0, 3.0))
+        self.assertEqual(image.ndim, 3)
+        self.assertEqual(image.shape[2], 3)
+        self.assertGreater(int(image.std()), 0)
+        self.assertEqual(view._layer_lanes(angle, 0), 2, "перекрытие 0.4: точку накрывают два соседних детектора")
+        self.assertEqual(view._layer_lanes(x, 2), 5, "перекрытие 0.8: точку накрывают пять соседних детекторов")
+        wrapped = next(w for w in encoder.detectors if w.dimension_index == 0 and w.center - w.half_width < 0.0)
+        segments = view._field_segments(wrapped, angle)
+        self.assertEqual(len(segments), 2, "поле у границы периода рисуется двумя кусками")
+        self.assertAlmostEqual(sum(end - start for start, end in segments), 2.0 * wrapped.half_width)
+
     def test_bit_colour_follows_receptive_field_width(self) -> None:
         """§3.2, §4.4.2, §5.14: широкие детекторы — красные младшие биты, узкие — фиолетовые старшие."""
         layers = geometric_detector_layers(layers_count=5, widest_detectors=2, narrowest_detectors=40, overlap=0.4)
@@ -159,6 +206,23 @@ class EncoderInvariantTests(unittest.TestCase):
         )
         _, flat_ok = flat.long_range_order("X", step=1.0)
         self.assertFalse(flat_ok)
+
+    def test_open_dimension_without_edge_detectors_keeps_exact_counts_and_covers_segment(self) -> None:
+        """§4.2.1: в слое ровно count детекторов внутри отрезка, соседние перекрываются, концы покрыты."""
+        layers = geometric_detector_layers(layers_count=5, widest_detectors=2, narrowest_detectors=14, overlap=0.4)
+        encoder = Encoder(
+            OpenedDimension("X", (0.0, 28.0), layers, code_length=128, edge_detectors=False),
+            random_seed=0,
+        )
+        for layer_index, layer in enumerate(layers):
+            windows = [w for w in encoder.detectors if w.layer_index == layer_index]
+            self.assertEqual(len(windows), layer.count)
+            self.assertTrue(all(0.0 < w.center < 28.0 for w in windows))
+            for value in [k * 0.25 for k in range(0, 113)]:
+                self.assertGreaterEqual(sum(1 for w in windows if w.is_active(value)), 1, (layer_index, value))
+            centers = sorted(w.center for w in windows)
+            if len(centers) > 1:
+                self.assertLess(centers[1] - centers[0], 2.0 * windows[0].half_width, "соседние поля перекрываются")
 
     def test_open_dimension_covers_its_ends_as_densely_as_the_middle(self) -> None:
         encoder = Encoder(
@@ -544,6 +608,35 @@ def _clustered_layout(seed: int = 0) -> Layout:
     return layout
 
 
+class RerunViewerTests(unittest.TestCase):
+    """Окно Rerun всегда показывает ход раскладки: логгер делает свою раскладку панелей активной."""
+
+    def test_logger_activates_damp_blueprint_right_after_spawning_viewer(self) -> None:
+        import inspect
+        from unittest import mock
+
+        import rerun.blueprint as rrb
+
+        from damp import logging as damp_logging
+
+        blueprint = damp_logging.RerunViewerBlueprint.build()
+        self.assertIsInstance(blueprint, rrb.Blueprint)
+        default_path = inspect.signature(Layout.run).parameters["log_path"].default
+        self.assertEqual(damp_logging.RerunViewerBlueprint.LAYOUT_MAP, f"/{default_path}/angle",
+                         "главная панель — ход раскладки по углу, туда его пишет Layout")
+        self.assertEqual(damp_logging.RerunViewerBlueprint.LAYOUT_CODE_MAP, f"/{default_path}/image")
+        logger = damp_logging.DampLogger(spawn=True)
+        with mock.patch.object(damp_logging.rr, "init"), \
+                mock.patch.object(damp_logging.rr, "is_enabled", return_value=True), \
+                mock.patch.object(damp_logging.rr, "spawn") as spawn, \
+                mock.patch.object(damp_logging.rr, "send_blueprint") as send:
+            logger._ensure_rerun()
+            logger._ensure_rerun()
+        spawn.assert_called_once()
+        send.assert_called_once()
+        self.assertTrue(send.call_args.kwargs["make_active"])
+
+
 class DetectorInvariantTests(unittest.TestCase):
     """§6.3–§6.5: случайные центры и биты, DBSCAN, вставка, уровень активации."""
 
@@ -724,7 +817,10 @@ class PinwheelConfigurationTests(unittest.TestCase):
         reference = main._build_encoder()
         self.assertEqual(encoder.signature, reference.signature)
         self.assertEqual([dim.title for dim in encoder.dimensions], ["Angle", "X", "Y"])
-        self.assertEqual(encoder.code_length, main.MNIST_ANGLE_CODE_LENGTH + 2 * main.MNIST_POSITION_CODE_LENGTH)
+        if main.ENCODER_SHARED_CODE:
+            self.assertEqual(encoder.code_length, main.ENCODER_SHARED_CODE_LENGTH)
+        else:
+            self.assertEqual(encoder.code_length, main.MNIST_ANGLE_CODE_LENGTH + 2 * main.MNIST_POSITION_CODE_LENGTH)
         for dimension in ("Angle", "X", "Y"):
             self.assertEqual(encoder.segment(dimension), reference.segment(dimension))
 
@@ -748,14 +844,16 @@ class PinwheelConfigurationTests(unittest.TestCase):
             for (x, y), entry in zip(main.PINWHEEL_POSITIONS, bucket):
                 _, expected = reference.encode(angle, x, y)
                 self.assertEqual(entry.code, expected, f"код ({angle}, {x}, {y}) отличается от MNIST")
-                bits = entry.code.to01()
-                for dimension, segments in position_segments[(x, y)].items():
-                    offset, length = reference.segment(dimension)
-                    segments.add(bits[offset:offset + length])
+                active = set(entry.code.active_indices())
+                for dimension, own in position_segments[(x, y)].items():
+                    value = x if dimension == "X" else y
+                    bits = frozenset(reference.dimension_bits(dimension, value))
+                    self.assertTrue(bits <= active, f"биты {dimension} позиции {(x, y)} входят в код")
+                    own.add(bits)
         for position, dimensions in position_segments.items():
-            for dimension, segments in dimensions.items():
-                self.assertEqual(len(segments), 1, f"сегмент {dimension} позиции {position} должен быть постоянным")
-                self.assertIn("1", next(iter(segments)))
+            for dimension, own in dimensions.items():
+                self.assertEqual(len(own), 1, f"код {dimension} позиции {position} должен быть постоянным")
+                self.assertTrue(next(iter(own)))
         self.assertNotEqual(codes[0.0][0].code, codes[0.0][1].code)
 
     def test_export_replaces_codes_and_labels_from_previous_experiment(self) -> None:

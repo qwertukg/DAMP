@@ -72,8 +72,13 @@ PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
 PIPELINE_CHECKPOINT_VERSION = 3
 
 # --- Первичное кодирование стимулов MNIST (угол, X, Y) по схеме Angle-Encoder:
-# фиксированная длина сегмента, случайный бит у каждого детектора, слои от
-# самого широкого к самому узкому (§2.2.3, §4.2.1, §4.4, §4.5).
+# случайный бит цветовой полосы у каждого детектора, слои от самого широкого к самому узкому
+# (§2.2.3, §3.2, §4.2.1, §4.4, §4.5).
+# §2.2.3: коды координат можно слить в общий код той же длины (OR, §2.2.1) или склеить (конкатенация).
+# True — общий код длины ENCODER_SHARED_CODE_LENGTH для угла и позиции; False — сегменты
+# MNIST_ANGLE_CODE_LENGTH + 2·MNIST_POSITION_CODE_LENGTH.
+ENCODER_SHARED_CODE = True
+ENCODER_SHARED_CODE_LENGTH = 512
 ENCODER_RANDOM_SEED = 0
 ENCODER_LOG_EVERY = 50
 ENCODER_LAYER_PHASE = True
@@ -89,13 +94,19 @@ MNIST_ANGLE_OVERLAP = 0.4
 MNIST_POSITION_MIN = 0.0
 MNIST_POSITION_MAX = 28.0
 MNIST_POSITION_CODE_LENGTH = 128
-MNIST_POSITION_LAYERS = 5
+# 15 слоёв — минимальное уменьшение с 22, при котором в pinwheel-тесте (позиции 2×2, режим сглаживания)
+# пропадает дыра на стыке четырёх позиций: соседние позиции достаточно похожи, чтобы точки на стыке
+# получали энергию от чужих кластеров (22 слоя: 3–10 пустых ячеек в центре, 16: 0–5, 15: 1–2).
+MNIST_POSITION_LAYERS = 22
 MNIST_POSITION_WIDEST_DETECTORS = 2
-MNIST_POSITION_NARROWEST_DETECTORS = MnistSobelAngleMap.EXPECTED_SIDE // 2
-# §4.5: коды позиций должны быть сходны и на ближней, и на дальней шкале. При 5 слоях и перекрытии 0.8
-# сходство по шагу сетки убывает монотонно на всём диапазоне (1 → 0.78 … 6 → 0.20) при плотности 16 %;
-# при 13 слоях и перекрытии 0.6 профиль выходил на шумовой пол уже с d = 3.
-MNIST_POSITION_OVERLAP = 0.8
+# Самый узкий слой позиции — 28 детекторов (самый широкий — MNIST_POSITION_WIDEST_DETECTORS = 2);
+# между ними слои растут геометрически, у каждого слоя своё число детекторов.
+MNIST_POSITION_NARROWEST_DETECTORS = 28
+# Перекрытие соседних позиционных детекторов слоя (§4.2.1: «detectors must overlap at each level»).
+MNIST_POSITION_OVERLAP = 0.4
+# False — в слое ровно MNIST_POSITION_WIDEST…NARROWEST детекторов внутри отрезка (2 … 14), без детекторов
+# за краями; True — детекторы заходят за концы отрезка, как в Angle-Encoder.
+MNIST_POSITION_EDGE_DETECTORS = False
 # Шаг сетки позиций (индексы участков): на нём проверяется дальний порядок кодов позиций (§4.5).
 MNIST_POSITION_STEP = 1.0
 
@@ -104,6 +115,8 @@ MNIST_POSITION_STEP = 1.0
 LAYOUT_PSEUDO_COLOR_MIN_HUE = 0.0
 LAYOUT_PSEUDO_COLOR_MAX_HUE = 300.0
 LAYOUT_COMPONENT_IMAGE_SUFFIX = ".angle.png"
+# Период угла для раскраски хода раскладки по углу стимула в Rerun (как pinwheel-тест, рис. 16).
+LAYOUT_COMPONENT_PERIOD = MNIST_ANGLE_MAX - MNIST_ANGLE_MIN
 LAYOUT_ENERGY_IMAGE_SUFFIX = ".energy.png"
 
 # --- Раскладка (§5.4, §7.1.6, §7.1.7): cosine, порог λ с сигмоидой η,
@@ -113,7 +126,7 @@ LAYOUT_ENERGY_IMAGE_SUFFIX = ".energy.png"
 # пинвилы друг к другу и убирают складки на их границах (docs/ARTICLE_COMPLIANCE.md).
 # False — дальняя фаза строго по статье: φ = Σ s·d по всему V (§5.5.1), радиус пар линейно от d/2 к 1,
 # триггер 1 % обменов и рост λ ступенями (§7.1.7), жадное правило обмена без отжига (§5.6).
-LAYOUT_SMOOTH_PINWHEELS = False
+LAYOUT_SMOOTH_PINWHEELS = True
 # Метка кеша раскладки: раскладки старых версий Encoder и другого режима дальней фазы не переиспользуются.
 LAYOUT_CACHE_TAG = "gauss-kernel-v1" if LAYOUT_SMOOTH_PINWHEELS else "article-kernel-v1"
 LAYOUT_SIMILARITY = "cosine"
@@ -291,6 +304,15 @@ PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
 PINWHEEL_COMPONENT_OUTPUT_PATH = "pinwheel_test.angle.png"
 PINWHEEL_ENERGY_OUTPUT_PATH = "pinwheel_test.energy.png"
 PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
+
+# --- Визуализация первичных детекторов угла и позиции (detectors_visual.py): слои, рецептивные поля,
+# их перекрытие и цветовые полосы бит (§4.1, §4.2.1, §3.2). Детекторы, активные для примера стимула
+# (угол, X, Y), выделяются; остальные рисуются с прозрачностью DETECTORS_VIEW_INACTIVE_ALPHA.
+DETECTORS_VIEW_OUTPUT_PATH = "detectors_view.png"
+DETECTORS_VIEW_STIMULUS = (45.0, 14.0, 14.0)
+DETECTORS_VIEW_INACTIVE_ALPHA = 0.3
+DETECTORS_VIEW_DPI = 110
+DETECTORS_VIEW_WIDTH_INCHES = 18.0
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
     "detectors.geometric_layers": LOG_INTERVAL_INIT,
@@ -711,6 +733,10 @@ class PipelineCheckpointStore:
             },
         )
 
+    def reset(self, layout_path: str, *, target_samples: int) -> None:
+        """Пустой чекпоинт: этапы и эмбеддинги прошлого запуска не используются (запуск без кеша)."""
+        self.save(layout_path, stages={}, target_samples=target_samples, embeddings=[])
+
     def records(self, payload: dict[str, object]) -> list[EmbeddingRecord]:
         records: list[EmbeddingRecord] = []
         for item in payload.get("embeddings", []):
@@ -1110,6 +1136,7 @@ class LayoutCacheFile:
             long_kernel=LAYOUT_LONG_KERNEL,
             long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
             long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
+            component_period=LAYOUT_COMPONENT_PERIOD,
         )
         if len(layout.positions()) != len(sorted_points):
             raise RuntimeError("layout load mismatch: points count differs")
@@ -1133,7 +1160,7 @@ class LayoutCacheFile:
 
 
 def _build_encoder() -> Encoder:
-    """Кодер MNIST-стимула (угол, X, Y): конкатенация трёх сегментов (§2.2.3, §4.2.1, §4.4)."""
+    """Кодер MNIST-стимула (угол, X, Y): общий код или конкатенация сегментов (§2.2.3, §4.2.1, §4.4)."""
     angle_layers = geometric_detector_layers(
         layers_count=MNIST_ANGLE_LAYERS,
         widest_detectors=MNIST_ANGLE_WIDEST_DETECTORS,
@@ -1146,28 +1173,33 @@ def _build_encoder() -> Encoder:
         narrowest_detectors=MNIST_POSITION_NARROWEST_DETECTORS,
         overlap=MNIST_POSITION_OVERLAP,
     )
+    angle_length = ENCODER_SHARED_CODE_LENGTH if ENCODER_SHARED_CODE else MNIST_ANGLE_CODE_LENGTH
+    position_length = ENCODER_SHARED_CODE_LENGTH if ENCODER_SHARED_CODE else MNIST_POSITION_CODE_LENGTH
     encoder = Encoder(
         ClosedDimension(
             "Angle",
             (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
             angle_layers,
-            code_length=MNIST_ANGLE_CODE_LENGTH,
+            code_length=angle_length,
         ),
         OpenedDimension(
             "X",
             (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
             position_layers,
-            code_length=MNIST_POSITION_CODE_LENGTH,
+            code_length=position_length,
+            edge_detectors=MNIST_POSITION_EDGE_DETECTORS,
         ),
         OpenedDimension(
             "Y",
             (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
             position_layers,
-            code_length=MNIST_POSITION_CODE_LENGTH,
+            code_length=position_length,
+            edge_detectors=MNIST_POSITION_EDGE_DETECTORS,
         ),
         random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
         layer_phase=ENCODER_LAYER_PHASE,
+        shared_code=ENCODER_SHARED_CODE,
     )
     # §4.5, §5.13.1: у каждой координаты сходство кодов должно убывать с расстоянием
     # на всём диапазоне, иначе раскладка не воспроизведёт её топологию.
@@ -1283,18 +1315,20 @@ def _run_layout(
     total_codes: int,
     colorizer: EncoderCodeColorizer | None = None,
     expected_code_length: int | None = None,
+    use_cache: bool = True,
 ) -> Layout:
     run_params = params or _default_layout_params()
     expected_pair_radius = _expected_pair_radius(total_codes, run_params)
     layout_path = _layout_json_path(count, expected_pair_radius)
-    cached_layout = LayoutCacheFile.load(
-        layout_path,
-        run_params,
-        expected_code_length=expected_code_length,
-        colorizer=colorizer,
-    )
-    if cached_layout is not None:
-        return cached_layout
+    if use_cache:
+        cached_layout = LayoutCacheFile.load(
+            layout_path,
+            run_params,
+            expected_code_length=expected_code_length,
+            colorizer=colorizer,
+        )
+        if cached_layout is not None:
+            return cached_layout
     layout = Layout(
         codes,
         empty_ratio=LAYOUT_EMPTY_RATIO,
@@ -1311,6 +1345,7 @@ def _run_layout(
         long_kernel=LAYOUT_LONG_KERNEL,
         long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
         long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
+        component_period=LAYOUT_COMPONENT_PERIOD,
     )
     step_offset = 1
     long_radius_start = max(
@@ -1433,9 +1468,13 @@ class MnistLayoutRunner:
         count: int,
         label: int | None = None,
         activation_samples: int | None = None,
+        reuse_cache: bool = True,
     ) -> None:
         self.count = count
         self.label = label
+        # False (--rebuild) — готовые раскладка, чекпоинт и эмбеддинги игнорируются, всё считается заново
+        # и записывается в кеш поверх старого.
+        self._reuse_cache = bool(reuse_cache)
         resolved_activation_samples = count if activation_samples is None else int(activation_samples)
         if resolved_activation_samples <= 0:
             raise ValueError("activation_samples must be positive")
@@ -1641,7 +1680,15 @@ class MnistLayoutRunner:
         self._embedding_store.save(layout_path, embeddings, metadata=self._activation_metadata)
 
     def run(self) -> None:
-        cached_layout = self._try_load_cached_layout()
+        if self._reuse_cache:
+            cached_layout = self._try_load_cached_layout()
+        else:
+            cached_layout = None
+            LOGGER.event(
+                "layout.cache.rebuild",
+                section=OUTSIDE_ARTICLE,
+                data={"count": self.count, "note": "--rebuild: готовый кеш игнорируется, новый записывается поверх"},
+            )
         dataset = self._build_dataset()
         if cached_layout is not None:
             layout, tuned_params, total_codes, layout_path = cached_layout
@@ -1674,6 +1721,8 @@ class MnistLayoutRunner:
             expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
             layout_path = _layout_json_path(self.count, expected_pair_radius)
             payload.save_base(layout_path)
+            if not self._reuse_cache:
+                self._checkpoint_store.reset(layout_path, target_samples=self._activation_samples)
             encoding_checkpoint = self._checkpoint_store.load(layout_path)
             encoding_stages = dict(encoding_checkpoint.get("stages", {}))
             encoding_stages["encoding"] = True
@@ -1690,6 +1739,7 @@ class MnistLayoutRunner:
                 total_codes=total_codes,
                 colorizer=self.colorizer,
                 expected_code_length=self.encoder.code_length,
+                use_cache=self._reuse_cache,
             )
             save_json = True
         checkpoint = self._checkpoint_store.load(layout_path)
@@ -2054,6 +2104,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="количество эмбеддингов; по умолчанию равно --count",
     )
+    layout_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="игнорировать готовую раскладку и эмбеддинги в data/: посчитать заново и записать новый кеш "
+        "(ход раскладки виден в Rerun)",
+    )
     predict_parser = subparsers.add_parser("predict", help="декодирование картинки или батча")
     predict_parser.add_argument("--layout-path", type=str, default=None)
     predict_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
@@ -2080,6 +2136,7 @@ def main() -> None:
             count=args.count,
             label=args.label,
             activation_samples=args.activation_samples,
+            reuse_cache=not args.rebuild,
         )
         runner.run()
         return
