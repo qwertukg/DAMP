@@ -10,6 +10,8 @@ import os
 import random
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
+
 from damp.article_refs import (
     ENERGY_CALC,
     ENERGY_LONG,
@@ -38,6 +40,7 @@ from damp.article_refs import (
 )
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import EncoderCodeColorizer
+from damp.layout.pair_energy_gpu import TorchPairEnergyEngine
 from damp.layout.payload import LayoutEncodedCode
 from damp.logging import LOGGER
 
@@ -1405,6 +1408,7 @@ class Layout:
         long_kernel_radius_min: int = 3,
         long_kernel_width: float = 0.5,
         component_period: float | None = None,
+        long_subset_min_neighbours: int = 50,
     ) -> None:
         if not codes:
             raise ValueError("codes must be non-empty")
@@ -1469,6 +1473,8 @@ class Layout:
         )
         self._colors_rgb_cache: tuple[tuple[int, int, int], ...] | None = None
         self._rng = random.Random(seed)
+        # Векторная выборка пар (§5.3, §5.9.1, §5.9.3) — отдельный генератор numpy с тем же seed.
+        self._np_rng = np.random.default_rng(seed)
         self._parallel_workers = parallel_workers
         self._use_gpu = use_gpu
         self._long_subset_size = (
@@ -1477,6 +1483,9 @@ class Layout:
         if self._long_subset_size is not None and self._long_subset_size <= 0:
             raise ValueError("long_subset_size must be positive when set")
         self._long_subset_refresh = max(1, int(long_subset_refresh))
+        if long_subset_min_neighbours <= 0:
+            raise ValueError("long_subset_min_neighbours must be positive")
+        self._long_subset_min_neighbours = int(long_subset_min_neighbours)
         self._long_subset_indices: list[int] = []
         self._long_subset_last_step: int = 0
         self._long_step_counter: int = 0
@@ -1568,6 +1577,7 @@ class Layout:
             data={
                 "long_subset_size": -1 if self._long_subset_size is None else self._long_subset_size,
                 "long_subset_refresh": self._long_subset_refresh,
+                "long_subset_min_neighbours": self._long_subset_min_neighbours,
                 "points": self._point_count,
             },
         )
@@ -1616,6 +1626,10 @@ class Layout:
         self._short_energy_last_step: int = -1
         self._short_energy_radius: int | None = None
         self._short_energy_eps: float = 1e-6
+        # Версия расстановки растёт при каждом обмене; энергии точек E(c, r) кешируются по (радиус, версия),
+        # чтобы раскладка, активация и экспорт не считали одно и то же (§5.7).
+        self._positions_version: int = 0
+        self._point_energy_cache: dict[int, tuple[int, list[float]]] = {}
         self._place_points()
 
         self._long_swap_radius_sum = 0.0
@@ -1638,16 +1652,37 @@ class Layout:
         self._last_energy_progress: float | None = None
         self._gpu_engine: _GpuLayoutEngine | None = None
         self._tensor_engine: _TensorLayoutEngine | None = None
+        self._torch_engine: TorchPairEnergyEngine | None = None
+        self._torch_positions_version = -1
+        # Точки и ячейки, изменившиеся с последней загрузки на устройство: после шага загружаются только они.
+        self._torch_dirty_points: set[int] = set()
+        self._torch_dirty_cells: dict[tuple[int, int], int] = {}
         self._gpu_positions_dirty = True
         if self._use_gpu:
-            self._gpu_engine = _GpuLayoutEngine.create(self._points, self._similarity)
-            self._tensor_engine = _TensorLayoutEngine.create(
+            # Основной путь: энергии пар и точек на torch со сходством из кодов (§5.9.5, §5.12);
+            # OpenGL-движок с матрицей N×N и прежний тензорный путь — только если torch недоступен.
+            self._torch_engine = TorchPairEnergyEngine.create(
                 code_matrix=self._code_matrix,
                 ones=self._ones_array,
                 similarity=self._similarity,
+                grid_shape=(self.height, self.width),
             )
-        if self._use_gpu and (self._gpu_engine is not None or self._tensor_engine is not None):
-            status = "OpenGL 4.1" if self._gpu_engine is not None else f"tensor:{self._tensor_engine.device}"
+            if self._torch_engine is None:
+                self._gpu_engine = _GpuLayoutEngine.create(self._points, self._similarity)
+                self._tensor_engine = _TensorLayoutEngine.create(
+                    code_matrix=self._code_matrix,
+                    ones=self._ones_array,
+                    similarity=self._similarity,
+                )
+        if self._use_gpu and (
+            self._torch_engine is not None or self._gpu_engine is not None or self._tensor_engine is not None
+        ):
+            if self._torch_engine is not None:
+                status = f"torch:{self._torch_engine.device}"
+            elif self._gpu_engine is not None:
+                status = "OpenGL 4.1"
+            else:
+                status = f"tensor:{self._tensor_engine.device}"
             LOGGER.event(
                 "layout.gpu.enabled",
                 section=GPU_IMPLEMENTATION,
@@ -2284,6 +2319,7 @@ class Layout:
         dropped = len(self._subset_similarity_cache) + len(self._short_similarity_cache)
         self._subset_similarity_cache.clear()
         self._short_similarity_cache.clear()
+        self._point_energy_cache.clear()
         if self._tensor_engine is not None:
             self._tensor_engine.reset_subset()
         LOGGER.event(
@@ -2322,6 +2358,7 @@ class Layout:
         self._pos_y = [p[0] for p in self._positions]
         self._pos_x = [p[1] for p in self._positions]
         self._gpu_positions_dirty = True
+        self._positions_version += 1
         LOGGER.event(
             "layout.restore_positions",
             section=LAYOUT_DISCRETE,
@@ -2354,6 +2391,7 @@ class Layout:
         short_config: ShortLayoutOptimConfig | None = None,
     ) -> int:
         swaps_with_delta: list[tuple[tuple[int, int, int, int], float]] = []
+        self._sync_arrays()
         if mode == "short":
             similarity_cutoff = (
                 self._lambda
@@ -2366,25 +2404,16 @@ class Layout:
                     step_index=step_index, config=short_config
                 )
             partitions = 1 if short_config is None else max(1, short_config.partitions)
-            if partitions > 1:
-                pairs = self._sample_pairs_short_partitioned(
-                    pairs_per_step,
-                    pair_radius=pair_radius,
-                    similarity_cutoff=similarity_cutoff,
-                    weighted_first=weighted_first,
-                    step_index=step_index,
-                    partitions=partitions,
-                )
-            else:
-                pairs = self._sample_pairs_short(
-                    pairs_per_step,
-                    pair_radius=pair_radius,
-                    similarity_cutoff=similarity_cutoff,
-                    weighted_first=weighted_first,
-                    step_index=step_index,
-                )
+            pairs_np = self._sample_pairs_short_np(
+                pairs_per_step,
+                pair_radius=pair_radius,
+                similarity_cutoff=similarity_cutoff,
+                weighted_first=weighted_first,
+                step_index=step_index,
+                partitions=partitions,
+            )
         else:
-            pairs = [self._sample_pair(pair_radius) for _ in range(pairs_per_step)]
+            pairs_np = self._sample_pairs_long_np(pairs_per_step, pair_radius)
 
         # Дальняя фаза с гауссовым ядром считается машинерией окрестности §5.5.2
         # (радиус r(t) = радиус пар, ядро gauss, обмен при φ_s > φ_c); выбор пар остаётся дальним (§5.3).
@@ -2392,6 +2421,19 @@ class Layout:
         eval_short = mode == "short" or gauss_long
         eval_kernel = "gauss" if gauss_long else "inverse"
         eval_local_radius = local_radius if mode == "short" else self._long_kernel_radius(pair_radius)
+
+        if self._torch_engine is not None:
+            torch_swaps = self._evaluate_pairs_torch(
+                pairs_np,
+                mode=mode,
+                eval_short=eval_short,
+                kernel=eval_kernel,
+                local_radius=eval_local_radius,
+                step_index=step_index,
+            )
+            if torch_swaps is not None:
+                return self._apply_tracked_swaps(torch_swaps, mode=mode)
+        pairs = [(int(row[0]), int(row[1]), int(row[2]), int(row[3])) for row in pairs_np]
 
         # Для дальней фазы с гауссовым ядром OpenGL-движок (все пары одним вызовом) быстрее
         # тензорного пути с подмножеством всего V, поэтому тензорный путь берётся только без OpenGL.
@@ -2506,6 +2548,374 @@ class Layout:
                 deltas.append(delta)
             swaps_with_delta = self._select_swaps(coords, deltas)
         return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
+
+    # ----------------------------------------------------------------- массивы и векторная выборка пар
+    def _sync_arrays(self) -> None:
+        """Позиции и сетка массивами из списков (источник истины — grid, _pos_y, _pos_x): O(N) на шаг."""
+        pos_y = np.asarray(self._pos_y, dtype=np.int64)
+        pos_x = np.asarray(self._pos_x, dtype=np.int64)
+        self._pos_np = np.stack([pos_y, pos_x], axis=1)
+        grid = np.full((self.height, self.width), -1, dtype=np.int64)
+        valid = (pos_y >= 0) & (pos_x >= 0)
+        grid[pos_y[valid], pos_x[valid]] = np.flatnonzero(valid)
+        self._grid_np = grid
+
+    def _ensure_torch_positions(self) -> None:
+        if self._torch_engine is None:
+            return
+        if self._torch_positions_version == self._positions_version:
+            return
+        incremental = (
+            self._torch_positions_version >= 0
+            and self._torch_positions_version + 1 == self._positions_version
+            and 0 < len(self._torch_dirty_points) <= max(1, self._point_count // 4)
+        )
+        if incremental:
+            indices = sorted(self._torch_dirty_points)
+            self._torch_engine.update_points(
+                indices,
+                [self._pos_y[idx] for idx in indices],
+                [self._pos_x[idx] for idx in indices],
+                [(y, x, occupant) for (y, x), occupant in self._torch_dirty_cells.items()],
+            )
+        else:
+            self._torch_engine.update_positions(self._pos_y, self._pos_x)
+        self._torch_dirty_points.clear()
+        self._torch_dirty_cells.clear()
+        self._torch_positions_version = self._positions_version
+
+    def _sample_nearby_np(
+        self,
+        y1: "np.ndarray",
+        x1: "np.ndarray",
+        radius: int | None,
+        bounds: tuple[int, int, int, int] | None,
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Вторые ячейки пар: до 50 попыток в радиусе r (§5.3, §5.9.1), затем любая ячейка в границах.
+
+        То же правило, что и у поштучной выборки, но для всех пар сразу: плитка из одной ячейки,
+        совпадающей с первой точкой, расширяется до всей сетки.
+        """
+        count = int(y1.size)
+        rng = self._np_rng
+        if bounds is None:
+            y_lo = np.zeros(count, dtype=np.int64)
+            y_hi = np.full(count, self.height - 1, dtype=np.int64)
+            x_lo = np.zeros(count, dtype=np.int64)
+            x_hi = np.full(count, self.width - 1, dtype=np.int64)
+        else:
+            y_lo = np.full(count, bounds[0], dtype=np.int64)
+            y_hi = np.full(count, bounds[1], dtype=np.int64)
+            x_lo = np.full(count, bounds[2], dtype=np.int64)
+            x_hi = np.full(count, bounds[3], dtype=np.int64)
+            single = (y_lo == y_hi) & (x_lo == x_hi) & (y_lo == y1) & (x_lo == x1)
+            y_lo[single] = 0
+            y_hi[single] = self.height - 1
+            x_lo[single] = 0
+            x_hi[single] = self.width - 1
+        y2 = np.empty(count, dtype=np.int64)
+        x2 = np.empty(count, dtype=np.int64)
+        pending = np.ones(count, dtype=bool)
+        if radius is not None:
+            radius_sq = radius * radius
+            for _ in range(50):
+                idx = np.flatnonzero(pending)
+                if idx.size == 0:
+                    break
+                dy = rng.integers(-radius, radius + 1, idx.size)
+                dx = rng.integers(-radius, radius + 1, idx.size)
+                cy = y1[idx] + dy
+                cx = x1[idx] + dx
+                ok = (
+                    (dy * dy + dx * dx <= radius_sq)
+                    & (cy >= y_lo[idx]) & (cy <= y_hi[idx])
+                    & (cx >= x_lo[idx]) & (cx <= x_hi[idx])
+                    & ~((cy == y1[idx]) & (cx == x1[idx]))
+                )
+                hit = idx[ok]
+                y2[hit] = cy[ok]
+                x2[hit] = cx[ok]
+                pending[hit] = False
+        while True:
+            idx = np.flatnonzero(pending)
+            if idx.size == 0:
+                break
+            cy = rng.integers(y_lo[idx], y_hi[idx] + 1)
+            cx = rng.integers(x_lo[idx], x_hi[idx] + 1)
+            ok = ~((cy == y1[idx]) & (cx == x1[idx]))
+            hit = idx[ok]
+            y2[hit] = cy[ok]
+            x2[hit] = cx[ok]
+            pending[hit] = False
+        return y2, x2
+
+    def _sample_pairs_long_np(self, count: int, radius: int | None) -> "np.ndarray":
+        """Пары дальней фазы (§5.3): первая точка — любая, вторая — ячейка в радиусе r; массив count × 4."""
+        idx_a = self._np_rng.integers(0, self._point_count, count)
+        y1 = self._pos_np[idx_a, 0]
+        x1 = self._pos_np[idx_a, 1]
+        y2, x2 = self._sample_nearby_np(y1, x1, radius, None)
+        return np.stack([y1, x1, y2, x2], axis=1)
+
+    def _pair_similarity_np(self, idx_a: "np.ndarray", idx_b: "np.ndarray") -> "np.ndarray":
+        """sim(a, b) для массива пар индексов без порога (§2.2.4) — для ранней отсечки пар (§5.9.1)."""
+        if self._code_matrix is None or self._ones_array is None:
+            return np.asarray(
+                [self._similarity_value(int(a), int(b)) for a, b in zip(idx_a, idx_b)], dtype=np.float64
+            )
+        common = (self._code_matrix[idx_a].astype(np.int64) * self._code_matrix[idx_b].astype(np.int64)).sum(axis=1)
+        ones_a = self._ones_array[idx_a].astype(np.float64)
+        ones_b = self._ones_array[idx_b].astype(np.float64)
+        if self._similarity == "cosine":
+            denominator = np.sqrt(ones_a * ones_b)
+        else:
+            denominator = ones_a + ones_b - common
+        sim = np.divide(
+            common.astype(np.float64),
+            denominator,
+            out=np.zeros(idx_a.size, dtype=np.float64),
+            where=(denominator > 0) & (ones_a > 0) & (ones_b > 0),
+        )
+        sim[idx_a == idx_b] = 1.0
+        return sim
+
+    def _sample_pairs_short_tile_np(
+        self,
+        count: int,
+        *,
+        pair_radius: int | None,
+        similarity_cutoff: float | None,
+        weighted_first: bool,
+        step_index: int | None,
+        candidate_indices: "np.ndarray | None" = None,
+        bounds: tuple[int, int, int, int] | None = None,
+    ) -> "np.ndarray":
+        """Пары ближней фазы (§5.3, §5.9.1, §5.9.3) массивом: первая точка по весам −ln Ê, вторая рядом,
+        пары с sim < отсечки отбрасываются; не добранное за 5·count попыток — как в дальней фазе."""
+        candidates = (
+            np.arange(self._point_count, dtype=np.int64) if candidate_indices is None else np.asarray(candidate_indices)
+        )
+        if candidates.size == 0:
+            return np.zeros((0, 4), dtype=np.int64)
+        probabilities = None
+        if weighted_first and self._short_energy_weights:
+            weights = np.asarray(self._short_energy_weights, dtype=np.float64)[candidates]
+            total = float(weights.sum())
+            if total > 0.0:
+                probabilities = weights / total
+        rows: list["np.ndarray"] = []
+        collected = 0
+        attempts = 0
+        rejected_similarity = 0
+        max_attempts = max(count * 5, count)
+        while collected < count and attempts < max_attempts:
+            batch = min(count - collected, max_attempts - attempts)
+            idx_a = self._np_rng.choice(candidates, size=batch, p=probabilities)
+            y1 = self._pos_np[idx_a, 0]
+            x1 = self._pos_np[idx_a, 1]
+            y2, x2 = self._sample_nearby_np(y1, x1, pair_radius, bounds)
+            keep = np.ones(batch, dtype=bool)
+            if similarity_cutoff is not None:
+                idx_b = self._grid_np[y2, x2]
+                has_b = idx_b >= 0
+                if has_b.any():
+                    sim = self._pair_similarity_np(idx_a[has_b], idx_b[has_b])
+                    rejected = sim < similarity_cutoff
+                    keep[np.flatnonzero(has_b)[rejected]] = False
+                    rejected_similarity += int(rejected.sum())
+            attempts += batch
+            rows.append(np.stack([y1[keep], x1[keep], y2[keep], x2[keep]], axis=1))
+            collected += int(keep.sum())
+        pairs = np.concatenate(rows, axis=0)[:count] if rows else np.zeros((0, 4), dtype=np.int64)
+        if pairs.shape[0] < count:
+            pairs = np.concatenate([pairs, self._sample_pairs_long_np(count - pairs.shape[0], pair_radius)], axis=0)
+        LOGGER.event(
+            "layout.short.pair_sampling",
+            section=OPTIM_PAIR_SELECTION,
+            data={
+                "pairs_requested": count,
+                "pairs_generated": int(pairs.shape[0]),
+                "rejected_similarity": rejected_similarity,
+                "attempts": attempts,
+                "pair_radius": "auto" if pair_radius is None else pair_radius,
+                "step": 0 if step_index is None else step_index,
+                "weighted": weighted_first,
+                "similarity_cutoff": similarity_cutoff,
+                "candidate_indices": -1 if candidate_indices is None else int(candidates.size),
+                "bounds": bounds,
+            },
+        )
+        return pairs
+
+    def _sample_pairs_short_np(
+        self,
+        count: int,
+        *,
+        pair_radius: int | None,
+        similarity_cutoff: float | None,
+        weighted_first: bool,
+        step_index: int | None,
+        partitions: int,
+    ) -> "np.ndarray":
+        """Пары ближней фазы по случайным плиткам сетки (§5.10): квота каждой плитки — её доля пар."""
+        if partitions <= 1:
+            return self._sample_pairs_short_tile_np(
+                count,
+                pair_radius=pair_radius,
+                similarity_cutoff=similarity_cutoff,
+                weighted_first=weighted_first,
+                step_index=step_index,
+            )
+        row_parts = max(1, int(round(math.sqrt(partitions))))
+        col_parts = max(1, math.ceil(partitions / row_parts))
+        segments_y = self._random_segments(self.height, row_parts)
+        segments_x = self._random_segments(self.width, col_parts)
+        y_ends = np.asarray([end for _, end in segments_y], dtype=np.int64)
+        x_ends = np.asarray([end for _, end in segments_x], dtype=np.int64)
+        tile_row = np.searchsorted(y_ends, self._pos_np[:, 0], side="left")
+        tile_col = np.searchsorted(x_ends, self._pos_np[:, 1], side="left")
+        tile_of_point = tile_row * col_parts + tile_col
+        tile_count = row_parts * col_parts
+        LOGGER.event(
+            "layout.short.tiles",
+            section=PARALLEL_PROCESSING,
+            data={
+                "partitions": tile_count,
+                "row_parts": row_parts,
+                "col_parts": col_parts,
+                "segments_y": segments_y,
+                "segments_x": segments_x,
+                "points": self._point_count,
+            },
+        )
+        order = list(range(tile_count))
+        self._rng.shuffle(order)
+        base = count // tile_count
+        extra = count % tile_count
+        chunks: list["np.ndarray"] = []
+        produced = 0
+        for position, tile_idx in enumerate(order):
+            quota = base + (1 if position < extra else 0)
+            if quota <= 0:
+                continue
+            candidates = np.flatnonzero(tile_of_point == tile_idx)
+            if candidates.size == 0:
+                continue
+            y_start, y_end = segments_y[tile_idx // col_parts]
+            x_start, x_end = segments_x[tile_idx % col_parts]
+            pairs = self._sample_pairs_short_tile_np(
+                quota,
+                pair_radius=pair_radius,
+                similarity_cutoff=similarity_cutoff,
+                weighted_first=weighted_first,
+                step_index=step_index,
+                candidate_indices=candidates,
+                bounds=(y_start, y_end, x_start, x_end),
+            )
+            chunks.append(pairs)
+            produced += int(pairs.shape[0])
+        remaining = count - produced
+        if remaining > 0:
+            chunks.append(
+                self._sample_pairs_short_tile_np(
+                    remaining,
+                    pair_radius=pair_radius,
+                    similarity_cutoff=similarity_cutoff,
+                    weighted_first=weighted_first,
+                    step_index=step_index,
+                )
+            )
+        LOGGER.event(
+            "layout.short.partition_pairs",
+            section=PARALLEL_PROCESSING,
+            data={
+                "requested": count,
+                "produced": produced + max(0, remaining),
+                "partitions": tile_count,
+                "remaining_fallback": remaining,
+            },
+        )
+        return np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 4), dtype=np.int64)
+
+    def _evaluate_pairs_torch(
+        self,
+        pairs_np: "np.ndarray",
+        *,
+        mode: str,
+        eval_short: bool,
+        kernel: str,
+        local_radius: int | None,
+        step_index: int | None,
+    ) -> list[tuple[tuple[int, int, int, int], float]] | None:
+        """Энергии всех пар шага на torch (§5.10, §5.12): по всему V или по подмножеству B (§5.9.4)."""
+        engine = self._torch_engine
+        if engine is None or pairs_np.shape[0] == 0:
+            return [] if engine is not None else None
+        y1, x1, y2, x2 = (pairs_np[:, i].copy() for i in range(4))
+        idx_a = self._grid_np[y1, x1]
+        idx_b = self._grid_np[y2, x2]
+        keep = (idx_a >= 0) | (idx_b >= 0)
+        y1, x1, y2, x2, idx_a, idx_b = (arr[keep] for arr in (y1, x1, y2, x2, idx_a, idx_b))
+        # Непустая точка всегда первая (вторая ячейка может быть пустой: перенос в пустую клетку).
+        flip = idx_a < 0
+        idx_a, idx_b = np.where(flip, idx_b, idx_a), np.where(flip, idx_a, idx_b)
+        y1, y2 = np.where(flip, y2, y1), np.where(flip, y1, y2)
+        x1, x2 = np.where(flip, x2, x1), np.where(flip, x1, x2)
+        eval_indices: list[int] | None = None
+        if mode == "long" and self._long_subset_size is not None and self._point_count > self._long_subset_size:
+            if eval_short:
+                # Гауссова окрестность (расширение статьи) — локальная сумма: подмножество B (§5.9.4) даёт
+                # несмещённую, но шумную оценку. Оно допустимо, пока в окрестность радиуса r ожидаемо попадает
+                # не меньше long_subset_min_neighbours точек B; при малых r энергия считается по всему V.
+                density = self._point_count / float(self.height * self.width)
+                expected = (self._long_subset_size / self._point_count) * density * math.pi * float(local_radius or 0) ** 2
+                if expected >= self._long_subset_min_neighbours:
+                    eval_indices = self._ensure_long_subset(step_index)
+            else:
+                eval_indices = self._ensure_long_subset(step_index)
+        try:
+            self._ensure_torch_positions()
+            energy_c, energy_s = engine.pair_energies(
+                idx_a,
+                idx_b,
+                np.stack([y1, x1], axis=1),
+                np.stack([y2, x2], axis=1),
+                neighbourhood=eval_short,
+                local_radius=local_radius if eval_short else None,
+                kernel=kernel,
+                euclidean=self._distance_mode("short" if eval_short else "long") == "euclidean",
+                distance_eps=self._distance_eps,
+                kernel_width=self._long_kernel_width,
+                lambda_threshold=self._lambda,
+                eta=self._eta,
+                eval_indices=eval_indices,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "layout.gpu.pair_energy.failed",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc), "pairs": int(idx_a.size), "mode": mode},
+            )
+            self._torch_engine = None
+            return None
+        # Окрестность (§5.5.2, и gauss-дальняя): обмен выгоден при φ_s > φ_c; дальняя §5.5.1: при φ_s < φ_c.
+        deltas = (energy_s - energy_c) if eval_short else (energy_c - energy_s)
+        LOGGER.event(
+            "layout.energy.pairs.gpu",
+            section=GPU_IMPLEMENTATION,
+            data={
+                "step": 0 if step_index is None else step_index,
+                "mode": mode,
+                "pairs": int(idx_a.size),
+                "eval_points": self._point_count if eval_indices is None else len(eval_indices),
+                "kernel": kernel if eval_short else "distance",
+                "local_radius": local_radius if eval_short else None,
+                "favourable": int((deltas > 0.0).sum()),
+                "device": engine.device,
+            },
+        )
+        coords = list(zip(y1.tolist(), x1.tolist(), y2.tolist(), x2.tolist()))
+        return self._select_swaps(coords, deltas.astype(np.float64).tolist())
 
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
@@ -2866,14 +3276,41 @@ class Layout:
                 return y2, x2
 
     def _compute_point_energies(self, radius: int) -> list[float]:
-        """Энергии E(c, r) всех точек V (§5.7): шейдер §5.12, если доступен, иначе CPU."""
-        return self._point_energies_with_mode(radius)[0]
+        """Энергии E(c, r) всех точек V (§5.7): шейдер §5.12, если доступен, иначе CPU.
+
+        Результат кешируется до следующего обмена или смены λ, η; возвращаемый список не изменять.
+        """
+        cached = self._point_energy_cache.get(int(radius))
+        if cached is not None and cached[0] == self._positions_version:
+            return cached[1]
+        energies = self._point_energies_with_mode(radius)[0]
+        self._point_energy_cache[int(radius)] = (self._positions_version, energies)
+        return energies
 
     def _point_energies_with_mode(self, radius: int) -> tuple[list[float], str]:
         if radius <= 0:
             raise ValueError("radius must be positive")
         if self._point_count == 0:
             return [], "empty"
+        if self._torch_engine is not None:
+            try:
+                self._ensure_torch_positions()
+                torch_energies = self._torch_engine.point_energies(
+                    radius,
+                    lambda_threshold=self._lambda,
+                    eta=self._eta,
+                    distance_eps=self._distance_eps,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.event(
+                    "layout.point_energy.gpu_failed",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc), "engine": "torch"},
+                )
+                self._torch_engine = None
+                torch_energies = None
+            if torch_energies is not None and len(torch_energies) == self._point_count:
+                return [float(value) for value in torch_energies], "gpu"
         if (
             self._gpu_engine is not None
             and self._ensure_gpu_similarity()
@@ -4031,11 +4468,18 @@ class Layout:
             used.add((y1, x1))
             used.add((y2, x2))
             applied += 1
+            if idx_a is not None:
+                self._torch_dirty_points.add(idx_a)
+            if idx_b is not None:
+                self._torch_dirty_points.add(idx_b)
+            self._torch_dirty_cells[(y1, x1)] = -1 if idx_b is None else idx_b
+            self._torch_dirty_cells[(y2, x2)] = -1 if idx_a is None else idx_a
             if mode == "long":
                 self._register_long_swap_radius(y1, x1, y2, x2)
         if applied:
             # §5.9.3: веса первой точки пересчитываются периодически (energy_recalc_every), а не после обмена.
             self._gpu_positions_dirty = True
+            self._positions_version += 1
         return applied
 
     def _register_long_swap_radius(self, y1: int, x1: int, y2: int, x2: int) -> None:

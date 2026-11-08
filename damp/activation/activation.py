@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import concurrent.futures
+import copy
 import random
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -73,14 +74,31 @@ class ActivatedDetector:
     detector: Detector
     activation_level: float
     active_points: int
+    index: int = -1  # номер детектора в иерархии движка; -1 — неизвестен
 
 
 @dataclass(frozen=True)
 class ActivationResult:
-    activation_values: list[float]
-    activation_matrix: list[list[float]]
+    """Реакция пространства на стимулы (§6.5): a_ji по точкам, активные детекторы D_μd и эмбеддинг C(A)."""
+
+    activation_values: Sequence[float]
     active_detectors: list[ActivatedDetector]
     embedding: BitArray
+    positions: Sequence[tuple[int, int]] | None = None
+    grid_shape: tuple[int, int] | None = None
+
+    @property
+    def activation_matrix(self) -> list[list[float]]:
+        """Карта активации по ячейкам сетки H×W; собирается по требованию, а не на каждую активацию."""
+        if self.positions is None or self.grid_shape is None:
+            raise ValueError("activation result has no layout geometry")
+        height, width = self.grid_shape
+        matrix = [[0.0 for _ in range(width)] for _ in range(height)]
+        for idx, value in enumerate(self.activation_values):
+            y, x = self.positions[idx]
+            if 0 <= y < height and 0 <= x < width:
+                matrix[y][x] = float(value)
+        return matrix
 
 
 def _similarity_name(similarity: str) -> str:
@@ -213,9 +231,8 @@ class _NumpyActivationBackend(_ActivationBackend):
             )
         sim = self._apply_threshold(sim)
         if sim.size == 0:
-            return [0.0 for _ in range(self._codes.shape[0])]
-        best = sim.max(axis=1)
-        return best.tolist()
+            return self._np.zeros(self._codes.shape[0], dtype=self._np.float32)
+        return sim.max(axis=1).astype(self._np.float32, copy=False)
 
     def _stack_stimuli(self, stimuli: Sequence[BitArray]) -> "np.ndarray":
         rows = []
@@ -282,24 +299,25 @@ class _TorchActivationBackend(_ActivationBackend):
                 sim = torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
             sim = self._apply_threshold(sim)
             if sim.numel() == 0:
-                return [0.0 for _ in range(self._codes.shape[0])]
+                return self._np.zeros(self._codes.shape[0], dtype=self._np.float32)
             best = torch.max(sim, dim=1).values
-            return best.detach().cpu().tolist()
+            return best.detach().cpu().numpy()
 
     def _stack_stimuli(self, stimuli: Sequence[BitArray]):
         torch = self._torch
-        rows = []
         for code in stimuli:
             if len(code) != self._code_length:
                 raise ValueError("stimulus code length must match layout code length")
-            if self._np is not None:
-                raw = self._np.frombuffer(code._bits, dtype=self._np.uint8, count=self._code_length)
-                tensor_row = torch.as_tensor(raw, dtype=torch.float32, device=self._codes.device)
-            else:
-                tensor_row = torch.as_tensor(list(code), dtype=torch.float32, device=self._codes.device)
-            rows.append(tensor_row)
-        if not rows:
+        if not stimuli:
             return torch.zeros((0, self._code_length), dtype=torch.float32, device=self._codes.device)
+        if self._np is not None:
+            # Все коды стимула одной матрицей и одной загрузкой на устройство, а не по коду.
+            matrix = self._np.stack(
+                [self._np.frombuffer(code._bits, dtype=self._np.uint8, count=self._code_length) for code in stimuli],
+                axis=0,
+            ).astype(self._np.float32, copy=False)
+            return torch.as_tensor(matrix, dtype=torch.float32, device=self._codes.device)
+        rows = [torch.as_tensor(list(code), dtype=torch.float32, device=self._codes.device) for code in stimuli]
         return torch.stack(rows, dim=0)
 
     def _apply_threshold(self, similarity):
@@ -372,11 +390,18 @@ class ActivationMap:
         return self._backend.name
 
     @property
+    def backend_uses_gpu(self) -> bool:
+        return bool(self._backend.uses_gpu)
+
+    @property
     def positions(self) -> list[tuple[int, int]]:
         return self._positions
 
-    def compute(self, stimuli: Sequence[BitArray]) -> list[float]:
+    def compute(self, stimuli: Sequence[BitArray]) -> Sequence[float]:
+        """a_ji = max_s sim_λ(s, v_ji) по всем точкам V (§6.5); numpy-вектор, если numpy доступен."""
         activation = self._backend.compute(stimuli)
+        if np is not None and not isinstance(activation, np.ndarray):
+            activation = np.asarray(activation, dtype=np.float32)
         if len(activation) != self.point_count:
             raise ValueError("activation size must match number of layout points")
         LOGGER.event(
@@ -568,6 +593,17 @@ class DbscanClusterer:
     def min_samples(self) -> int:
         return self._min_samples
 
+    def _offsets(self) -> list[tuple[int, int]]:
+        """Смещения соседей в радиусе eps по сетке (включая саму точку), в порядке dy, dx по возрастанию."""
+        eps_sq = self._eps * self._eps
+        reach = int(math.ceil(self._eps))
+        return [
+            (dy, dx)
+            for dy in range(-reach, reach + 1)
+            for dx in range(-reach, reach + 1)
+            if dy * dy + dx * dx <= eps_sq
+        ]
+
     def cluster_of(
         self,
         positions: Sequence[tuple[int, int]],
@@ -576,27 +612,50 @@ class DbscanClusterer:
         """Точки кластера, содержащего ``seed``; пустой список, если seed является шумом."""
         if not positions:
             return []
+        if np is None:
+            return self._cluster_of_python(positions, seed)
+        ys = np.asarray([p[0] for p in positions], dtype=np.int64)
+        xs = np.asarray([p[1] for p in positions], dtype=np.int64)
+        mask = self.cluster_mask(ys, xs, (int(seed[0]), int(seed[1])))
+        return sorted((int(y), int(x)) for y, x in zip(ys[mask], xs[mask]))
+
+    def cluster_mask(
+        self,
+        ys: "np.ndarray",
+        xs: "np.ndarray",
+        seed: tuple[int, int],
+    ) -> "np.ndarray":
+        """Маска точек кластера, содержащего seed (все False, если seed — шум); порядок — как у входа."""
+        if ys.size == 0:
+            return np.zeros(0, dtype=bool)
+        positions = list(zip(ys.tolist(), xs.tolist()))
+        cluster = self._cluster_of_python(positions, (int(seed[0]), int(seed[1])))
+        if not cluster:
+            return np.zeros(ys.shape, dtype=bool)
+        members = set(cluster)
+        return np.fromiter((position in members for position in positions), dtype=bool, count=len(positions))
+
+    def _cluster_of_python(
+        self,
+        positions: Sequence[tuple[int, int]],
+        seed: tuple[int, int],
+    ) -> list[tuple[int, int]]:
+        """DBSCAN на множествах без numpy (эталонная реализация)."""
         index_of = {position: index for index, position in enumerate(positions)}
         if seed not in index_of:
             return []
-        eps_sq = self._eps * self._eps
-        reach = int(math.ceil(self._eps))
+        offsets = self._offsets()
         position_set = set(index_of)
 
         def neighbours(point: tuple[int, int]) -> list[tuple[int, int]]:
-            found: list[tuple[int, int]] = []
-            for dy in range(-reach, reach + 1):
-                for dx in range(-reach, reach + 1):
-                    if dy * dy + dx * dx > eps_sq:
-                        continue
-                    candidate = (point[0] + dy, point[1] + dx)
-                    if candidate in position_set:
-                        found.append(candidate)
-            return found
+            return [
+                (point[0] + dy, point[1] + dx)
+                for dy, dx in offsets
+                if (point[0] + dy, point[1] + dx) in position_set
+            ]
 
         seed_neighbours = neighbours(seed)
         if len(seed_neighbours) < self._min_samples:
-            # Seed может быть граничной точкой чужого ядра: ищем ядро рядом.
             core_nearby = [
                 point
                 for point in seed_neighbours
@@ -675,6 +734,21 @@ class DetectorHierarchyBuilder:
         self._seed = int(seed)
         self._clusterer = clusterer
         self._output_rng = random.Random(seed)
+        if np is None:
+            raise RuntimeError("DetectorHierarchyBuilder requires numpy")
+        # Координаты и энергии точек массивами: поиск точек в диске и сходство центра с диском — векторно.
+        self._pos_y_np = np.asarray(layout._pos_y, dtype=np.float64)
+        self._pos_x_np = np.asarray(layout._pos_x, dtype=np.float64)
+        self._energies_np = np.asarray(self._energies, dtype=np.float64)
+        # Точки, отсортированные по y: диск радиуса r ищется в полосе строк, а не по всем N точкам.
+        self._y_order = np.argsort(self._pos_y_np, kind="stable")
+        self._y_sorted = self._pos_y_np[self._y_order]
+        # Коды упакованы по 8 бит в байт: общие биты центра с точками диска — AND и подсчёт единиц
+        # (np.bitwise_count), в 32 раза меньше памяти, чем строки float32-матрицы кодов.
+        code_matrix = getattr(layout, "_code_matrix", None)
+        self._packed_codes = None
+        if code_matrix is not None and hasattr(np, "bitwise_count"):
+            self._packed_codes = np.packbits(np.asarray(code_matrix, dtype=np.uint8), axis=1)
         LOGGER.event(
             "activation.detector.builder.init",
             section=DETECTOR_CONSTRUCTION,
@@ -758,6 +832,9 @@ class DetectorHierarchyBuilder:
         rng: random.Random,
     ) -> list[DetectorCandidate]:
         selected: list[DetectorCandidate] = []
+        # Центры, радиусы и плотности выбранных детекторов массивами — проверка перекрытий (§6.4.5) одним
+        # вычислением расстояний вместо перебора; пересобираются при изменении состава слоя.
+        selected_arrays: tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"] | None = None
         candidate_cache: dict[int, DetectorCandidate | None] = {}
         unchanged = 0
         attempts = 0
@@ -775,20 +852,34 @@ class DetectorHierarchyBuilder:
             if candidate is None:
                 unchanged += 1
                 continue
-            overlaps = [item for item in selected if self._overlaps(candidate, item)]
-            if overlaps:
+            if selected:
+                if selected_arrays is None:
+                    selected_arrays = (
+                        np.asarray([item.center[0] for item in selected], dtype=np.float64),
+                        np.asarray([item.center[1] for item in selected], dtype=np.float64),
+                        np.asarray([item.radius for item in selected], dtype=np.float64),
+                        np.asarray([item.insertion_density for item in selected], dtype=np.float64),
+                    )
+                sel_y, sel_x, sel_r, sel_density = selected_arrays
+                distance = np.hypot(sel_y - candidate.center[0], sel_x - candidate.center[1])
+                overlap_mask = (distance <= sel_r) | (distance <= candidate.radius)
+            else:
+                overlap_mask = None
+            if overlap_mask is not None and overlap_mask.any():
                 # §6.4.5: при перекрытии новый детектор должен быть плотнее
                 # каждого перекрываемого, иначе он отбрасывается.
-                if any(item.insertion_density >= candidate.insertion_density for item in overlaps):
+                if np.any(sel_density[overlap_mask] >= candidate.insertion_density):
                     unchanged += 1
                     continue
-                overlap_set = set(overlaps)
-                selected = [item for item in selected if item not in overlap_set]
+                keep = ~overlap_mask
+                selected = [item for item, kept in zip(selected, keep) if kept]
                 selected.append(candidate)
+                selected_arrays = None
                 replacements += 1
                 unchanged = 0
                 continue
             selected.append(candidate)
+            selected_arrays = None
             unchanged = 0
         LOGGER.event(
             "activation.detector.layer.filled",
@@ -814,91 +905,79 @@ class DetectorHierarchyBuilder:
             return None
         center_y = self._layout._pos_y[center_index]
         center_x = self._layout._pos_x[center_index]
-        # §6.4.1: активация A_λd(c̃, r_a) кодом центра в радиусе r_a.
-        active: dict[tuple[int, int], tuple[int, float]] = {}
-        for point_index in self._indices_in_radius(center_y, center_x, layer.activation_radius):
-            point_energy = self._energies[point_index]
-            if point_energy < self._energy_threshold:
-                continue
-            similarity = self._layout._similarity_value(center_index, point_index)
-            activation = self._threshold_similarity(similarity, lambda_value)
-            if activation <= 0.0:
-                continue
-            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
-            # §6.4.2: вес точки — произведение активации и энергии.
-            active[position] = (point_index, activation * point_energy)
+        # §6.4.1: активация A_λd(c̃, r_a) кодом центра в радиусе r_a; точки с e < μ не участвуют.
+        disc = self._indices_in_radius_np(center_y, center_x, layer.activation_radius)
+        disc = disc[self._energies_np[disc] >= self._energy_threshold]
+        activation = self._threshold_similarity_np(self._similarity_row(center_index, disc), lambda_value)
+        active_mask = activation > 0.0
+        active_indices = disc[active_mask]
+        # §6.4.2: вес точки — произведение активации и энергии.
+        weights = activation[active_mask] * self._energies_np[active_indices]
+        active_y = self._pos_y_np[active_indices].astype(np.int64)
+        active_x = self._pos_x_np[active_indices].astype(np.int64)
         seed = (center_y, center_x)
-        if seed not in active:
+        if not np.any((active_y == center_y) & (active_x == center_x)):
             return None
-        cluster_positions = self._clusterer.cluster_of(list(active), seed)
-        if len(cluster_positions) < layer.min_points:
+        cluster_mask = self._clusterer.cluster_mask(active_y, active_x, seed)
+        cluster_count = int(cluster_mask.sum())
+        if cluster_count < layer.min_points:
             return None
         LOGGER.event(
             "activation.detector.cluster",
             section=DETECTOR_CLUSTERING,
             data={
-                "points": len(cluster_positions),
-                "activated": len(active),
+                "points": cluster_count,
+                "activated": int(active_indices.size),
                 "lambda": lambda_value,
                 "seed": seed,
             },
         )
-        weight_sum = sum(active[position][1] for position in cluster_positions)
+        cluster_w = weights[cluster_mask]
+        weight_sum = float(cluster_w.sum())
         if weight_sum <= 0.0:
             return None
-        centroid_y = sum(position[0] * active[position][1] for position in cluster_positions) / weight_sum
-        centroid_x = sum(position[1] * active[position][1] for position in cluster_positions) / weight_sum
+        cluster_y = active_y[cluster_mask].astype(np.float64)
+        cluster_x = active_x[cluster_mask].astype(np.float64)
+        centroid_y = float((cluster_y * cluster_w).sum() / weight_sum)
+        centroid_x = float((cluster_x * cluster_w).sum() / weight_sum)
         LOGGER.event(
             "activation.detector.center",
             section=DETECTOR_CENTER,
             data={"center_y": centroid_y, "center_x": centroid_x, "weight_sum": weight_sum},
         )
         # §6.4.3: радиус по максимуму f(p) = |{q: r(q) ≤ r(p)}| / (π r(p)²).
-        distances = sorted(
-            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
-            for position in cluster_positions
-        )
-        best_radius = 0.0
-        best_fill = -1.0
-        for count, distance in enumerate(distances, start=1):
-            candidate_radius = max(float(self._radius_min), distance)
-            if candidate_radius > layer.activation_radius:
-                continue
-            if count < layer.min_points:
-                continue
-            fill_factor = count / (math.pi * candidate_radius * candidate_radius)
-            if fill_factor > best_fill:
-                best_fill = fill_factor
-                best_radius = candidate_radius
+        distances = np.sort(np.hypot(cluster_y - centroid_y, cluster_x - centroid_x))
+        counts = np.arange(1, distances.size + 1, dtype=np.float64)
+        candidate_radii = np.maximum(float(self._radius_min), distances)
+        allowed = (candidate_radii <= layer.activation_radius) & (counts >= layer.min_points)
+        if not allowed.any():
+            return None
+        fill = np.where(allowed, counts / (math.pi * candidate_radii * candidate_radii), -np.inf)
+        best_index = int(np.argmax(fill))
+        best_fill = float(fill[best_index])
+        best_radius = float(candidate_radii[best_index])
         if best_radius <= 0.0:
             return None
         # §6.3, §6.4.5: после c_d и r_d поле A_λd(c_d, r_d) активируется кодом из центра детектора
         # (§6.1: все точки R(c_d, r_d), включая нулевую активацию); A_μ — точки поля с e ≥ μ,
         # n_d = |A_μ|, e_d = Σ a_ji · e_ji по A_μ.
-        center_code = self._center_code_index(centroid_y, centroid_x, best_radius)
-        if center_code is None:
+        field_points = self._indices_in_radius_np(centroid_y, centroid_x, best_radius)
+        if field_points.size == 0:
             return None
-        field_points = self._indices_in_radius(centroid_y, centroid_x, best_radius)
-        detector_energy = 0.0
-        points_count = 0
-        activated_points = 0
-        for point_index in field_points:
-            point_energy = self._energies[point_index]
-            if point_energy < self._energy_threshold:
-                continue
-            points_count += 1
-            activation = self._threshold_similarity(
-                self._layout._similarity_value(center_code, point_index), lambda_value
-            )
-            if activation > 0.0:
-                activated_points += 1
-                detector_energy += activation * point_energy
+        center_code = self._center_code_index_np(field_points, centroid_y, centroid_x)
+        field_energy = self._energies_np[field_points]
+        in_a_mu = field_energy >= self._energy_threshold
+        a_mu = field_points[in_a_mu]
+        field_activation = self._threshold_similarity_np(self._similarity_row(center_code, a_mu), lambda_value)
+        points_count = int(a_mu.size)
+        activated_points = int(np.count_nonzero(field_activation > 0.0))
+        detector_energy = float((field_activation * field_energy[in_a_mu]).sum())
         LOGGER.event(
             "activation.detector.params",
             section=DETECTOR_PARAMS,
             data={
-                "center_code": center_code,
-                "field_points": len(field_points),
+                "center_code": int(center_code),
+                "field_points": int(field_points.size),
                 "n_d": points_count,
                 "activated_points": activated_points,
                 "e_d": detector_energy,
@@ -915,7 +994,7 @@ class DetectorHierarchyBuilder:
                 "radius": best_radius,
                 "fill_factor": best_fill,
                 "points_count": points_count,
-                "cluster_points": len(cluster_positions),
+                "cluster_points": cluster_count,
                 "energy": detector_energy,
             },
         )
@@ -927,6 +1006,61 @@ class DetectorHierarchyBuilder:
             fill_factor=best_fill,
             insertion_density=points_count / best_radius,
         )
+
+    def _similarity_row(self, center_index: int, indices: "np.ndarray") -> "np.ndarray":
+        """Сходство кода центра с кодами точек indices (§2.2.4) одним матричным произведением."""
+        if indices.size == 0:
+            return np.zeros(0, dtype=np.float64)
+        layout = self._layout
+        code_matrix = layout._code_matrix
+        ones = layout._ones_array
+        if self._packed_codes is not None and ones is not None:
+            common = np.bitwise_count(self._packed_codes[indices] & self._packed_codes[center_index]).sum(axis=1)
+            ones_center = float(ones[center_index])
+            ones_points = ones[indices].astype(np.float64)
+            if layout._similarity == "cosine":
+                denominator = np.sqrt(ones_center * ones_points)
+            else:
+                denominator = ones_center + ones_points - common
+            row = np.divide(
+                common.astype(np.float64),
+                denominator,
+                out=np.zeros(indices.size, dtype=np.float64),
+                where=(denominator > 0) & (ones_points > 0) & (ones_center > 0),
+            )
+        elif code_matrix is None or ones is None:
+            sim_base = getattr(layout, "_sim_base", None)
+            if sim_base is not None:
+                row = np.asarray(sim_base[center_index], dtype=np.float64)[indices]
+            else:
+                row = np.asarray([layout._similarity_value(center_index, int(i)) for i in indices], dtype=np.float64)
+        else:
+            if True:
+                # float32 — BLAS; значения целые и < 2^24, поэтому произведение точное.
+                common = code_matrix[indices].astype(np.float32) @ code_matrix[center_index].astype(np.float32)
+                ones_center = float(ones[center_index])
+                ones_points = ones[indices].astype(np.float64)
+                if layout._similarity == "cosine":
+                    denominator = np.sqrt(ones_center * ones_points)
+                else:
+                    denominator = ones_center + ones_points - common
+                row = np.divide(
+                    common.astype(np.float64),
+                    denominator,
+                    out=np.zeros(indices.size, dtype=np.float64),
+                    where=(denominator > 0) & (ones_points > 0) & (ones_center > 0),
+                )
+        row = row.copy()
+        row[indices == center_index] = 1.0
+        return row
+
+    def _threshold_similarity_np(self, similarity: "np.ndarray", lambda_value: float) -> "np.ndarray":
+        """Порог λ_d или сигмоида η для вектора сходств (§5.4), как _threshold_similarity поэлементно."""
+        positive = similarity > 0.0
+        if self._eta is None:
+            return np.where(positive & (similarity >= lambda_value), similarity, 0.0)
+        scaled = similarity / (1.0 + np.exp(-self._eta * (similarity - lambda_value)))
+        return np.where(positive, scaled, 0.0)
 
     def _threshold_similarity(self, similarity: float, lambda_value: float) -> float:
         if similarity <= 0.0:
@@ -951,6 +1085,21 @@ class DetectorHierarchyBuilder:
                 if point_index is not None:
                     indices.append(point_index)
         return indices
+
+    def _indices_in_radius_np(self, center_y: float, center_x: float, radius: float) -> "np.ndarray":
+        """R(c, r) = {v : ‖v − c‖ ≤ r} по массивам координат (§5.7, §6.1); тот же критерий, что и построчно."""
+        lo = int(np.searchsorted(self._y_sorted, center_y - radius, side="left"))
+        hi = int(np.searchsorted(self._y_sorted, center_y + radius, side="right"))
+        band = self._y_order[lo:hi]
+        band = band[np.abs(self._pos_x_np[band] - center_x) <= radius]
+        inside = np.hypot(self._pos_y_np[band] - center_y, self._pos_x_np[band] - center_x) <= radius
+        return np.sort(band[inside])
+
+    def _center_code_index_np(self, candidates: "np.ndarray", center_y: float, center_x: float) -> int:
+        """Код из центра детектора (§6.3): ближайшая к c_d точка поля, при равенстве — с меньшим индексом."""
+        distance_sq = (self._pos_y_np[candidates] - center_y) ** 2 + (self._pos_x_np[candidates] - center_x) ** 2
+        order = np.lexsort((candidates, distance_sq))
+        return int(candidates[order[0]])
 
     def _center_code_index(self, center_y: float, center_x: float, radius: float) -> int | None:
         """Код из центра детектора (§6.3): точка, занимающая ячейку, ближайшую к c_d."""
@@ -1045,10 +1194,20 @@ class DetectorOutputSizer:
         engine: "ActivationEngine",
         stimuli_batches: Sequence[Sequence[BitArray]],
     ) -> OutputCodeSize:
+        size, _ = self.measure_with_results(engine, stimuli_batches)
+        return size
+
+    def measure_with_results(
+        self,
+        engine: "ActivationEngine",
+        stimuli_batches: Sequence[Sequence[BitArray]],
+    ) -> tuple[OutputCodeSize, list[list[ActivatedDetector]]]:
+        """Размер выхода и активные детекторы каждого калибровочного стимула (их уровни можно переиспользовать)."""
         batches = [batch for batch in stimuli_batches if batch]
         if not batches:
             raise ValueError("at least one non-empty stimuli batch is required")
-        counts = [len(engine.activate(batch).active_detectors) for batch in batches]
+        active_lists = [engine.detect(batch)[1] for batch in batches]
+        counts = [len(active) for active in active_lists]
         mean_active = sum(counts) / len(counts)
         saturation = max(self._min_saturation, min(self._max_saturation, int(round(mean_active))))
         required_bits = int(math.ceil(saturation / self._max_density))
@@ -1075,7 +1234,7 @@ class DetectorOutputSizer:
                 "detectors": len(engine.detectors),
             },
         )
-        return size
+        return size, active_lists
 
 
 # ----------------------------------------------------------------------------
@@ -1115,7 +1274,10 @@ class ActivationEngine:
         self._energies = self._prepare_energy_map(energy_map)
         self._energies_array = np.asarray(self._energies, dtype=np.float32) if np is not None else None
         self._coverage = self._precompute_coverage()
+        self._coverage_rows, self._coverage_cols = self._flatten_coverage(self._coverage)
+        self._detector_energy = self._detector_energy_array()
         self._code_length = self._resolve_code_length()
+        self._executor: concurrent.futures.ThreadPoolExecutor | None = None
         LOGGER.event(
             "activation.engine.init",
             section=STIMULUS_DETECTION,
@@ -1137,9 +1299,9 @@ class ActivationEngine:
     def detectors(self) -> tuple[Detector, ...]:
         return tuple(self._detectors)
 
-    def activate(self, stimuli: Sequence[BitArray]) -> ActivationResult:
+    def detect(self, stimuli: Sequence[BitArray]) -> tuple[Sequence[float], list[ActivatedDetector]]:
+        """Активация A(S) и активные детекторы D_μd(A) без построения эмбеддинга (§6.5)."""
         activation_values = self._activation_map.compute(stimuli)
-        activation_matrix = self._activation_map.to_matrix(activation_values)
         self._log_map(
             activation_values,
             event="activation.map.visual",
@@ -1152,7 +1314,10 @@ class ActivationEngine:
             section=POINT_ENERGY,
             path="activation/energy",
         )
-        active_detectors = self._evaluate_detectors(activation_values)
+        return activation_values, self._evaluate_detectors(activation_values)
+
+    def activate(self, stimuli: Sequence[BitArray]) -> ActivationResult:
+        activation_values, active_detectors = self.detect(stimuli)
         embedding = self._build_embedding(active_detectors)
         LOGGER.event(
             "activation.embedding",
@@ -1165,10 +1330,58 @@ class ActivationEngine:
         )
         return ActivationResult(
             activation_values=activation_values,
-            activation_matrix=activation_matrix,
             active_detectors=active_detectors,
             embedding=embedding,
+            positions=self._activation_map.positions,
+            grid_shape=(self._activation_map.height, self._activation_map.width),
         )
+
+    def embedding_from_active(self, active_detectors: Sequence[ActivatedDetector]) -> BitArray:
+        """Эмбеддинг по уже найденным активным детекторам (их номера — в поле index).
+
+        Уровни активации не зависят от выходных кодов и насыщенности (§6.5), поэтому после перевыдачи
+        битов (§6.3) те же уровни дают эмбеддинг без повторной активации пространства.
+        """
+        remapped = [
+            ActivatedDetector(
+                detector=self._detectors[item.index],
+                activation_level=item.activation_level,
+                active_points=item.active_points,
+                index=item.index,
+            )
+            for item in active_detectors
+        ]
+        return self._build_embedding(remapped)
+
+    def rebind(self, detectors: Sequence[Detector], *, saturation_limit: int) -> "ActivationEngine":
+        """Движок с теми же детекторами по геометрии и энергии, но новыми выходными кодами и σ.
+
+        Карта активации (коды V на устройстве), покрытие детекторов и энергии переиспользуются.
+        """
+        detectors = list(detectors)
+        if saturation_limit <= 0:
+            raise ValueError("saturation_limit must be positive")
+        if len(detectors) != len(self._detectors):
+            raise ValueError("rebind requires the same number of detectors")
+        for old, new in zip(self._detectors, detectors):
+            if old.center != new.center or old.radius != new.radius or old.energy != new.energy:
+                raise ValueError("rebind requires detectors with the same geometry and energy")
+        clone = copy.copy(self)
+        clone._detectors = detectors
+        clone._saturation_limit = int(saturation_limit)
+        clone._code_length = clone._resolve_code_length()
+        clone._executor = None
+        LOGGER.event(
+            "activation.engine.rebind",
+            section=STIMULUS_DETECTION,
+            data={
+                "detectors": len(detectors),
+                "saturation_limit": clone._saturation_limit,
+                "output_bits": clone._code_length,
+                "note": "покрытие и карта активации общие: уровни E(d, A) не зависят от b_d и σ (§6.5)",
+            },
+        )
+        return clone
 
     def activate_many(
         self,
@@ -1193,11 +1406,13 @@ class ActivationEngine:
                 "backend": self._activation_map.backend_name,
             },
         )
-        if effective_workers == 1:
+        if effective_workers == 1 or self._activation_map.backend_uses_gpu:
+            # GPU-бэкенд: активация — несколько матричных операций, потоки под GIL только мешают.
             results = [self.activate(stimuli) for stimuli in batches]
         else:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                results = list(executor.map(self.activate, batches))
+            if self._executor is None or self._executor._max_workers < effective_workers:
+                self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
+            results = list(self._executor.map(self.activate, batches))
         LOGGER.event(
             "activation.parallel.done",
             section=OUTSIDE_ARTICLE,
@@ -1214,94 +1429,159 @@ class ActivationEngine:
         return energies
 
     def _precompute_coverage(self) -> list[tuple[int, ...]]:
+        """Точки рецептивного поля каждого детектора: ‖a − c_d‖ ≤ r_d (§6.5), как r(p) в §6.4.3."""
         coverage: list[tuple[int, ...] | "np.ndarray"] = []
         positions = self._activation_map.positions
-        for idx, detector in enumerate(self._detectors):
-            covered: list[int] = []
-            for point_idx, (y, x) in enumerate(positions):
-                # §6.5: ‖a − c_d‖ ≤ r_d; то же вычисление расстояния, что и при выборе r_d (§6.4.3).
-                if math.hypot(float(y) - float(detector.center[0]), float(x) - float(detector.center[1])) <= detector.radius:
-                    covered.append(point_idx)
+        if np is not None:
+            pos = np.asarray(positions, dtype=np.float64).reshape(-1, 2)
+            pos_y, pos_x = pos[:, 0], pos[:, 1]
+        covered_counts: list[int] = []
+        for detector in self._detectors:
             if np is not None:
-                coverage.append(np.asarray(covered, dtype=np.int32))
+                inside = np.hypot(pos_y - float(detector.center[0]), pos_x - float(detector.center[1])) <= detector.radius
+                covered = np.flatnonzero(inside).astype(np.int32)
+                coverage.append(covered)
             else:
-                coverage.append(tuple(covered))
-            LOGGER.event(
-                "activation.detector.coverage",
-                section=STIMULUS_DETECTION,
-                data={
-                    "detector": idx,
-                    "detector_label": "" if detector.label is None else str(detector.label),
-                    "receptive_radius": detector.radius,
-                    "covered_points": len(covered),
-                },
-            )
+                covered_list = [
+                    point_idx
+                    for point_idx, (y, x) in enumerate(positions)
+                    if math.hypot(float(y) - float(detector.center[0]), float(x) - float(detector.center[1]))
+                    <= detector.radius
+                ]
+                coverage.append(tuple(covered_list))
+                covered = covered_list
+            covered_counts.append(len(covered))
+        LOGGER.event(
+            "activation.detector.coverage",
+            section=STIMULUS_DETECTION,
+            data={
+                "detectors": len(self._detectors),
+                "covered_points_min": min(covered_counts, default=0),
+                "covered_points_mean": sum(covered_counts) / len(covered_counts) if covered_counts else 0.0,
+                "covered_points_max": max(covered_counts, default=0),
+                "receptive_radius_min": min((d.radius for d in self._detectors), default=0.0),
+                "receptive_radius_max": max((d.radius for d in self._detectors), default=0.0),
+            },
+        )
         return coverage
 
+    @staticmethod
+    def _flatten_coverage(coverage: Sequence[Sequence[int]]) -> tuple["np.ndarray | None", "np.ndarray | None"]:
+        """Покрытие как разреженная матрица D×N в координатном виде (строка — детектор, столбец — точка)."""
+        if np is None:
+            return None, None
+        rows = np.concatenate(
+            [np.full(len(indices), det_idx, dtype=np.int64) for det_idx, indices in enumerate(coverage)]
+            or [np.zeros(0, dtype=np.int64)]
+        )
+        cols = np.concatenate(
+            [np.asarray(indices, dtype=np.int64) for indices in coverage] or [np.zeros(0, dtype=np.int64)]
+        )
+        return rows, cols
+
+    def _detector_energy_array(self) -> "np.ndarray | None":
+        if np is None:
+            return None
+        return np.asarray([detector.energy for detector in self._detectors], dtype=np.float64)
+
     def _evaluate_detectors(self, activation_values: Sequence[float]) -> list[ActivatedDetector]:
-        """Уровень активации E(d, A) = Σ a·e / e_d без ограничения сверху (§6.5)."""
+        """Уровень активации E(d, A) = Σ a·e / e_d без ограничения сверху (§6.5).
+
+        A_μe(d, A) — точки поля детектора с e ≥ μ_e и a > 0; сумма по всем детекторам считается одним
+        bincount по разреженной матрице покрытия, затем порог μ_d (§6.5).
+        """
         if len(activation_values) != self._activation_map.point_count:
             raise ValueError("activation size must match number of layout points")
-        active: list[ActivatedDetector] = []
-        activation_np = np.asarray(activation_values, dtype=np.float32) if np is not None else None
-        energies_np = self._energies_array if np is not None else None
-        for idx, detector in enumerate(self._detectors):
-            indices_obj = self._coverage[idx]
-            energy_sum = 0.0
-            points_used = 0
-            if (
-                np is not None
-                and activation_np is not None
-                and energies_np is not None
-                and not isinstance(indices_obj, tuple)
-            ):
-                if indices_obj.size > 0:
-                    act_slice = activation_np[indices_obj]
-                    energy_slice = energies_np[indices_obj]
-                    valid_mask = (energy_slice >= self._energy_threshold) & (act_slice > 0.0)
-                    if valid_mask.any():
-                        weighted = act_slice[valid_mask] * energy_slice[valid_mask]
-                        energy_sum = float(weighted.sum())
-                        points_used = int(valid_mask.sum())
-            else:
-                for point_idx in indices_obj:
-                    energy = self._energies[int(point_idx)]
-                    if energy < self._energy_threshold:
-                        continue
-                    act_value = activation_values[int(point_idx)]
-                    if act_value <= 0.0:
-                        continue
-                    energy_sum += act_value * energy
-                    points_used += 1
-            activation_level = 0.0 if detector.energy <= 0 else energy_sum / detector.energy
+        if np is not None and self._coverage_rows is not None and self._energies_array is not None:
+            activation_np = np.asarray(activation_values, dtype=np.float64)
+            energies_np = self._energies_array.astype(np.float64, copy=False)
+            valid = (energies_np >= self._energy_threshold) & (activation_np > 0.0)
+            weights = np.where(valid, activation_np * energies_np, 0.0)
+            detector_count = len(self._detectors)
+            energy_sum = np.bincount(
+                self._coverage_rows, weights=weights[self._coverage_cols], minlength=detector_count
+            )
+            points_used = np.bincount(
+                self._coverage_rows, weights=valid[self._coverage_cols].astype(np.float64), minlength=detector_count
+            )
+            levels = np.divide(
+                energy_sum,
+                self._detector_energy,
+                out=np.zeros(detector_count, dtype=np.float64),
+                where=self._detector_energy > 0.0,
+            )
+            active_indices = np.flatnonzero(levels >= self._detector_threshold)
+            active = [
+                ActivatedDetector(
+                    detector=self._detectors[int(idx)],
+                    activation_level=float(levels[idx]),
+                    active_points=int(round(points_used[idx])),
+                    index=int(idx),
+                )
+                for idx in active_indices
+            ]
+            top = int(np.argmax(levels)) if detector_count else -1
             LOGGER.event(
                 "activation.detector.level",
                 section=STIMULUS_DETECTION,
                 data={
-                    "detector": idx,
-                    "detector_label": "" if detector.label is None else str(detector.label),
-                    "activation_level": activation_level,
-                    "points_used": points_used,
-                    "energy_sum": energy_sum,
+                    "detectors": detector_count,
+                    "active": len(active),
+                    "detector_threshold": self._detector_threshold,
+                    "level_max": float(levels[top]) if top >= 0 else 0.0,
+                    "level_mean": float(levels.mean()) if detector_count else 0.0,
+                    "top_detector": top,
+                    "top_detector_label": "" if top < 0 or self._detectors[top].label is None else str(self._detectors[top].label),
+                    "top_points_used": int(round(points_used[top])) if top >= 0 else 0,
+                    "top_energy_sum": float(energy_sum[top]) if top >= 0 else 0.0,
                 },
             )
-            if activation_level >= self._detector_threshold:
-                activated = ActivatedDetector(
-                    detector=detector,
-                    activation_level=activation_level,
-                    active_points=points_used,
-                )
-                active.append(activated)
+            if active:
+                strongest = max(active, key=lambda item: item.activation_level)
                 LOGGER.event(
                     "activation.detector.active",
                     section=STIMULUS_DETECTION,
                     data={
-                        "detector": idx,
-                        "detector_label": "" if detector.label is None else str(detector.label),
-                        "activation_level": activation_level,
-                        "points_used": points_used,
+                        "active": len(active),
+                        "detector": strongest.index,
+                        "detector_label": "" if strongest.detector.label is None else str(strongest.detector.label),
+                        "activation_level": strongest.activation_level,
+                        "points_used": strongest.active_points,
                     },
                 )
+            return active
+        return self._evaluate_detectors_python(activation_values)
+
+    def _evaluate_detectors_python(self, activation_values: Sequence[float]) -> list[ActivatedDetector]:
+        """Тот же расчёт E(d, A) без numpy (§6.5)."""
+        active: list[ActivatedDetector] = []
+        for idx, detector in enumerate(self._detectors):
+            energy_sum = 0.0
+            points_used = 0
+            for point_idx in self._coverage[idx]:
+                energy = self._energies[int(point_idx)]
+                if energy < self._energy_threshold:
+                    continue
+                act_value = float(activation_values[int(point_idx)])
+                if act_value <= 0.0:
+                    continue
+                energy_sum += act_value * energy
+                points_used += 1
+            activation_level = 0.0 if detector.energy <= 0 else energy_sum / detector.energy
+            if activation_level >= self._detector_threshold:
+                active.append(
+                    ActivatedDetector(
+                        detector=detector,
+                        activation_level=activation_level,
+                        active_points=points_used,
+                        index=idx,
+                    )
+                )
+        LOGGER.event(
+            "activation.detector.level",
+            section=STIMULUS_DETECTION,
+            data={"detectors": len(self._detectors), "active": len(active), "detector_threshold": self._detector_threshold},
+        )
         return active
 
     def _build_embedding(self, active_detectors: Sequence[ActivatedDetector]) -> BitArray:
@@ -1395,15 +1675,15 @@ class ActivationEngine:
         section: str,
         path: str,
     ) -> None:
-        if not values:
+        if len(values) == 0:
             return
         if len(values) != self._activation_map.point_count:
             raise ValueError("map values length must match points count")
         if not LOGGER.should_log(event):
             return
-        vmax = max(values)
+        vmax = float(max(values))
         scale = 1.0 / vmax if vmax > 0 else 0.0
-        colors = [self._value_to_rgba(val * scale) for val in values]
+        colors = [self._value_to_rgba(float(val) * scale) for val in values]
         positions = self._activation_map.positions
         point_positions = [(x + 0.5, y + 0.5) for y, x in positions]
         LOGGER.event(
@@ -1412,7 +1692,7 @@ class ActivationEngine:
             data={
                 "points": len(values),
                 "value_max": vmax,
-                "value_min": min(values),
+                "value_min": float(min(values)),
             },
             visuals=[
                 LOGGER.visual_points2d(

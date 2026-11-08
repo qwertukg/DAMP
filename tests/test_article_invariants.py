@@ -892,5 +892,174 @@ class PinwheelConfigurationTests(unittest.TestCase):
                 self.assertIsNotNone(point["y"])
 
 
+def _random_layout(seed: int = 3, *, points: int = 40, grid_size: int = 9, use_gpu: bool = False, **kwargs) -> Layout:
+    """Случайные разреженные коды на сетке с пустыми ячейками — для сверки GPU-энергий с CPU-формулами."""
+    import random as _random
+
+    rng = _random.Random(seed)
+    codes: dict[float, list] = {}
+    for index in range(points):
+        bits = rng.sample(range(64), 12)
+        codes.setdefault(float(index % 7), []).append(
+            LayoutEncodedCode(code=BitArray.from_indices(64, bits), label=str(index))
+        )
+    params = dict(similarity="cosine", lambda_threshold=0.2, eta=None, use_gpu=use_gpu, seed=seed, grid_size=grid_size)
+    params.update(kwargs)
+    return Layout(codes, **params)
+
+
+class GpuPairEnergyTests(unittest.TestCase):
+    """§5.5, §5.7, §5.9.4, §5.12: энергии пар и точек на GPU равны CPU-формулам; выбор пар векторный."""
+
+    def _gpu_layout(self, **kwargs) -> Layout:
+        layout = _random_layout(use_gpu=True, **kwargs)
+        if layout._torch_engine is None:
+            self.skipTest("torch с GPU недоступен")
+        return layout
+
+    def _pairs(self, layout: Layout, count: int = 60):
+        import numpy as np
+
+        layout._sync_arrays()
+        rng = np.random.default_rng(11)
+        rows = []
+        while len(rows) < count:
+            y1, x1 = int(rng.integers(0, layout.height)), int(rng.integers(0, layout.width))
+            y2, x2 = int(rng.integers(0, layout.height)), int(rng.integers(0, layout.width))
+            if (y1, x1) == (y2, x2) or (layout.grid[y1][x1] is None and layout.grid[y2][x2] is None):
+                continue
+            if layout.grid[y1][x1] is None:
+                y1, x1, y2, x2 = y2, x2, y1, x1
+            rows.append((y1, x1, y2, x2))
+        return rows
+
+    def test_neighbourhood_energies_match_cpu_for_both_kernels(self) -> None:
+        import numpy as np
+
+        for kernel, distance in (("gauss", "squared"), ("inverse", "squared"), ("inverse", "euclidean")):
+            layout = self._gpu_layout(long_kernel="gauss", short_distance=distance, long_kernel_width=1.0)
+            pairs = self._pairs(layout)
+            idx_a = np.array([layout.grid[y1][x1] for y1, x1, _, _ in pairs])
+            idx_b = np.array([-1 if layout.grid[y2][x2] is None else layout.grid[y2][x2] for _, _, y2, x2 in pairs])
+            pos_a = np.array([(y1, x1) for y1, x1, _, _ in pairs], dtype=float)
+            pos_b = np.array([(y2, x2) for _, _, y2, x2 in pairs], dtype=float)
+            layout._ensure_torch_positions()
+            radius = 3
+            energy_c, energy_s = layout._torch_engine.pair_energies(
+                idx_a, idx_b, pos_a, pos_b, neighbourhood=True, local_radius=radius, kernel=kernel,
+                euclidean=(distance == "euclidean"), distance_eps=layout._distance_eps,
+                kernel_width=layout._long_kernel_width, lambda_threshold=layout._lambda, eta=layout._eta,
+            )
+            for i, (y1, x1, y2, x2) in enumerate(pairs):
+                r = layout._short_pair_radius(y1, x1, y2, x2, radius)
+                cpu_c, cpu_s = layout._pair_energy_short(
+                    int(idx_a[i]), (y1, x1), None if idx_b[i] < 0 else int(idx_b[i]), (y2, x2), radius=r, kernel=kernel
+                )
+                self.assertAlmostEqual(float(energy_c[i]), cpu_c, places=4, msg=f"{kernel}/{distance} phi_c pair {i}")
+                self.assertAlmostEqual(float(energy_s[i]), cpu_s, places=4, msg=f"{kernel}/{distance} phi_s pair {i}")
+
+    def test_far_energies_match_cpu_formula_over_subset(self) -> None:
+        """§5.5.1 по подмножеству B ⊆ V (§5.9.4): φ_c = Σ_{v∈B} s1·d1 + s2·d2 с евклидовым d."""
+        import numpy as np
+
+        layout = self._gpu_layout(long_distance="euclidean")
+        pairs = self._pairs(layout, count=30)
+        subset = list(range(0, layout._point_count, 2))
+        layout._ensure_torch_positions()
+        idx_a = np.array([layout.grid[y1][x1] for y1, x1, _, _ in pairs])
+        idx_b = np.array([-1 if layout.grid[y2][x2] is None else layout.grid[y2][x2] for _, _, y2, x2 in pairs])
+        energy_c, energy_s = layout._torch_engine.pair_energies(
+            idx_a, idx_b, np.array([p[:2] for p in pairs], dtype=float), np.array([p[2:] for p in pairs], dtype=float),
+            neighbourhood=False, local_radius=None, kernel="inverse", euclidean=True,
+            distance_eps=layout._distance_eps, kernel_width=1.0, lambda_threshold=layout._lambda, eta=layout._eta,
+            eval_indices=subset,
+        )
+        for i, (y1, x1, y2, x2) in enumerate(pairs):
+            expected_c = expected_s = 0.0
+            for v in subset:
+                if v == idx_a[i] or v == idx_b[i]:
+                    continue
+                s1 = layout._sim_lambda_idx(int(idx_a[i]), v)
+                s2 = 0.0 if idx_b[i] < 0 else layout._sim_lambda_idx(int(idx_b[i]), v)
+                vy, vx = layout._positions[v]
+                d1 = math.hypot(y1 - vy, x1 - vx)
+                d2 = math.hypot(y2 - vy, x2 - vx)
+                expected_c += s1 * d1 + s2 * d2
+                expected_s += s2 * d1 + s1 * d2
+            self.assertAlmostEqual(float(energy_c[i]), expected_c, places=3)
+            self.assertAlmostEqual(float(energy_s[i]), expected_s, places=3)
+
+    def test_point_energies_on_gpu_match_cpu(self) -> None:
+        for points, grid_size in ((40, 9), (300, 24)):  # малое окно → полный проход; большое V → окно ячеек
+            layout = self._gpu_layout(points=points, grid_size=grid_size)
+            gpu = layout._compute_point_energies(3)
+            cpu = layout._point_energies_cpu(3)
+            self.assertEqual(len(gpu), len(cpu))
+            for got, want in zip(gpu, cpu):
+                self.assertAlmostEqual(got, want, places=4)
+
+    def test_local_window_energies_match_full_pass_and_cpu(self) -> None:
+        """Окно ячеек вокруг центра пары даёт те же φ_c, φ_s, что проход по всему V и CPU (§5.5.2)."""
+        import numpy as np
+
+        layout = self._gpu_layout(points=300, grid_size=24, long_kernel="gauss", long_kernel_width=1.0)
+        pairs = self._pairs(layout, count=80)
+        idx_a = np.array([layout.grid[y1][x1] for y1, x1, _, _ in pairs])
+        idx_b = np.array([-1 if layout.grid[y2][x2] is None else layout.grid[y2][x2] for _, _, y2, x2 in pairs])
+        pos_a = np.array([(y1, x1) for y1, x1, _, _ in pairs], dtype=float)
+        pos_b = np.array([(y2, x2) for _, _, y2, x2 in pairs], dtype=float)
+        layout._ensure_torch_positions()
+        engine = layout._torch_engine
+        for kernel in ("gauss", "inverse"):
+            common = dict(neighbourhood=True, local_radius=2, kernel=kernel, euclidean=False,
+                          distance_eps=layout._distance_eps, kernel_width=1.0,
+                          lambda_threshold=layout._lambda, eta=layout._eta)
+            local_c, local_s = engine.pair_energies(idx_a, idx_b, pos_a, pos_b, **common)
+            # полный проход — тот же вызов с явным списком всех точек (окно не используется)
+            full_c, full_s = engine.pair_energies(
+                idx_a, idx_b, pos_a, pos_b, eval_indices=list(range(layout._point_count)), **common
+            )
+            for i, (y1, x1, y2, x2) in enumerate(pairs):
+                r = layout._short_pair_radius(y1, x1, y2, x2, 2)
+                cpu_c, cpu_s = layout._pair_energy_short(
+                    int(idx_a[i]), (y1, x1), None if idx_b[i] < 0 else int(idx_b[i]), (y2, x2), radius=r, kernel=kernel
+                )
+                self.assertAlmostEqual(float(local_c[i]), cpu_c, places=4, msg=f"{kernel} local phi_c {i}")
+                self.assertAlmostEqual(float(local_s[i]), cpu_s, places=4, msg=f"{kernel} local phi_s {i}")
+                self.assertAlmostEqual(float(full_c[i]), cpu_c, places=4, msg=f"{kernel} full phi_c {i}")
+                self.assertAlmostEqual(float(full_s[i]), cpu_s, places=4, msg=f"{kernel} full phi_s {i}")
+
+    def test_vectorised_pair_sampling_respects_radius_bounds_and_cutoff(self) -> None:
+        import numpy as np
+
+        layout = _random_layout(points=30, grid_size=8)
+        layout._sync_arrays()
+        pairs = layout._sample_pairs_long_np(200, 2)
+        self.assertEqual(pairs.shape, (200, 4))
+        self.assertTrue(np.all((pairs[:, 0] != pairs[:, 2]) | (pairs[:, 1] != pairs[:, 3])), "ячейки пары различны")
+        self.assertTrue(np.all(pairs >= 0) and np.all(pairs[:, [0, 2]] < layout.height) and np.all(pairs[:, [1, 3]] < layout.width))
+        dist_sq = (pairs[:, 0] - pairs[:, 2]) ** 2 + (pairs[:, 1] - pairs[:, 3]) ** 2
+        self.assertGreater(float(np.mean(dist_sq <= 4)), 0.9, "вторая точка почти всегда в радиусе r (§5.3)")
+        # плитка из одной ячейки с первой точкой расширяется до всей сетки (§5.10)
+        y1 = np.array([layout._positions[0][0]])
+        x1 = np.array([layout._positions[0][1]])
+        y2, x2 = layout._sample_nearby_np(y1, x1, 1, bounds=(int(y1[0]), int(y1[0]), int(x1[0]), int(x1[0])))
+        self.assertNotEqual((int(y2[0]), int(x2[0])), (int(y1[0]), int(x1[0])))
+        # отсечка по сходству (§5.9.1): при cutoff > 1 все пары с занятой второй ячейкой отбрасываются,
+        # недобор восполняется парами дальней фазы
+        strict = layout._sample_pairs_short_tile_np(
+            40, pair_radius=None, similarity_cutoff=1.01, weighted_first=False, step_index=0
+        )
+        self.assertEqual(strict.shape, (40, 4))
+        loose = layout._sample_pairs_short_tile_np(
+            40, pair_radius=2, similarity_cutoff=None, weighted_first=False, step_index=0
+        )
+        self.assertEqual(loose.shape, (40, 4))
+        partitioned = layout._sample_pairs_short_np(
+            45, pair_radius=2, similarity_cutoff=None, weighted_first=True, step_index=0, partitions=4
+        )
+        self.assertEqual(partitioned.shape, (45, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

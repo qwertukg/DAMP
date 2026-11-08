@@ -21,6 +21,20 @@ class BitArray:
             result.set(int(index), 1)
         return result
 
+    @classmethod
+    def from_bits(cls, bits: bytes | bytearray, active: Iterable[int]) -> "BitArray":
+        """Вектор из готового буфера 0/1 и списка его единичных индексов (без побитовой установки).
+
+        Буфер и индексы должны согласовываться: это быстрый путь для кодера, который уже посчитал
+        биты векторно; проверка не делается ради скорости.
+        """
+        if len(bits) <= 0:
+            raise ValueError("bit array length must be positive")
+        result = cls.__new__(cls)
+        result._bits = bytearray(bits)
+        result._active = {int(index) for index in active}
+        return result
+
     def set(self, index: int, value: int = 1) -> None:
         resolved = 1 if value else 0
         self._bits[index] = resolved

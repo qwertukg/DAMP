@@ -259,15 +259,21 @@ class _DimensionIndex:
     half_widths: "np.ndarray"
     bits: "np.ndarray"
 
-    def active_bits(self, value: float) -> tuple["np.ndarray", "np.ndarray"]:
+    def active_mask(self, values: "np.ndarray") -> "np.ndarray":
+        """Маска (значения × детекторы): детектор активен, если значение в его рецептивном поле (§4.1)."""
+        values = np.asarray(values, dtype=np.float64)[:, None]
         if self.closed:
-            diff = np.abs(value - self.centers) % self.period
+            diff = np.abs(values - self.centers[None, :]) % self.period
             distance = np.minimum(diff, self.period - diff)
-            active = (distance <= self.half_widths) | (self.half_widths >= self.period / 2.0)
-        else:
-            active = np.abs(value - self.centers) <= self.half_widths
-        bits = self.bits[active]
-        unique, hits = np.unique(bits, return_counts=True)
+            return (distance <= self.half_widths[None, :]) | (self.half_widths[None, :] >= self.period / 2.0)
+        return np.abs(values - self.centers[None, :]) <= self.half_widths[None, :]
+
+    def active_detector_bits(self, value: float) -> "np.ndarray":
+        """Биты всех активных детекторов (с повторами: несколько детекторов могут делить бит)."""
+        return self.bits[self.active_mask(np.asarray([value]))[0]]
+
+    def active_bits(self, value: float) -> tuple["np.ndarray", "np.ndarray"]:
+        unique, hits = np.unique(self.active_detector_bits(value), return_counts=True)
         return unique, hits
 
 
@@ -664,31 +670,62 @@ class Encoder:
         self, *values: float
     ) -> tuple[tuple[float, ...], tuple[int, ...], int]:
         """Нормализованные значения, активные биты и число паразитных битов."""
-        if len(values) != len(self.dimensions):
-            raise ValueError("number of values must match number of dimensions")
-        normalized_values: List[float] = []
-        bit_hits: dict[int, int] = {}
-        for value, dim, index in zip(values, self.dimensions, self._indices):
-            v = self._normalize_value(dim, value)
-            normalized_values.append(v)
-            bits, hits = index.active_bits(v)
-            for bit, count in zip(bits, hits):
-                bit_hits[int(bit)] = bit_hits.get(int(bit), 0) + int(count)
+        normalized, hits = self._hit_matrix([values])
+        active = np.flatnonzero(hits[0])
         # OR кодов координат (§2.2.1); бит, который поставили несколько детекторов, — паразитный (§4.2.1).
-        shared_bits = sum(1 for count in bit_hits.values() if count > 1)
-        return tuple(normalized_values), tuple(sorted(bit_hits)), shared_bits
+        shared_bits = int(np.count_nonzero(hits[0] > 1))
+        return tuple(float(v) for v in normalized[0]), tuple(int(bit) for bit in active), shared_bits
+
+    def _hit_matrix(self, rows: Sequence[Sequence[float]]) -> tuple["np.ndarray", "np.ndarray"]:
+        """Для набора стимулов: нормализованные значения (k × dims) и число детекторов на бит (k × длина кода).
+
+        Все координаты считаются векторно: маска активных детекторов каждой координаты (§4.1),
+        их биты суммируются в общую матрицу — это OR кодов координат (§2.2.1) с подсчётом коллизий (§4.2.1).
+        """
+        matrix = np.asarray(rows, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[1] != len(self.dimensions):
+            raise ValueError("number of values must match number of dimensions")
+        count = matrix.shape[0]
+        normalized = np.empty_like(matrix)
+        flat_hits: list[np.ndarray] = []
+        for column, (dim, index) in enumerate(zip(self.dimensions, self._indices)):
+            normalized[:, column] = self._normalize_values(dim, matrix[:, column])
+            if count == 0:
+                continue
+            mask = index.active_mask(normalized[:, column])
+            row_ids, detector_ids = np.nonzero(mask)
+            flat_hits.append(row_ids.astype(np.int64) * self.code_length + index.bits[detector_ids])
+        if count == 0:
+            return normalized, np.zeros((0, self.code_length), dtype=np.int32)
+        flat = np.concatenate(flat_hits) if flat_hits else np.zeros(0, dtype=np.int64)
+        hits = np.bincount(flat, minlength=count * self.code_length).astype(np.int32)
+        return normalized, hits.reshape(count, self.code_length)
 
     @staticmethod
-    def _normalize_value(dim: "Dimension", value: float) -> float:
-        v = float(value)
+    def _normalize_values(dim: "Dimension", values: "np.ndarray") -> "np.ndarray":
+        values = np.asarray(values, dtype=np.float64)
         if dim.closed:
-            return ((v - dim.min_value) % dim.period) + dim.min_value
-        if not (dim.min_value <= v <= dim.max_value):
+            return ((values - dim.min_value) % dim.period) + dim.min_value
+        outside = (values < dim.min_value) | (values > dim.max_value)
+        if np.any(outside):
+            v = float(values[outside][0])
             raise ValueError(
                 f"value {v} is outside the open dimension range "
                 f"[{dim.min_value}, {dim.max_value}]"
             )
-        return v
+        return values
+
+    @classmethod
+    def _normalize_value(cls, dim: "Dimension", value: float) -> float:
+        return float(cls._normalize_values(dim, np.asarray([float(value)]))[0])
+
+    @staticmethod
+    def _bit_arrays_from_hits(hits: "np.ndarray") -> list[BitArray]:
+        bit_matrix = (hits > 0).astype(np.uint8)
+        return [
+            BitArray.from_bits(bit_matrix[i].tobytes(), np.flatnonzero(bit_matrix[i]).tolist())
+            for i in range(bit_matrix.shape[0])
+        ]
 
     def dimension_bits(self, dimension: int | str, value: float) -> tuple[int, ...]:
         """Биты, которые ставят детекторы одной координаты при данном значении (её собственный код)."""
@@ -704,83 +741,121 @@ class Encoder:
         log_label: int | None = None,
         log_measurements: Sequence[tuple[float, int, int]] | None = None,
     ) -> Tuple[Tuple[float, ...], BitArray]:
+        results = self.encode_batch(
+            [values], log_image=log_image, log_label=log_label, log_measurements=log_measurements
+        )
+        return results[0]
+
+    def encode_batch(
+        self,
+        rows: Sequence[Sequence[float]],
+        *,
+        log_image: object | None = None,
+        log_label: int | None = None,
+        log_measurements: Sequence[tuple[float, int, int]] | None = None,
+    ) -> list[Tuple[Tuple[float, ...], BitArray]]:
+        """Коды набора стимулов одним векторным проходом (все углопозиции цифры разом).
+
+        Результат побитово тот же, что у encode для каждого стимула по отдельности; коды считаются
+        матрицей (стимулы × биты), поэтому стоимость почти не зависит от числа стимулов.
+        """
+        rows = [tuple(float(v) for v in row) for row in rows]
+        if not rows:
+            return []
         LOGGER.event(
             "encoder.encode.input",
             section=MULTI_DIM_CODES,
-            data={"values": values},
+            data={"stimuli": len(rows), "values": rows[0], "dimensions": len(self.dimensions)},
         )
-        normalized_values, active_indices, shared_bits = self.encode_indices(*values)
-        bit_array = BitArray.from_indices(self.code_length, active_indices)
+        normalized, hits = self._hit_matrix(rows)
+        codes = self._bit_arrays_from_hits(hits)
+        active_counts = np.count_nonzero(hits > 0, axis=1)
+        shared_counts = np.count_nonzero(hits > 1, axis=1)
         LOGGER.event(
             "encoder.encode.normalized",
             section=CYCLIC_COORDS,
-            data={"values": normalized_values},
+            data={"stimuli": len(rows), "values": tuple(float(v) for v in normalized[0])},
         )
-        self._log_counter += 1
+        self._log_counter += len(rows)
         code_visuals = []
         code_bits: list[int] | None = None
         patch_meta: dict[str, float | int | str] = {}
-        if self.log_every > 0 and self._log_counter % self.log_every == 0:
-            code_bits = list(bit_array)
+        if self.log_every > 0 and self._log_counter % self.log_every < len(rows):
+            code_bits = list(codes[0])
             code_visuals.append(LOGGER.visual_bar_chart("encoding/code_bits", code_bits))
         if log_image is not None or log_measurements:
-            image_visuals = []
-            image_array = None
-            image_path = "encoding/image"
-            if log_label is not None:
-                image_path = f"label_{int(log_label)}/image"
-            if log_image is not None:
-                image_array = np.asarray(log_image)
-                image_visuals.append(LOGGER.visual_image(image_path, image_array))
-                if code_bits is None:
-                    code_bits = list(bit_array)
-                image_visuals.append(
-                    LOGGER.visual_bar_chart(f"{image_path}/code_bits", code_bits)
-                )
-            if log_measurements:
-                positions, colors, patch_meta, grid = self._patch_points(
-                    log_measurements,
-                    image_array.shape if image_array is not None else None,
-                    grid_override=self._infer_patch_grid(),
-                )
-                image_visuals.append(
-                    LOGGER.visual_points2d(
-                        image_path, positions, colors=colors, radii=grid["radius"]
-                    )
-                )
-                if grid["mins"]:
-                    image_visuals.append(
-                        LOGGER.visual_boxes2d(
-                            image_path, grid["mins"], grid["sizes"], colors=grid["colors"]
-                        )
-                    )
-            if image_visuals:
-                LOGGER.event(
-                    "encoder.encode.image",
-                    section=OUTSIDE_ARTICLE,
-                    data={
-                        "label": int(log_label) if log_label is not None else None,
-                        "measurements": len(log_measurements) if log_measurements else 0,
-                        **patch_meta,
-                    },
-                    visuals=image_visuals,
-                )
+            patch_meta = self._log_stimulus_image(
+                codes[0], code_bits, log_image=log_image, log_label=log_label, log_measurements=log_measurements
+            )
         LOGGER.event(
             "encoder.encode.code",
             section=SPARSE_BIT_VECTORS,
             data={
+                "stimuli": len(rows),
                 "code_length": self.code_length,
-                "active_bits": bit_array.count(),
-                "density": bit_array.count() / self.code_length,
-                "shared_bits": shared_bits,
-                "code": bit_array,
+                "active_bits": int(active_counts[0]),
+                "active_bits_mean": float(active_counts.mean()),
+                "density": float(active_counts.mean()) / self.code_length,
+                "shared_bits": int(shared_counts[0]),
+                "shared_bits_mean": float(shared_counts.mean()),
+                "code": codes[0],
                 "label": int(log_label) if log_label is not None else None,
                 "measurements": len(log_measurements) if log_measurements else 0,
                 **patch_meta,
             },
             visuals=code_visuals if code_visuals else None,
         )
-        return normalized_values, bit_array
+        return [
+            (tuple(float(v) for v in normalized[i]), codes[i]) for i in range(len(rows))
+        ]
+
+    def _log_stimulus_image(
+        self,
+        code: BitArray,
+        code_bits: list[int] | None,
+        *,
+        log_image: object | None,
+        log_label: int | None,
+        log_measurements: Sequence[tuple[float, int, int]] | None,
+    ) -> dict[str, float | int | str]:
+        """Картинка стимула с углопозициями и код первого стимула — в Rerun (вне статьи)."""
+        image_visuals = []
+        image_array = None
+        patch_meta: dict[str, float | int | str] = {}
+        image_path = "encoding/image"
+        if log_label is not None:
+            image_path = f"label_{int(log_label)}/image"
+        if log_image is not None:
+            image_array = np.asarray(log_image)
+            image_visuals.append(LOGGER.visual_image(image_path, image_array))
+            if code_bits is None:
+                code_bits = list(code)
+            image_visuals.append(LOGGER.visual_bar_chart(f"{image_path}/code_bits", code_bits))
+        if log_measurements:
+            positions, colors, patch_meta, grid = self._patch_points(
+                log_measurements,
+                image_array.shape if image_array is not None else None,
+                grid_override=self._infer_patch_grid(),
+            )
+            image_visuals.append(
+                LOGGER.visual_points2d(image_path, positions, colors=colors, radii=grid["radius"])
+            )
+            if grid["mins"]:
+                image_visuals.append(
+                    LOGGER.visual_boxes2d(image_path, grid["mins"], grid["sizes"], colors=grid["colors"])
+                )
+        if image_visuals:
+            LOGGER.event(
+                "encoder.encode.image",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "label": int(log_label) if log_label is not None else None,
+                    "measurements": len(log_measurements) if log_measurements else 0,
+                    **patch_meta,
+                },
+                visuals=image_visuals,
+            )
+        return patch_meta
 
     # ------------------------------------------------------------- pseudo colour
     @staticmethod

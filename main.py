@@ -8,6 +8,7 @@ from typing import ClassVar, Mapping, Sequence
 import argparse
 
 from damp.article_refs import (
+    DETECTOR_CONSTRUCTION,
     LAYOUT_PARAMETERS,
     OPTIM_SUBSET,
     OUTSIDE_ARTICLE,
@@ -67,6 +68,8 @@ EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
 EMBEDDINGS_VERSION = 5
 ACTIVATION_METADATA_KEY = "activation"
+# Детекторы иерархии (§6.3) сохраняются вместе с эмбеддингами: evaluate/predict не строят их заново.
+ACTIVATION_DETECTORS_KEY = "detectors"
 ENCODER_SIGNATURE_KEY = "encoder_signature"
 # Как получены стимулы раскладки (окно Собеля и режим углопозиций). В старых файлах этих ключей нет —
 # они собраны окнами 4×4 по среднему градиенту окна; кеш с другими значениями не подхватывается.
@@ -184,6 +187,10 @@ LAYOUT_EMPTY_RATIO = 0.15
 LAYOUT_USE_GPU = True
 LAYOUT_RANDOM_SEED = 0
 LAYOUT_LONG_FULL_SPACE_MAX_POINTS = 8000
+# Подмножество B в гауссовой дальней фазе допустимо, пока в окрестность радиуса r(t) ожидаемо попадает
+# не меньше стольких точек B (иначе оценка локальной энергии шумная и обмены случайны); ниже — всё V.
+# На 100 цифрах (8 693 точки, |B| = 745) подмножество на всём протяжении фазы давало Ē 0.26 вместо 0.70.
+LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS = 50
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
@@ -432,6 +439,7 @@ LOG_INTERVALS = {
     "layout.energy.short.tensor.empty_subset": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.progress": LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS,
+    "layout.energy.pairs.gpu": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
     "layout.gpu.disabled": LOG_INTERVAL_INIT,
@@ -1038,20 +1046,38 @@ def _output_sizer() -> DetectorOutputSizer:
     )
 
 
+@dataclass(frozen=True)
+class CalibratedActivation:
+    """Движок после калибровки размера выхода и эмбеддинги калибровочных стимулов (§6.6)."""
+
+    engine: ActivationEngine
+    size: OutputCodeSize
+    embeddings: tuple[BitArray, ...]
+    active_counts: tuple[int, ...]
+
+
 def _calibrated_activation_engine(
     layout: Layout,
     energies: list[float],
     calibration_batches: Sequence[Sequence[BitArray]],
-) -> tuple[ActivationEngine, OutputCodeSize]:
-    """§6.6: строит детекторы, измеряет среднее число активных и задаёт размер выхода."""
+) -> CalibratedActivation:
+    """§6.6: строит детекторы, измеряет среднее число активных и задаёт размер выхода.
+
+    Калибровочные стимулы активируются один раз: уровни детекторов не зависят от выходных кодов и σ
+    (§6.5), поэтому после перевыдачи битов (§6.3) их эмбеддинги собираются из тех же уровней.
+    """
     detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
     provisional = _build_activation_engine(layout, energies, detectors=detectors)
-    size = _output_sizer().measure(provisional, calibration_batches)
+    size, active_lists = _output_sizer().measure_with_results(provisional, calibration_batches)
     resized = reassign_output_bits(detectors, output_bits=size.output_bits, seed=ACTIVATION_DETECTOR_SEED)
-    engine = _build_activation_engine(
-        layout, energies, detectors=resized, saturation_limit=size.saturation_limit
+    engine = provisional.rebind(resized, saturation_limit=size.saturation_limit)
+    embeddings = tuple(engine.embedding_from_active(active) for active in active_lists)
+    return CalibratedActivation(
+        engine=engine,
+        size=size,
+        embeddings=embeddings,
+        active_counts=tuple(len(active) for active in active_lists),
     )
-    return engine, size
 
 
 def _activation_engine_from_size(
@@ -1060,20 +1086,70 @@ def _activation_engine_from_size(
     *,
     output_bits: int,
     saturation_limit: int,
+    stored_detectors: Sequence[Mapping[str, object]] | None = None,
 ) -> ActivationEngine:
-    """Восстанавливает детекторы и выходной код тех же размеров, что при обучении."""
-    detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
-    resized = reassign_output_bits(detectors, output_bits=output_bits, seed=ACTIVATION_DETECTOR_SEED)
+    """Восстанавливает детекторы и выходной код тех же размеров, что при обучении.
+
+    Если детекторы сохранены вместе с эмбеддингами, они читаются из файла; иначе строятся заново
+    с тем же seed (§6.4 — построение стохастическое, но воспроизводимое).
+    """
+    if stored_detectors:
+        resized = _detectors_from_payload(stored_detectors, output_bits=output_bits)
+        LOGGER.event(
+            "activation.detectors.restored",
+            section=DETECTOR_CONSTRUCTION,
+            data={"detectors": len(resized), "output_bits": output_bits},
+        )
+    else:
+        detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
+        resized = reassign_output_bits(detectors, output_bits=output_bits, seed=ACTIVATION_DETECTOR_SEED)
     return _build_activation_engine(layout, energies, detectors=resized, saturation_limit=saturation_limit)
 
 
-def _activation_metadata(size: OutputCodeSize) -> dict[str, object]:
-    return {
+def _detectors_payload(detectors: Sequence[Detector]) -> list[dict[str, object]]:
+    """Детекторы (§6.3) в JSON: центр, радиус, λ_d, e_d, n_d, единичные биты b_d."""
+    return [
+        {
+            "center": [float(detector.center[0]), float(detector.center[1])],
+            "radius": float(detector.radius),
+            "lambda": float(detector.lambda_threshold),
+            "energy": float(detector.energy),
+            "points": int(detector.points_count),
+            "bits": [int(bit) for bit in detector.output_code.active_indices()],
+            "label": detector.label,
+        }
+        for detector in detectors
+    ]
+
+
+def _detectors_from_payload(items: Sequence[Mapping[str, object]], *, output_bits: int) -> list[Detector]:
+    detectors: list[Detector] = []
+    for item in items:
+        center = item["center"]
+        detectors.append(
+            Detector(
+                center=(float(center[0]), float(center[1])),
+                radius=float(item["radius"]),
+                lambda_threshold=float(item["lambda"]),
+                energy=float(item["energy"]),
+                points_count=int(item["points"]),
+                output_code=BitArray.from_indices(output_bits, [int(bit) for bit in item["bits"]]),
+                label=None if item.get("label") is None else str(item["label"]),
+            )
+        )
+    return detectors
+
+
+def _activation_metadata(size: OutputCodeSize, detectors: Sequence[Detector] | None = None) -> dict[str, object]:
+    metadata: dict[str, object] = {
         "output_bits": int(size.output_bits),
         "saturation_limit": int(size.saturation_limit),
         "mean_active_detectors": float(size.mean_active_detectors),
         "calibration_samples": int(size.samples),
     }
+    if detectors is not None:
+        metadata[ACTIVATION_DETECTORS_KEY] = _detectors_payload(detectors)
+    return metadata
 
 
 class LayoutCacheFile:
@@ -1337,9 +1413,69 @@ def _stimulus_metadata(extractor: MnistSobelAngleMap) -> dict[str, object]:
 
 
 
+@dataclass(frozen=True)
+class DigitCodes:
+    """Одна цифра набора: метка, углы её углопозиций и их коды (§4.4, §4.6)."""
+
+    label: int
+    angles: tuple[float, ...]
+    codes: tuple[BitArray, ...]
+
+
+class StimulusCodeCache:
+    """Углопозиции и коды цифр считаются один раз: раскладка, калибровка и база эмбеддингов берут их отсюда.
+
+    Цифры идут в порядке набора; все углопозиции цифры кодируются одним батчем (Encoder.encode_batch).
+    Цифры без углопозиций остаются в списке пустыми: раскладка учитывает их в счётчике цифр, а база
+    эмбеддингов пропускает — как и раньше, когда каждый потребитель читал набор заново (вне статьи).
+    """
+
+    def __init__(self, dataset, encoder: Encoder, extractor: MnistSobelAngleMap, *, label: int | None) -> None:
+        self._iterator = iter(dataset)
+        self._encoder = encoder
+        self._extractor = extractor
+        self._label = label
+        self._items: list[DigitCodes] = []
+        self._exhausted = False
+
+    def _load_next(self) -> bool:
+        for img_tensor, digit in self._iterator:
+            if self._label is not None and int(digit) != self._label:
+                continue
+            img = img_tensor.squeeze(0).numpy()
+            measurements = self._extractor.extract(img, digit)[int(digit)]
+            codes: tuple[BitArray, ...] = ()
+            if measurements:
+                encoded = self._encoder.encode_batch(
+                    [(float(a), float(x), float(y)) for a, x, y in measurements],
+                    log_image=img,
+                    log_label=int(digit),
+                    log_measurements=measurements,
+                )
+                codes = tuple(code for _, code in encoded)
+            self._items.append(
+                DigitCodes(label=int(digit), angles=tuple(float(a) for a, _, _ in measurements), codes=codes)
+            )
+            return True
+        self._exhausted = True
+        return False
+
+    def take(self, count: int) -> list[DigitCodes]:
+        """Первые count цифр набора (включая цифры без углопозиций)."""
+        while len(self._items) < count and not self._exhausted:
+            self._load_next()
+        return self._items[:count]
+
+    def take_nonempty(self, count: int) -> list[DigitCodes]:
+        """Первые count цифр, у которых есть хотя бы одна углопозиция."""
+        while sum(1 for item in self._items if item.codes) < count and not self._exhausted:
+            self._load_next()
+        result = [item for item in self._items if item.codes]
+        return result[:count]
+
+
 def _collect_codes(
-    dataset,
-    label: int | None,
+    cache: StimulusCodeCache,
     count: int,
     encoder: Encoder,
     extractor: MnistSobelAngleMap,
@@ -1351,72 +1487,16 @@ def _collect_codes(
         metadata={ENCODER_SIGNATURE_KEY: encoder.signature, **_stimulus_metadata(extractor)},
     )
     total_codes = 0
-    found = 0
-
-    for img_tensor, digit in dataset:
-        if label is not None and int(digit) != label:
-            continue
-        found += 1
-        if found > count:
-            break
-        img = img_tensor.squeeze(0).numpy()
-        digit_values = extractor.extract(img, digit)
-        measurements = digit_values[int(digit)]
-        first = True
-        for (a, x, y) in measurements:
-            log_image = img if first else None
-            log_label = int(digit) if first else None
-            log_measurements = measurements if first else None
-            _, code = encoder.encode(
-                float(a),
-                float(x),
-                float(y),
-                log_image=log_image,
-                log_label=log_label,
-                log_measurements=log_measurements,
-            )
-            payload.add_code(label=int(digit), hue=float(a), code=code)
+    for item in cache.take(count):
+        for angle, code in zip(item.angles, item.codes):
+            payload.add_code(label=item.label, hue=angle, code=code)
             total_codes += 1
-            first = False
     return payload, total_codes
 
 
-def _collect_samples(
-    dataset,
-    sample_count: int,
-    encoder: Encoder,
-    extractor: MnistSobelAngleMap,
-    *,
-    label: int | None,
-) -> list[tuple[int, list[BitArray]]]:
-    samples: list[tuple[int, list[BitArray]]] = []
-    for img_tensor, digit in dataset:
-        if label is not None and int(digit) != label:
-            continue
-        img = img_tensor.squeeze(0).numpy()
-        digit_values = extractor.extract(img, digit)
-        measurements = digit_values[int(digit)]
-        codes: list[BitArray] = []
-        first = True
-        for (a, x, y) in measurements:
-            log_image = img if first else None
-            log_label = int(digit) if first else None
-            log_measurements = measurements if first else None
-            _, code = encoder.encode(
-                float(a),
-                float(x),
-                float(y),
-                log_image=log_image,
-                log_label=log_label,
-                log_measurements=log_measurements,
-            )
-            codes.append(code)
-            first = False
-        if codes:
-            samples.append((int(digit), codes))
-        if len(samples) >= sample_count:
-            break
-    return samples
+def _collect_samples(cache: StimulusCodeCache, sample_count: int) -> list[tuple[int, list[BitArray]]]:
+    return [(item.label, list(item.codes)) for item in cache.take_nonempty(sample_count)]
+
 
 def _run_layout(
     codes: dict[float, list],
@@ -1457,6 +1537,7 @@ def _run_layout(
         long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
         long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
         component_period=LAYOUT_COMPONENT_PERIOD,
+        long_subset_min_neighbours=LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS,
     )
     step_offset = 1
     long_radius_start = max(
@@ -1595,6 +1676,7 @@ class MnistLayoutRunner:
         self.encoder = _build_encoder()
         self.colorizer = _build_colorizer()
         self.extractor = _build_extractor()
+        self._codes: StimulusCodeCache | None = None
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1677,6 +1759,12 @@ class MnistLayoutRunner:
             transform=transforms.ToTensor(),
         )
 
+    def _code_cache(self, dataset) -> StimulusCodeCache:
+        """Коды цифр набора — один общий кеш для раскладки и активации."""
+        if self._codes is None:
+            self._codes = StimulusCodeCache(dataset, self.encoder, self.extractor, label=self.label)
+        return self._codes
+
     def _tune_layout(self, total_codes: int) -> TunedLayoutParams:
         tuner = LayoutParameterTuner(
             empty_ratio=LAYOUT_EMPTY_RATIO,
@@ -1724,39 +1812,53 @@ class MnistLayoutRunner:
         initial_embeddings: Sequence[EmbeddingRecord],
     ) -> list[EmbeddingRecord]:
         energies = layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
-        samples = _collect_samples(
-            dataset,
-            self._activation_samples,
-            self.encoder,
-            self.extractor,
-            label=self.label,
-        )
-        engine, size = _calibrated_activation_engine(
+        samples = _collect_samples(self._code_cache(dataset), self._activation_samples)
+        calibrated = _calibrated_activation_engine(
             layout,
             energies,
             [codes for _, codes in samples[:ACTIVATION_OUTPUT_CALIBRATION_SAMPLES]],
         )
-        self._activation_metadata = _activation_metadata(size)
+        engine = calibrated.engine
+        self._activation_metadata = _activation_metadata(calibrated.size, detectors=engine.detectors)
         embeddings = list(initial_embeddings[: len(samples)])
         start_index = len(embeddings)
+        # Калибровочные стимулы уже активированы (§6.6): их эмбеддинги готовы, повторно не считаются.
+        precomputed: dict[int, tuple[BitArray, int]] = {
+            index: (embedding, count)
+            for index, (embedding, count) in enumerate(zip(calibrated.embeddings, calibrated.active_counts))
+            if index >= start_index
+        }
         LOGGER.event(
             "activation.resume",
             section=OUTSIDE_ARTICLE,
             data={
                 "completed": start_index,
                 "target": len(samples),
+                "precomputed": len(precomputed),
                 "workers": ACTIVATION_PARALLEL_WORKERS,
                 "batch_size": ACTIVATION_BATCH_SIZE,
             },
         )
         for batch_start in range(start_index, len(samples), ACTIVATION_BATCH_SIZE):
             batch = samples[batch_start : batch_start + ACTIVATION_BATCH_SIZE]
-            results = engine.activate_many(
-                [codes for _, codes in batch],
-                max_workers=ACTIVATION_PARALLEL_WORKERS,
-            )
-            for offset, ((label, codes), result) in enumerate(zip(batch, results)):
+            pending = [
+                (batch_start + offset, codes)
+                for offset, (_, codes) in enumerate(batch)
+                if batch_start + offset not in precomputed
+            ]
+            computed: dict[int, tuple[BitArray, int]] = {}
+            if pending:
+                results = engine.activate_many(
+                    [codes for _, codes in pending],
+                    max_workers=ACTIVATION_PARALLEL_WORKERS,
+                )
+                computed = {
+                    index: (result.embedding, len(result.active_detectors))
+                    for (index, _), result in zip(pending, results)
+                }
+            for offset, (label, codes) in enumerate(batch):
                 index = batch_start + offset
+                embedding, active_count = precomputed.get(index) or computed[index]
                 LOGGER.event(
                     "activation.sample",
                     section=STIMULUS_DETECTION,
@@ -1764,14 +1866,15 @@ class MnistLayoutRunner:
                         "index": index,
                         "sample_label": str(int(label)),
                         "stimuli": len(codes),
-                        "active_detectors": len(result.active_detectors),
-                        "embedding_bits": result.embedding.count(),
+                        "active_detectors": active_count,
+                        "embedding_bits": embedding.count(),
+                        "from_calibration": index in precomputed,
                     },
                 )
                 embeddings.append(
                     EmbeddingRecord(
                         class_label=str(int(label)),
-                        embedding_bits=result.embedding.to01(),
+                        embedding_bits=embedding.to01(),
                     )
                 )
             if (
@@ -1820,8 +1923,7 @@ class MnistLayoutRunner:
             save_json = False
         else:
             payload, total_codes = _collect_codes(
-                dataset,
-                self.label,
+                self._code_cache(dataset),
                 self.count,
                 self.encoder,
                 self.extractor,
@@ -1996,6 +2098,7 @@ class MnistDecodeRunner:
                 energies,
                 output_bits=int(metadata["output_bits"]),
                 saturation_limit=int(metadata["saturation_limit"]),
+                stored_detectors=metadata.get(ACTIVATION_DETECTORS_KEY),
             )
         database = EmbeddingDatabase(
             labeled_embeddings,
@@ -2034,25 +2137,24 @@ class MnistDecodeRunner:
         energies: list[float],
     ) -> tuple[list[EmbeddingRecord], ActivationEngine]:
         dataset = self._build_dataset(train=True)
-        samples = _collect_samples(
-            dataset,
-            DECODER_DATASET_LIMIT,
-            self.encoder,
-            self.extractor,
-            label=None,
-        )
-        engine, size = _calibrated_activation_engine(
+        cache = StimulusCodeCache(dataset, self.encoder, self.extractor, label=None)
+        samples = _collect_samples(cache, DECODER_DATASET_LIMIT)
+        calibrated = _calibrated_activation_engine(
             layout,
             energies,
             [codes for _, codes in samples[:ACTIVATION_OUTPUT_CALIBRATION_SAMPLES]],
         )
+        engine = calibrated.engine
         embeddings: list[EmbeddingRecord] = []
         for idx, (label, codes) in enumerate(samples):
-            result = engine.activate(codes)
+            if idx < len(calibrated.embeddings):
+                embedding = calibrated.embeddings[idx]
+            else:
+                embedding = engine.activate(codes).embedding
             embeddings.append(
                 EmbeddingRecord(
                     class_label=str(int(label)),
-                    embedding_bits=result.embedding.to01(),
+                    embedding_bits=embedding.to01(),
                 )
             )
             LOGGER.event(
@@ -2062,10 +2164,12 @@ class MnistDecodeRunner:
                     "index": idx,
                     "label": int(label),
                     "stimuli": len(codes),
-                    "bits": result.embedding.count(),
+                    "bits": embedding.count(),
                 },
             )
-        self._embedding_store.save(layout_path, embeddings, metadata=_activation_metadata(size))
+        self._embedding_store.save(
+            layout_path, embeddings, metadata=_activation_metadata(calibrated.size, detectors=engine.detectors)
+        )
         LOGGER.event(
             "decoder.base.generated",
             section=STIMULUS_DETECTION,
