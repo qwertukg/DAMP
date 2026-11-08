@@ -91,7 +91,11 @@ MNIST_ANGLE_LAYERS = 22
 MNIST_ANGLE_WIDEST_DETECTORS = 2
 MNIST_ANGLE_NARROWEST_DETECTORS = 180
 MNIST_ANGLE_OVERLAP = 0.4
-MNIST_POSITION_MIN = 0.0
+# Позиции MNIST — индексы участков 0…6. Нижняя граница вынесена на шаг за край данных: детекторов за краями
+# отрезка нет (MNIST_POSITION_EDGE_DETECTORS = False), и при MIN = 0 участок 0 лежал на самой границе —
+# 22 бита вместо ~34 и J(0, 1) = 0,81 при ~0,57 у остальных соседей. С MIN = -1 перекрытие соседних
+# участков ровное (J = 0,55…0,61), их коды различимы одинаково (§4.2.1, §4.5).
+MNIST_POSITION_MIN = -1.0
 MNIST_POSITION_MAX = 28.0
 MNIST_POSITION_CODE_LENGTH = 128
 # 15 слоёв — минимальное уменьшение с 22, при котором в pinwheel-тесте (позиции 2×2, режим сглаживания)
@@ -313,6 +317,20 @@ DETECTORS_VIEW_STIMULUS = (45.0, 14.0, 14.0)
 DETECTORS_VIEW_INACTIVE_ALPHA = 0.3
 DETECTORS_VIEW_DPI = 110
 DETECTORS_VIEW_WIDTH_INCHES = 18.0
+
+# --- Проверка, как цифра строится из углопозиций (digit_sketch.py): случайный стимул MNIST заданной цифры,
+# его углопозиции (угол, X, Y) от того же MnistSobelAngleMap, что и в конвейере (§4.4, §4.6), и по каждой —
+# отрезок длиной в окно Собеля, перпендикулярный градиенту (край штриха). Цвет отрезка — угол, как на рис. 16.
+DIGIT_SKETCH_MNIST_ROOT = "./data"
+DIGIT_SKETCH_SPLIT = "train"
+DIGIT_SKETCH_LINE_LENGTH = float(MnistSobelAngleMap.PATCH_SIZE)
+DIGIT_SKETCH_LINE_RADIUS = 0.2
+# Окно «со штрихом», если в нём есть пиксель ярче порога: такие окна без углопозиции (средний градиент
+# погасился и не прошёл MNIST_GRAD_THRESHOLD) подсвечиваются — там цифра теряет форму.
+DIGIT_SKETCH_INK_THRESHOLD = 0.5
+DIGIT_SKETCH_GRID_COLOR = (255, 255, 255, 50)
+DIGIT_SKETCH_LOST_COLOR = (255, 60, 60, 220)
+DIGIT_SKETCH_ENTITY_PATH = "/digit"
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
     "detectors.geometric_layers": LOG_INTERVAL_INIT,

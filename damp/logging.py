@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import rerun as rr
 
@@ -95,6 +95,57 @@ class RerunViewerBlueprint:
         )
 
 
+class DigitSketchBlueprint:
+    """Окно digit_sketch.py: оригинальный стимул MNIST рядом с цифрой, собранной из линий его углопозиций.
+
+    Обе панели показывают одну и ту же область side × side пикселей, поэтому линию можно сравнить с местом
+    стимула, откуда она взята; сетка окон Собеля видна на обеих. Пути сущностей отсюда же берёт
+    AnglePositionSketch, чтобы панели и данные не разошлись.
+    """
+
+    def __init__(self, root: str, *, side: float) -> None:
+        self.root = "/" + root.strip("/")
+        self.side = float(side)
+
+    @property
+    def stimulus_path(self) -> str:
+        return f"{self.root}/stimulus"
+
+    @property
+    def grid_path(self) -> str:
+        return f"{self.root}/grid"
+
+    @property
+    def lines_path(self) -> str:
+        return f"{self.root}/lines"
+
+    def build(self):
+        import rerun.blueprint as rrb
+
+        bounds = rrb.VisualBounds2D(x_range=[0.0, self.side], y_range=[0.0, self.side])
+        stimulus = rrb.Spatial2DView(
+            name="Оригинальный стимул",
+            origin=self.root,
+            contents=[self.stimulus_path, self.grid_path],
+            visual_bounds=bounds,
+        )
+        sketch = rrb.Spatial2DView(
+            name="Цифра из линий углопозиций",
+            origin=self.root,
+            contents=[self.lines_path, self.grid_path],
+            background=[0, 0, 0],
+            visual_bounds=bounds,
+        )
+        return rrb.Blueprint(
+            rrb.Vertical(
+                rrb.Horizontal(stimulus, sketch),
+                rrb.TextLogView(name="Лог", origin=f"/{LOG_PATH}"),
+                row_shares=[3, 1],
+            ),
+            rrb.SelectionPanel(state="collapsed"),
+        )
+
+
 class DampLogger:
     def __init__(self, app_id: str = "damp", base_path: str = LOG_PATH, *, spawn: bool = True) -> None:
         self._app_id = app_id
@@ -104,6 +155,16 @@ class DampLogger:
         self._spawned = False
         self._event_sequence = 0
         self._interval_policy: LogIntervalPolicy | None = None
+        self._blueprint_builder: Callable[[], Any] = RerunViewerBlueprint.build
+
+    def use_blueprint(self, builder: Callable[[], Any]) -> None:
+        """Своя раскладка панелей окна для отдельного скрипта; по умолчанию — ход раскладки DAMP.
+
+        Если окно уже открыто, новая раскладка сразу становится активной.
+        """
+        self._blueprint_builder = builder
+        if self._spawned:
+            self._send_blueprint()
 
     def _ensure_rerun(self) -> None:
         if not self._initialized:
@@ -117,7 +178,7 @@ class DampLogger:
     def _send_blueprint(self) -> None:
         """Делает раскладку панелей DAMP активной, перекрывая сохранённую в окне с прошлых сессий."""
         try:
-            rr.send_blueprint(RerunViewerBlueprint.build(), make_active=True, make_default=True)
+            rr.send_blueprint(self._blueprint_builder(), make_active=True, make_default=True)
         except Exception as exc:  # окно всё равно получает данные, просто с панелями по умолчанию
             self._console_log(f"rerun.blueprint.error error={exc!r}")
 
@@ -271,6 +332,21 @@ class DampLogger:
         return LogVisual(
             path=path,
             payload=rr.Points2D(positions, colors=colors, radii=radii),
+            static=static,
+        )
+
+    def visual_line_strips2d(
+        self,
+        path: str,
+        strips: Sequence[Sequence[Sequence[float]]],
+        *,
+        colors: Sequence[Sequence[int]] | None = None,
+        radii: float | Sequence[float] | None = None,
+        static: bool = False,
+    ) -> LogVisual:
+        return LogVisual(
+            path=path,
+            payload=rr.LineStrips2D(strips, colors=colors, radii=radii),
             static=static,
         )
 
