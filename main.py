@@ -23,7 +23,7 @@ from damp.activation import (
     OutputCodeSize,
     reassign_output_bits,
 )
-from damp.MnistSobelAngleMap import MnistSobelAngleMap
+from damp.MnistSobelAngleMap import MnistSobelAngleMap, UpscaledSobel
 from damp.encoding.damp_encoder import (
     ClosedDimension,
     Encoder,
@@ -68,6 +68,11 @@ EMBEDDINGS_VERSION_KEY = "embeddings_version"
 EMBEDDINGS_VERSION = 5
 ACTIVATION_METADATA_KEY = "activation"
 ENCODER_SIGNATURE_KEY = "encoder_signature"
+# Как получены стимулы раскладки (окно Собеля и режим углопозиций). В старых файлах этих ключей нет —
+# они собраны окнами 4×4 по среднему градиенту окна; кеш с другими значениями не подхватывается.
+PATCH_SIZE_KEY = "patch_size"
+STIMULUS_MODE_KEY = "stimulus_mode"
+LAYOUT_CACHE_LEGACY_STIMULUS = {PATCH_SIZE_KEY: 4, STIMULUS_MODE_KEY: "window"}
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
 PIPELINE_CHECKPOINT_VERSION = 3
 
@@ -84,6 +89,35 @@ ENCODER_LOG_EVERY = 50
 ENCODER_LAYER_PHASE = True
 MNIST_ANGLE_IN_DEGREES = True
 MNIST_GRAD_THRESHOLD = 0.05
+# Сторона окна Собеля, по которому берётся углопозиция (вне статьи), — в пикселях картинки, на которой
+# считается Собель: стимула 28×28 или, при MNIST_SOBEL_UPSCALE_ENABLED, увеличенной (28·MNIST_SOBEL_UPSCALE).
+# Сетка окон — сторона // окно (без увеличения: 4 → 7×7, 3 → 9×9, 2 → 14×14; при ×8: 16 → 14×14, 3 → 74×74).
+# Остаток у правого и нижнего края в окна не попадает. При 3 ядро 3×3 совпадает с окном, меньше 3 — захватывает
+# соседей. X, Y углопозиции — индексы окон 0…сетка−1: диапазон MNIST_POSITION_MIN…MAX должен их покрывать.
+# После смены пересоберите раскладку: python main.py layout --rebuild (кеш на другом окне не подхватится).
+MNIST_PATCH_SIZE = 9   # при ×8: окно 9×9 увеличенных пикселей, сетка 224 // 9 = 24×24, X, Y ∈ 0…23
+# True — углопозиции только по контуру цифры: окно берётся, если через него проходит контур (пиксель штриха
+# ≥ MNIST_CONTOUR_LEVEL рядом с фоном), угол — по градиенту в пикселях контура. Залитая середина штриха и фон
+# пропускаются, контур не рвётся на границах окон. False — прежний режим: средний градиент по всему окну.
+MNIST_CONTOUR_ONLY = True
+MNIST_CONTOUR_LEVEL = 0.5
+# Окно даёт ровно одну углопозицию. Если края в окне смотрят в противоположные стороны (|Σg| / Σ|g| ниже
+# порога — тонкий штрих целиком в окне), их градиенты гасили бы друг друга — берётся сильнейший край.
+# 0.5 — наименьшая ошибка ориентации линий относительно контура на 1000 цифрах MNIST (0.3: 9.79°, 0.5: 9.58°,
+# 0.7: 9.61°, 0.9: 9.63°). Линия толщиной в пиксель (градиент в её середине гасится) берётся по окну с кольцом
+# соседних пикселей — на 3000 цифрах ни одного окна контура без углопозиции.
+MNIST_CONTOUR_TWO_EDGE_COHERENCE = 0.5
+# Предобработка перед Собелем как в process_image (Rust): увеличение ×MNIST_SOBEL_UPSCALE фильтром Lanczos3,
+# контраст MNIST_SOBEL_CONTRAST (image::imageops::contrast: отклонение от середины × ((100 + c) / 100)²),
+# Собель в целых числах. Контур и градиент ищутся на увеличенной картинке, окно MNIST_PATCH_SIZE — в её пикселях.
+# Отсечка ±255 из оригинала (u8-каналы картинки) — только у картинок gx, gy в Rerun: углы считаются по полному
+# отклику, иначе края с наклоном ~15…75° слипаются в 45° (на 1000 цифрах ошибка ориентации 13.6° против 8.9°).
+# Увеличенная картинка и отклики gx, gy (красный — плюс, синий — минус) — в Rerun, MNIST_SOBEL_ENTITY_PATH.
+# False — без предобработки; в digit_sketch.py и digits_contour_test.py переопределяется ключом --upscale.
+MNIST_SOBEL_UPSCALE_ENABLED = True
+MNIST_SOBEL_UPSCALE = 8
+MNIST_SOBEL_CONTRAST = 100.0
+MNIST_SOBEL_ENTITY_PATH = "/sobel"
 MNIST_ANGLE_MIN = 0.0
 MNIST_ANGLE_MAX = 360.0
 MNIST_ANGLE_CODE_LENGTH = 256
@@ -208,6 +242,13 @@ LAYOUT_ENERGY_RADIUS = 3
 LAYOUT_ENERGY_TARGET = None
 LAYOUT_MIN_SWAP_RATIO = 0.0001
 LAYOUT_MIN_SWAP_WINDOW = 20
+# Отдельный порог остановки ближней фазы (вне статьи): средняя доля обменов за LAYOUT_MIN_SWAP_WINDOW шагов,
+# ниже которой фаза переходит к следующему этапу расписания радиуса, а на последнем — останавливается.
+# С общим 0.0001 (меньше 0.2 обмена на шаг) ближняя фаза почти всегда идёт все шаги, хотя уже почти ничего не меняет:
+# 100 цифр MNIST (окно 9, ×8, 8 693 точки) — доля обменов всю фазу 0.002…0.006, Ē после дальней фазы 0.69778;
+# порог 0.005 → 20 шагов, 14 с, Ē 0.69787; 0.003 → 71 шаг, 45 с, Ē 0.69794; 0.0001 → 160 шагов, 93 с, Ē 0.69393.
+# При LAYOUT_SMOOTH_PINWHEELS = False (расписание "swaps") порог сначала переводит фазу к следующему этапу r и λ.
+LAYOUT_SHORT_MIN_SWAP_RATIO = 0.005
 
 # --- Детекторная иерархия (§6.3–§6.5, §7.1.10, §7.1.12). Порог активации λ_a
 # равен порогу нижнего слоя детекторов (§7.1.11); размер и насыщенность
@@ -321,16 +362,30 @@ DETECTORS_VIEW_WIDTH_INCHES = 18.0
 # --- Проверка, как цифра строится из углопозиций (digit_sketch.py): случайный стимул MNIST заданной цифры,
 # его углопозиции (угол, X, Y) от того же MnistSobelAngleMap, что и в конвейере (§4.4, §4.6), и по каждой —
 # отрезок длиной в окно Собеля, перпендикулярный градиенту (край штриха). Цвет отрезка — угол, как на рис. 16.
+# Размер окна — MNIST_PATCH_SIZE, у скрипта его можно переопределить ключом --patch-size.
 DIGIT_SKETCH_MNIST_ROOT = "./data"
 DIGIT_SKETCH_SPLIT = "train"
-DIGIT_SKETCH_LINE_LENGTH = float(MnistSobelAngleMap.PATCH_SIZE)
-DIGIT_SKETCH_LINE_RADIUS = 0.2
-# Окно «со штрихом», если в нём есть пиксель ярче порога: такие окна без углопозиции (средний градиент
-# погасился и не прошёл MNIST_GRAD_THRESHOLD) подсвечиваются — там цифра теряет форму.
-DIGIT_SKETCH_INK_THRESHOLD = 0.5
+DIGIT_SKETCH_LINE_SCALE = 1.0   # длина отрезка в сторонах окна: 1.0 — ровно окно
+DIGIT_SKETCH_LINE_RADIUS_SCALE = 0.1   # толщина (радиус) отрезка в сторонах окна
+# Окна, через которые проходит контур (MNIST_CONTOUR_LEVEL), но углопозиции нет, подсвечиваются
+# DIGIT_SKETCH_LOST_COLOR — там контур цифры рвётся.
 DIGIT_SKETCH_GRID_COLOR = (255, 255, 255, 50)
 DIGIT_SKETCH_LOST_COLOR = (255, 60, 60, 220)
 DIGIT_SKETCH_ENTITY_PATH = "/digit"
+
+# --- Тест «цифры из контуров» (digits_contour_test.py): по случайному стимулу каждой цифры — строка таблицы
+# «оригинал | цифра из линий углопозиций в режиме контура» для каждого окна из DIGITS_CONTOUR_PATCH_SIZES.
+# Режим контура включается в тесте всегда, независимо от MNIST_CONTOUR_ONLY; seed фиксирован — таблица
+# воспроизводится, ключ --seed выбирает другие стимулы. Цвета сетки и пропусков — DIGIT_SKETCH_*.
+DIGITS_CONTOUR_DIGITS = tuple(range(10))
+DIGITS_CONTOUR_PATCH_SIZES = (MNIST_PATCH_SIZE,)   # то же окно, что у конвейера
+DIGITS_CONTOUR_SEED = 0
+DIGITS_CONTOUR_SCALE = 16        # пикселей таблицы на пиксель стимула
+DIGITS_CONTOUR_LINE_WIDTH = 4
+DIGITS_CONTOUR_GAP = 10
+DIGITS_CONTOUR_OUTPUT_PATH = "digits_contour_test.png"
+DIGITS_CONTOUR_ENTITY_PATH = "/digits_contour"
+LOG_INTERVAL_ANGLE_LINES = 100
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
     "detectors.geometric_layers": LOG_INTERVAL_INIT,
@@ -430,6 +485,12 @@ LOG_INTERVALS = {
     "layout.export.json.error": LOG_INTERVAL_LAYOUT_EXPORT,
     "layout.load.cache": LOG_INTERVAL_INIT,
     "sobel_map.extract": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.contour": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.contour_patches": LOG_INTERVAL_SOBEL_IMAGE,
+    "upscaled_sobel.init": LOG_INTERVAL_INIT,
+    "upscaled_sobel.apply": LOG_INTERVAL_SOBEL_IMAGE,
+    "angle_lines.angle_position": LOG_INTERVAL_ANGLE_LINES,
+    "angle_lines.segment": LOG_INTERVAL_ANGLE_LINES,
     "sobel_map.init": LOG_INTERVAL_INIT,
     "sobel_map.patch.angle": LOG_INTERVAL_SOBEL_PATCH,
     "sobel_map.patch.metrics": LOG_INTERVAL_SOBEL_PATCH,
@@ -1057,6 +1118,7 @@ class LayoutCacheFile:
         expected_code_length: int | None = None,
         colorizer: EncoderCodeColorizer | None = None,
         expected_encoder_signature: str | None = None,
+        expected_stimulus: Mapping[str, object] | None = None,
     ) -> Layout | None:
         if not os.path.exists(path):
             return None
@@ -1075,6 +1137,15 @@ class LayoutCacheFile:
                 data={"path": path, "reason": "encoder_signature"},
             )
             return None
+        for key, expected_value in (expected_stimulus or {}).items():
+            stored_value = data.get(key, LAYOUT_CACHE_LEGACY_STIMULUS.get(key))
+            if stored_value != expected_value:
+                LOGGER.event(
+                    "layout.cache.incompatible",
+                    section=OUTSIDE_ARTICLE,
+                    data={"path": path, "reason": key, "stored": str(stored_value), "expected": str(expected_value)},
+                )
+                return None
         if expected_code_length is not None and points_payload:
             stored_length = len(str(points_payload[0].get("value", "")))
             if stored_length != expected_code_length:
@@ -1236,11 +1307,33 @@ def _build_colorizer() -> EncoderCodeColorizer:
     )
 
 
-def _build_extractor() -> MnistSobelAngleMap:
+def _build_extractor(
+    patch_size: int = MNIST_PATCH_SIZE,
+    *,
+    contour_only: bool = MNIST_CONTOUR_ONLY,
+    upscale: bool = MNIST_SOBEL_UPSCALE_ENABLED,
+) -> MnistSobelAngleMap:
+    upscaled = None
+    if upscale:
+        upscaled = UpscaledSobel(
+            scale=MNIST_SOBEL_UPSCALE,
+            contrast=MNIST_SOBEL_CONTRAST,
+            entity_path=MNIST_SOBEL_ENTITY_PATH,
+        )
     return MnistSobelAngleMap(
         angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
         grad_threshold=MNIST_GRAD_THRESHOLD,
+        patch_size=patch_size,
+        contour_only=contour_only,
+        contour_level=MNIST_CONTOUR_LEVEL,
+        two_edge_coherence=MNIST_CONTOUR_TWO_EDGE_COHERENCE,
+        upscaled=upscaled,
     )
+
+
+def _stimulus_metadata(extractor: MnistSobelAngleMap) -> dict[str, object]:
+    """Параметры получения стимулов, без совпадения которых кеш раскладки не подходит."""
+    return {PATCH_SIZE_KEY: extractor.patch_size, STIMULUS_MODE_KEY: extractor.stimulus_mode}
 
 
 
@@ -1255,7 +1348,7 @@ def _collect_codes(
         similarity=None,
         lambda_threshold=None,
         eta=None,
-        metadata={ENCODER_SIGNATURE_KEY: encoder.signature},
+        metadata={ENCODER_SIGNATURE_KEY: encoder.signature, **_stimulus_metadata(extractor)},
     )
     total_codes = 0
     found = 0
@@ -1435,7 +1528,7 @@ def _run_layout(
         pair_radius=short_radius_start,
         mode="short",
         local_radius=run_params.short_local_radius,
-        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_ratio=LAYOUT_SHORT_MIN_SWAP_RATIO,
         min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
@@ -1543,6 +1636,7 @@ class MnistLayoutRunner:
                 expected_code_length=self.encoder.code_length,
                 colorizer=self.colorizer,
                 expected_encoder_signature=self.encoder.signature,
+                expected_stimulus=_stimulus_metadata(self.extractor),
             )
             if layout is None:
                 LOGGER.event(
@@ -1862,6 +1956,7 @@ class MnistDecodeRunner:
                 expected_code_length=self.encoder.code_length,
                 colorizer=self.colorizer,
                 expected_encoder_signature=self.encoder.signature,
+                expected_stimulus=_stimulus_metadata(self.extractor),
             )
             if layout is None:
                 continue

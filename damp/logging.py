@@ -103,9 +103,10 @@ class DigitSketchBlueprint:
     AnglePositionSketch, чтобы панели и данные не разошлись.
     """
 
-    def __init__(self, root: str, *, side: float) -> None:
+    def __init__(self, root: str, *, side: float, sobel_root: str | None = None) -> None:
         self.root = "/" + root.strip("/")
         self.side = float(side)
+        self.sobel_root = None if sobel_root is None else "/" + sobel_root.strip("/")
 
     @property
     def stimulus_path(self) -> str:
@@ -136,11 +137,50 @@ class DigitSketchBlueprint:
             background=[0, 0, 0],
             visual_bounds=bounds,
         )
+        text_log = rrb.TextLogView(name="Лог", origin=f"/{LOG_PATH}")
+        bottom = text_log if self.sobel_root is None else rrb.Horizontal(sobel_views(self.sobel_root), text_log)
         return rrb.Blueprint(
             rrb.Vertical(
                 rrb.Horizontal(stimulus, sketch),
+                bottom,
+                row_shares=[3, 2] if self.sobel_root else [3, 1],
+            ),
+            rrb.SelectionPanel(state="collapsed"),
+        )
+
+
+def sobel_views(root: str):
+    """Вкладки предобработки UpscaledSobel: увеличенная картинка и отклики Собеля (красный +, синий −)."""
+    import rerun.blueprint as rrb
+
+    return rrb.Tabs(
+        rrb.Spatial2DView(name="Увеличено + контраст", origin=f"{root}/image"),
+        rrb.Spatial2DView(name="Собель X (вправо)", origin=f"{root}/gx"),
+        rrb.Spatial2DView(name="Собель Y (вверх)", origin=f"{root}/gy"),
+    )
+
+
+class DigitsSheetBlueprint:
+    """Окно digits_contour_test.py: таблица «оригинал | цифра из линий углопозиций» по всем цифрам."""
+
+    def __init__(self, root: str, *, sobel_root: str | None = None) -> None:
+        self.root = "/" + root.strip("/")
+        self.sobel_root = None if sobel_root is None else "/" + sobel_root.strip("/")
+
+    @property
+    def sheet_path(self) -> str:
+        return f"{self.root}/sheet"
+
+    def build(self):
+        import rerun.blueprint as rrb
+
+        sheet = rrb.Spatial2DView(name="Цифры из линий углопозиций", origin=self.root)
+        left = sheet if self.sobel_root is None else rrb.Vertical(sheet, sobel_views(self.sobel_root), row_shares=[3, 1])
+        return rrb.Blueprint(
+            rrb.Horizontal(
+                left,
                 rrb.TextLogView(name="Лог", origin=f"/{LOG_PATH}"),
-                row_shares=[3, 1],
+                column_shares=[3, 2],
             ),
             rrb.SelectionPanel(state="collapsed"),
         )

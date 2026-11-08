@@ -56,6 +56,7 @@ class SticksLayoutRunner:
         damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF = 0.03
         damp_main.LAYOUT_SHORT_WEIGHTED_FIRST = True
         damp_main.LAYOUT_MIN_SWAP_RATIO = 0.003
+        damp_main.LAYOUT_SHORT_MIN_SWAP_RATIO = 0.003
         damp_main.LAYOUT_MIN_SWAP_WINDOW = 50
         damp_main.LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.4
         damp_main.LAYOUT_LOG_VISUALS = True
@@ -78,6 +79,7 @@ class SticksLayoutRunner:
                 "short_similarity_cutoff": damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF,
                 "short_weighted_first": damp_main.LAYOUT_SHORT_WEIGHTED_FIRST,
                 "min_swap_ratio": damp_main.LAYOUT_MIN_SWAP_RATIO,
+                "short_min_swap_ratio": damp_main.LAYOUT_SHORT_MIN_SWAP_RATIO,
                 "min_swap_window": damp_main.LAYOUT_MIN_SWAP_WINDOW,
                 "adaptive_radius_factor": damp_main.LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
                 "log_visuals": damp_main.LAYOUT_LOG_VISUALS,
