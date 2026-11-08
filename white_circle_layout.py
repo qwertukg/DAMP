@@ -50,7 +50,6 @@ class SingleImageLayoutRunner:
         damp_main.LAYOUT_SHORT_STEPS = 30
         damp_main.LAYOUT_SHORT_LOCAL_RADIUS = 1
         damp_main.LAYOUT_SHORT_ENERGY_RADIUS = 2
-        damp_main.LAYOUT_SHORT_ENERGY_MAX_POINTS = 24
         damp_main.LAYOUT_SHORT_PARTITIONS = 1
         damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF = None
         damp_main.LAYOUT_SHORT_WEIGHTED_FIRST = False
@@ -73,7 +72,6 @@ class SingleImageLayoutRunner:
                 "short_pairs": damp_main.LAYOUT_SHORT_PAIRS_PER_STEP,
                 "short_local_radius": damp_main.LAYOUT_SHORT_LOCAL_RADIUS,
                 "short_energy_radius": damp_main.LAYOUT_SHORT_ENERGY_RADIUS,
-                "short_energy_max_points": damp_main.LAYOUT_SHORT_ENERGY_MAX_POINTS,
                 "short_partitions": damp_main.LAYOUT_SHORT_PARTITIONS,
                 "short_similarity_cutoff": damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF,
                 "short_weighted_first": damp_main.LAYOUT_SHORT_WEIGHTED_FIRST,

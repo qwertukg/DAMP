@@ -10,16 +10,15 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 
 from damp.article_refs import (
-    CHROMODYNAMICS,
+    COLOR_ENCODING,
     CONCATENATION,
     CYCLIC_COORDS,
-    ENCODING_SYSTEM,
-    GEOMETRIC_METHOD,
     INTEGER_ENCODING,
     LAID_OUT_STRUCTURE,
     LONG_RANGE_IMPORTANCE,
     MULTI_DIM_CODES,
     ONE_DIM_CODES,
+    OUTSIDE_ARTICLE,
     SHORT_LONG_ORDER,
     SPARSE_BIT_VECTORS,
     WIDE_DETECTORS,
@@ -124,6 +123,8 @@ class Dimension:
             raise ValueError("detector_layers must be non-empty")
         if code_length <= 0:
             raise ValueError("code_length must be positive")
+        if code_length < len(detector_layers):
+            raise ValueError("code_length must give every detector layer at least one bit (colour band, §3.2)")
         self.detector_layers = list(detector_layers)
         self.closed = bool(closed)
         self.code_length = int(code_length)
@@ -148,6 +149,25 @@ class Dimension:
                 section=CYCLIC_COORDS,
                 data={"title": self.title, "period": self.period},
             )
+
+    def layer_band(self, layer_index: int) -> tuple[int, int]:
+        """Цветовая полоса слоя в сегменте: начало и длина (§3.2, §4.4.2, §5.14).
+
+        Цвет бита — его важность при colour merge (§3.2). Широкие детекторы отвечают за дальний
+        порядок и красную часть «спектра», узкие — за ближний и фиолетовую (§3.3.1, §4.2.1, §4.4.2);
+        младший бит красный, старший фиолетовый (§5.14). Поэтому слой с индексом 0 (самый широкий)
+        получает младшие биты сегмента, самый узкий — старшие. Полосы равной длины: при этом
+        ожидаемое число случайных совпадений бит Σ 1/b_l минимально при заданной длине сегмента.
+        """
+        layers = len(self.detector_layers)
+        if not 0 <= layer_index < layers:
+            raise ValueError("layer_index out of range")
+        base, remainder = divmod(self.code_length, layers)
+        # Остаток отдаётся самым узким слоям: у них больше всего детекторов.
+        extra_from = layers - remainder
+        start = layer_index * base + max(0, layer_index - extra_from)
+        length = base + (1 if layer_index >= extra_from else 0)
+        return start, length
 
 
 class ClosedDimension(Dimension):
@@ -314,7 +334,7 @@ class Encoder:
             )
         LOGGER.event(
             "encoder.init",
-            section=ENCODING_SYSTEM,
+            section=MULTI_DIM_CODES,
             data={
                 "dimensions": len(self.dimensions),
                 "random_seed": random_seed,
@@ -372,7 +392,7 @@ class Encoder:
         half_width = width / 2.0
         LOGGER.event(
             "encoder.layer",
-            section=GEOMETRIC_METHOD,
+            section=INTEGER_ENCODING,
             data={
                 "dimension": dim.title,
                 "dimension_index": dim_index,
@@ -389,9 +409,31 @@ class Encoder:
                 "closed": dim.closed,
             },
         )
+        band_start, band_length = dim.layer_band(layer_index)
+        LOGGER.event(
+            "encoder.colour_band",
+            section=COLOR_ENCODING,
+            data={
+                "dimension": dim.title,
+                "layer_index": layer_index,
+                "colour_rank": layer_index,
+                "band_start": band_start,
+                "band_length": band_length,
+                "detectors": len(centers),
+                "note": "§3.2: цвет бита — важность; широкий слой — красные младшие биты, "
+                "узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1)",
+            },
+        )
         windows: List[DetectorWindow] = []
+        # Один случайный бит на детектор (§4.2.1): биты полосы выдаются случайной перестановкой, поэтому
+        # детекторы слоя не совпадают, пока их не больше длины полосы; дальше перестановка повторяется
+        # и совпадения далёких детекторов допускаются (коллизии §4.2.1).
+        bit_pool: list[int] = []
         for position, center in enumerate(centers):
-            local_bit = self._rng.randrange(dim.code_length)
+            if not bit_pool:
+                bit_pool = list(range(band_start, band_start + band_length))
+                self._rng.shuffle(bit_pool)
+            local_bit = bit_pool.pop()
             windows.append(
                 DetectorWindow(
                     detector_index=start_index + position,
@@ -439,9 +481,13 @@ class Encoder:
     # ---------------------------------------------------------------- properties
     @staticmethod
     def expected_dimension_density(dim: Dimension) -> float:
-        """Оценка плотности сегмента как в Angle-Encoder (§4.2.1)."""
-        active_detectors = sum(1.0 / (1.0 - layer.overlap) for layer in dim.detector_layers)
-        return 1.0 - (1.0 - 1.0 / dim.code_length) ** active_detectors
+        """Оценка плотности сегмента (§4.2.1): в полосе слоя b_l бит и ≈ 1/(1 − overlap) активных детекторов."""
+        expected_bits = 0.0
+        for layer_index, layer in enumerate(dim.detector_layers):
+            _, band_length = dim.layer_band(layer_index)
+            active_detectors = 1.0 / (1.0 - layer.overlap)
+            expected_bits += band_length * (1.0 - (1.0 - 1.0 / band_length) ** active_detectors)
+        return expected_bits / dim.code_length
 
     def expected_density(self) -> float:
         expected_bits = sum(
@@ -538,7 +584,11 @@ class Encoder:
         max_distance = profile[-1][0]
         middle = [v for d, v in profile if 0.25 * max_distance - 1e-9 <= d <= 0.75 * max_distance + 1e-9]
         plateau = bool(total_drop > 0.0 and len(middle) >= 2 and (middle[0] - middle[-1]) < 0.15 * total_drop)
-        ordered = monotone and not plateau
+        # §4.5: сходство и на ближней, и на дальней шкале — профиль должен убывать с расстоянием
+        # (постоянный профиль, в том числе нулевой, порядка не несёт) и не обнуляться на дальнем конце.
+        decreasing = total_drop > 0.0
+        far_similarity = profile[-1][1] > 0.0
+        ordered = monotone and decreasing and far_similarity and not plateau
         LOGGER.event(
             "encoder.long_range_order",
             section=LONG_RANGE_IMPORTANCE,
@@ -546,6 +596,8 @@ class Encoder:
                 "dimension": dim.title,
                 "samples": samples,
                 "monotone": monotone,
+                "decreasing": decreasing,
+                "far_similarity": far_similarity,
                 "plateau": plateau,
                 "ordered": ordered,
                 "profile": [(round(d, 3), round(v, 3)) for d, v in profile],
@@ -553,6 +605,19 @@ class Encoder:
                 "иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1)",
             },
         )
+        if not ordered:
+            LOGGER.event(
+                "encoder.long_range_order.warning",
+                section=LONG_RANGE_IMPORTANCE,
+                data={
+                    "dimension": dim.title,
+                    "monotone": monotone,
+                    "decreasing": decreasing,
+                    "far_similarity": far_similarity,
+                    "plateau": plateau,
+                    "note": "у координаты нет дальнего порядка (§4.5): измените перекрытие или число слоёв",
+                },
+            )
         return profile, ordered
 
     def encode_indices(
@@ -639,7 +704,7 @@ class Encoder:
             if image_visuals:
                 LOGGER.event(
                     "encoder.encode.image",
-                    section=MULTI_DIM_CODES,
+                    section=OUTSIDE_ARTICLE,
                     data={
                         "label": int(log_label) if log_label is not None else None,
                         "measurements": len(log_measurements) if log_measurements else 0,
@@ -831,7 +896,7 @@ class EncoderCodeColorizer:
         colorizer = cls(min_hue=min_hue, max_hue=max_hue, start_bit=start, bit_length=length)
         LOGGER.event(
             "encoder.colorizer.dimension",
-            section=CHROMODYNAMICS,
+            section=LAID_OUT_STRUCTURE,
             data={
                 "dimension": dimension,
                 "start_bit": start,

@@ -17,17 +17,14 @@ from damp.article_refs import (
     DETECTOR_CENTER,
     DETECTOR_CLUSTERING,
     DETECTOR_CONSTRUCTION,
-    DETECTOR_HIERARCHY,
-    DETECTOR_INSERTION,
     DETECTOR_LEVELS,
     DETECTOR_PARAMS,
     DETECTOR_RADIUS,
-    ENERGY_CALC,
     MORPHOLOGICAL_EMBEDDINGS,
     NEURAL_ANALOGY,
+    OUTSIDE_ARTICLE,
+    POINT_ENERGY,
     STIMULUS_DETECTION,
-    GPU_IMPLEMENTATION,
-    PARALLEL_PROCESSING,
 )
 from damp.encoding.bitarray import BitArray
 from damp.layout.damp_layout import Layout
@@ -90,8 +87,7 @@ def _similarity_name(similarity: str) -> str:
     name = (similarity or "jaccard").lower()
     if name in ("cosine", "cos"):
         return "cosine"
-    if name in ("jaccard2", "j2", "jac2"):
-        return "jaccard2"
+    # §2.2.4.2: J2(a, b) = Σ a_i·b_i / Σ max(a_i², b_i²); для битовых векторов a_i² = a_i, и J2 = |a∧b| / |a∨b| = J.
     return "jaccard"
 
 
@@ -156,10 +152,7 @@ class _PythonActivationBackend(_ActivationBackend):
         union = ones_a + ones_b - common
         if union == 0:
             return 0.0
-        jaccard = common / union
-        if self._similarity == "jaccard2":
-            return jaccard * jaccard
-        return jaccard
+        return common / union
 
     def _apply_threshold(self, similarity: float) -> float:
         if similarity <= 0.0:
@@ -218,8 +211,6 @@ class _NumpyActivationBackend(_ActivationBackend):
                 out=self._np.zeros_like(intersection),
                 where=union > 0,
             )
-            if self._similarity == "jaccard2":
-                sim = sim * sim
         sim = self._apply_threshold(sim)
         if sim.size == 0:
             return [0.0 for _ in range(self._codes.shape[0])]
@@ -289,8 +280,6 @@ class _TorchActivationBackend(_ActivationBackend):
             else:
                 union = self._ones[:, None] + stim_ones[None, :] - intersection
                 sim = torch.where(union > 0, intersection / union, torch.zeros_like(intersection))
-                if self._similarity == "jaccard2":
-                    sim = sim * sim
             sim = self._apply_threshold(sim)
             if sim.numel() == 0:
                 return [0.0 for _ in range(self._codes.shape[0])]
@@ -355,7 +344,7 @@ class ActivationMap:
         self._backend, backend_reason = self._select_backend(use_gpu)
         self._log_backend(self._backend, requested_gpu=use_gpu, reason=backend_reason)
         LOGGER.event(
-            "activation.engine.init",
+            "activation.map.init",
             section=CODE_SPACE_ACTIVATION,
             data={
                 "points": len(self._codes),
@@ -392,7 +381,7 @@ class ActivationMap:
             raise ValueError("activation size must match number of layout points")
         LOGGER.event(
             "activation.map",
-            section=CODE_SPACE_ACTIVATION,
+            section=STIMULUS_DETECTION,
             data={
                 "stimuli": len(stimuli),
                 "points": len(activation),
@@ -441,7 +430,7 @@ class ActivationMap:
         except Exception as exc:  # noqa: BLE001
             LOGGER.event(
                 "activation.backend.gpu_unavailable",
-                section=GPU_IMPLEMENTATION,
+                section=OUTSIDE_ARTICLE,
                 data={"error": str(exc)},
             )
             return None
@@ -453,7 +442,7 @@ class ActivationMap:
         if device is None:
             LOGGER.event(
                 "activation.backend.gpu_unavailable",
-                section=GPU_IMPLEMENTATION,
+                section=OUTSIDE_ARTICLE,
                 data={"error": "no gpu device"},
             )
             return None
@@ -470,7 +459,7 @@ class ActivationMap:
         except Exception as exc:  # noqa: BLE001
             LOGGER.event(
                 "activation.backend.gpu_fallback",
-                section=GPU_IMPLEMENTATION,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "error": str(exc),
                     "device": str(device),
@@ -515,7 +504,7 @@ class ActivationMap:
     def _log_backend(self, backend: _ActivationBackend, *, requested_gpu: bool | None, reason: str | None) -> None:
         LOGGER.event(
             "activation.backend",
-            section=GPU_IMPLEMENTATION if backend.uses_gpu else PARALLEL_PROCESSING,
+            section=OUTSIDE_ARTICLE,
             data={
                 "backend": backend.name,
                 "device": backend.device or "cpu",
@@ -753,7 +742,7 @@ class DetectorHierarchyBuilder:
         )
         LOGGER.event(
             "activation.detector.hierarchy",
-            section=DETECTOR_HIERARCHY,
+            section=DETECTOR_CONSTRUCTION,
             data={
                 "detectors": len(detectors),
                 "layers": len(self._layer_configs),
@@ -803,7 +792,7 @@ class DetectorHierarchyBuilder:
             unchanged = 0
         LOGGER.event(
             "activation.detector.layer.filled",
-            section=DETECTOR_INSERTION,
+            section=DETECTOR_CONSTRUCTION,
             data={
                 "lambda": layer.lambda_threshold,
                 "attempts": attempts,
@@ -883,14 +872,40 @@ class DetectorHierarchyBuilder:
                 best_radius = candidate_radius
         if best_radius <= 0.0:
             return None
-        included = [
-            position
-            for position in cluster_positions
-            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
-        ]
-        # §6.3: n_d = |A_μ|, e_d = Σ a_ji · e_ji по точкам рецептивного поля.
-        detector_energy = sum(active[position][1] for position in included)
-        points_count = len(included)
+        # §6.3, §6.4.5: после c_d и r_d поле A_λd(c_d, r_d) активируется кодом из центра детектора
+        # (§6.1: все точки R(c_d, r_d), включая нулевую активацию); A_μ — точки поля с e ≥ μ,
+        # n_d = |A_μ|, e_d = Σ a_ji · e_ji по A_μ.
+        center_code = self._center_code_index(centroid_y, centroid_x, best_radius)
+        if center_code is None:
+            return None
+        field_points = self._indices_in_radius(centroid_y, centroid_x, best_radius)
+        detector_energy = 0.0
+        points_count = 0
+        activated_points = 0
+        for point_index in field_points:
+            point_energy = self._energies[point_index]
+            if point_energy < self._energy_threshold:
+                continue
+            points_count += 1
+            activation = self._threshold_similarity(
+                self._layout._similarity_value(center_code, point_index), lambda_value
+            )
+            if activation > 0.0:
+                activated_points += 1
+                detector_energy += activation * point_energy
+        LOGGER.event(
+            "activation.detector.params",
+            section=DETECTOR_PARAMS,
+            data={
+                "center_code": center_code,
+                "field_points": len(field_points),
+                "n_d": points_count,
+                "activated_points": activated_points,
+                "e_d": detector_energy,
+                "lambda": lambda_value,
+                "mu": self._energy_threshold,
+            },
+        )
         if detector_energy <= 0.0 or points_count < layer.min_points:
             return None
         LOGGER.event(
@@ -920,20 +935,35 @@ class DetectorHierarchyBuilder:
             return similarity if similarity >= lambda_value else 0.0
         return similarity / (1.0 + math.exp(-self._eta * (similarity - lambda_value)))
 
-    def _indices_in_radius(self, center_y: int, center_x: int, radius: int) -> list[int]:
+    def _indices_in_radius(self, center_y: float, center_x: float, radius: float) -> list[int]:
+        """Точки окрестности R(c, r) = {v : ‖v − c‖ ≤ r} (§5.7, §6.1); центр и радиус могут быть вещественными."""
         indices: list[int] = []
-        radius_sq = radius * radius
-        for y in range(max(0, center_y - radius), min(self._layout.height - 1, center_y + radius) + 1):
-            dy_sq = (center_y - y) ** 2
+        y_min = max(0, math.ceil(center_y - radius))
+        y_max = min(self._layout.height - 1, math.floor(center_y + radius))
+        for y in range(y_min, y_max + 1):
             for x in self._layout._row_occupied[y]:
                 if x < center_x - radius or x > center_x + radius:
                     continue
-                if dy_sq + (center_x - x) ** 2 > radius_sq:
+                # Расстояние считается так же, как r(p) в §6.4.3: точка, задающая r_d, входит в поле.
+                if math.hypot(y - center_y, x - center_x) > radius:
                     continue
                 point_index = self._layout.grid[y][x]
                 if point_index is not None:
                     indices.append(point_index)
         return indices
+
+    def _center_code_index(self, center_y: float, center_x: float, radius: float) -> int | None:
+        """Код из центра детектора (§6.3): точка, занимающая ячейку, ближайшую к c_d."""
+        candidates = self._indices_in_radius(center_y, center_x, radius)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda index: (
+                (self._layout._pos_y[index] - center_y) ** 2 + (self._layout._pos_x[index] - center_x) ** 2,
+                index,
+            ),
+        )
 
     @staticmethod
     def _overlaps(left: DetectorCandidate, right: DetectorCandidate) -> bool:
@@ -1088,7 +1118,7 @@ class ActivationEngine:
         self._code_length = self._resolve_code_length()
         LOGGER.event(
             "activation.engine.init",
-            section=DETECTOR_HIERARCHY,
+            section=STIMULUS_DETECTION,
             data={
                 "detectors": len(self._detectors),
                 "points": self._activation_map.point_count,
@@ -1113,20 +1143,20 @@ class ActivationEngine:
         self._log_map(
             activation_values,
             event="activation.map.visual",
-            section=CODE_SPACE_ACTIVATION,
+            section=STIMULUS_DETECTION,
             path="activation/map",
         )
         self._log_map(
             self._energies,
             event="activation.energy.visual",
-            section=ENERGY_CALC,
+            section=POINT_ENERGY,
             path="activation/energy",
         )
         active_detectors = self._evaluate_detectors(activation_values)
         embedding = self._build_embedding(active_detectors)
         LOGGER.event(
             "activation.embedding",
-            section=DETECTOR_INSERTION,
+            section=STIMULUS_DETECTION,
             data={
                 "active_detectors": len(active_detectors),
                 "embedding_bits": embedding.count(),
@@ -1156,7 +1186,7 @@ class ActivationEngine:
         effective_workers = min(workers, len(batches))
         LOGGER.event(
             "activation.parallel.start",
-            section=PARALLEL_PROCESSING,
+            section=OUTSIDE_ARTICLE,
             data={
                 "images": len(batches),
                 "workers": effective_workers,
@@ -1170,7 +1200,7 @@ class ActivationEngine:
                 results = list(executor.map(self.activate, batches))
         LOGGER.event(
             "activation.parallel.done",
-            section=PARALLEL_PROCESSING,
+            section=OUTSIDE_ARTICLE,
             data={"images": len(results), "workers": effective_workers},
         )
         return results
@@ -1187,12 +1217,10 @@ class ActivationEngine:
         coverage: list[tuple[int, ...] | "np.ndarray"] = []
         positions = self._activation_map.positions
         for idx, detector in enumerate(self._detectors):
-            radius_sq = detector.radius * detector.radius
             covered: list[int] = []
             for point_idx, (y, x) in enumerate(positions):
-                dy = float(y) - float(detector.center[0])
-                dx = float(x) - float(detector.center[1])
-                if dy * dy + dx * dx <= radius_sq:
+                # §6.5: ‖a − c_d‖ ≤ r_d; то же вычисление расстояния, что и при выборе r_d (§6.4.3).
+                if math.hypot(float(y) - float(detector.center[0]), float(x) - float(detector.center[1])) <= detector.radius:
                     covered.append(point_idx)
             if np is not None:
                 coverage.append(np.asarray(covered, dtype=np.int32))
@@ -1200,7 +1228,7 @@ class ActivationEngine:
                 coverage.append(tuple(covered))
             LOGGER.event(
                 "activation.detector.coverage",
-                section=DETECTOR_RADIUS,
+                section=STIMULUS_DETECTION,
                 data={
                     "detector": idx,
                     "detector_label": "" if detector.label is None else str(detector.label),

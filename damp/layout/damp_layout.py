@@ -12,12 +12,12 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from damp.article_refs import (
     ENERGY_CALC,
-    ENERGIES,
     ENERGY_LONG,
     ENERGY_SHORT,
     GPU_IMPLEMENTATION,
+    LAID_OUT_STRUCTURE,
     LAYOUT_ALGORITHM,
-    LAYOUT_COMPACTNESS,
+    LAYOUT_DISCRETE,
     LAYOUT_PARAMETERS,
     MAPPING_CONTINUITY,
     OPTIM_ENERGY,
@@ -25,15 +25,15 @@ from damp.article_refs import (
     OPTIM_PAIR_SELECTION,
     OPTIM_SIM_MATRIX,
     OPTIM_SUBSET,
-    LAID_OUT_STRUCTURE,
+    OUTSIDE_ARTICLE,
     PAIR_SELECTION,
     PARALLEL_PROCESSING,
     POINT_ENERGY,
     POINT_EXCHANGE,
     QUALITY_ASSESS,
-    SIMILARITY_DEFINITION,
     SIMILARITY_MEASURES,
     SIMILARITY_THRESHOLD,
+    SPACE_FILLING,
     SPARSE_BIT_VECTORS,
 )
 from damp.encoding.bitarray import BitArray
@@ -50,18 +50,29 @@ class LayoutPoint:
     ones: int
 
 
+_RADIUS_SCHEDULES = ("swaps", "linear", "geometric")
+
+
 @dataclass(frozen=True)
 class AdaptiveLayoutConfig:
-    """Радиус выбора пар убывает от d/2 к 1, порог λ растёт ступенями (§7.1.7)."""
+    """Радиус выбора пар убывает от d/2 к 1, порог λ растёт ступенями (§7.1.7).
+
+    radius_schedule = "swaps" — по статье: λ и r меняются, когда число обменов за шаг падает
+    до swap_ratio_trigger от начального значения этапа (§7.1.7); r умножается на radius_factor.
+    "linear" и "geometric" — расширение статьи: r убывает по номеру шага независимо от обменов.
+    """
 
     start_radius: int
     end_radius: int = 1
     swap_ratio_trigger: float = 0.01
     lambda_step: float | None = None
     lambda_max: float = 1.0
-    # Геометрическое убывание радиуса (постоянный множитель за шаг, как ширина окрестности в SOM)
-    # вместо линейного; расширение статьи, нужно гауссову ядру дальней фазы.
-    geometric: bool = False
+    radius_schedule: str = "swaps"
+    # Во сколько раз уменьшается r при срабатывании триггера: статья говорит только «постепенно» (§7.1.7).
+    radius_factor: float = 0.5
+    # Число обменов за шаг усредняется по окну шагов («число обменов в единицу времени», §7.1.7);
+    # начальное значение этапа — среднее по первому окну после смены λ и r.
+    swap_window: int = 1
     # Отжиг (расширение статьи): пока радиус пар лежит в [temperature_radius_min, temperature_radius_max],
     # невыгодные обмены принимаются с вероятностью exp(Δ / (T·rms|Δ|)); вне окна правило жадное (§5.6).
     temperature: float = 0.0
@@ -73,6 +84,12 @@ class AdaptiveLayoutConfig:
             raise ValueError("lambda_max must be in (0, 1]")
         if self.temperature < 0.0:
             raise ValueError("temperature must be >= 0")
+        if self.radius_schedule not in _RADIUS_SCHEDULES:
+            raise ValueError("radius_schedule must be 'swaps', 'linear' or 'geometric'")
+        if not 0.0 < self.radius_factor < 1.0:
+            raise ValueError("radius_factor must be in (0, 1)")
+        if self.swap_window <= 0:
+            raise ValueError("swap_window must be positive")
 
     def temperature_for_radius(self, radius: int) -> float:
         if self.temperature <= 0.0:
@@ -83,7 +100,6 @@ class AdaptiveLayoutConfig:
 @dataclass(frozen=True)
 class ShortLayoutOptimConfig:
     energy_radius: int
-    energy_max_points: int | None = None
     energy_recalc_every: int = 50
     energy_eps: float = 1e-6
     use_weighted_first_point: bool = True
@@ -110,7 +126,6 @@ _SIM_POINTS: Sequence[LayoutPoint] | None = None
 _SIM_MODE: str | None = None
 _VISUAL_ENERGY_POINT_LIMIT = 5000
 _VISUAL_POINT_LIMIT = 200000
-_AUTO_ENERGY_RADIUS_MAX = 15
 # §5.5: d евклидово; §5.9.2 допускает суммы квадратов без корня.
 _DISTANCE_MODES = ("squared", "euclidean")
 # Ядро дальней энергии: "distance" — φ = Σ s·d (§5.5.1, минимизация); "gauss" — расширение статьи:
@@ -655,14 +670,15 @@ class _GpuLayoutEngine:
         energies = raw[:pair_count]
         return [(float(row[0]), float(row[1])) for row in energies]
 
-    def average_local_energy(
+    def point_energies(
         self,
         radius: int,
         *,
         lambda_threshold: float,
         eta: float | None,
         distance_eps: float,
-    ) -> float | None:
+    ) -> "numpy.ndarray | None":
+        """Энергии E(c, r) всех точек V одним проходом шейдера (§5.7, §5.12)."""
         if self._sim_tex is None:
             return None
 
@@ -690,13 +706,7 @@ class _GpuLayoutEngine:
         self._avg_vao.render(mode=self._gl.TRIANGLES, vertices=3)
 
         data = self._avg_out_tex.read()
-        energies = self._np.frombuffer(data, dtype=self._np.float32)
-        if energies.size == 0:
-            return 0.0
-        emax = float(energies.max())
-        if emax <= 0.0:
-            return 0.0
-        return float((energies / emax).mean())
+        return self._np.frombuffer(data, dtype=self._np.float32).copy()
 
 
 @dataclass(frozen=True)
@@ -1227,19 +1237,47 @@ class _TensorLayoutEngine:
             )
 
 
+@dataclass(frozen=True)
+class _AdaptiveUpdate:
+    """Итог шага расписания §7.1.7: доля обменов этапа и смена параметров по триггеру."""
+
+    new_lambda: float | None
+    swap_ratio: float | None
+    swap_rate: float | None
+    stage_initial: float | None
+    triggered: bool
+    radius: int
+
+
 class _AdaptiveLayoutState:
+    """Расписание радиуса выбора пар r и порога λ (§7.1.7)."""
+
+    _LAMBDA_EPS = 1e-12
+
     def __init__(self, config: AdaptiveLayoutConfig, total_steps: int) -> None:
         self._config = config
         self._total_steps = max(1, total_steps)
-        self._initial_swaps: int | None = None
         self._radius_cap = max(config.start_radius, config.end_radius)
+        self._window: deque[int] = deque(maxlen=config.swap_window)
+        self._stage_initial: float | None = None
         self._trigger_count = 0
 
+    @property
+    def trigger_count(self) -> int:
+        return self._trigger_count
+
+    @property
+    def by_swaps(self) -> bool:
+        return self._config.radius_schedule == "swaps"
+
     def _base_radius_for_step(self, step: int) -> int:
+        if self.by_swaps:
+            # §7.1.7: r меняется только по триггеру обменов, между срабатываниями постоянен.
+            return self._config.start_radius
         if self._total_steps <= 1:
             return self._config.end_radius
         progress = step / max(1, self._total_steps - 1)
-        if self._config.geometric:
+        if self._config.radius_schedule == "geometric":
             ratio = self._config.end_radius / self._config.start_radius
             decayed = self._config.start_radius * (ratio ** progress)
         else:
@@ -1252,49 +1290,69 @@ class _AdaptiveLayoutState:
         radius = self._base_radius_for_step(step)
         return min(radius, self._radius_cap)
 
+    def schedule_complete(self, current_lambda: float) -> bool:
+        """По статье остановка по числу обменов (§5.6) имеет смысл после того, как r = 1 и λ = λ_max."""
+        if not self.by_swaps:
+            return True
+        lambda_done = (
+            self._config.lambda_step is None
+            or current_lambda >= self._config.lambda_max - self._LAMBDA_EPS
+        )
+        return self._radius_cap <= self._config.end_radius and lambda_done
+
     def update_after_step(
         self, *, step: int, swaps: int, current_lambda: float
-    ) -> tuple[float | None, float]:
-        if self._initial_swaps is None:
-            self._initial_swaps = max(1, swaps)
-        swap_ratio = 0.0 if self._initial_swaps == 0 else swaps / self._initial_swaps
-        new_lambda: float | None = None
-        if swap_ratio <= self._config.swap_ratio_trigger:
-            self._trigger_count += 1
-            self._initial_swaps = max(1, swaps)
-            base_radius = self._base_radius_for_step(step)
-            reduced_cap = max(self._config.end_radius, int(base_radius * 0.5))
-            if reduced_cap < self._radius_cap:
-                self._radius_cap = reduced_cap
-            if self._config.lambda_step is not None:
-                # §7.1.7: λ повышается ступенями, но не выше заданного максимума.
-                capped = min(self._config.lambda_max, current_lambda + self._config.lambda_step)
-                if capped > current_lambda:
-                    new_lambda = capped
-        return new_lambda, swap_ratio
+    ) -> _AdaptiveUpdate:
+        self._window.append(swaps)
+        if len(self._window) < self._window.maxlen:
+            return _AdaptiveUpdate(None, None, None, self._stage_initial, False, self.radius_for_step(step))
+        rate = sum(self._window) / len(self._window)
+        if self._stage_initial is None:
+            # Начальное число обменов этапа — первое окно после старта или смены λ и r (§7.1.7).
+            self._stage_initial = max(1.0, rate)
+        stage_initial = self._stage_initial
+        swap_ratio = rate / stage_initial
+        # После r = 1 и λ = λ_max менять нечего: дальше действует только остановка по обменам (§5.6).
+        triggered = (
+            swap_ratio <= self._config.swap_ratio_trigger
+            and not (self.by_swaps and self.schedule_complete(current_lambda))
+        )
+        new_lambda = self._next_stage(step, current_lambda) if triggered else None
+        return _AdaptiveUpdate(
+            new_lambda=new_lambda,
+            swap_ratio=swap_ratio,
+            swap_rate=rate,
+            stage_initial=stage_initial,
+            triggered=triggered,
+            radius=self.radius_for_step(step + 1),
+        )
 
+    def force_next_stage(self, *, step: int, current_lambda: float) -> _AdaptiveUpdate:
+        """Обмены упали ниже порога остановки (§5.6) раньше, чем r = 1 и λ = λ_max: следующий этап §7.1.7."""
+        new_lambda = self._next_stage(step, current_lambda)
+        return _AdaptiveUpdate(
+            new_lambda=new_lambda,
+            swap_ratio=None,
+            swap_rate=None,
+            stage_initial=None,
+            triggered=True,
+            radius=self.radius_for_step(step + 1),
+        )
 
-@dataclass
-class _EnergyStabilityMonitor:
-    window: int
-    threshold: float
-    history: deque[float] = field(init=False)
-    last_energy: float | None = None
-
-    def __post_init__(self) -> None:
-        self.history = deque(maxlen=self.window)
-
-    def update(self, energy: float) -> tuple[bool, float | None, float]:
-        diff = None
-        if self.last_energy is not None:
-            diff = abs(energy - self.last_energy)
-            self.history.append(diff)
-        self.last_energy = energy
-        if len(self.history) < self.history.maxlen:
-            max_delta = max(self.history) if self.history else 0.0
-            return False, diff, max_delta
-        max_delta = max(self.history) if self.history else 0.0
-        return max_delta < self.threshold, diff, max_delta
+    def _next_stage(self, step: int, current_lambda: float) -> float | None:
+        self._trigger_count += 1
+        # Новый этап: начальное число обменов берётся заново по следующему окну.
+        self._stage_initial = None
+        self._window.clear()
+        current_radius = self._radius_cap if self.by_swaps else self._base_radius_for_step(step)
+        reduced_cap = max(self._config.end_radius, int(current_radius * self._config.radius_factor))
+        if reduced_cap < self._radius_cap:
+            self._radius_cap = reduced_cap
+        if self._config.lambda_step is None:
+            return None
+        # §7.1.7: λ повышается ступенями, но не выше заданного максимума.
+        capped = min(self._config.lambda_max, current_lambda + self._config.lambda_step)
+        return capped if capped > current_lambda else None
 
 
 @dataclass
@@ -1305,6 +1363,9 @@ class _SwapStallMonitor:
 
     def __post_init__(self) -> None:
         self.history = deque(maxlen=self.window)
+
+    def reset(self) -> None:
+        self.history.clear()
 
     def update(self, swaps: int, pairs_per_step: int) -> tuple[bool, float, float]:
         if pairs_per_step <= 0:
@@ -1439,7 +1500,7 @@ class Layout:
         )
         LOGGER.event(
             "layout.grid",
-            section=LAYOUT_COMPACTNESS,
+            section=SPACE_FILLING,
             data={
                 "grid_size": grid_size,
                 "empty_ratio": empty_ratio,
@@ -1452,7 +1513,7 @@ class Layout:
         )
         LOGGER.event(
             "layout.thresholds",
-            section=ENERGIES,
+            section=SIMILARITY_THRESHOLD,
             data={"lambda_threshold": self._lambda, "eta": self._eta},
         )
         LOGGER.event(
@@ -1492,7 +1553,7 @@ class Layout:
         )
         LOGGER.event(
             "layout.precompute_limit",
-            section=OPTIM_SUBSET,
+            section=OPTIM_SIM_MATRIX,
             data={"max_precompute": max_precompute},
         )
         LOGGER.event(
@@ -1560,12 +1621,13 @@ class Layout:
         self._swap_temperature = 0.0
         LOGGER.event(
             "layout.distance_eps",
-            section=ENERGIES,
+            section=OUTSIDE_ARTICLE,
             data={"distance_eps": self._distance_eps},
         )
         self._last_visual_energy: float | None = None
         self._last_visual_energy_step: int | None = None
         self._last_energy_value: float | None = None
+        self._quality_radius: int | None = None
         self._last_energy_step: int | None = None
         self._last_energy_progress: float | None = None
         self._gpu_engine: _GpuLayoutEngine | None = None
@@ -1644,10 +1706,8 @@ class Layout:
         log_visuals: bool = True,
         step_offset: int = 0,
         energy_radius: int | None = None,
-        energy_stability_window: int | None = None,
-        energy_stability_delta: float = 1e-3,
-        energy_stability_every: int = 1,
-        energy_stability_max_points: int | None = None,
+        energy_every: int | None = None,
+        energy_target: float | None = None,
         adaptive_params: AdaptiveLayoutConfig | None = None,
         short_optim: ShortLayoutOptimConfig | None = None,
         save_on_stop_path: str | None = None,
@@ -1670,14 +1730,14 @@ class Layout:
             raise ValueError("step_offset must be >= 0")
         if energy_radius is not None and energy_radius <= 0:
             raise ValueError("energy_radius must be positive when set")
-        if energy_stability_window is not None and energy_stability_window <= 0:
-            raise ValueError("energy_stability_window must be positive when set")
-        if energy_stability_delta < 0:
-            raise ValueError("energy_stability_delta must be >= 0")
-        if energy_stability_every <= 0:
-            raise ValueError("energy_stability_every must be positive")
-        if energy_stability_max_points is not None and energy_stability_max_points <= 0:
-            raise ValueError("energy_stability_max_points must be positive when set")
+        if energy_every is not None and energy_every <= 0:
+            raise ValueError("energy_every must be positive when set")
+        if energy_every is not None and energy_radius is None:
+            raise ValueError("energy_every requires energy_radius: r_e of Ē (§5.7, §5.8) must be given")
+        if energy_target is not None and not 0.0 < energy_target <= 1.0:
+            raise ValueError("energy_target must be in (0, 1]: Ē is the mean normalised energy (§5.8)")
+        if energy_target is not None and energy_every is None:
+            raise ValueError("energy_target requires energy_every: Ē must be evaluated to be compared")
         if adaptive_params is not None:
             if adaptive_params.start_radius <= 0:
                 raise ValueError("adaptive start_radius must be positive")
@@ -1694,23 +1754,26 @@ class Layout:
                 raise ValueError("short energy_recalc_every must be positive")
             if short_optim.energy_eps <= 0:
                 raise ValueError("short energy_eps must be positive")
-            if short_optim.energy_max_points is not None and short_optim.energy_max_points <= 0:
-                raise ValueError("short energy_max_points must be positive when set")
             if short_optim.partitions <= 0:
                 raise ValueError("short partitions must be positive")
 
         effective_energy_radius = energy_radius
-        if effective_energy_radius is None:
-            auto_radius = max(
-                1, min(min(self.height, self.width) // 2, _AUTO_ENERGY_RADIUS_MAX)
-            )
-            effective_energy_radius = auto_radius
-            LOGGER.event(
-                "layout.energy.auto_radius",
-                section=QUALITY_ASSESS,
-                data={"energy_radius": effective_energy_radius},
-            )
+        if energy_radius is not None:
+            # §5.7: r_e — радиус энергии точки для матрицы Ê и качества Ē (§5.8); «r_e ≤ 5 достаточно».
+            self._quality_radius = int(energy_radius)
 
+        LOGGER.event(
+            "layout.run.speculative",
+            section=PARALLEL_PROCESSING,
+            data={
+                "mode": mode,
+                "pairs_per_step": pairs_per_step,
+                "points": self._point_count,
+                "pairs_per_point": pairs_per_step / max(1, self._point_count),
+                "note": "пары шага считаются по старым позициям; без влияния на результат, "
+                "пока обменов за шаг много меньше числа точек (§5.10)",
+            },
+        )
         resolved_pair_radius = self._resolve_pair_radius(pair_radius, mode)
         LOGGER.event(
             "layout.run.selection",
@@ -1748,20 +1811,16 @@ class Layout:
                 "energy_radius": effective_energy_radius,
             },
         )
-        energy_monitor: _EnergyStabilityMonitor | None = None
-        if energy_stability_window is not None:
-            energy_monitor = _EnergyStabilityMonitor(
-                window=energy_stability_window,
-                threshold=energy_stability_delta,
-            )
+        if energy_every is not None:
             LOGGER.event(
-                "layout.run.energy_stability",
-                section=QUALITY_ASSESS,
+                "layout.run.energy_target",
+                section=POINT_EXCHANGE,
                 data={
-                    "window": energy_stability_window,
-                    "delta": energy_stability_delta,
-                    "every": energy_stability_every,
-                    "max_points": energy_stability_max_points,
+                    "every": energy_every,
+                    "energy_radius": energy_radius,
+                    "energy_target": energy_target,
+                    "note": "шаги повторяются, пока число обменов не упадёт ниже порога или "
+                    "качество Ē (§5.8) не достигнет заданного значения; None — только по обменам",
                 },
             )
         swap_monitor: _SwapStallMonitor | None = None
@@ -1769,7 +1828,7 @@ class Layout:
             swap_monitor = _SwapStallMonitor(min_swap_ratio, min_swap_window)
             LOGGER.event(
                 "layout.run.swap_monitor",
-                section=OPTIM_PAIR_SELECTION,
+                section=POINT_EXCHANGE,
                 data={
                     "min_swap_ratio": min_swap_ratio,
                     "window": min_swap_window,
@@ -1786,16 +1845,19 @@ class Layout:
                     "mode": mode,
                     "start_radius": adaptive_params.start_radius,
                     "end_radius": adaptive_params.end_radius,
+                    "radius_schedule": adaptive_params.radius_schedule,
+                    "radius_factor": adaptive_params.radius_factor,
                     "swap_ratio_trigger": adaptive_params.swap_ratio_trigger,
+                    "swap_window": adaptive_params.swap_window,
                     "lambda_step": adaptive_params.lambda_step,
                     "lambda_max": adaptive_params.lambda_max,
-                    "geometric": adaptive_params.geometric,
                     "temperature": adaptive_params.temperature,
                     "temperature_radius_min": adaptive_params.temperature_radius_min,
                     "temperature_radius_max": adaptive_params.temperature_radius_max,
                     "steps": steps,
-                    "note": "линейное убывание радиуса, триггер обменов и рост λ — §7.1.7; "
-                    "geometric и temperature > 0 — расширение статьи (сглаживание между пинвилами)",
+                    "note": "swaps — по статье: λ и r меняются, когда обмены падают до доли trigger "
+                    "от начального значения этапа (§7.1.7); linear/geometric и temperature > 0 — "
+                    "расширение статьи (сглаживание между пинвилами)",
                 },
             )
         short_config: ShortLayoutOptimConfig | None = short_optim
@@ -1804,7 +1866,6 @@ class Layout:
                 base_energy_radius = local_radius if local_radius is not None else 3
                 short_config = ShortLayoutOptimConfig(
                     energy_radius=base_energy_radius,
-                    energy_max_points=None,
                     energy_recalc_every=max(1, steps // 20),
                     energy_eps=1e-6,
                     use_weighted_first_point=True,
@@ -1814,7 +1875,6 @@ class Layout:
             elif short_config.similarity_cutoff is None:
                 short_config = ShortLayoutOptimConfig(
                     energy_radius=short_config.energy_radius,
-                    energy_max_points=short_config.energy_max_points,
                     energy_recalc_every=short_config.energy_recalc_every,
                     energy_eps=short_config.energy_eps,
                     use_weighted_first_point=short_config.use_weighted_first_point,
@@ -1827,9 +1887,6 @@ class Layout:
                 data={
                     "energy_radius": short_config.energy_radius,
                     "energy_recalc_every": short_config.energy_recalc_every,
-                    "energy_max_points": -1
-                    if short_config.energy_max_points is None
-                    else short_config.energy_max_points,
                     "energy_eps": short_config.energy_eps,
                     "similarity_cutoff": short_config.similarity_cutoff,
                     "weighted_first": short_config.use_weighted_first_point,
@@ -1883,7 +1940,7 @@ class Layout:
                 )
                 LOGGER.event(
                     "layout.run.swap_ratio",
-                    section=OPTIM_PAIR_SELECTION,
+                    section=POINT_EXCHANGE,
                     data={
                         "step": current_step,
                         "swap_ratio": swap_ratio,
@@ -1895,10 +1952,35 @@ class Layout:
                     visuals=swap_visuals,
                     force=log_swap_ratio,
                 )
+                if (
+                    should_stop_swaps
+                    and adaptive_state is not None
+                    and not adaptive_state.schedule_complete(self._lambda)
+                ):
+                    # §5.6 + §7.1.7: при текущих λ и r обменов почти нет, но r ещё не 1 или λ не λ_max —
+                    # вместо остановки фаза переходит к следующему этапу расписания.
+                    should_stop_swaps = False
+                    forced = adaptive_state.force_next_stage(step=step, current_lambda=self._lambda)
+                    swap_monitor.reset()
+                    LOGGER.event(
+                        "layout.adaptive.stage.forced",
+                        section=LAYOUT_PARAMETERS,
+                        data={
+                            "step": current_step,
+                            "avg_swaps": avg_swaps_window,
+                            "min_swap_ratio": swap_monitor.min_ratio,
+                            "pair_radius": forced.radius,
+                            "lambda_threshold": self._lambda
+                            if forced.new_lambda is None
+                            else forced.new_lambda,
+                            "triggers": adaptive_state.trigger_count,
+                        },
+                    )
+                    self._apply_adaptive_lambda(forced, step=current_step)
                 if should_stop_swaps:
                     LOGGER.event(
                         "layout.run.swap_stability.stop",
-                        section=OPTIM_PAIR_SELECTION,
+                        section=POINT_EXCHANGE,
                         data={
                             "step": current_step,
                             "window": swap_monitor.window,
@@ -1927,37 +2009,26 @@ class Layout:
                 self._log_layout_state(
                     path=log_path, step=step + step_offset, log_visuals=log_visuals
                 )
-            energy_for_stability: float | None = None
+            energy_value: float | None = None
             previous_energy: float | None = None
-            should_eval_energy = (
-                energy_monitor is not None
-                and step % energy_stability_every == 0
-            )
-            if effective_energy_radius is not None and should_eval_energy:
-                energy = self.average_local_energy(
-                    effective_energy_radius,
-                    max_points=energy_stability_max_points,
-                )
-                energy_for_stability = energy
+            if energy_every is not None and step % energy_every == 0:
+                energy_value = self.average_local_energy(effective_energy_radius)
                 previous_energy = self._last_energy_progress
-                self._last_energy_value = energy
+                self._last_energy_value = energy_value
                 self._last_energy_step = step + step_offset
-                self._last_energy_progress = energy
-            if (
-                mode == "long"
-                and energy_for_stability is not None
-                and effective_energy_radius is not None
-            ):
-                minimization = (
+                self._last_energy_progress = energy_value
+            if mode == "long" and energy_value is not None:
+                # §5.8: Ē — качество раскладки, при упорядочивании растёт; прирост за период оценки.
+                energy_gain = (
                     0.0
                     if previous_energy is None
-                    else previous_energy - energy_for_stability
+                    else energy_value - previous_energy
                 )
                 log_energy_progress = LOGGER.should_log("layout.energy.long.progress")
                 energy_visuals = (
                     LOGGER.visual_scalars(
                         f"{log_path}/energy/long",
-                        {"energy_minimization": minimization},
+                        {"average_energy": energy_value, "energy_gain": energy_gain},
                         step=current_step,
                         timeline=_LAYOUT_STEP_TIMELINE,
                     )
@@ -1969,71 +2040,92 @@ class Layout:
                     section=QUALITY_ASSESS,
                     data={
                         "step": current_step,
-                        "energy": energy_for_stability,
+                        "energy": energy_value,
                         "energy_prev": previous_energy,
-                        "energy_minimization": minimization,
+                        "energy_gain": energy_gain,
                         "radius": effective_energy_radius,
                     },
                     visuals=energy_visuals,
                     force=log_energy_progress,
                 )
             if adaptive_state is not None:
-                new_lambda, swap_ratio = adaptive_state.update_after_step(
+                update = adaptive_state.update_after_step(
                     step=step, swaps=swaps, current_lambda=self._lambda
                 )
                 LOGGER.event(
                     "layout.adaptive.radius",
                     section=LAYOUT_PARAMETERS,
                     data={
-                        "step": step + step_offset,
+                        "step": current_step,
                         "pair_radius": effective_pair_radius,
-                        "swap_ratio": swap_ratio,
+                        "swap_rate": update.swap_rate,
+                        "stage_initial_swaps": update.stage_initial,
+                        "swap_ratio": update.swap_ratio,
                         "lambda_threshold": self._lambda,
                     },
                 )
-                if new_lambda is not None and new_lambda != self._lambda:
-                    self._lambda = new_lambda
+                if update.triggered:
+                    if adaptive_state.by_swaps and swap_monitor is not None:
+                        swap_monitor.reset()
                     LOGGER.event(
-                        "layout.adaptive.lambda",
+                        "layout.adaptive.trigger",
                         section=LAYOUT_PARAMETERS,
                         data={
-                            "step": step + step_offset,
-                            "lambda_threshold": self._lambda,
-                            "swap_ratio": swap_ratio,
+                            "step": current_step,
+                            "swap_rate": update.swap_rate,
+                            "stage_initial_swaps": update.stage_initial,
+                            "swap_ratio": update.swap_ratio,
+                            "swap_ratio_trigger": adaptive_params.swap_ratio_trigger,
+                            "pair_radius": update.radius,
+                            "triggers": adaptive_state.trigger_count,
                         },
                     )
-            if energy_monitor is not None and energy_for_stability is not None:
-                should_stop, energy_diff, max_delta = energy_monitor.update(
-                    energy_for_stability
+                self._apply_adaptive_lambda(update, step=current_step)
+            if (
+                energy_target is not None
+                and energy_value is not None
+                and energy_value >= energy_target
+            ):
+                LOGGER.event(
+                    "layout.run.energy_target.stop",
+                    section=POINT_EXCHANGE,
+                    data={
+                        "step": current_step,
+                        "energy": energy_value,
+                        "energy_target": energy_target,
+                        "total_swaps": total_swaps,
+                    },
                 )
-                if should_stop:
-                    LOGGER.event(
-                        "layout.run.energy_stability.stop",
-                        section=QUALITY_ASSESS,
-                        data={
-                            "step": step + step_offset,
-                            "window": energy_monitor.window,
-                            "delta": energy_monitor.threshold,
-                            "every": energy_stability_every,
-                            "max_delta": max_delta,
-                            "last_energy_diff": energy_diff,
-                            "total_swaps": total_swaps,
-                        },
+                if mode == "long":
+                    self._log_layout_state(
+                        path=log_path,
+                        step=current_step,
+                        log_visuals=log_visuals,
+                        force=True,
                     )
-                    if mode == "long":
-                        self._log_layout_state(
-                            path=log_path,
-                            step=current_step,
-                            log_visuals=log_visuals,
-                            force=True,
-                        )
-                        self._save_on_stop(
-                            path=save_on_stop_path,
-                            reason="energy_stability",
-                            step=current_step,
-                            mode=mode,
-                        )
-                    break
+                    self._save_on_stop(
+                        path=save_on_stop_path,
+                        reason="energy_target",
+                        step=current_step,
+                        mode=mode,
+                    )
+                break
+
+        if adaptive_state is not None and not adaptive_state.schedule_complete(self._lambda):
+            LOGGER.event(
+                "layout.adaptive.incomplete",
+                section=LAYOUT_PARAMETERS,
+                data={
+                    "mode": mode,
+                    "steps": steps_executed,
+                    "pair_radius": adaptive_state.radius_for_step(steps_executed),
+                    "end_radius": adaptive_params.end_radius,
+                    "lambda_threshold": self._lambda,
+                    "lambda_max": adaptive_params.lambda_max,
+                    "triggers": adaptive_state.trigger_count,
+                    "note": "бюджет шагов кончился раньше, чем r дошёл до 1 и λ до λ_max (§7.1.7)",
+                },
+            )
 
         if self._swap_temperature != 0.0:
             self.set_swap_temperature(0.0)
@@ -2057,7 +2149,7 @@ class Layout:
             self.save_json(path)
             LOGGER.event(
                 "layout.run.save_on_stop",
-                section=LAID_OUT_STRUCTURE,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "path": path,
                     "reason": reason,
@@ -2068,7 +2160,7 @@ class Layout:
         except Exception as exc:
             LOGGER.event(
                 "layout.run.save_on_stop.error",
-                section=LAID_OUT_STRUCTURE,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "path": path,
                     "reason": reason,
@@ -2114,8 +2206,13 @@ class Layout:
             energy_value = self._last_energy_value
             energy_radius = None
             energy_source = "cached"
-        elif log_visuals and self._point_count <= _VISUAL_ENERGY_POINT_LIMIT:
-            energy_radius = max(1, min(self.height, self.width) // 2)
+        elif (
+            log_visuals
+            and self._quality_radius is not None
+            and self._point_count <= _VISUAL_ENERGY_POINT_LIMIT
+        ):
+            # §5.8: Ē с тем же радиусом r_e, что и критерий качества фазы (§5.7).
+            energy_radius = self._quality_radius
             energy_value = self.average_local_energy(energy_radius)
             energy_source = "visual"
         elif not log_visuals:
@@ -2162,10 +2259,24 @@ class Layout:
         if eta is not _UNSET:
             self._validate_eta(eta)
             self._eta = eta
+        self._invalidate_threshold_caches(reason="similarity_params")
         LOGGER.event(
             "layout.similarity_params",
-            section=ENERGIES,
+            section=SIMILARITY_THRESHOLD,
             data={"lambda_threshold": self._lambda, "eta": self._eta},
+        )
+
+    def _invalidate_threshold_caches(self, *, reason: str) -> None:
+        """Кеши строк sim_λ хранят схожесть с уже применённым порогом (§5.4): при смене λ или η они устаревают."""
+        dropped = len(self._subset_similarity_cache) + len(self._short_similarity_cache)
+        self._subset_similarity_cache.clear()
+        self._short_similarity_cache.clear()
+        if self._tensor_engine is not None:
+            self._tensor_engine.reset_subset()
+        LOGGER.event(
+            "layout.similarity_threshold.cache_reset",
+            section=SIMILARITY_THRESHOLD,
+            data={"reason": reason, "lambda_threshold": self._lambda, "eta": self._eta, "dropped_rows": dropped},
         )
 
     @staticmethod
@@ -2178,6 +2289,31 @@ class Layout:
                 "eta must be positive or None for a hard cutoff; eta=0 would "
                 "turn sim_lambda into a constant 0.5*sim and disable the threshold (§5.4)"
             )
+
+    def restore_positions(self, positions: Sequence[tuple[int, int]]) -> None:
+        """Восстановить уже разложенное пространство: одна точка в ячейке дискретной матрицы (§5.1.2)."""
+        if len(positions) != self._point_count:
+            raise ValueError("positions must contain one cell per point")
+        grid: list[list[int | None]] = [[None for _ in range(self.width)] for _ in range(self.height)]
+        row_occupied: list[set[int]] = [set() for _ in range(self.height)]
+        for idx, (y, x) in enumerate(positions):
+            if not (0 <= y < self.height and 0 <= x < self.width):
+                raise ValueError(f"position {(y, x)} is outside the {self.height}x{self.width} grid")
+            if grid[y][x] is not None:
+                raise ValueError(f"cell {(y, x)} holds two points; the layout matrix is discrete (§5.1.2)")
+            grid[y][x] = idx
+            row_occupied[y].add(x)
+        self.grid = grid
+        self._row_occupied = row_occupied
+        self._positions = [(int(y), int(x)) for y, x in positions]
+        self._pos_y = [p[0] for p in self._positions]
+        self._pos_x = [p[1] for p in self._positions]
+        self._gpu_positions_dirty = True
+        LOGGER.event(
+            "layout.restore_positions",
+            section=LAYOUT_DISCRETE,
+            data={"points": self._point_count, "width": self.width, "height": self.height},
+        )
 
     @property
     def pair_radius(self) -> int | None:
@@ -2373,37 +2509,34 @@ class Layout:
     def save_json(self, path: str) -> None:
         if not path:
             raise ValueError("path must be provided")
+        # Из базового файла сохраняются только метаданные верхнего уровня (подпись кодера, стимулы);
+        # список точек пишется заново из самой раскладки.
         base_payload: dict[str, Any] | None = None
-        base_layout: dict[int, Mapping[str, Any]] = {}
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fp:
                     base_payload = json.load(fp)
-                for item in base_payload.get("layout", []):  # type: ignore[attr-defined]
-                    try:
-                        base_layout[int(item.get("index"))] = item
-                    except Exception:
-                        continue
             except Exception as exc:
                 LOGGER.event(
                     "layout.export.json.error",
-                    section=LAID_OUT_STRUCTURE,
+                    section=OUTSIDE_ARTICLE,
                     data={"path": path, "error": str(exc), "stage": "read"},
                 )
                 base_payload = None
         points_payload: list[dict[str, Any]] = []
         for idx, (y, x) in enumerate(self._positions):
             point = self._points[idx]
-            base_entry = base_layout.get(idx, {})
+            # Код, подпись и позиция берутся у одной и той же точки раскладки: порядок точек Layout
+            # (сгруппированный по hue) может не совпадать с порядком записей базового файла.
             points_payload.append(
                 {
                     "index": idx,
                     "y": y,
                     "x": x,
-                    "label": base_entry.get("label", self._labels[idx]),
-                    "value": base_entry.get("value", self._values[idx]),
-                    "hue": base_entry.get("hue", point.hue),
-                    "ones": base_entry.get("ones", point.ones),
+                    "label": point.label,
+                    "value": self._values[idx],
+                    "hue": point.hue,
+                    "ones": point.ones,
                 }
             )
         payload = dict(base_payload) if isinstance(base_payload, dict) else {}
@@ -2428,13 +2561,13 @@ class Layout:
         except Exception as exc:
             LOGGER.event(
                 "layout.export.json.error",
-                section=LAID_OUT_STRUCTURE,
+                section=OUTSIDE_ARTICLE,
                 data={"path": path, "error": str(exc)},
             )
             raise
         LOGGER.event(
             "layout.export.json",
-            section=LAID_OUT_STRUCTURE,
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "points": self._point_count,
@@ -2594,8 +2727,8 @@ class Layout:
             import numpy as np
         except Exception as exc:
             LOGGER.event(
-                "layout.energy.long.numpy_unavailable",
-                section=OPTIM_ENERGY,
+                "layout.image.numpy_unavailable",
+                section=LAID_OUT_STRUCTURE,
                 data={"error": str(exc)},
             )
             return []
@@ -2608,98 +2741,25 @@ class Layout:
                 image[y, x] = colors[idx]
         return image
 
-    def average_local_energy(
-        self,
-        radius: int,
-        *,
-        max_points: int | None = None,
-    ) -> float:
+    def average_local_energy(self, radius: int) -> float:
+        """Качество раскладки Ē = (1/|V+|) Σ Ê(v, r_e) по всем точкам, E_max = max по V (§5.7, §5.8)."""
         if radius <= 0:
             raise ValueError("radius must be positive")
         if self._point_count == 0:
             return 0.0
-        use_subset = (
-            max_points is not None and max_points > 0 and max_points < self._point_count
-        )
-        if not use_subset:
-            if (
-                self._gpu_engine is not None
-                and self._ensure_gpu_similarity()
-                and self._ensure_gpu_positions()
-            ):
-                try:
-                    energy = self._gpu_engine.average_local_energy(
-                        radius,
-                        lambda_threshold=self._lambda,
-                        eta=self._eta,
-                        distance_eps=self._distance_eps,
-                    )
-                except Exception:
-                    self._gpu_engine = None
-                    energy = None
-                if energy is not None:
-                    LOGGER.event(
-                        "layout.energy.average",
-                        section=QUALITY_ASSESS,
-                        data={"radius": radius, "energy": energy, "mode": "gpu"},
-                    )
-                    return energy
-                self._gpu_engine = None
-
-        radius_sq = radius * radius
-        energies: list[float] = []
-        pos_y = self._pos_y
-        pos_x = self._pos_x
-        sim_lambda = self._sim_lambda_idx
-        if use_subset:
-            indices = self._rng.sample(range(self._point_count), max_points)  # type: ignore[arg-type]
-        else:
-            indices = range(self._point_count)
-
-        for idx in indices:
-            cy = pos_y[idx]
-            cx = pos_x[idx]
-            energy = 0.0
-            y_min = max(0, cy - radius)
-            y_max = min(self.height - 1, cy + radius)
-            x_min = max(0, cx - radius)
-            x_max = min(self.width - 1, cx + radius)
-            for y in range(y_min, y_max + 1):
-                dy = cy - y
-                dy_sq = dy * dy
-                occupied = self._row_occupied[y]
-                if not occupied:
-                    continue
-                for x in occupied:
-                    if x < x_min or x > x_max:
-                        continue
-                    dx = cx - x
-                    dist_sq = dy_sq + dx * dx
-                    if dist_sq > radius_sq:
-                        continue
-                    other_idx = self.grid[y][x]
-                    if other_idx is None or other_idx == idx:
-                        continue
-                    sim = sim_lambda(idx, other_idx)
-                    if sim <= 0.0:
-                        continue
-                    # §5.7: E(c, r) = Σ sim_λ(c, v) / d_c, расстояние евклидово.
-                    energy += sim / (math.sqrt(dist_sq) + self._distance_eps)
-            energies.append(energy)
-
+        energies, mode = self._point_energies_with_mode(radius)
         emax = max(energies)
-        if emax <= 0.0:
-            return 0.0
-        avg_energy = sum(e / emax for e in energies) / len(energies)
+        avg_energy = 0.0 if emax <= 0.0 else sum(e / emax for e in energies) / len(energies)
         LOGGER.event(
             "layout.energy.average",
             section=QUALITY_ASSESS,
             data={
                 "radius": radius,
                 "energy": avg_energy,
-                "mode": "cpu_sample" if use_subset else "cpu",
-                "sample_size": len(energies),
-                "points": self._point_count,
+                "energy_max": emax,
+                "points": len(energies),
+                "mode": mode,
+                "note": "Ē по всем точкам V+, нормировка на E_max по всему V (§5.7)",
             },
         )
         return avg_energy
@@ -2792,25 +2852,43 @@ class Layout:
             if (y2, x2) != (y1, x1):
                 return y2, x2
 
-    def _compute_point_energies(
-        self,
-        radius: int,
-        *,
-        max_points: int | None = None,
-    ) -> list[float]:
+    def _compute_point_energies(self, radius: int) -> list[float]:
+        """Энергии E(c, r) всех точек V (§5.7): шейдер §5.12, если доступен, иначе CPU."""
+        return self._point_energies_with_mode(radius)[0]
+
+    def _point_energies_with_mode(self, radius: int) -> tuple[list[float], str]:
         if radius <= 0:
             raise ValueError("radius must be positive")
         if self._point_count == 0:
-            return []
-        radius_sq = radius * radius
-        indices: Sequence[int]
-        if max_points is not None and 0 < max_points < self._point_count:
-            indices = self._rng.sample(range(self._point_count), max_points)  # type: ignore[arg-type]
-        else:
-            indices = range(self._point_count)
+            return [], "empty"
+        if (
+            self._gpu_engine is not None
+            and self._ensure_gpu_similarity()
+            and self._ensure_gpu_positions()
+        ):
+            try:
+                gpu_energies = self._gpu_engine.point_energies(
+                    radius,
+                    lambda_threshold=self._lambda,
+                    eta=self._eta,
+                    distance_eps=self._distance_eps,
+                )
+            except Exception as exc:
+                LOGGER.event(
+                    "layout.point_energy.gpu_failed",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc)},
+                )
+                self._gpu_engine = None
+                gpu_energies = None
+            if gpu_energies is not None and len(gpu_energies) == self._point_count:
+                return [float(value) for value in gpu_energies], "gpu"
+        return self._point_energies_cpu(radius), "cpu"
 
+    def _point_energies_cpu(self, radius: int) -> list[float]:
+        radius_sq = radius * radius
         energies = [0.0 for _ in range(self._point_count)]
-        for idx in indices:
+        for idx in range(self._point_count):
             cy = self._pos_y[idx]
             cx = self._pos_x[idx]
             y_min = max(0, cy - radius)
@@ -2877,9 +2955,8 @@ class Layout:
             and abs(self._short_energy_eps - config.energy_eps) < 1e-12
         ):
             return
-        energies = self._compute_point_energies(
-            config.energy_radius, max_points=config.energy_max_points
-        )
+        # §5.9.3: периодически считаются энергии всех точек V, P(p) ∝ −ln Ê(p, r).
+        energies = self._compute_point_energies(config.energy_radius)
         self._short_energy_radius = config.energy_radius
         self._short_energy_eps = config.energy_eps
         self._short_energy_last_step = 0 if step_index is None else step_index
@@ -2912,8 +2989,8 @@ class Layout:
                 "points": self._point_count,
                 "step": self._short_energy_last_step,
                 "recalc_every": config.energy_recalc_every,
-                "max_points": -1 if config.energy_max_points is None else config.energy_max_points,
                 "weighted": config.use_weighted_first_point,
+                "note": "энергии всех точек, пересчёт раз в recalc_every шагов (§5.9.3)",
             },
         )
 
@@ -3423,6 +3500,22 @@ class Layout:
                   "note": "0 — обмен только при выгодной энергии (§5.6); >0 — отжиг (расширение статьи)"},
         )
 
+    def _apply_adaptive_lambda(self, update: _AdaptiveUpdate, *, step: int) -> None:
+        """Порог λ повышается ступенью при смене этапа расписания (§7.1.7)."""
+        if update.new_lambda is None or update.new_lambda == self._lambda:
+            return
+        self._lambda = update.new_lambda
+        self._invalidate_threshold_caches(reason="adaptive_lambda")
+        LOGGER.event(
+            "layout.adaptive.lambda",
+            section=LAYOUT_PARAMETERS,
+            data={
+                "step": step,
+                "lambda_threshold": self._lambda,
+                "swap_ratio": update.swap_ratio,
+            },
+        )
+
     def _select_swaps(
         self,
         coords: Sequence[tuple[int, int, int, int]],
@@ -3552,7 +3645,7 @@ class Layout:
         )
         LOGGER.event(
             "layout.energy.long.sim_lambda",
-            section=SIMILARITY_DEFINITION,
+            section=SIMILARITY_THRESHOLD,
             data={
                 "lambda_threshold": self._lambda,
                 "eta": self._eta,
@@ -3561,7 +3654,7 @@ class Layout:
         )
         LOGGER.event(
             "layout.energy.long.threshold",
-            section=ENERGIES,
+            section=SIMILARITY_THRESHOLD,
             data={
                 "lambda_threshold": self._lambda,
                 "eta": self._eta,
@@ -3928,8 +4021,7 @@ class Layout:
             if mode == "long":
                 self._register_long_swap_radius(y1, x1, y2, x2)
         if applied:
-            self._short_energy_weights = None
-            self._short_energy_last_step = -1
+            # §5.9.3: веса первой точки пересчитываются периодически (energy_recalc_every), а не после обмена.
             self._gpu_positions_dirty = True
         return applied
 
@@ -4185,7 +4277,7 @@ class Layout:
         except Exception as exc:
             LOGGER.event(
                 "layout.sim_matrix.numpy_unavailable",
-                section=OPTIM_ENERGY,
+                section=OPTIM_SIM_MATRIX,
                 data={"error": str(exc)},
             )
             return None, None
@@ -4199,7 +4291,7 @@ class Layout:
             ones[idx] = float(point.ones)
         LOGGER.event(
             "layout.sim_matrix.ready",
-            section=OPTIM_ENERGY,
+            section=OPTIM_SIM_MATRIX,
             data={
                 "points": self._point_count,
                 "code_len": code_len,

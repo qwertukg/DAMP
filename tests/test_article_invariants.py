@@ -71,6 +71,24 @@ class EncoderInvariantTests(unittest.TestCase):
         bits = [window.bit for window in encoder.detectors if window.dimension_index == 0]
         self.assertNotEqual(bits, sorted(bits), "биты назначаются случайно, а не по порядку")
 
+    def test_bit_colour_follows_receptive_field_width(self) -> None:
+        """§3.2, §4.4.2, §5.14: широкие детекторы — красные младшие биты, узкие — фиолетовые старшие."""
+        layers = geometric_detector_layers(layers_count=5, widest_detectors=2, narrowest_detectors=40, overlap=0.4)
+        dim = ClosedDimension("Angle", (0.0, 360.0), layers, code_length=53)
+        encoder = Encoder(dim, random_seed=0)
+        bands = [dim.layer_band(index) for index in range(len(layers))]
+        self.assertEqual(bands[0][0], 0)
+        self.assertEqual(sum(length for _, length in bands), 53)
+        for (start, length), (next_start, _) in zip(bands, bands[1:]):
+            self.assertEqual(start + length, next_start, "полосы идут подряд от широкого слоя к узкому")
+        for window in encoder.detectors:
+            start, length = bands[window.layer_index]
+            self.assertTrue(start <= window.local_bit < start + length, window)
+        widest = [w.local_bit for w in encoder.detectors if w.layer_index == 0]
+        self.assertEqual(len(widest), len(set(widest)), "в полосе хватает бит: детекторы слоя не совпадают")
+        with self.assertRaises(ValueError):
+            ClosedDimension("Angle", (0.0, 360.0), layers, code_length=4)
+
     def test_random_bits_are_reproducible_by_seed_and_differ_between_seeds(self) -> None:
         first = _angle_encoder(seed=7)
         second = _angle_encoder(seed=7)
@@ -80,7 +98,7 @@ class EncoderInvariantTests(unittest.TestCase):
         self.assertEqual(first.encode(42.0)[1].to01(), second.encode(42.0)[1].to01())
 
     def test_bit_collisions_are_allowed_and_measured_density_matches_estimate(self) -> None:
-        encoder = _angle_encoder(seed=0, layers=22, narrowest=180)
+        encoder = _angle_encoder(seed=0, layers=22, narrowest=180, length=256)  # угол MNIST из main.py
         codes = [encoder.encode(float(angle))[1] for angle in range(360)]
         measured = sum(code.count() for code in codes) / (360 * encoder.code_length)
         self.assertGreater(len(encoder.detectors), encoder.code_length, "детекторов больше, чем битов")
@@ -299,7 +317,7 @@ class LayoutInvariantTests(unittest.TestCase):
             self._tiny_layout(long_kernel="flat")
         # дальняя фаза с гауссовым ядром выполняется на CPU без ошибок
         layout.run(steps=2, pairs_per_step=4, pair_radius=2, mode="long", min_swap_ratio=0.0,
-                   min_swap_window=None, log_every=None, energy_stability_window=None, log_visuals=False)
+                   min_swap_window=None, log_every=None, log_visuals=False)
 
     def test_adaptive_lambda_never_exceeds_lambda_max(self) -> None:
         from damp.layout.damp_layout import AdaptiveLayoutConfig, _AdaptiveLayoutState
@@ -311,14 +329,144 @@ class LayoutInvariantTests(unittest.TestCase):
         )
         current = 0.5
         for step in range(5):
-            new_lambda, _ = state.update_after_step(step=step, swaps=0, current_lambda=current)
+            new_lambda = state.update_after_step(step=step, swaps=0, current_lambda=current).new_lambda
             if new_lambda is not None:
                 current = new_lambda
         self.assertAlmostEqual(current, 0.7)
 
+    def test_swap_schedule_changes_radius_and_lambda_only_on_one_percent_trigger(self) -> None:
+        """§7.1.7: r и λ меняются, когда обмены за единицу времени падают до 1 % от начального значения этапа."""
+        from damp.layout.damp_layout import AdaptiveLayoutConfig, _AdaptiveLayoutState
+
+        config = AdaptiveLayoutConfig(start_radius=40, end_radius=1, swap_ratio_trigger=0.01,
+                                      lambda_step=0.05, lambda_max=0.8, radius_schedule="swaps",
+                                      radius_factor=0.5, swap_window=2)
+        state = _AdaptiveLayoutState(config, total_steps=1000)
+        current = 0.65
+        # Первое окно задаёт начальное значение этапа (200 обменов), r постоянен, пока обмены не упали до 1 %.
+        for step, swaps in enumerate([200, 200, 150, 50, 10, 4]):
+            update = state.update_after_step(step=step, swaps=swaps, current_lambda=current)
+            self.assertFalse(update.triggered)
+            self.assertEqual(state.radius_for_step(step + 1), 40)
+        update = state.update_after_step(step=6, swaps=0, current_lambda=current)  # среднее окна 2 = 1 % от 200
+        self.assertTrue(update.triggered)
+        self.assertAlmostEqual(update.new_lambda, 0.70)
+        self.assertEqual(state.radius_for_step(500), 20)
+        current = update.new_lambda
+        # Новый этап: начальное значение берётся заново, старые 200 обменов не учитываются.
+        update = state.update_after_step(step=7, swaps=6, current_lambda=current)
+        self.assertIsNone(update.swap_ratio)
+        update = state.update_after_step(step=8, swaps=6, current_lambda=current)
+        self.assertAlmostEqual(update.stage_initial, 6.0)
+        self.assertFalse(update.triggered)
+        self.assertFalse(state.schedule_complete(current))
+        # Обмены упали ниже порога остановки §5.6 до конца расписания: следующий этап вместо остановки.
+        for step in range(9, 40):
+            current = state.force_next_stage(step=step, current_lambda=current).new_lambda or current
+        self.assertEqual(state.radius_for_step(1000), 1)
+        self.assertAlmostEqual(current, 0.8)
+        self.assertTrue(state.schedule_complete(current))
+
+    def test_step_schedules_are_marked_as_extension_and_validated(self) -> None:
+        from damp.layout.damp_layout import AdaptiveLayoutConfig, _AdaptiveLayoutState
+
+        with self.assertRaises(ValueError):
+            AdaptiveLayoutConfig(start_radius=4, radius_schedule="cosine")
+        geometric = _AdaptiveLayoutState(
+            AdaptiveLayoutConfig(start_radius=16, end_radius=1, swap_ratio_trigger=0.0,
+                                 radius_schedule="geometric"),
+            total_steps=5,
+        )
+        self.assertEqual([geometric.radius_for_step(s) for s in range(5)], [16, 8, 4, 2, 1])
+        self.assertTrue(geometric.schedule_complete(0.65))
+
+    def test_far_energies_follow_lambda_after_adaptive_raise(self) -> None:
+        """§5.4, §7.1.7: после подъёма λ дальние энергии считаются с новым порогом, а не из кеша строк sim_λ."""
+        from damp.layout.damp_layout import _AdaptiveUpdate
+
+        layout = self._tiny_layout(grid_size=3)  # sim(a, b) = 2/3 > λ = 0.3, c не похож ни на кого
+        (ya, xa), (yc, xc) = layout._positions[0], layout._positions[2]
+        pair = [(ya, xa, yc, xc, 0, 2)]  # пара (a, c): в φ входит слагаемое s(a, b)·d
+        before = layout._calculate_far_energies(pair, advance_step=False)
+        self.assertGreater(max(abs(v) for v in before[0]), 0.0)
+        layout._apply_adaptive_lambda(
+            _AdaptiveUpdate(new_lambda=0.8, swap_ratio=0.0, swap_rate=0.0, stage_initial=1.0,
+                            triggered=True, radius=1),
+            step=1,
+        )
+        after = layout._calculate_far_energies(pair, advance_step=False)
+        # При λ = 0.8 > 2/3 и жёстком пороге все sim_λ нулевые: энергии пары обнуляются.
+        self.assertEqual(after[0], (0.0, 0.0))
+
+    def test_layout_stops_when_quality_reaches_target(self) -> None:
+        """§5.6: шаги повторяются, пока качество раскладки Ē (§5.8) не достигнет заданного значения."""
+        layout = self._tiny_layout(grid_size=5)
+        layout.run(steps=50, pairs_per_step=4, pair_radius=2, mode="long", min_swap_ratio=0.0,
+                   min_swap_window=None, log_every=None, log_visuals=False,
+                   energy_radius=3, energy_every=1, energy_target=1e-9)
+        self.assertLess(layout.last_steps, 50)
+        self.assertGreaterEqual(layout._last_energy_value, 1e-9)
+        with self.assertRaises(ValueError):
+            layout.run(steps=1, pairs_per_step=1, pair_radius=1, mode="long", energy_target=0.5)
+        with self.assertRaises(ValueError):  # r_e для Ē задаётся явно (§5.7)
+            layout.run(steps=1, pairs_per_step=1, pair_radius=1, mode="long", energy_every=1)
+
+    def test_saved_json_keeps_code_and_position_of_the_same_point(self) -> None:
+        """§5.14: в JSON раскладки код и координаты одной записи принадлежат одной точке."""
+        layout = _clustered_layout()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "layout.json"
+            # Базовый файл с другим порядком записей (как payload MNIST в порядке стимулов).
+            shuffled = list(reversed(range(layout._point_count)))
+            path.write_text(json.dumps({
+                "encoder_signature": "kept",
+                "layout": [{"index": k, "value": layout._values[i], "label": layout._labels[i], "hue": -1.0}
+                           for k, i in enumerate(shuffled)],
+            }), encoding="utf-8")
+            layout.save_json(str(path))
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["encoder_signature"], "kept")
+        for item in payload["layout"]:
+            index = int(item["index"])
+            self.assertEqual(item["value"], layout._values[index])
+            self.assertEqual((item["y"], item["x"]), layout._positions[index])
+            self.assertEqual(item["hue"], layout._points[index].hue)
+
+    def test_average_energy_is_normalised_by_maximum_over_whole_space(self) -> None:
+        """§5.7, §5.8: Ē = (1/|V+|) Σ E/E_max, E_max = max по всему V, без выборки."""
+        layout = _clustered_layout()
+        raw = layout._compute_point_energies(3)
+        self.assertEqual(len(raw), layout._point_count)
+        expected = sum(value / max(raw) for value in raw) / len(raw)
+        self.assertAlmostEqual(layout.average_local_energy(3), expected, places=6)
+        normalised = layout.point_energies(3)
+        self.assertAlmostEqual(max(normalised), 1.0)
+
+    def test_first_point_weights_use_energies_of_all_points_and_are_periodic(self) -> None:
+        """§5.9.3: P(p) ∝ −ln Ê(p, r) по энергиям всех точек, веса пересчитываются периодически."""
+        from damp.layout.damp_layout import ShortLayoutOptimConfig
+
+        layout = _clustered_layout()
+        config = ShortLayoutOptimConfig(energy_radius=3, energy_recalc_every=10, energy_eps=1e-6)
+        layout._ensure_short_energy_weights(step_index=0, config=config)
+        energies = layout.point_energies(3)
+        expected = [max(0.0, -math.log(max(1e-6, value))) for value in energies]
+        for got, want in zip(layout._short_energy_weights, expected):
+            self.assertAlmostEqual(got, want, places=6)
+        cap = -math.log(1e-6)
+        self.assertLess(sum(1 for w in layout._short_energy_weights if w >= cap - 1e-9), layout._point_count)
+        weights_before = layout._short_energy_weights
+        (y1, x1), (y2, x2) = layout._positions[0], layout._positions[20]
+        layout._apply_swaps([(y1, x1, y2, x2)], mode="short")
+        self.assertIs(layout._short_energy_weights, weights_before, "обмен не сбрасывает веса")
+        layout._ensure_short_energy_weights(step_index=5, config=config)
+        self.assertIs(layout._short_energy_weights, weights_before, "пересчёт только раз в energy_recalc_every")
+        layout._ensure_short_energy_weights(step_index=10, config=config)
+        self.assertIsNot(layout._short_energy_weights, weights_before)
+
     def test_main_layout_threshold_is_enabled(self) -> None:
-        self.assertIsNotNone(main.LAYOUT_ETA)
-        self.assertGreater(main.LAYOUT_ETA, 0.0)
+        # §5.4: η = 0 выключает порог; η = None — жёсткий порог η = ∞ (§7.1.7).
+        self.assertTrue(main.LAYOUT_ETA is None or main.LAYOUT_ETA > 0.0)
         self.assertGreater(main.LAYOUT_LAMBDA_THRESHOLD, 0.0)
 
     def test_smoothing_flag_switches_long_phase_between_extension_and_article(self) -> None:
@@ -346,15 +494,18 @@ class LayoutInvariantTests(unittest.TestCase):
         article = load(False)
         self.assertEqual(article.LAYOUT_LONG_KERNEL, "distance")
         self.assertEqual(article.LAYOUT_ADAPTIVE_RADIUS_START_FACTOR, 0.5)
-        self.assertFalse(article.LAYOUT_ADAPTIVE_RADIUS_GEOMETRIC)
+        self.assertEqual(article.LAYOUT_ADAPTIVE_RADIUS_SCHEDULE, "swaps")
+        self.assertEqual(article.LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE, "swaps")
         self.assertEqual(article.LAYOUT_ANNEAL_TEMPERATURE, 0.0)
         self.assertEqual(article.LAYOUT_ADAPTIVE_SWAP_TRIGGER, 0.01)
-        self.assertIsNotNone(article.LAYOUT_ADAPTIVE_LAMBDA_STEP)
-        self.assertGreater(article.LAYOUT_ADAPTIVE_LAMBDA_MAX, article.LAYOUT_LAMBDA_THRESHOLD)
+        self.assertIsNone(article.LAYOUT_ETA)
+        self.assertEqual(article.LAYOUT_LAMBDA_THRESHOLD, 0.65)
+        self.assertAlmostEqual(article.LAYOUT_ADAPTIVE_LAMBDA_STEP, 0.05)
+        self.assertAlmostEqual(article.LAYOUT_ADAPTIVE_LAMBDA_MAX, 0.8)
         smooth = load(True)
         self.assertEqual(smooth.LAYOUT_LONG_KERNEL, "gauss")
         self.assertGreater(smooth.LAYOUT_ANNEAL_TEMPERATURE, 0.0)
-        self.assertTrue(smooth.LAYOUT_ADAPTIVE_RADIUS_GEOMETRIC)
+        self.assertEqual(smooth.LAYOUT_ADAPTIVE_RADIUS_SCHEDULE, "geometric")
         self.assertNotEqual(article.LAYOUT_CACHE_TAG, smooth.LAYOUT_CACHE_TAG)
 
 
@@ -452,6 +603,46 @@ class DetectorInvariantTests(unittest.TestCase):
         other = [(d.output_code.active_indices()) for d in self._build(seed=5)]
         self.assertEqual(first, repeat)
         self.assertNotEqual([bit for _, bit in first], other)
+
+    def test_detector_energy_counts_whole_receptive_field_activated_by_centre_code(self) -> None:
+        """§6.3, §6.4.5: n_d = |A_μ|, e_d = Σ a·e по A_λd(c_d, r_d) — всё поле r_d вокруг c_d, код из центра."""
+        layout = _clustered_layout()
+        energies = layout.point_energies(3)
+        positions = layout.positions()
+        for detector in self._build(seed=0, layout=layout):
+            cy, cx = detector.center
+            field = [i for i, (y, x) in enumerate(positions) if math.hypot(y - cy, x - cx) <= detector.radius]
+            centre = min(field, key=lambda i: (math.hypot(positions[i][0] - cy, positions[i][1] - cx), i))
+            a_mu = [i for i in field if energies[i] >= 0.05]
+            e_d = 0.0
+            for i in a_mu:
+                similarity = layout._similarity_value(centre, i)
+                e_d += (similarity if similarity >= detector.lambda_threshold else 0.0) * energies[i]
+            self.assertEqual(detector.points_count, len(a_mu))
+            self.assertAlmostEqual(detector.energy, e_d, places=9)
+            engine = ActivationEngine(layout=layout, detectors=[detector], lambda_threshold=detector.lambda_threshold,
+                                      eta=None, energy_threshold=0.05, detector_threshold=0.0, saturation_limit=8,
+                                      energy_map=energies, use_gpu=False)
+            level = engine.activate([layout._points[centre].code]).active_detectors[0].activation_level
+            self.assertAlmostEqual(level, 1.0, places=6, msg="код из центра активирует детектор ровно на e_d (§6.5)")
+
+    def test_jaccard2_is_the_article_formula_for_bit_vectors(self) -> None:
+        """§2.2.4.2: J2 = Σ a·b / Σ max(a², b²); для битов это |a∧b| / |a∨b| = J."""
+        import types
+
+        from damp.decode.mnist_decoder import EmbeddingDatabase
+
+        a = BitArray.from_indices(16, [0, 1, 2, 3, 4, 5])
+        b = BitArray.from_indices(16, [0, 1, 2, 3, 8, 9])
+        bits_a, bits_b = [int(c) for c in a.to01()], [int(c) for c in b.to01()]
+        article_j2 = sum(x * y for x, y in zip(bits_a, bits_b)) / sum(max(x * x, y * y) for x, y in zip(bits_a, bits_b))
+        for name in ("jaccard", "jaccard2"):
+            database = types.SimpleNamespace(_config=types.SimpleNamespace(similarity=name))
+            got = EmbeddingDatabase._similarity_value(database, a, a.count(), b, b.count())
+            self.assertAlmostEqual(got, article_j2)
+        from damp.activation.activation import _similarity_name
+
+        self.assertEqual(_similarity_name("jaccard2"), "jaccard")
 
     def test_activation_level_is_a_ratio_without_clipping(self) -> None:
         layout = _clustered_layout()

@@ -11,11 +11,10 @@ import math
 from typing import Mapping, Sequence
 
 from damp.article_refs import (
-    CYCLIC_COORDS,
-    LAID_OUT_STRUCTURE,
     LONG_RANGE_IMPORTANCE,
     MAPPING_CONTINUITY,
     MULTI_DIM_CODES,
+    OUTSIDE_ARTICLE,
 )
 from damp.encoding.damp_encoder import (
     Encoder,
@@ -29,18 +28,19 @@ from main import (
     ENCODER_SIGNATURE_KEY,
     LAYOUT_ADAPTIVE_LAMBDA_MAX,
     LAYOUT_ADAPTIVE_LAMBDA_STEP,
-    LAYOUT_ADAPTIVE_RADIUS_GEOMETRIC,
     LAYOUT_ADAPTIVE_RADIUS_MIN,
+    LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
     LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+    LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
     LAYOUT_ADAPTIVE_SWAP_TRIGGER,
+    LAYOUT_ADAPTIVE_SWAP_WINDOW,
     LAYOUT_ANNEAL_RADIUS_MAX_FACTOR,
     LAYOUT_ANNEAL_RADIUS_MIN,
     LAYOUT_ANNEAL_TEMPERATURE,
     LAYOUT_EMPTY_RATIO,
-    LAYOUT_ENERGY_STABILITY_DELTA,
-    LAYOUT_ENERGY_STABILITY_EVERY,
-    LAYOUT_ENERGY_STABILITY_MAX_POINTS,
-    LAYOUT_ENERGY_STABILITY_WINDOW,
+    LAYOUT_ENERGY_EVAL_EVERY,
+    LAYOUT_ENERGY_RADIUS,
+    LAYOUT_ENERGY_TARGET,
     LAYOUT_ETA,
     LAYOUT_LAMBDA_THRESHOLD,
     LAYOUT_LOG_EVERY_LONG,
@@ -56,9 +56,9 @@ from main import (
     LAYOUT_PSEUDO_COLOR_MIN_HUE,
     LAYOUT_RANDOM_SEED,
     LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR,
+    LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE,
     LAYOUT_SHORT_DISTANCE,
     LAYOUT_SHORT_ENERGY_EPS,
-    LAYOUT_SHORT_ENERGY_MAX_POINTS,
     LAYOUT_SHORT_PARTITIONS,
     LAYOUT_SHORT_SIMILARITY_CUTOFF,
     LAYOUT_SHORT_WEIGHTED_FIRST,
@@ -243,7 +243,7 @@ class PinwheelExperiment:
                 self._payload.add_code(label=f"angle={angle:.3f}, x={x:g}, y={y:g}", hue=angle, code=code)
         LOGGER.event(
             "pinwheel.codes",
-            section=CYCLIC_COORDS,
+            section=MULTI_DIM_CODES,
             data={
                 "angles": PINWHEEL_ANGLE_COUNT,
                 "positions": len(self._positions),
@@ -293,7 +293,9 @@ class PinwheelExperiment:
             swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
             lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
             lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
-            geometric=LAYOUT_ADAPTIVE_RADIUS_GEOMETRIC,
+            radius_schedule=LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
+            radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
+            swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
             temperature=LAYOUT_ANNEAL_TEMPERATURE,
             temperature_radius_max=int(layout.width * LAYOUT_ANNEAL_RADIUS_MAX_FACTOR),
             temperature_radius_min=LAYOUT_ANNEAL_RADIUS_MIN,
@@ -308,11 +310,9 @@ class PinwheelExperiment:
             log_every=LAYOUT_LOG_EVERY_LONG,
             step_offset=1,
             adaptive_params=adaptive_long,
-            energy_radius=None,
-            energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
-            energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
-            energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
-            energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+            energy_radius=LAYOUT_ENERGY_RADIUS,
+            energy_every=LAYOUT_ENERGY_EVAL_EVERY,
+            energy_target=LAYOUT_ENERGY_TARGET,
             log_visuals=LAYOUT_LOG_VISUALS,
         )
         step_offset = 1 + layout.last_steps
@@ -330,10 +330,12 @@ class PinwheelExperiment:
             swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
             lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
             lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+            radius_schedule=LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE,
+            radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
+            swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
         )
         short_optim = ShortLayoutOptimConfig(
             energy_radius=run_params.short_energy_radius,
-            energy_max_points=LAYOUT_SHORT_ENERGY_MAX_POINTS,
             energy_recalc_every=run_params.short_energy_recalc_every,
             energy_eps=LAYOUT_SHORT_ENERGY_EPS,
             use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
@@ -376,7 +378,7 @@ class PinwheelExperiment:
         layout.save_json(self._layout_path)
         LOGGER.event(
             "pinwheel.image.save",
-            section=LAID_OUT_STRUCTURE,
+            section=OUTSIDE_ARTICLE,
             data={
                 "image": self._output_path,
                 "component_image": self._component_output_path,

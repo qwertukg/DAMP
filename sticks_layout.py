@@ -52,7 +52,6 @@ class SticksLayoutRunner:
         damp_main.LAYOUT_SHORT_STEPS = 120
         damp_main.LAYOUT_SHORT_LOCAL_RADIUS = 4
         damp_main.LAYOUT_SHORT_ENERGY_RADIUS = 4
-        damp_main.LAYOUT_SHORT_ENERGY_MAX_POINTS = 256
         damp_main.LAYOUT_SHORT_PARTITIONS = 4
         damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF = 0.03
         damp_main.LAYOUT_SHORT_WEIGHTED_FIRST = True
@@ -75,7 +74,6 @@ class SticksLayoutRunner:
                 "short_pairs": damp_main.LAYOUT_SHORT_PAIRS_PER_STEP,
                 "short_local_radius": damp_main.LAYOUT_SHORT_LOCAL_RADIUS,
                 "short_energy_radius": damp_main.LAYOUT_SHORT_ENERGY_RADIUS,
-                "short_energy_max_points": damp_main.LAYOUT_SHORT_ENERGY_MAX_POINTS,
                 "short_partitions": damp_main.LAYOUT_SHORT_PARTITIONS,
                 "short_similarity_cutoff": damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF,
                 "short_weighted_first": damp_main.LAYOUT_SHORT_WEIGHTED_FIRST,

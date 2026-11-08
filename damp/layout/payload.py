@@ -6,7 +6,9 @@ import json
 import os
 from typing import Dict, List, Mapping, Sequence
 
-from damp.article_refs import LAID_OUT_STRUCTURE
+from damp.article_refs import (
+    OUTSIDE_ARTICLE,
+)
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 
@@ -99,7 +101,7 @@ class LayoutPayloadBuilder:
             json.dump(payload, fp, ensure_ascii=True, indent=2)
         LOGGER.event(
             "layout.payload.base",
-            section=LAID_OUT_STRUCTURE,
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "points": len(self._records),

@@ -7,7 +7,11 @@ from typing import Sequence
 
 import numpy as np
 
-from damp.article_refs import CODE_SPACE_ACTIVATION, SIMILARITY_DEFINITION, SIMILARITY_MEASURES, STIMULUS_DETECTION
+from damp.article_refs import (
+    OUTSIDE_ARTICLE,
+    SIMILARITY_MEASURES,
+    STIMULUS_DETECTION,
+)
 from damp.activation import ActivationEngine, ActivationResult
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import Encoder
@@ -177,7 +181,7 @@ class EmbeddingDatabase:
             confidence = max(probabilities) if probabilities else 0.0
             LOGGER.event(
                 "decoder.base.predict",
-                section=SIMILARITY_DEFINITION,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "classes": len(self._expected_classes),
                     "best_label": predicted_label,
@@ -229,7 +233,7 @@ class EmbeddingDatabase:
 
         LOGGER.event(
             "decoder.base.predict",
-            section=SIMILARITY_DEFINITION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "classes": len(self._expected_classes),
                 "best_label": predicted_label,
@@ -275,11 +279,8 @@ class EmbeddingDatabase:
         union = query_ones + stored_ones - common
         if union == 0:
             return 0.0
-        v = common / union
-
-        if sim_name in ("jaccard2", "j2", "jac2"):
-            return v * v
-        return v
+        # §2.2.4.2: J2 = Σ a_i·b_i / Σ max(a_i², b_i²); для битовых векторов это то же, что J = |a∧b| / |a∨b|.
+        return common / union
 
 
 class MnistDecoder:
@@ -298,7 +299,7 @@ class MnistDecoder:
         code_len = getattr(activation_engine, "_code_length", None)
         LOGGER.event(
             "decoder.init",
-            section=CODE_SPACE_ACTIVATION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "code_length": code_len,
                 "classes": len(self._embedding_db.expected_classes),
@@ -343,7 +344,7 @@ class MnistDecoder:
         activation_result = self._activation_engine.activate(codes)
         LOGGER.event(
             "decoder.embed",
-            section=CODE_SPACE_ACTIVATION,
+            section=STIMULUS_DETECTION,
             data={
                 "codes": len(codes),
                 "active_detectors": len(activation_result.active_detectors),
@@ -365,7 +366,7 @@ class MnistDecoder:
         prediction = self._embedding_db.predict(activation_result.embedding, temperature=temperature)
         LOGGER.event(
             "decoder.predict.image",
-            section=STIMULUS_DETECTION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "predicted_class": prediction.predicted_class,
                 "confidence": prediction.confidence,
@@ -402,7 +403,7 @@ class MnistDecoder:
             accuracy = correct / len(results)
         LOGGER.event(
             "decoder.predict.batch",
-            section=STIMULUS_DETECTION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "samples": len(results),
                 "accuracy": accuracy,

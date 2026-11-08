@@ -5,7 +5,7 @@ from typing import ClassVar, Dict, List, Tuple, Union
 
 import numpy as np
 
-from damp.article_refs import CYCLIC_COORDS, SLIDING_WINDOW, TWO_DIM_CODES
+from damp.article_refs import CYCLIC_COORDS, OUTSIDE_ARTICLE
 from damp.logging import LOGGER
 
 
@@ -40,10 +40,32 @@ class MnistSobelAngleMap:
                                          [ 0,  0,  0],
                                          [-1, -2, -1]], dtype=np.float32)
 
+    @classmethod
+    def load_image(cls, path: str) -> np.ndarray:
+        """Картинка из файла в градациях серого 28×28 со значениями в [0, 1]."""
+        from PIL import Image
+
+        target_h, target_w = cls.EXPECTED_SHAPE
+        image = Image.open(path).convert("L").resize((target_w, target_h))
+        array = np.asarray(image, dtype="float32")
+        if array.max() > 1.5:
+            array = array / 255.0
+        LOGGER.event(
+            "sobel_map.image.load",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "path": path,
+                "shape": array.shape,
+                "max": float(array.max()) if array.size else 0.0,
+                "min": float(array.min()) if array.size else 0.0,
+            },
+        )
+        return array
+
     def __post_init__(self) -> None:
         LOGGER.event(
             "sobel_map.init",
-            section=CYCLIC_COORDS,
+            section=OUTSIDE_ARTICLE,
             data={
                 "angle_in_degrees": self.angle_in_degrees,
                 "grad_threshold": self.grad_threshold,
@@ -66,7 +88,7 @@ class MnistSobelAngleMap:
 
         LOGGER.event(
             "sobel_map.patch_grid",
-            section=SLIDING_WINDOW,
+            section=OUTSIDE_ARTICLE,
             data={
                 "label": int(label),
                 "image_shape": img.shape,
@@ -77,7 +99,7 @@ class MnistSobelAngleMap:
         )
         LOGGER.event(
             "sobel_map.patch_coords",
-            section=TWO_DIM_CODES,
+            section=OUTSIDE_ARTICLE,
             data={
                 "x_range": (0, self.GRID_SIZE - 1),
                 "y_range": (0, self.GRID_SIZE - 1),
@@ -99,7 +121,7 @@ class MnistSobelAngleMap:
                 kept = mag > self.grad_threshold
                 LOGGER.event(
                     "sobel_map.patch.metrics",
-                    section=SLIDING_WINDOW,
+                    section=OUTSIDE_ARTICLE,
                     data={
                         "x": bx,
                         "y": by,
@@ -135,7 +157,7 @@ class MnistSobelAngleMap:
 
         LOGGER.event(
             "sobel_map.extract",
-            section=CYCLIC_COORDS,
+            section=OUTSIDE_ARTICLE,
             data={
                 "label": int(label),
                 "normalized": normalized,
