@@ -19,6 +19,7 @@ from damp.article_refs import (
     LAYOUT_ALGORITHM,
     LAYOUT_COMPACTNESS,
     LAYOUT_PARAMETERS,
+    MAPPING_CONTINUITY,
     OPTIM_ENERGY,
     OPTIM_FIRST_POINT,
     OPTIM_PAIR_SELECTION,
@@ -27,12 +28,16 @@ from damp.article_refs import (
     LAID_OUT_STRUCTURE,
     PAIR_SELECTION,
     PARALLEL_PROCESSING,
+    POINT_ENERGY,
+    POINT_EXCHANGE,
     QUALITY_ASSESS,
     SIMILARITY_DEFINITION,
     SIMILARITY_MEASURES,
+    SIMILARITY_THRESHOLD,
     SPARSE_BIT_VECTORS,
 )
 from damp.encoding.bitarray import BitArray
+from damp.encoding.damp_encoder import EncoderCodeColorizer
 from damp.layout.payload import LayoutEncodedCode
 from damp.logging import LOGGER
 
@@ -47,10 +52,32 @@ class LayoutPoint:
 
 @dataclass(frozen=True)
 class AdaptiveLayoutConfig:
+    """Радиус выбора пар убывает от d/2 к 1, порог λ растёт ступенями (§7.1.7)."""
+
     start_radius: int
     end_radius: int = 1
     swap_ratio_trigger: float = 0.01
     lambda_step: float | None = None
+    lambda_max: float = 1.0
+    # Геометрическое убывание радиуса (постоянный множитель за шаг, как ширина окрестности в SOM)
+    # вместо линейного; расширение статьи, нужно гауссову ядру дальней фазы.
+    geometric: bool = False
+    # Отжиг (расширение статьи): пока радиус пар лежит в [temperature_radius_min, temperature_radius_max],
+    # невыгодные обмены принимаются с вероятностью exp(Δ / (T·rms|Δ|)); вне окна правило жадное (§5.6).
+    temperature: float = 0.0
+    temperature_radius_max: int = 0
+    temperature_radius_min: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.lambda_max <= 1.0:
+            raise ValueError("lambda_max must be in (0, 1]")
+        if self.temperature < 0.0:
+            raise ValueError("temperature must be >= 0")
+
+    def temperature_for_radius(self, radius: int) -> float:
+        if self.temperature <= 0.0:
+            return 0.0
+        return self.temperature if self.temperature_radius_min <= radius <= self.temperature_radius_max else 0.0
 
 
 @dataclass(frozen=True)
@@ -75,13 +102,23 @@ class _ShortPair:
     radius: float
 
 _UNSET = object()
-HUE = 360.0
+# Псевдоцвета по умолчанию: младший бит красный, старший фиолетовый (§5.14).
+_DEFAULT_PSEUDO_COLOR_MIN_HUE = 0.0
+_DEFAULT_PSEUDO_COLOR_MAX_HUE = 300.0
 _PARALLEL_SIM_MIN_PAIRS = 50_000
 _SIM_POINTS: Sequence[LayoutPoint] | None = None
 _SIM_MODE: str | None = None
 _VISUAL_ENERGY_POINT_LIMIT = 5000
 _VISUAL_POINT_LIMIT = 200000
 _AUTO_ENERGY_RADIUS_MAX = 15
+# §5.5: d евклидово; §5.9.2 допускает суммы квадратов без корня.
+_DISTANCE_MODES = ("squared", "euclidean")
+# Ядро дальней энергии: "distance" — φ = Σ s·d (§5.5.1, минимизация); "gauss" — расширение статьи:
+# φ = Σ s·exp(−2d²/r²) по окрестности радиуса r(t) = радиусу выбора пар (максимизация),
+# ограниченное ядро не даёт далёким парам навязывать одинаковую закрутку соседним кластерам.
+_LONG_KERNELS = ("distance", "gauss")
+# Ядро окрестности при вычислении по §5.5.2: inverse — s/d, gauss — s·exp(−2d²/r²).
+_NEIGHBOURHOOD_KERNELS = ("inverse", "gauss")
 _LAYOUT_STEP_TIMELINE = "layout/step"
 
 
@@ -191,6 +228,9 @@ class _GpuLayoutEngine:
         uniform float eta;
         uniform int eta_enabled;
         uniform float distance_eps;
+        uniform int euclidean_distance;
+        uniform int kernel_mode;
+        uniform float kernel_width;
         out vec4 frag;
 
         float apply_lambda(float sim) {
@@ -226,7 +266,9 @@ class _GpuLayoutEngine:
                 float dy = pos_a_y - pos_b_y;
                 float dx = pos_a_x - pos_b_x;
                 float dist = sqrt(dy * dy + dx * dx);
-                float base_rad = max(1.0, ceil(dist));
+                // §5.5.2: r >= |p1 - p2|; +1 гарантирует, что окрестность
+                // содержит точки помимо самой пары.
+                float base_rad = ceil(dist) + 1.0;
                 float rad = base_rad;
                 if (use_radius_override == 1) {
                     rad = max(rad, radius);
@@ -260,14 +302,32 @@ class _GpuLayoutEngine:
                 float dx1 = pos_a_x - ox;
                 float dy2 = pos_b_y - oy;
                 float dx2 = pos_b_x - ox;
-                float d1 = dy1 * dy1 + dx1 * dx1;
-                float d2 = dy2 * dy2 + dx2 * dx2;
+                float d1sq = dy1 * dy1 + dx1 * dx1;
+                float d2sq = dy2 * dy2 + dx2 * dx2;
+                float d1 = d1sq;
+                float d2 = d2sq;
+                if (euclidean_distance == 1) {
+                    // §5.5: d1, d2 — евклидовы расстояния; иначе квадраты (§5.9.2).
+                    d1 = sqrt(d1sq);
+                    d2 = sqrt(d2sq);
+                }
                 if (mode == 0) {
                     energy_c += s1 * d1 + s2 * d2;
                     energy_s += s2 * d1 + s1 * d2;
                 } else {
-                    energy_c += s1 / (d1 + distance_eps) + s2 / (d2 + distance_eps);
-                    energy_s += s2 / (d1 + distance_eps) + s1 / (d2 + distance_eps);
+                    float w1;
+                    float w2;
+                    if (kernel_mode == 1) {
+                        // Гауссово ядро окрестности радиуса r, σ = kernel_width·r (расширение статьи).
+                        float sig2 = 2.0 * kernel_width * kernel_width * radius_sq;
+                        w1 = exp(-d1sq / sig2);
+                        w2 = exp(-d2sq / sig2);
+                    } else {
+                        w1 = 1.0 / (d1 + distance_eps);
+                        w2 = 1.0 / (d2 + distance_eps);
+                    }
+                    energy_c += s1 * w1 + s2 * w2;
+                    energy_s += s2 * w1 + s1 * w2;
                 }
             }
 
@@ -321,7 +381,8 @@ class _GpuLayoutEngine:
                 if (sim <= 0.0) {
                     continue;
                 }
-                energy += sim / (dist_sq + distance_eps);
+                // §5.7: E(c, r) = Σ sim_λ / d_c, d_c евклидово (как в CPU-пути).
+                energy += sim / (sqrt(dist_sq) + distance_eps);
             }
             frag = energy;
         }
@@ -528,6 +589,9 @@ class _GpuLayoutEngine:
         lambda_threshold: float,
         eta: float | None,
         distance_eps: float,
+        euclidean: bool = False,
+        kernel: str = "inverse",
+        kernel_width: float = 0.5,
     ) -> list[tuple[float, float]] | None:
         if self._sim_tex is None:
             return None
@@ -576,6 +640,9 @@ class _GpuLayoutEngine:
         self._pair_prog["eta_enabled"].value = 0 if eta is None else 1
         self._pair_prog["eta"].value = 0.0 if eta is None else float(eta)
         self._pair_prog["distance_eps"].value = float(distance_eps)
+        self._pair_prog["euclidean_distance"].value = 1 if euclidean else 0
+        self._pair_prog["kernel_mode"].value = {"inverse": 0, "gauss": 1}[kernel]
+        self._pair_prog["kernel_width"].value = float(kernel_width)
 
         self._pair_fbo.use()
         self._ctx.viewport = (0, 0, pair_count, 1)
@@ -879,6 +946,7 @@ class _TensorLayoutEngine:
         pos_x: Sequence[int],
         sim_lookup: Mapping[int, "numpy.ndarray"],
         distance_eps: float,
+        euclidean: bool = False,
     ) -> _TensorEnergyBatch | None:
         if self._subset_tensor is None or not pairs:
             return None
@@ -957,8 +1025,15 @@ class _TensorLayoutEngine:
             dx1 = pair_x1[:, None] - eval_x[None, :]
             dy2 = pair_y2[:, None] - eval_y[None, :]
             dx2 = pair_x2[:, None] - eval_x[None, :]
-            dist1 = dy1 * dy1 + dx1 * dx1
-            dist2 = dy2 * dy2 + dx2 * dx2
+            dist1_sq = dy1 * dy1 + dx1 * dx1
+            dist2_sq = dy2 * dy2 + dx2 * dx2
+            if euclidean:
+                # §5.5.1: φ = Σ(s1·d1 + s2·d2) с евклидовыми d; иначе d² (§5.9.2).
+                dist1 = torch.sqrt(dist1_sq)
+                dist2 = torch.sqrt(dist2_sq)
+            else:
+                dist1 = dist1_sq
+                dist2 = dist2_sq
 
             energy_c = torch.sum(s1 * dist1 + s2 * dist2, dim=1)
             energy_s = torch.sum(s2 * dist1 + s1 * dist2, dim=1)
@@ -1017,6 +1092,9 @@ class _TensorLayoutEngine:
         pos_x: Sequence[int],
         sim_lookup: Mapping[int, "numpy.ndarray"],
         distance_eps: float,
+        euclidean: bool = False,
+        kernel: str = "inverse",
+        kernel_width: float = 0.5,
     ) -> _TensorShortEnergyBatch | None:
         if self._subset_tensor is None:
             return None
@@ -1115,14 +1193,24 @@ class _TensorLayoutEngine:
 
             dist1 = (pair_y1[:, None] - subset_y[None, :]) ** 2 + (pair_x1[:, None] - subset_x[None, :]) ** 2
             dist2 = (pair_y2[:, None] - subset_y[None, :]) ** 2 + (pair_x2[:, None] - subset_x[None, :]) ** 2
-            denom1 = dist1 + distance_eps
-            denom2 = dist2 + distance_eps
+            if kernel == "gauss":
+                # Гауссово ядро окрестности радиуса r, σ = kernel_width·r (расширение статьи).
+                sig2 = 2.0 * kernel_width * kernel_width * radius_sq
+                w1 = torch.exp(-dist1 / sig2)
+                w2 = torch.exp(-dist2 / sig2)
+            else:
+                if euclidean:
+                    # §5.5.2: φ = Σ(s1/d1 + s2/d2) с евклидовыми d; иначе d² (§5.9.2).
+                    dist1 = torch.sqrt(dist1)
+                    dist2 = torch.sqrt(dist2)
+                w1 = 1.0 / (dist1 + distance_eps)
+                w2 = 1.0 / (dist2 + distance_eps)
 
             s1_masked = torch.where(mask_radius, s1, torch.zeros_like(s1))
             s2_masked = torch.where(mask_radius, s2, torch.zeros_like(s2))
 
-            energy_c = torch.sum(s1_masked / denom1 + s2_masked / denom2, dim=1)
-            energy_s = torch.sum(s2_masked / denom1 + s1_masked / denom2, dim=1)
+            energy_c = torch.sum(s1_masked * w1 + s2_masked * w2, dim=1)
+            energy_s = torch.sum(s2_masked * w1 + s1_masked * w2, dim=1)
             contrib_mask = mask_radius & ((s1_masked > 0.0) | (s2_masked > 0.0))
             contrib_counts = torch.sum(contrib_mask, dim=1)
 
@@ -1151,9 +1239,13 @@ class _AdaptiveLayoutState:
         if self._total_steps <= 1:
             return self._config.end_radius
         progress = step / max(1, self._total_steps - 1)
-        decayed = self._config.start_radius - (
-            (self._config.start_radius - self._config.end_radius) * progress
-        )
+        if self._config.geometric:
+            ratio = self._config.end_radius / self._config.start_radius
+            decayed = self._config.start_radius * (ratio ** progress)
+        else:
+            decayed = self._config.start_radius - (
+                (self._config.start_radius - self._config.end_radius) * progress
+            )
         return max(self._config.end_radius, int(round(decayed)))
 
     def radius_for_step(self, step: int) -> int:
@@ -1175,7 +1267,10 @@ class _AdaptiveLayoutState:
             if reduced_cap < self._radius_cap:
                 self._radius_cap = reduced_cap
             if self._config.lambda_step is not None:
-                new_lambda = min(1.0, current_lambda + self._config.lambda_step)
+                # §7.1.7: λ повышается ступенями, но не выше заданного максимума.
+                capped = min(self._config.lambda_max, current_lambda + self._config.lambda_step)
+                if capped > current_lambda:
+                    new_lambda = capped
         return new_lambda, swap_ratio
 
 
@@ -1240,17 +1335,32 @@ class Layout:
         seed: int = 0,
         parallel_workers: int | None = None,
         use_gpu: bool = True,
-        long_subset_size: int | None = 512,
+        long_subset_size: int | None = None,
         long_subset_refresh: int = 50,
+        colorizer: EncoderCodeColorizer | None = None,
+        long_distance: str = "squared",
+        short_distance: str = "squared",
+        long_kernel: str = "distance",
+        long_kernel_radius_min: int = 3,
+        long_kernel_width: float = 0.5,
     ) -> None:
         if not codes:
             raise ValueError("codes must be non-empty")
+        if long_kernel not in _LONG_KERNELS:
+            raise ValueError("long_kernel must be 'distance' or 'gauss'")
+        if long_kernel_radius_min <= 0:
+            raise ValueError("long_kernel_radius_min must be positive")
+        if long_kernel_width <= 0.0:
+            raise ValueError("long_kernel_width must be positive")
         if empty_ratio < 0:
             raise ValueError("empty_ratio must be >= 0")
         if similarity not in ("cosine", "jaccard"):
             raise ValueError("similarity must be 'cosine' or 'jaccard'")
+        if long_distance not in _DISTANCE_MODES or short_distance not in _DISTANCE_MODES:
+            raise ValueError("long_distance and short_distance must be 'squared' or 'euclidean'")
         if not 0 <= lambda_threshold <= 1:
             raise ValueError("lambda_threshold must be in [0, 1]")
+        self._validate_eta(eta)
         if max_precompute <= 0:
             raise ValueError("max_precompute must be positive")
         if parallel_workers is not None and parallel_workers < 0:
@@ -1279,8 +1389,18 @@ class Layout:
         self._values = [point.code.to01() for point in self._points]
         self._point_count = len(self._points)
         self._similarity = similarity
+        self._long_distance = long_distance
+        self._short_distance = short_distance
+        self._long_kernel = long_kernel
+        self._long_kernel_radius_min = int(long_kernel_radius_min)
+        self._long_kernel_width = float(long_kernel_width)
         self._lambda = lambda_threshold
         self._eta = eta
+        self._colorizer = colorizer or EncoderCodeColorizer(
+            min_hue=_DEFAULT_PSEUDO_COLOR_MIN_HUE,
+            max_hue=_DEFAULT_PSEUDO_COLOR_MAX_HUE,
+        )
+        self._colors_rgb_cache: tuple[tuple[int, int, int], ...] | None = None
         self._rng = random.Random(seed)
         self._parallel_workers = parallel_workers
         self._use_gpu = use_gpu
@@ -1334,6 +1454,36 @@ class Layout:
             "layout.thresholds",
             section=ENERGIES,
             data={"lambda_threshold": self._lambda, "eta": self._eta},
+        )
+        LOGGER.event(
+            "layout.energy.distance",
+            section=OPTIM_ENERGY,
+            data={
+                "long_distance": self._long_distance,
+                "short_distance": self._short_distance,
+                "note": "euclidean = d из §5.5; squared = сумма квадратов без корня (§5.9.2)",
+            },
+        )
+        LOGGER.event(
+            "layout.energy.long.kernel",
+            section=ENERGY_LONG,
+            data={
+                "kernel": self._long_kernel,
+                "radius_min": self._long_kernel_radius_min,
+                "width": self._long_kernel_width,
+                "note": "distance — φ = Σ s·d по всему V (§5.5.1); gauss — расширение статьи: "
+                "φ = Σ s·exp(−d²/2σ²) по окрестности r(t) = радиусу выбора пар (§7.1.7), σ = width·r, максимизация",
+            },
+        )
+        LOGGER.event(
+            "layout.similarity_threshold",
+            section=SIMILARITY_THRESHOLD,
+            data={
+                "lambda_threshold": self._lambda,
+                "eta": 0.0 if self._eta is None else float(self._eta),
+                "eta_mode": "hard_cutoff" if self._eta is None else "sigmoid",
+                "function": "sim * sigmoid(eta * (sim - lambda))" if self._eta is not None else "sim if sim >= lambda else 0",
+            },
         )
         LOGGER.event(
             "layout.precompute",
@@ -1405,6 +1555,9 @@ class Layout:
         self._long_swap_count = 0
         self._pair_radius: int | None = None
         self._distance_eps = 1e-6
+        # Температура принятия обменов: 0 — жадное правило §5.6; T > 0 — невыгодный обмен принимается
+        # с вероятностью exp(Δ / (T · rms|Δ|)) (отжиг, расширение статьи; §5.2 упоминает SA как прообраз).
+        self._swap_temperature = 0.0
         LOGGER.event(
             "layout.distance_eps",
             section=ENERGIES,
@@ -1630,11 +1783,19 @@ class Layout:
                 "layout.adaptive.config",
                 section=LAYOUT_PARAMETERS,
                 data={
+                    "mode": mode,
                     "start_radius": adaptive_params.start_radius,
                     "end_radius": adaptive_params.end_radius,
                     "swap_ratio_trigger": adaptive_params.swap_ratio_trigger,
                     "lambda_step": adaptive_params.lambda_step,
+                    "lambda_max": adaptive_params.lambda_max,
+                    "geometric": adaptive_params.geometric,
+                    "temperature": adaptive_params.temperature,
+                    "temperature_radius_min": adaptive_params.temperature_radius_min,
+                    "temperature_radius_max": adaptive_params.temperature_radius_max,
                     "steps": steps,
+                    "note": "линейное убывание радиуса, триггер обменов и рост λ — §7.1.7; "
+                    "geometric и temperature > 0 — расширение статьи (сглаживание между пинвилами)",
                 },
             )
         short_config: ShortLayoutOptimConfig | None = short_optim
@@ -1684,6 +1845,12 @@ class Layout:
                 if adaptive_state is not None
                 else resolved_pair_radius
             )
+            if adaptive_params is not None and mode == "long":
+                step_temperature = adaptive_params.temperature_for_radius(
+                    effective_pair_radius if effective_pair_radius is not None else 0
+                )
+                if step_temperature != self._swap_temperature:
+                    self.set_swap_temperature(step_temperature)
             swaps = self.step(
                 pairs_per_step=pairs_per_step,
                 pair_radius=effective_pair_radius,
@@ -1868,6 +2035,8 @@ class Layout:
                         )
                     break
 
+        if self._swap_temperature != 0.0:
+            self.set_swap_temperature(0.0)
         self.last_steps = steps_executed
         avg_swaps = (total_swaps / steps_executed) if steps_executed else 0.0
         LOGGER.event(
@@ -1991,12 +2160,24 @@ class Layout:
                 raise ValueError("lambda_threshold must be in [0, 1]")
             self._lambda = lambda_threshold
         if eta is not _UNSET:
+            self._validate_eta(eta)
             self._eta = eta
         LOGGER.event(
             "layout.similarity_params",
             section=ENERGIES,
             data={"lambda_threshold": self._lambda, "eta": self._eta},
         )
+
+    @staticmethod
+    def _validate_eta(eta: object) -> None:
+        """η задаёт крутизну сигмоиды порога λ; η = 0 отключает порог (§5.4)."""
+        if eta is None:
+            return
+        if not isinstance(eta, (int, float)) or isinstance(eta, bool) or float(eta) <= 0.0:
+            raise ValueError(
+                "eta must be positive or None for a hard cutoff; eta=0 would "
+                "turn sim_lambda into a constant 0.5*sim and disable the threshold (§5.4)"
+            )
 
     @property
     def pair_radius(self) -> int | None:
@@ -2056,10 +2237,20 @@ class Layout:
         else:
             pairs = [self._sample_pair(pair_radius) for _ in range(pairs_per_step)]
 
-        if mode == "short":
+        # Дальняя фаза с гауссовым ядром считается машинерией окрестности §5.5.2
+        # (радиус r(t) = радиус пар, ядро gauss, обмен при φ_s > φ_c); выбор пар остаётся дальним (§5.3).
+        gauss_long = mode == "long" and self._long_kernel == "gauss"
+        eval_short = mode == "short" or gauss_long
+        eval_kernel = "gauss" if gauss_long else "inverse"
+        eval_local_radius = local_radius if mode == "short" else self._long_kernel_radius(pair_radius)
+
+        # Для дальней фазы с гауссовым ядром OpenGL-движок (все пары одним вызовом) быстрее
+        # тензорного пути с подмножеством всего V, поэтому тензорный путь берётся только без OpenGL.
+        if eval_short and not (gauss_long and self._gpu_engine is not None):
             tensor_swaps = self._evaluate_pairs_short_tensor(
                 pairs,
-                local_radius=local_radius,
+                local_radius=eval_local_radius,
+                kernel=eval_kernel,
             )
             if tensor_swaps is not None:
                 return self._apply_tracked_swaps(tensor_swaps, mode=mode)
@@ -2099,11 +2290,14 @@ class Layout:
                 if pair_data:
                     energies = self._gpu_engine.compute_pair_energies(
                         pair_data,
-                        mode=mode,
-                        local_radius=local_radius,
+                        mode="short" if eval_short else "long",
+                        local_radius=eval_local_radius,
                         lambda_threshold=self._lambda,
                         eta=self._eta,
                         distance_eps=self._distance_eps,
+                        euclidean=self._distance_mode("short" if eval_short else "long") == "euclidean",
+                        kernel=eval_kernel,
+                        kernel_width=self._long_kernel_width,
                     )
                 else:
                     energies = []
@@ -2112,21 +2306,16 @@ class Layout:
                 energies = None
 
             if energies is not None:
-                for (y1, x1, y2, x2), (energy_c, energy_s) in zip(
-                    swap_coords, energies
-                ):
-                    if mode == "long":
-                        delta = energy_c - energy_s
-                        if energy_s < energy_c:
-                            swaps_with_delta.append(((y1, x1, y2, x2), delta))
-                    else:
-                        delta = energy_s - energy_c
-                        if energy_s > energy_c:
-                            swaps_with_delta.append(((y1, x1, y2, x2), delta))
-                return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
+                deltas = [
+                    (energy_s - energy_c) if eval_short else (energy_c - energy_s)
+                    for (energy_c, energy_s) in energies
+                ]
+                return self._apply_tracked_swaps(
+                    self._select_swaps(swap_coords, deltas), mode=mode
+                )
             self._gpu_engine = None
 
-        if mode == "long":
+        if mode == "long" and not gauss_long:
             pair_data: list[tuple[int, int, int, int, int | None, int | None]] = []
             swap_coords = []
             for y1, x1, y2, x2 in pairs:
@@ -2140,13 +2329,10 @@ class Layout:
                 energies = self._calculate_far_energies(pair_data)
             else:
                 energies = []
-            for (y1, x1, y2, x2), (energy_c, energy_s) in zip(
-                swap_coords, energies
-            ):
-                delta = energy_c - energy_s
-                if energy_s < energy_c:
-                    swaps_with_delta.append(((y1, x1, y2, x2), delta))
-            return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
+            deltas = [energy_c - energy_s for (energy_c, energy_s) in energies]
+            return self._apply_tracked_swaps(
+                self._select_swaps(swap_coords, deltas), mode=mode
+            )
 
         partitions = 1 if short_config is None else max(1, short_config.partitions)
         if partitions > 1:
@@ -2158,12 +2344,18 @@ class Layout:
                 partitions=partitions,
             )
         else:
+            coords: list[tuple[int, int, int, int]] = []
+            deltas: list[float] = []
             for y1, x1, y2, x2 in pairs:
-                should_swap, delta = self._should_swap(
-                    y1, x1, y2, x2, mode=mode, local_radius=local_radius
+                _, delta = self._should_swap(
+                    y1, x1, y2, x2,
+                    mode="short" if eval_short else mode,
+                    local_radius=eval_local_radius,
+                    kernel=eval_kernel,
                 )
-                if should_swap:
-                    swaps_with_delta.append(((y1, x1, y2, x2), delta))
+                coords.append((y1, x1, y2, x2))
+                deltas.append(delta)
+            swaps_with_delta = self._select_swaps(coords, deltas)
         return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
 
     def positions(self) -> list[tuple[int, int]]:
@@ -2251,19 +2443,58 @@ class Layout:
             },
         )
 
+    @property
+    def colorizer(self) -> EncoderCodeColorizer:
+        return self._colorizer
+
     def colors_rgb(self) -> list[tuple[int, int, int]]:
-        hues = self._normalized_hues()
-        return [self._hue_to_rgb(hue) for hue in hues]
+        """Псевдоцвет каждой точки как сумма цветов её единичных битов (§5.14)."""
+        if self._colors_rgb_cache is None:
+            self._colors_rgb_cache = tuple(
+                self._colorizer.color(point.code) for point in self._points
+            )
+        return list(self._colors_rgb_cache)
+
+    def component_colors_rgb(self, *, period: float | None = None) -> list[tuple[int, int, int]]:
+        """Диагностическая раскраска по известной компоненте стимула (рис. 13–16).
+
+        Используется только для визуальной проверки раскладки: значение ``hue``
+        точки — это исходная величина (например, угол), а не код. В самом
+        алгоритме раскладки она не участвует.
+        """
+        import colorsys
+
+        hues = [point.hue for point in self._points]
+        if not hues:
+            return []
+        if period is None:
+            min_hue = min(hues)
+            max_hue = max(hues)
+            span = max_hue - min_hue
+            normalized = [
+                0.0 if span <= 0.0 else (hue - min_hue) / span * (1.0 - 1e-9)
+                for hue in hues
+            ]
+        else:
+            if period <= 0.0:
+                raise ValueError("period must be positive")
+            normalized = [(hue % period) / period for hue in hues]
+        colors: list[tuple[int, int, int]] = []
+        for value in normalized:
+            r, g, b = colorsys.hsv_to_rgb(value, 1.0, 1.0)
+            colors.append((int(r * 255), int(g * 255), int(b * 255)))
+        return colors
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
+        """Карта раскладки в псевдоцветах кодов (§5.14)."""
         colors = self.colors_rgb()
         image = self._build_image(colors)
         if log:
             positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
             LOGGER.event(
                 "layout.render_image",
-                section=LAYOUT_ALGORITHM,
-                data={"height": self.height, "width": self.width},
+                section=LAID_OUT_STRUCTURE,
+                data={"height": self.height, "width": self.width, "coloring": "code_bits"},
                 visuals=[
                     LOGGER.visual_image(
                         "layout/final/image",
@@ -2272,6 +2503,80 @@ class Layout:
                     ),
                     LOGGER.visual_points2d(
                         "layout/final/points",
+                        positions,
+                        colors=colors,
+                        radii=0.5,
+                        static=True,
+                    ),
+                ],
+            )
+        return image
+
+    def render_energy_image(
+        self, energies: Sequence[float], *, log: bool = True
+    ) -> "numpy.ndarray":
+        """Композиция V и Ê: цвет точки по коду, яркость по энергии (рис. 18, §5.14)."""
+        if len(energies) != self._point_count:
+            raise ValueError("energies must match the number of layout points")
+        colors = self.colors_rgb()
+        shaded: list[tuple[int, int, int]] = []
+        for color, energy in zip(colors, energies):
+            brightness = max(0.0, min(1.0, float(energy)))
+            shaded.append(tuple(int(round(channel * brightness)) for channel in color))
+        image = self._build_image(shaded)
+        if log:
+            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+            LOGGER.event(
+                "layout.render_energy_image",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "height": self.height,
+                    "width": self.width,
+                    "coloring": "code_bits_times_energy",
+                    "energy_mean": sum(float(e) for e in energies) / max(1, len(energies)),
+                },
+                visuals=[
+                    LOGGER.visual_image(
+                        "layout/final/energy_image",
+                        image,
+                        static=True,
+                    ),
+                    LOGGER.visual_points2d(
+                        "layout/final/energy_points",
+                        positions,
+                        colors=shaded,
+                        radii=0.5,
+                        static=True,
+                    ),
+                ],
+            )
+        return image
+
+    def render_component_image(
+        self, *, period: float | None = None, log: bool = True
+    ) -> "numpy.ndarray":
+        """Карта раскладки в цветах известной компоненты стимула (ср. рис. 16, §5.13.2)."""
+        colors = self.component_colors_rgb(period=period)
+        image = self._build_image(colors)
+        if log:
+            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+            LOGGER.event(
+                "layout.render_component_image",
+                section=MAPPING_CONTINUITY,
+                data={
+                    "height": self.height,
+                    "width": self.width,
+                    "coloring": "stimulus_component",
+                    "period": period,
+                },
+                visuals=[
+                    LOGGER.visual_image(
+                        "layout/final/component_image",
+                        image,
+                        static=True,
+                    ),
+                    LOGGER.visual_points2d(
+                        "layout/final/component_points",
                         positions,
                         colors=colors,
                         radii=0.5,
@@ -2378,7 +2683,8 @@ class Layout:
                     sim = sim_lambda(idx, other_idx)
                     if sim <= 0.0:
                         continue
-                    energy += sim / (dist_sq + self._distance_eps)
+                    # §5.7: E(c, r) = Σ sim_λ(c, v) / d_c, расстояние евклидово.
+                    energy += sim / (math.sqrt(dist_sq) + self._distance_eps)
             energies.append(energy)
 
         emax = max(energies)
@@ -2448,6 +2754,18 @@ class Layout:
         y_max_bound = (self.height - 1) if bounds is None else bounds[1]
         x_min_bound = 0 if bounds is None else bounds[2]
         x_max_bound = (self.width - 1) if bounds is None else bounds[3]
+        # Случайная плитка разбиения может состоять из единственной клетки.
+        # В ней нет второй точки, поэтому локальный цикл никогда не завершится.
+        if (
+            y_min_bound == y_max_bound
+            and x_min_bound == x_max_bound
+            and y_min_bound == y1
+            and x_min_bound == x1
+        ):
+            y_min_bound = 0
+            y_max_bound = self.height - 1
+            x_min_bound = 0
+            x_max_bound = self.width - 1
         if radius is None:
             while True:
                 y2 = self._rng.randint(y_min_bound, y_max_bound)
@@ -2519,9 +2837,31 @@ class Layout:
                     sim = self._sim_lambda_idx(idx, other_idx)
                     if sim <= 0.0:
                         continue
-                    energy += sim / (dist_sq + self._distance_eps)
+                    # §5.7: энергия точки использует евклидово расстояние d_c.
+                    energy += sim / (math.sqrt(dist_sq) + self._distance_eps)
             energies[idx] = energy
         return energies
+
+    def point_energies(self, radius: int) -> list[float]:
+        """Нормированная энергия каждой точки Ê(c, r_e) = E / E_max (§5.7)."""
+        if radius <= 0:
+            raise ValueError("radius must be positive")
+        energies = self._compute_point_energies(radius)
+        emax = max(energies, default=0.0)
+        normalized = [energy / emax if emax > 0.0 else 0.0 for energy in energies]
+        LOGGER.event(
+            "layout.point_energy.map",
+            section=POINT_ENERGY,
+            data={
+                "radius": radius,
+                "points": self._point_count,
+                "energy_max": emax,
+                "energy_mean_normalized": (
+                    sum(normalized) / len(normalized) if normalized else 0.0
+                ),
+            },
+        )
+        return normalized
 
     def _ensure_short_energy_weights(
         self, *, step_index: int | None, config: ShortLayoutOptimConfig
@@ -2828,7 +3168,8 @@ class Layout:
 
     def _short_pair_radius(self, y1: int, x1: int, y2: int, x2: int, local_radius: int | None) -> int:
         dist_sq = (y1 - y2) ** 2 + (x1 - x2) ** 2
-        base_radius = max(1, int(math.ceil(math.sqrt(dist_sq))))
+        # §5.5.2: r >= |p1 - p2|; +1 гарантирует точки помимо самой пары.
+        base_radius = int(math.ceil(math.sqrt(dist_sq))) + 1
         if local_radius is None:
             return base_radius
         return max(local_radius, base_radius)
@@ -2870,6 +3211,7 @@ class Layout:
         pairs: Sequence[tuple[int, int, int, int]],
         *,
         local_radius: int | None,
+        kernel: str = "inverse",
     ) -> list[tuple[tuple[int, int, int, int], float]] | None:
         tensor_engine = self._tensor_engine if self._use_gpu else None
         if tensor_engine is None:
@@ -3002,6 +3344,9 @@ class Layout:
                 self._pos_x,
                 self._short_similarity_cache,
                 self._distance_eps,
+                euclidean=self._short_distance == "euclidean",
+                kernel=kernel,
+                kernel_width=self._long_kernel_width,
             )
         except Exception as exc:
             recovered_from_oom = tensor_engine.release_memory_on_oom(
@@ -3024,6 +3369,9 @@ class Layout:
                         self._pos_x,
                         self._short_similarity_cache,
                         self._distance_eps,
+                        euclidean=self._short_distance == "euclidean",
+                        kernel=kernel,
+                        kernel_width=self._long_kernel_width,
                     )
                 except Exception as retry_exc:
                     LOGGER.event(
@@ -3063,6 +3411,57 @@ class Layout:
                 swaps_with_delta.append(((pair.y1, pair.x1, pair.y2, pair.x2), delta))
         return swaps_with_delta
 
+    def set_swap_temperature(self, temperature: float) -> None:
+        """Температура принятия обменов: 0 — жадное правило §5.6, иначе Metropolis по нормированной Δ."""
+        if temperature < 0.0:
+            raise ValueError("swap temperature must be >= 0")
+        self._swap_temperature = float(temperature)
+        LOGGER.event(
+            "layout.swap.temperature",
+            section=POINT_EXCHANGE,
+            data={"temperature": self._swap_temperature,
+                  "note": "0 — обмен только при выгодной энергии (§5.6); >0 — отжиг (расширение статьи)"},
+        )
+
+    def _select_swaps(
+        self,
+        coords: Sequence[tuple[int, int, int, int]],
+        deltas: Sequence[float],
+    ) -> list[tuple[tuple[int, int, int, int], float]]:
+        """Отбор обменов по Δ (положительная Δ = выгодно): жадно (§5.6) или с температурой."""
+        if self._swap_temperature <= 0.0:
+            return [(c, float(d)) for c, d in zip(coords, deltas) if d > 0.0]
+        import numpy as np
+
+        arr = np.asarray(deltas, dtype=np.float64)
+        if arr.size == 0:
+            return []
+        rms = float(np.sqrt(np.mean(arr * arr))) or 1.0
+        scale = self._swap_temperature * rms
+        accept = arr > 0.0
+        losing = ~accept & (arr < 0.0)
+        if losing.any():
+            draws = np.array([self._rng.random() for _ in range(int(losing.sum()))])
+            accept[losing] = draws < np.exp(arr[losing] / scale)
+        LOGGER.event(
+            "layout.swap.annealed",
+            section=POINT_EXCHANGE,
+            data={"pairs": int(arr.size), "favourable": int((arr > 0.0).sum()),
+                  "accepted_unfavourable": int((accept & (arr <= 0.0)).sum()),
+                  "temperature": self._swap_temperature, "rms_delta": rms},
+        )
+        return [(c, float(d)) for c, d, ok in zip(coords, deltas, accept) if ok]
+
+    def _long_kernel_radius(self, pair_radius: int | None) -> int:
+        """Радиус окрестности гауссова ядра дальней фазы: следует за радиусом выбора пар, не ниже минимума."""
+        if pair_radius is None:
+            return self._long_kernel_radius_min
+        return max(self._long_kernel_radius_min, int(pair_radius))
+
+    def _distance_mode(self, mode: str) -> str:
+        """Режим расстояния энергии фазы: евклидово d (§5.5) или d² (§5.9.2)."""
+        return self._long_distance if mode == "long" else self._short_distance
+
     def _should_swap(
         self,
         y1: int,
@@ -3072,6 +3471,7 @@ class Layout:
         *,
         mode: str,
         local_radius: int | None,
+        kernel: str = "inverse",
     ) -> tuple[bool, float]:
         idx_a = self.grid[y1][x1]
         idx_b = self.grid[y2][x2]
@@ -3089,10 +3489,11 @@ class Layout:
             return energy_s < energy_c, energy_c - energy_s
 
         dist_sq = (y1 - y2) ** 2 + (x1 - x2) ** 2
-        base_radius = max(1, int(math.ceil(math.sqrt(dist_sq))))
+        # §5.5.2: r >= |p1 - p2|; +1 гарантирует точки помимо самой пары.
+        base_radius = int(math.ceil(math.sqrt(dist_sq))) + 1
         radius = base_radius if local_radius is None else max(local_radius, base_radius)
         energy_c, energy_s = self._pair_energy_short(
-            idx_a, (y1, x1), idx_b, (y2, x2), radius=radius
+            idx_a, (y1, x1), idx_b, (y2, x2), radius=radius, kernel=kernel
         )
         return energy_s > energy_c, energy_s - energy_c
 
@@ -3248,6 +3649,7 @@ class Layout:
                     self._pos_x,
                     sim_lookup,
                     self._distance_eps,
+                    euclidean=self._long_distance == "euclidean",
                 )
             except Exception as exc:
                 LOGGER.event(
@@ -3342,8 +3744,15 @@ class Layout:
             dx1 = x1 - eval_x
             dy2 = y2 - eval_y
             dx2 = x2 - eval_x
-            dist1 = dy1 * dy1 + dx1 * dx1
-            dist2 = dy2 * dy2 + dx2 * dx2
+            dist1_sq = dy1 * dy1 + dx1 * dx1
+            dist2_sq = dy2 * dy2 + dx2 * dx2
+            if self._long_distance == "euclidean":
+                # §5.5.1: φ = Σ(s1·d1 + s2·d2) с евклидовыми d; иначе d² (§5.9.2).
+                dist1 = np.sqrt(dist1_sq)
+                dist2 = np.sqrt(dist2_sq)
+            else:
+                dist1 = dist1_sq
+                dist2 = dist2_sq
             energy_c = float(np.sum(s1 * dist1 + s2 * dist2))
             energy_s = float(np.sum(s2 * dist1 + s1 * dist2))
 
@@ -3420,7 +3829,10 @@ class Layout:
         pos_b: tuple[int, int],
         *,
         radius: int,
+        kernel: str = "inverse",
     ) -> tuple[float, float]:
+        if kernel not in _NEIGHBOURHOOD_KERNELS:
+            raise ValueError("kernel must be 'inverse' or 'gauss'")
         cy = (pos_a[0] + pos_b[0]) / 2.0
         cx = (pos_a[1] + pos_b[1]) / 2.0
         radius_sq = radius * radius
@@ -3458,12 +3870,19 @@ class Layout:
                 dx2 = pos_b[1] - x
                 d1 = dy1 * dy1 + dx1 * dx1
                 d2 = dy2 * dy2 + dx2 * dx2
-                energy_c += s1 / (d1 + self._distance_eps) + s2 / (
-                    d2 + self._distance_eps
-                )
-                energy_s += s2 / (d1 + self._distance_eps) + s1 / (
-                    d2 + self._distance_eps
-                )
+                if kernel == "gauss":
+                    sig2 = 2.0 * self._long_kernel_width ** 2 * radius_sq
+                    w1 = math.exp(-d1 / sig2)
+                    w2 = math.exp(-d2 / sig2)
+                else:
+                    if self._short_distance == "euclidean":
+                        # §5.5.2: φ = Σ(s1/d1 + s2/d2) с евклидовыми d; иначе d² (§5.9.2).
+                        d1 = math.sqrt(d1)
+                        d2 = math.sqrt(d2)
+                    w1 = 1.0 / (d1 + self._distance_eps)
+                    w2 = 1.0 / (d2 + self._distance_eps)
+                energy_c += s1 * w1 + s2 * w2
+                energy_s += s2 * w1 + s1 * w2
         return energy_c, energy_s
 
     def _apply_tracked_swaps(
@@ -3929,23 +4348,6 @@ class Layout:
             return f"{number:.3f}"
         return str(value)
 
-    def _normalized_hues(self) -> list[float]:
-        if not self._points:
-            return []
-        hues = [point.hue for point in self._points]
-        min_hue = min(hues)
-        max_hue = max(hues)
-        if max_hue == min_hue:
-            return [0.0 for _ in hues]
-        scale = HUE / (max_hue - min_hue)
-        normalized = []
-        for hue in hues:
-            value = (hue - min_hue) * scale
-            if value >= HUE:
-                value = HUE - 1e-9
-            normalized.append(value)
-        return normalized
-
     def _coerce_code_entry(
         self,
         entry: LayoutEncodedCode | BitArray | Iterable[int],
@@ -3977,16 +4379,3 @@ class Layout:
                 layout_code.set(idx, 1)
                 ones += 1
         return layout_code, ones
-
-    @staticmethod
-    def _angle_similarity(angle_a: float, angle_b: float) -> float:
-        diff = abs(angle_a - angle_b) % 360.0
-        diff = min(diff, 360.0 - diff)
-        return (math.cos(math.radians(diff)) + 1.0) / 2.0
-
-    @staticmethod
-    def _hue_to_rgb(hue: float) -> tuple[int, int, int]:
-        import colorsys
-
-        r, g, b = colorsys.hsv_to_rgb((hue % HUE) / HUE, 1.0, 1.0)
-        return int(r * 255), int(g * 255), int(b * 255)

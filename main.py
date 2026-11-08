@@ -4,27 +4,43 @@ from dataclasses import dataclass
 import json
 import os
 from collections import OrderedDict
-from typing import ClassVar, Sequence
+from typing import ClassVar, Mapping, Sequence
 import argparse
 
 from damp.article_refs import (
+    LONG_RANGE_IMPORTANCE,
     CODE_SPACE_ACTIVATION,
-    DETECTOR_CONSTRUCTION,
     DETECTOR_HIERARCHY,
-    DETECTOR_RADIUS,
     DETECTOR_INSERTION,
-    ENERGY_CALC,
     LAYOUT_PARAMETERS,
     LAYOUT_SYSTEM,
     LAID_OUT_STRUCTURE,
+    MAPPING_CONTINUITY,
+    OPTIM_SUBSET,
+    SPACE_FILLING,
     STIMULUS_DETECTION,
     ENCODING_SYSTEM,
     GPU_IMPLEMENTATION,
     PARALLEL_PROCESSING,
 )
-from damp.activation import ActivationEngine, Detector
+from damp.activation import (
+    ActivationEngine,
+    DbscanClusterer,
+    Detector,
+    DetectorHierarchyBuilder,
+    DetectorLayerConfig,
+    DetectorOutputSizer,
+    OutputCodeSize,
+    reassign_output_bits,
+)
 from damp.MnistSobelAngleMap import MnistSobelAngleMap
-from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
+from damp.encoding.damp_encoder import (
+    ClosedDimension,
+    Encoder,
+    EncoderCodeColorizer,
+    OpenedDimension,
+    geometric_detector_layers,
+)
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
 from damp.encoding.bitarray import BitArray
@@ -60,19 +76,76 @@ LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 3
+EMBEDDINGS_VERSION = 5
+ACTIVATION_METADATA_KEY = "activation"
+ENCODER_SIGNATURE_KEY = "encoder_signature"
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 2
+PIPELINE_CHECKPOINT_VERSION = 3
 
+# --- Первичное кодирование стимулов MNIST (угол, X, Y) по схеме Angle-Encoder:
+# фиксированная длина сегмента, случайный бит у каждого детектора, слои от
+# самого широкого к самому узкому (§2.2.3, §4.2.1, §4.4, §4.5).
+ENCODER_RANDOM_SEED = 0
+ENCODER_LOG_EVERY = 50
+ENCODER_LAYER_PHASE = True
+MNIST_ANGLE_IN_DEGREES = True
+MNIST_GRAD_THRESHOLD = 0.05
+MNIST_ANGLE_MIN = 0.0
+MNIST_ANGLE_MAX = 360.0
+MNIST_ANGLE_CODE_LENGTH = 256
+MNIST_ANGLE_LAYERS = 22
+MNIST_ANGLE_WIDEST_DETECTORS = 2
+MNIST_ANGLE_NARROWEST_DETECTORS = 180
+MNIST_ANGLE_OVERLAP = 0.4
+MNIST_POSITION_MIN = 0.0
+MNIST_POSITION_MAX = 6.0
+MNIST_POSITION_CODE_LENGTH = 128
+MNIST_POSITION_LAYERS = 13
+MNIST_POSITION_WIDEST_DETECTORS = 2
+MNIST_POSITION_NARROWEST_DETECTORS = MnistSobelAngleMap.EXPECTED_SIDE // 2
+# Перекрытие ≥ 0.5 нужно, чтобы точка покрывалась двумя детекторами на слой: тогда сходство кодов
+# позиций убывает с расстоянием монотонно (§4.5), и раскладка воспроизводит решётку позиций.
+MNIST_POSITION_OVERLAP = 0.6
+# Шаг сетки позиций (индексы участков): на нём проверяется дальний порядок кодов позиций (§4.5).
+MNIST_POSITION_STEP = 1.0
+
+# --- Псевдоцвета карт: младший бит красный, старший фиолетовый (§5.14);
+# диагностическая раскраска по углу стимула как на рис. 16 (§5.13.2).
+LAYOUT_PSEUDO_COLOR_MIN_HUE = 0.0
+LAYOUT_PSEUDO_COLOR_MAX_HUE = 300.0
+LAYOUT_COMPONENT_IMAGE_SUFFIX = ".angle.png"
+LAYOUT_ENERGY_IMAGE_SUFFIX = ".energy.png"
+
+# --- Раскладка (§5.4, §7.1.6, §7.1.7): cosine, порог λ с сигмоидой η,
+# запас пустых ячеек ≈15%, дальняя энергия по всему пространству V (§5.5.1).
+# Сглаживание пространства между пинвилами (расширение статьи): гауссово ядро дальней фазы, старт радиуса
+# со всей карты, геометрическое убывание радиуса, фиксированный λ и слабый отжиг разворачивают соседние
+# пинвилы друг к другу и убирают складки на их границах (docs/ARTICLE_COMPLIANCE.md).
+# False — дальняя фаза строго по статье: φ = Σ s·d по всему V (§5.5.1), радиус пар линейно от d/2 к 1,
+# триггер 1 % обменов и рост λ ступенями (§7.1.7), жадное правило обмена без отжига (§5.6).
+LAYOUT_SMOOTH_PINWHEELS = False
+# Метка кеша раскладки: раскладки старых версий Encoder и другого режима дальней фазы не переиспользуются.
+LAYOUT_CACHE_TAG = "gauss-kernel-v1" if LAYOUT_SMOOTH_PINWHEELS else "article-kernel-v1"
 LAYOUT_SIMILARITY = "cosine"
+# Расстояние в парных энергиях: "euclidean" — d из §5.5, "squared" — d² без корня (§5.9.2).
+LAYOUT_LONG_DISTANCE = "euclidean"
+LAYOUT_SHORT_DISTANCE = "squared"
+# Ядро дальней энергии: "distance" — φ = Σ s·d по §5.5.1; "gauss" — расширение статьи: ограниченное
+# гауссово ядро окрестности радиуса r(t), r(t) следует за радиусом выбора пар (§7.1.7), не ниже минимума.
+# Ограниченное ядро даёт гладкую карту из нескольких пинвилов с чередованием закрутки (как в V1).
+LAYOUT_LONG_KERNEL = "gauss" if LAYOUT_SMOOTH_PINWHEELS else "distance"
+LAYOUT_LONG_KERNEL_RADIUS_MIN = 3
+LAYOUT_LONG_KERNEL_WIDTH = 1.0   # σ гауссова ядра = width · r(t); при σ = r связь через границы кластеров сильнее
 LAYOUT_LAMBDA_THRESHOLD = 0.65
-LAYOUT_ETA = 0
-LAYOUT_EMPTY_RATIO = 0.5
+LAYOUT_ETA = 10.0
+LAYOUT_EMPTY_RATIO = 0.15
 LAYOUT_USE_GPU = True
+LAYOUT_RANDOM_SEED = 0
+LAYOUT_LONG_FULL_SPACE_MAX_POINTS = 8000
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
-LAYOUT_LONG_SUBSET_SIZE = 1024
+LAYOUT_LONG_SUBSET_SIZE = None
 LAYOUT_LONG_SUBSET_REFRESH = 40
 
 LAYOUT_SHORT_PAIRS_PER_STEP = 100
@@ -88,47 +161,78 @@ LAYOUT_SHORT_PARTITIONS = 8
 
 MPS_HIGH_WATERMARK_RATIO = 0.0
 
-ENCODER_LOG_EVERY = 50
 LAYOUT_LOG_EVERY_LONG = 150
 LAYOUT_LOG_EVERY_SHORT = 50
 LAYOUT_LOG_VISUALS = True
-LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.5
+# Стартовый радиус выбора пар в долях стороны карты: 0.5 — d/2 по §7.1.7; 1.0 — вся карта,
+# как начальная ширина окрестности в SOM (нужно гауссову ядру, иначе позиции распадаются на куски).
+LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 1.0 if LAYOUT_SMOOTH_PINWHEELS else 0.5
+# Геометрическое убывание радиуса в дальней фазе (расширение статьи); False — линейное (§7.1.7).
+LAYOUT_ADAPTIVE_RADIUS_GEOMETRIC = LAYOUT_SMOOTH_PINWHEELS
+# Отжиг в дальней фазе (расширение статьи): температура принятия невыгодных обменов в долях rms|Δ|
+# на радиусах от LAYOUT_ANNEAL_RADIUS_MIN до LAYOUT_ANNEAL_RADIUS_MAX_FACTOR·d — масштаб, на котором
+# соседние кластеры согласуют закрутку и фазу; снимает замёрзшие складки между кластерами.
+# 0 — отжига нет, обмен только при выигрыше энергии (§5.6).
+LAYOUT_ANNEAL_TEMPERATURE = 0.1 if LAYOUT_SMOOTH_PINWHEELS else 0.0
+LAYOUT_ANNEAL_RADIUS_MAX_FACTOR = 0.4
+LAYOUT_ANNEAL_RADIUS_MIN = 5
 LAYOUT_ADAPTIVE_RADIUS_MIN = 1
-LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
-LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
+# Триггер по доле обменов (1% от начальной, §7.1.7): 0 — расписание не ускоряется по обменам.
+LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.0 if LAYOUT_SMOOTH_PINWHEELS else 0.01
+# Рост λ ступенями до LAYOUT_ADAPTIVE_LAMBDA_MAX (§7.1.7); None — λ фиксирован: с гауссовым ядром
+# рост λ ослабляет связь через границы кластеров и оставляет складки.
+LAYOUT_ADAPTIVE_LAMBDA_STEP = None if LAYOUT_SMOOTH_PINWHEELS else 0.05
+LAYOUT_ADAPTIVE_LAMBDA_MAX = 0.85
 LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR = 1.0
 LAYOUT_ENERGY_STABILITY_WINDOW = 20
 LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
 LAYOUT_ENERGY_STABILITY_EVERY = 200
 LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
-LAYOUT_MIN_SWAP_RATIO = 0.003
-LAYOUT_MIN_SWAP_WINDOW = 1
+LAYOUT_MIN_SWAP_RATIO = 0.0001
+LAYOUT_MIN_SWAP_WINDOW = 20
 
-ACTIVATION_LAMBDA_THRESHOLD = 0.55
+# --- Детекторная иерархия (§6.3–§6.5, §7.1.10, §7.1.12). Порог активации λ_a
+# равен порогу нижнего слоя детекторов (§7.1.11); размер и насыщенность
+# выходного кода вычисляются по среднему числу активных детекторов (§6.6).
+ACTIVATION_LAMBDA_THRESHOLD = 0.7
 ACTIVATION_ETA = None
 ACTIVATION_ENERGY_THRESHOLD = 0.12
 ACTIVATION_DETECTOR_THRESHOLD = 0.5
-ACTIVATION_SATURATION_LIMIT = 50
-ACTIVATION_POINT_ENERGY_RADIUS = 3
-ACTIVATION_DETECTOR_RADIUS = 6
-ACTIVATION_DETECTOR_RADIUS_MIN = 1
-ACTIVATION_DETECTOR_TARGET_POINTS = 28
-ACTIVATION_DETECTOR_MIN_POINTS = 3
-ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR = 0.8
-ACTIVATION_DETECTOR_STEP_DENSITY = 6
-
-ACTIVATION_MAX_DETECTORS = 256
 ACTIVATION_OUTPUT_BITS = 256
-ACTIVATION_LAMBDA_LEVELS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.85)
+ACTIVATION_SATURATION_LIMIT = 50
+ACTIVATION_MAX_EMBEDDING_DENSITY = 0.25
+ACTIVATION_SATURATION_MIN = 16
+ACTIVATION_SATURATION_MAX = 128
+ACTIVATION_OUTPUT_CALIBRATION_SAMPLES = 100
+ACTIVATION_POINT_ENERGY_RADIUS = 3
+ACTIVATION_DETECTOR_RADIUS_MIN = 1
+# Слои иерархии (§7.1.10): порог λ_d, радиус активации r_a как доля стороны
+# карты (нижние слои — области и гиперкластеры, верхние — кластеры и секторы)
+# и минимальное число точек кластера.
+ACTIVATION_DETECTOR_LAYER_SPECS = (
+    (0.70, 0.35, 12),
+    (0.75, 0.28, 10),
+    (0.80, 0.22, 8),
+    (0.85, 0.16, 6),
+    (0.90, 0.12, 4),
+)
+ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 400
+ACTIVATION_DETECTOR_SEED = 0
+ACTIVATION_DBSCAN_EPS = 1.5
+ACTIVATION_DBSCAN_MIN_SAMPLES = 3
 ACTIVATION_USE_GPU = True
 ACTIVATION_PARALLEL_WORKERS = 4
 ACTIVATION_BATCH_SIZE = 10
 ACTIVATION_CHECKPOINT_EVERY = 10
 
+# --- Декодер: нечёткий поиск по базе эмбеддингов (§2.2.5).
 DECODER_SIMILARITY = "jaccard2"
 DECODER_SOFTMAX_TEMPERATURE = 0.35
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
+DECODER_KNN_TOP_K = 200
+DECODER_TOP_K_PER_CLASS = 20
+DECODER_MIN_SIMILARITY = 0.0
 DECODER_DATASET_LIMIT = 64
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
@@ -137,8 +241,8 @@ LAYOUT_TUNE_LONG_PAIR_FACTOR = 0.35
 LAYOUT_TUNE_LONG_PAIRS_MIN = 4000
 LAYOUT_TUNE_LONG_PAIRS_MAX = 20000
 LAYOUT_TUNE_LONG_STEPS_DIVISOR = 25
-LAYOUT_TUNE_LONG_STEPS_MIN = 300
-LAYOUT_TUNE_LONG_STEPS_MAX = 1500
+LAYOUT_TUNE_LONG_STEPS_MIN = 2500
+LAYOUT_TUNE_LONG_STEPS_MAX = 5000
 LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER = 8
 LAYOUT_TUNE_LONG_SUBSET_MIN = 512
 LAYOUT_TUNE_LONG_SUBSET_MAX = 2048
@@ -151,11 +255,50 @@ LAYOUT_TUNE_SHORT_PAIRS_MAX = 12000
 LAYOUT_TUNE_SHORT_STEPS_FACTOR = 1.6
 LAYOUT_TUNE_SHORT_STEPS_MIN = 160
 LAYOUT_TUNE_SHORT_STEPS_MAX = 900
-LAYOUT_TUNE_SHORT_RADIUS_FACTOR = 0.05
-LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR = 0.04
+LAYOUT_TUNE_SHORT_RADIUS_FACTOR = 0.08
+LAYOUT_SHORT_LOCAL_RADIUS_MIN = 3
+LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR = 0.06
 LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR = 30
+
+# --- Тест MNIST-кодера: по 360 углов при двух позициях в сетке участков.
+# Код Angle || X || Y и параметры раскладки общие с MNIST (§2.2.3, §4.6, §5).
+PINWHEEL_ANGLE_COUNT = 360
+PINWHEEL_POSITION_X = (MNIST_POSITION_MIN + MNIST_POSITION_MAX) / 2.0
+PINWHEEL_POSITION_Y = (MNIST_POSITION_MIN + MNIST_POSITION_MAX) / 2.0
+PINWHEEL_POSITIONS = (
+    (1.0, 1.0),
+    (2.0, 1.0),
+    (1.0, 2.0),
+    (2.0, 2.0),
+
+)
+
+
+PINWHEEL_SMOOTH_DELTA = 15.0
+PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
+PINWHEEL_COMPONENT_OUTPUT_PATH = "pinwheel_test.angle.png"
+PINWHEEL_ENERGY_OUTPUT_PATH = "pinwheel_test.energy.png"
+PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
+    "detectors.geometric_layers": LOG_INTERVAL_INIT,
+    "encoder.random_bits": LOG_INTERVAL_INIT,
+    "encoder.colorizer.dimension": LOG_INTERVAL_INIT,
+    "encoder.code.color": LOG_INTERVAL_LAYOUT_PAIR,
+    "layout.similarity_threshold": LOG_INTERVAL_INIT,
+    "layout.point_energy.map": LOG_INTERVAL_INIT,
+    "layout.render_component_image": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.render_energy_image": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.visual.save": LOG_INTERVAL_LAYOUT_EXPORT,
+    "activation.detector.builder.init": LOG_INTERVAL_INIT,
+    "activation.detector.levels": LOG_INTERVAL_INIT,
+    "activation.detector.hierarchy": LOG_INTERVAL_INIT,
+    "activation.detector.layer.filled": LOG_INTERVAL_INIT,
+    "activation.detector.cluster": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.cluster.noise": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.center": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.radius": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.embedding.saturation": LOG_INTERVAL_ACTIVATION_EMBEDDING,
     "dimension.closed": LOG_INTERVAL_INIT,
     "dimension.init": LOG_INTERVAL_INIT,
     "encoder.code_length": LOG_INTERVAL_INIT,
@@ -254,7 +397,10 @@ LOG_INTERVALS = {
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
 }
 
-LAYOUT_CACHE_PATTERNS = ("data/layout-{count}-*.json", "layout-{count}-*.json")
+LAYOUT_CACHE_PATTERNS = (
+    f"data/layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
+    f"layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
+)
 
 
 def _layout_cache_paths_for_count(count: int) -> list[str]:
@@ -369,7 +515,13 @@ class EmbeddingStore:
         self._version_key = str(version_key)
         self._version = int(version)
 
-    def save(self, path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
+    def save(
+        self,
+        path: str,
+        embeddings: Sequence[EmbeddingRecord],
+        *,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
         if not path:
             raise ValueError("path must be provided to save embeddings")
         directory = os.path.dirname(path)
@@ -394,6 +546,8 @@ class EmbeddingStore:
                 payload = {}
         payload[self._json_key] = [record.as_payload() for record in embeddings]
         payload[self._version_key] = self._version
+        if metadata is not None:
+            payload[ACTIVATION_METADATA_KEY] = dict(metadata)
         with open(path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=True, indent=2)
         LOGGER.event(
@@ -405,6 +559,16 @@ class EmbeddingStore:
             "json_key": self._json_key,
         },
     )
+    def load_metadata(self, path: str) -> dict[str, object]:
+        """Размер выходного кода и насыщенность, сохранённые при обучении (§6.6)."""
+        if not path or not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        if data.get(self._version_key) != self._version:
+            return {}
+        metadata = data.get(ACTIVATION_METADATA_KEY)
+        return dict(metadata) if isinstance(metadata, dict) else {}
 
 
 def _load_embeddings_from_file(path: str) -> list["EmbeddingRecord"]:
@@ -596,10 +760,21 @@ class LayoutParameterTuner:
             LAYOUT_TUNE_LONG_STEPS_MIN,
             min(LAYOUT_TUNE_LONG_STEPS_MAX, int(total_points / LAYOUT_TUNE_LONG_STEPS_DIVISOR)),
         )
-        long_subset_size = min(
-            LAYOUT_TUNE_LONG_SUBSET_MAX,
-            max(LAYOUT_TUNE_LONG_SUBSET_MIN, int(math.sqrt(total_points) * LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER)),
-        )
+        if total_points <= LAYOUT_LONG_FULL_SPACE_MAX_POINTS:
+            # §5.5.1: дальняя энергия считается по всему пространству V.
+            long_subset_size: int | None = None
+        else:
+            # §5.9.4: для очень больших пространств допускается подмножество.
+            long_subset_size = min(
+                LAYOUT_TUNE_LONG_SUBSET_MAX,
+                max(LAYOUT_TUNE_LONG_SUBSET_MIN, int(math.sqrt(total_points) * LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER)),
+            )
+            LOGGER.event(
+                "layout.tune.long_subset",
+                section=OPTIM_SUBSET,
+                data={"points": total_points, "long_subset_size": long_subset_size,
+                      "full_space_max_points": LAYOUT_LONG_FULL_SPACE_MAX_POINTS},
+            )
         long_subset_refresh = max(
             LAYOUT_TUNE_LONG_SUBSET_REFRESH_MIN,
             min(
@@ -615,11 +790,13 @@ class LayoutParameterTuner:
             LAYOUT_TUNE_SHORT_STEPS_MIN,
             min(LAYOUT_TUNE_SHORT_STEPS_MAX, int(grid_size * LAYOUT_TUNE_SHORT_STEPS_FACTOR)),
         )
+        # §5.5.2: окрестность R должна содержать точки помимо самой пары,
+        # поэтому локальный радиус не опускается ниже LAYOUT_SHORT_LOCAL_RADIUS_MIN.
         short_local_radius = max(
-            LAYOUT_ADAPTIVE_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_RADIUS_FACTOR)
+            LAYOUT_SHORT_LOCAL_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_RADIUS_FACTOR)
         )
         short_energy_radius = max(
-            LAYOUT_ADAPTIVE_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR)
+            LAYOUT_SHORT_LOCAL_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR)
         )
         short_energy_recalc_every = max(LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR, short_steps // 6)
         LOGGER.event(
@@ -632,7 +809,8 @@ class LayoutParameterTuner:
                 "start_radius_factor": self._start_radius_factor,
                 "long_pairs_per_step": long_pairs,
                 "long_steps": long_steps,
-                "long_subset_size": long_subset_size,
+                "long_subset_size": -1 if long_subset_size is None else long_subset_size,
+                "long_subset_mode": "full_space" if long_subset_size is None else "subset",
                 "long_subset_refresh": long_subset_refresh,
                 "short_pairs_per_step": short_pairs,
                 "short_steps": short_steps,
@@ -672,7 +850,7 @@ def _default_layout_params() -> TunedLayoutParams:
 
 def _layout_json_path(count: int, pair_radius: int | None) -> str:
     suffix = "auto" if pair_radius is None else str(pair_radius)
-    return f"data/layout-{count}-{suffix}.json"
+    return f"data/layout-{count}-{suffix}-{LAYOUT_CACHE_TAG}.json"
 
 
 def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> int:
@@ -689,553 +867,153 @@ def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> i
     )
 
 
-def _points_in_radius(
-    center: tuple[int, int],
-    positions: list[tuple[int, int]],
-    radius_sq: float,
-) -> list[int]:
-    cy, cx = center
-    covered: list[int] = []
-    for idx, (y, x) in enumerate(positions):
-        dy = float(cy) - float(y)
-        dx = float(cx) - float(x)
-        if dy * dy + dx * dx <= radius_sq:
-            covered.append(idx)
-    return covered
-
-
-def _compute_point_energies(layout: Layout, radius: int) -> list[float]:
-    if radius <= 0:
-        raise ValueError("radius must be positive for activation energy map")
-    point_count = len(layout._positions)
-    if point_count == 0:
-        return []
-    radius_sq = radius * radius
-    energies: list[float] = []
-    pos_y = layout._pos_y
-    pos_x = layout._pos_x
-    row_occupied = layout._row_occupied
-    distance_eps = layout._distance_eps
-    sim_lambda = layout._sim_lambda_idx
-    for idx in range(point_count):
-        cy = pos_y[idx]
-        cx = pos_x[idx]
-        energy = 0.0
-        y_min = max(0, cy - radius)
-        y_max = min(layout.height - 1, cy + radius)
-        x_min = max(0, cx - radius)
-        x_max = min(layout.width - 1, cx + radius)
-        for y in range(y_min, y_max + 1):
-            dy = cy - y
-            dy_sq = dy * dy
-            occupied = row_occupied[y]
-            if not occupied:
-                continue
-            for x in occupied:
-                if x < x_min or x > x_max:
-                    continue
-                dx = cx - x
-                dist_sq = dy_sq + dx * dx
-                if dist_sq > radius_sq:
-                    continue
-                other_idx = layout.grid[y][x]
-                if other_idx is None or other_idx == idx:
-                    continue
-                sim = sim_lambda(idx, other_idx)
-                if sim <= 0.0:
-                    continue
-                energy += sim / (dist_sq + distance_eps)
-        energies.append(energy)
-    emax = max(energies)
-    normalized = [e / emax if emax > 0 else 0.0 for e in energies]
-    LOGGER.event(
-        "activation.energy.map",
-        section=ENERGY_CALC,
-        data={
-            "radius": radius,
-            "points": point_count,
-            "energy_max": emax,
-        },
+def _detector_layer_configs(layout: Layout) -> tuple[DetectorLayerConfig, ...]:
+    """Слои иерархии: один порог λ_d на слой, r_a и минимум точек (§6.4, §7.1.10)."""
+    extent = max(1, min(layout.width, layout.height))
+    return tuple(
+        DetectorLayerConfig(
+            lambda_threshold=float(level),
+            activation_radius=max(ACTIVATION_DETECTOR_RADIUS_MIN, int(round(extent * float(radius_factor)))),
+            min_points=int(min_points),
+        )
+        for level, radius_factor, min_points in ACTIVATION_DETECTOR_LAYER_SPECS
     )
-    return normalized
-
-
-def _build_detectors_from_layout_legacy(
-    layout: Layout,
-    energies: list[float],
-    *,
-    radius: int,
-    max_detectors: int,
-    output_bits: int,
-    lambda_levels: tuple[float, ...],
-) -> list[Detector]:
-    """
-    Построение иерархии детекторов "как в статье":
-    - несколько уровней λ (детекторная иерархия);
-    - радиус детектора выбирается адаптивно (приближение fill-factor) по целевому числу точек покрытия;
-    - центры детекторов выбираются из точек с высокой статической энергией и разреживаются (NMS);
-    - выходной код детектора — уникальный бит в своём слое (без коллизий).
-    """
-    if radius <= 0:
-        raise ValueError("detector radius must be positive")
-    if max_detectors <= 0:
-        raise ValueError("max_detectors must be positive")
-    if output_bits <= 0:
-        raise ValueError("output_bits must be positive")
-    if not lambda_levels:
-        raise ValueError("lambda_levels must be non-empty")
-    if len(energies) != len(layout._positions):
-        raise ValueError("energies size must match layout points")
-
-    layers = len(lambda_levels)
-    per_layer_limit = max(1, max_detectors // layers)
-    required_bits = per_layer_limit * layers
-    if output_bits < required_bits:
-        raise ValueError(
-            f"output_bits must be >= per_layer_limit*layers ({required_bits}), got {output_bits}"
-        )
-
-    # Предпочитаем точки с высокой статической энергией
-    sorted_indices = sorted(range(len(energies)), key=lambda i: energies[i], reverse=True)
-
-    # Быстрая выборка индексов по радиусу через grid/row_occupied (как в _compute_point_energies)
-    row_occupied = layout._row_occupied
-    grid = layout.grid
-    height = layout.height
-    width = layout.width
-    pos_y = layout._pos_y
-    pos_x = layout._pos_x
-
-    def covered_indices_for(center_idx: int, r: int) -> list[int]:
-        cy = pos_y[center_idx]
-        cx = pos_x[center_idx]
-        r_sq = r * r
-        covered: list[int] = []
-        y_min = max(0, cy - r)
-        y_max = min(height - 1, cy + r)
-        x_min = max(0, cx - r)
-        x_max = min(width - 1, cx + r)
-        for y in range(y_min, y_max + 1):
-            dy = cy - y
-            dy_sq = dy * dy
-            occupied = row_occupied[y]
-            if not occupied:
-                continue
-            for x in occupied:
-                if x < x_min or x > x_max:
-                    continue
-                dx = cx - x
-                if dy_sq + dx * dx > r_sq:
-                    continue
-                other_idx = grid[y][x]
-                if other_idx is None:
-                    continue
-                covered.append(other_idx)
-        return covered
-
-    # Адаптивный радиус (приближение подбора fill-factor)
-    r_min = ACTIVATION_DETECTOR_RADIUS_MIN
-    r_max = radius
-    target_points = max(1, ACTIVATION_DETECTOR_TARGET_POINTS)
-
-    def choose_radius(center_idx: int) -> tuple[int, list[int]]:
-        chosen_r = r_max
-        chosen_cov: list[int] = []
-        for r in range(r_min, r_max + 1):
-            cov = covered_indices_for(center_idx, r)
-            if len(cov) >= target_points:
-                return r, cov
-            # запомним лучший (самый большой) на случай, если до цели не дотянули
-            if len(cov) > len(chosen_cov):
-                chosen_cov = cov
-                chosen_r = r
-        return chosen_r, chosen_cov
-
-    # NMS: не даём центрам быть слишком близко (избегаем дубликатов детекторов)
-    min_dist = max(1.0, float(r_max) * float(ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR))
-    min_dist_sq = min_dist * min_dist
-    detectors: list[Detector] = []
-
-    for layer_idx, lambda_value in enumerate(lambda_levels):
-        layer_detectors: list[Detector] = []
-        # §6.4.5 запрещает перекрытие только внутри одного слоя D_lambda.
-        chosen_centers: list[tuple[float, float]] = []
-        layer_offset = layer_idx * per_layer_limit
-
-        # Берём кандидатов плотнее, чем "строго per_layer_limit", чтобы NMS не выжигал слой
-        step = max(1, len(sorted_indices) // (per_layer_limit * max(1, int(ACTIVATION_DETECTOR_STEP_DENSITY))))
-
-        local_id = 0
-        for idx in sorted_indices[::step]:
-            if len(layer_detectors) >= per_layer_limit or len(detectors) >= max_detectors:
-                break
-
-            cy = pos_y[idx]
-            cx = pos_x[idx]
-            # NMS check
-            too_close = False
-            for (py, px) in chosen_centers:
-                dy = float(cy) - float(py)
-                dx = float(cx) - float(px)
-                if dy * dy + dx * dx < min_dist_sq:
-                    too_close = True
-                    break
-            if too_close:
-                continue
-
-            chosen_r, covered = choose_radius(idx)
-            if not covered:
-                continue
-
-            # §6.3: e_d = sum(a_ji * e_ji). Активация a_ji вычисляется
-            # кодом центра при пороге lambda данного слоя, а не заменяется единицей.
-            center_code = layout._points[idx].code
-            center_ones = layout._points[idx].ones
-            energy_sum = 0.0
-            active_points = 0
-            for i in covered:
-                point_energy = energies[i]
-                if point_energy < ACTIVATION_ENERGY_THRESHOLD:
-                    continue
-                point = layout._points[i]
-                denominator = math.sqrt(center_ones * point.ones)
-                if denominator <= 0.0:
-                    continue
-                activation = center_code.common(point.code) / denominator
-                if activation < lambda_value:
-                    continue
-                energy_sum += activation * point_energy
-                active_points += 1
-            if energy_sum <= 0.0 or active_points <= 0:
-                continue
-
-            # Уникальный бит в своём слое (без коллизий)
-            bit_index = layer_offset + local_id
-            if bit_index >= output_bits:
-                break
-            output_code = BitArray(output_bits)
-            output_code.set(bit_index, 1)
-            local_id += 1
-
-            center = (cy, cx)
-            detector = Detector(
-                center=center,
-                radius=float(chosen_r),
-                lambda_threshold=lambda_value,
-                energy=energy_sum,
-                points_count=active_points,
-                output_code=output_code,
-                label=f"λ={lambda_value:.2f}",
-            )
-
-            layer_detectors.append(detector)
-            detectors.append(detector)
-            chosen_centers.append((float(cy), float(cx)))
-
-        LOGGER.event(
-            "activation.detector.layer",
-            section=DETECTOR_CONSTRUCTION,
-            data={
-                "lambda": lambda_value,
-                "layer_detectors": len(layer_detectors),
-                "per_layer_limit": per_layer_limit,
-                "total_detectors": len(detectors),
-                "radius_min": r_min,
-                "radius_max": r_max,
-                "target_points": target_points,
-            },
-        )
-
-        if len(detectors) >= max_detectors:
-            break
-
-    if not detectors:
-        raise RuntimeError("не удалось построить ни одного детектора для активации")
-    return detectors
-
-
-@dataclass(frozen=True)
-class DetectorCandidate:
-    center: tuple[float, float]
-    radius: float
-    energy: float
-    points_count: int
-    fill_factor: float
-    insertion_density: float
-
-
-class DetectorHierarchyBuilder:
-    """Строит слои D_lambda по формулам §6.3–6.4.5."""
-
-    def __init__(
-        self,
-        *,
-        layout: Layout,
-        energies: Sequence[float],
-        radius: int,
-        radius_min: int,
-        min_points: int,
-        max_detectors: int,
-        output_bits: int,
-        lambda_levels: Sequence[float],
-        energy_threshold: float,
-        candidate_density: int,
-    ) -> None:
-        if radius <= 0 or radius_min <= 0 or radius_min > radius:
-            raise ValueError("invalid detector radius range")
-        if min_points <= 0:
-            raise ValueError("min_points must be positive")
-        if max_detectors <= 0 or output_bits <= 0:
-            raise ValueError("detector and output sizes must be positive")
-        if len(energies) != len(layout._positions):
-            raise ValueError("energies size must match layout points")
-        if not lambda_levels:
-            raise ValueError("lambda_levels must be non-empty")
-        self._layout = layout
-        self._energies = [float(value) for value in energies]
-        self._radius = int(radius)
-        self._radius_min = int(radius_min)
-        self._min_points = int(min_points)
-        self._max_detectors = int(max_detectors)
-        self._output_bits = int(output_bits)
-        self._lambda_levels = tuple(float(value) for value in lambda_levels)
-        self._energy_threshold = float(energy_threshold)
-        self._candidate_density = max(1, int(candidate_density))
-        self._sorted_indices = sorted(
-            range(len(self._energies)),
-            key=lambda index: self._energies[index],
-            reverse=True,
-        )
-
-    def build(self) -> list[Detector]:
-        per_layer_limit = max(1, self._max_detectors // len(self._lambda_levels))
-        if per_layer_limit * len(self._lambda_levels) > self._output_bits:
-            raise ValueError("output_bits is too small for detector hierarchy")
-        detectors: list[Detector] = []
-        for layer_index, lambda_value in enumerate(self._lambda_levels):
-            candidates = self._build_layer(lambda_value, per_layer_limit)
-            layer_offset = layer_index * per_layer_limit
-            for local_index, candidate in enumerate(candidates):
-                output_code = BitArray(self._output_bits)
-                output_code.set(layer_offset + local_index, 1)
-                detectors.append(
-                    Detector(
-                        center=candidate.center,
-                        radius=candidate.radius,
-                        lambda_threshold=lambda_value,
-                        energy=candidate.energy,
-                        points_count=candidate.points_count,
-                        output_code=output_code,
-                        label=f"λ={lambda_value:.2f}",
-                    )
-                )
-            LOGGER.event(
-                "activation.detector.layer",
-                section=DETECTOR_CONSTRUCTION,
-                data={
-                    "lambda": lambda_value,
-                    "layer_detectors": len(candidates),
-                    "per_layer_limit": per_layer_limit,
-                    "fill_min": min((item.fill_factor for item in candidates), default=0.0),
-                    "fill_max": max((item.fill_factor for item in candidates), default=0.0),
-                    "radius_min": min((item.radius for item in candidates), default=0.0),
-                    "radius_max": max((item.radius for item in candidates), default=0.0),
-                },
-            )
-        if not detectors:
-            raise RuntimeError("не удалось построить ни одного детектора для активации")
-        return detectors
-
-    def _build_layer(self, lambda_value: float, limit: int) -> list[DetectorCandidate]:
-        selected: list[DetectorCandidate] = []
-        step = max(1, len(self._sorted_indices) // (limit * self._candidate_density))
-        for center_index in self._sorted_indices[::step]:
-            candidate = self._make_candidate(center_index, lambda_value)
-            if candidate is None:
-                continue
-            overlaps = [
-                existing
-                for existing in selected
-                if self._overlaps(candidate, existing)
-            ]
-            if overlaps:
-                if any(
-                    existing.insertion_density >= candidate.insertion_density
-                    for existing in overlaps
-                ):
-                    continue
-                selected = [item for item in selected if item not in overlaps]
-            selected.append(candidate)
-        selected.sort(key=lambda item: item.insertion_density, reverse=True)
-        return selected[:limit]
-
-    def _make_candidate(
-        self,
-        center_index: int,
-        lambda_value: float,
-    ) -> DetectorCandidate | None:
-        if self._energies[center_index] < self._energy_threshold:
-            return None
-        center_point = self._layout._points[center_index]
-        center_y = self._layout._pos_y[center_index]
-        center_x = self._layout._pos_x[center_index]
-        active: dict[tuple[int, int], tuple[int, float]] = {}
-        for point_index in self._indices_in_radius(center_y, center_x, self._radius):
-            point_energy = self._energies[point_index]
-            if point_energy < self._energy_threshold:
-                continue
-            point = self._layout._points[point_index]
-            denominator = math.sqrt(center_point.ones * point.ones)
-            if denominator <= 0.0:
-                continue
-            activation = center_point.code.common(point.code) / denominator
-            if activation < lambda_value:
-                continue
-            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
-            active[position] = (point_index, activation * point_energy)
-        seed = (center_y, center_x)
-        if seed not in active:
-            return None
-        cluster_positions = self._connected_component(seed, active)
-        if len(cluster_positions) < self._min_points:
-            return None
-        weight_sum = sum(active[position][1] for position in cluster_positions)
-        if weight_sum <= 0.0:
-            return None
-        centroid_y = sum(position[0] * active[position][1] for position in cluster_positions) / weight_sum
-        centroid_x = sum(position[1] * active[position][1] for position in cluster_positions) / weight_sum
-        distances = sorted(
-            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
-            for position in cluster_positions
-        )
-        best_radius = 0.0
-        best_fill = -1.0
-        for distance in distances:
-            candidate_radius = max(float(self._radius_min), distance)
-            if candidate_radius > self._radius:
-                continue
-            points_count = sum(1 for value in distances if value <= candidate_radius)
-            if points_count < self._min_points:
-                continue
-            fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
-            if fill_factor > best_fill:
-                best_fill = fill_factor
-                best_radius = candidate_radius
-        if best_radius <= 0.0:
-            return None
-        included = [
-            position
-            for position in cluster_positions
-            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
-        ]
-        detector_energy = sum(active[position][1] for position in included)
-        points_count = len(included)
-        if detector_energy <= 0.0 or points_count < self._min_points:
-            return None
-        return DetectorCandidate(
-            center=(centroid_y, centroid_x),
-            radius=best_radius,
-            energy=detector_energy,
-            points_count=points_count,
-            fill_factor=best_fill,
-            insertion_density=points_count / best_radius,
-        )
-
-    def _indices_in_radius(self, center_y: int, center_x: int, radius: int) -> list[int]:
-        indices: list[int] = []
-        radius_sq = radius * radius
-        for y in range(max(0, center_y - radius), min(self._layout.height - 1, center_y + radius) + 1):
-            dy_sq = (center_y - y) ** 2
-            for x in self._layout._row_occupied[y]:
-                if x < center_x - radius or x > center_x + radius:
-                    continue
-                if dy_sq + (center_x - x) ** 2 > radius_sq:
-                    continue
-                point_index = self._layout.grid[y][x]
-                if point_index is not None:
-                    indices.append(point_index)
-        return indices
-
-    @staticmethod
-    def _connected_component(
-        seed: tuple[int, int],
-        active: dict[tuple[int, int], tuple[int, float]],
-    ) -> list[tuple[int, int]]:
-        pending = [seed]
-        visited = {seed}
-        while pending:
-            y, x = pending.pop()
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    neighbour = (y + dy, x + dx)
-                    if neighbour in active and neighbour not in visited:
-                        visited.add(neighbour)
-                        pending.append(neighbour)
-        return list(visited)
-
-    @staticmethod
-    def _overlaps(left: DetectorCandidate, right: DetectorCandidate) -> bool:
-        distance = math.hypot(
-            left.center[0] - right.center[0],
-            left.center[1] - right.center[1],
-        )
-        return distance <= left.radius or distance <= right.radius
 
 
 def _build_detectors_from_layout(
     layout: Layout,
     energies: list[float],
     *,
-    radius: int,
-    max_detectors: int,
     output_bits: int,
-    lambda_levels: tuple[float, ...],
 ) -> list[Detector]:
     return DetectorHierarchyBuilder(
         layout=layout,
         energies=energies,
-        radius=radius,
+        layer_configs=_detector_layer_configs(layout),
         radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
-        min_points=ACTIVATION_DETECTOR_MIN_POINTS,
-        max_detectors=max_detectors,
         output_bits=output_bits,
-        lambda_levels=lambda_levels,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
-        candidate_density=ACTIVATION_DETECTOR_STEP_DENSITY,
+        eta=ACTIVATION_ETA,
+        attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
+        seed=ACTIVATION_DETECTOR_SEED,
+        clusterer=DbscanClusterer(
+            eps=ACTIVATION_DBSCAN_EPS,
+            min_samples=ACTIVATION_DBSCAN_MIN_SAMPLES,
+        ),
     ).build()
 
 
-def _build_activation_engine(layout: Layout, energies: list[float]) -> ActivationEngine:
-    detectors = _build_detectors_from_layout(
-        layout,
-        energies,
-        radius=ACTIVATION_DETECTOR_RADIUS,
-        max_detectors=ACTIVATION_MAX_DETECTORS,
-        output_bits=ACTIVATION_OUTPUT_BITS,
-        lambda_levels=ACTIVATION_LAMBDA_LEVELS,
-    )
-    eta_value = ACTIVATION_ETA
+def _build_activation_engine(
+    layout: Layout,
+    energies: list[float],
+    *,
+    detectors: Sequence[Detector] | None = None,
+    saturation_limit: int = ACTIVATION_SATURATION_LIMIT,
+) -> ActivationEngine:
+    if detectors is None:
+        detectors = _build_detectors_from_layout(
+            layout,
+            energies,
+            output_bits=ACTIVATION_OUTPUT_BITS,
+        )
     return ActivationEngine(
         layout=layout,
         detectors=detectors,
         lambda_threshold=ACTIVATION_LAMBDA_THRESHOLD,
-        eta=eta_value,
+        eta=ACTIVATION_ETA,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
         detector_threshold=ACTIVATION_DETECTOR_THRESHOLD,
-        saturation_limit=ACTIVATION_SATURATION_LIMIT,
+        saturation_limit=saturation_limit,
         energy_map=energies,
         use_gpu=ACTIVATION_USE_GPU,
     )
 
 
-def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout | None:
+def _output_sizer() -> DetectorOutputSizer:
+    return DetectorOutputSizer(
+        max_density=ACTIVATION_MAX_EMBEDDING_DENSITY,
+        min_output_bits=ACTIVATION_OUTPUT_BITS,
+        min_saturation=ACTIVATION_SATURATION_MIN,
+        max_saturation=ACTIVATION_SATURATION_MAX,
+    )
+
+
+def _calibrated_activation_engine(
+    layout: Layout,
+    energies: list[float],
+    calibration_batches: Sequence[Sequence[BitArray]],
+) -> tuple[ActivationEngine, OutputCodeSize]:
+    """§6.6: строит детекторы, измеряет среднее число активных и задаёт размер выхода."""
+    detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
+    provisional = _build_activation_engine(layout, energies, detectors=detectors)
+    size = _output_sizer().measure(provisional, calibration_batches)
+    resized = reassign_output_bits(detectors, output_bits=size.output_bits, seed=ACTIVATION_DETECTOR_SEED)
+    engine = _build_activation_engine(
+        layout, energies, detectors=resized, saturation_limit=size.saturation_limit
+    )
+    return engine, size
+
+
+def _activation_engine_from_size(
+    layout: Layout,
+    energies: list[float],
+    *,
+    output_bits: int,
+    saturation_limit: int,
+) -> ActivationEngine:
+    """Восстанавливает детекторы и выходной код тех же размеров, что при обучении."""
+    detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
+    resized = reassign_output_bits(detectors, output_bits=output_bits, seed=ACTIVATION_DETECTOR_SEED)
+    return _build_activation_engine(layout, energies, detectors=resized, saturation_limit=saturation_limit)
+
+
+def _activation_metadata(size: OutputCodeSize) -> dict[str, object]:
+    return {
+        "output_bits": int(size.output_bits),
+        "saturation_limit": int(size.saturation_limit),
+        "mean_active_detectors": float(size.mean_active_detectors),
+        "calibration_samples": int(size.samples),
+    }
+
+
+def _load_layout_from_file(
+    path: str,
+    run_params: TunedLayoutParams,
+    *,
+    expected_code_length: int | None = None,
+    colorizer: EncoderCodeColorizer | None = None,
+    expected_encoder_signature: str | None = None,
+) -> Layout | None:
     if not os.path.exists(path):
         return None
     with open(path, "r", encoding="utf-8") as fp:
         data = json.load(fp)
     points_payload = data.get("layout", [])
+    stored_signature = data.get(ENCODER_SIGNATURE_KEY)
+    if (
+        expected_encoder_signature is not None
+        and stored_signature is not None
+        and str(stored_signature) != expected_encoder_signature
+    ):
+        LOGGER.event(
+            "layout.cache.incompatible",
+            section=LAID_OUT_STRUCTURE,
+            data={"path": path, "reason": "encoder_signature"},
+        )
+        return None
+    if expected_code_length is not None and points_payload:
+        stored_length = len(str(points_payload[0].get("value", "")))
+        if stored_length != expected_code_length:
+            LOGGER.event(
+                "layout.cache.incompatible",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "path": path,
+                    "stored_code_length": stored_length,
+                    "expected_code_length": expected_code_length,
+                },
+            )
+            return None
     width = data.get("width")
     height = data.get("height")
     if width in (None, 0) or height in (None, 0):
@@ -1292,10 +1070,16 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
         similarity=data.get("similarity", LAYOUT_SIMILARITY),
         lambda_threshold=data.get("lambda_threshold", LAYOUT_LAMBDA_THRESHOLD),
         eta=data.get("eta", LAYOUT_ETA),
-        seed=0,
+        seed=LAYOUT_RANDOM_SEED,
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=None,
         long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
+        colorizer=colorizer,
+        long_distance=LAYOUT_LONG_DISTANCE,
+        short_distance=LAYOUT_SHORT_DISTANCE,
+        long_kernel=LAYOUT_LONG_KERNEL,
+        long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
+        long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
     )
     if len(layout._positions) != len(sorted_points):
         raise RuntimeError("layout load mismatch: points count differs")
@@ -1328,48 +1112,103 @@ def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout |
 
 
 def _build_encoder() -> Encoder:
-    return Encoder(
-        # Angle
+    """Кодер MNIST-стимула (угол, X, Y): конкатенация трёх сегментов (§2.2.3, §4.2.1, §4.4)."""
+    angle_layers = geometric_detector_layers(
+        layers_count=MNIST_ANGLE_LAYERS,
+        widest_detectors=MNIST_ANGLE_WIDEST_DETECTORS,
+        narrowest_detectors=MNIST_ANGLE_NARROWEST_DETECTORS,
+        overlap=MNIST_ANGLE_OVERLAP,
+    )
+    position_layers = geometric_detector_layers(
+        layers_count=MNIST_POSITION_LAYERS,
+        widest_detectors=MNIST_POSITION_WIDEST_DETECTORS,
+        narrowest_detectors=MNIST_POSITION_NARROWEST_DETECTORS,
+        overlap=MNIST_POSITION_OVERLAP,
+    )
+    encoder = Encoder(
         ClosedDimension(
             "Angle",
-            (0.0, 360.0),
-            [
-                #Detectors(360, 0.4),
-                #Detectors(180, 0.4),
-                Detectors(90, 0.7),
-                Detectors(45, 0.7),
-                Detectors(30, 0.7),
-                Detectors(10, 0.7),
-                #Detectors(5, 0.4),
-            ],
+            (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
+            angle_layers,
+            code_length=MNIST_ANGLE_CODE_LENGTH,
         ),
-        # X
         OpenedDimension(
             "X",
-            (0, 6),
-            [
-                Detectors(7, 0.7),
-                Detectors(6, 0.7),
-                Detectors(5, 0.7),
-                Detectors(4, 0.7),
-                Detectors(3, 0.7),
-                Detectors(2, 0.7),
-            ],
+            (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
+            position_layers,
+            code_length=MNIST_POSITION_CODE_LENGTH,
         ),
-        # Y
         OpenedDimension(
             "Y",
-            (0, 6),
-            [
-                Detectors(7, 0.7),
-                Detectors(6, 0.7),
-                Detectors(5, 0.7),
-                Detectors(4, 0.7),
-                Detectors(3, 0.7),
-                Detectors(2, 0.7),
-            ],
+            (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
+            position_layers,
+            code_length=MNIST_POSITION_CODE_LENGTH,
         ),
+        random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
+        layer_phase=ENCODER_LAYER_PHASE,
+    )
+    # §4.5, §5.13.1: у каждой координаты сходство кодов должно убывать с расстоянием
+    # на всём диапазоне, иначе раскладка не воспроизведёт её топологию.
+    for dimension in encoder.dimensions:
+        step = None if dimension.closed else MNIST_POSITION_STEP
+        _, ordered = encoder.long_range_order(dimension.title, step=step)
+        if not ordered:
+            LOGGER.event(
+                "encoder.long_range_order.warning",
+                section=LONG_RANGE_IMPORTANCE,
+                data={"dimension": dimension.title,
+                      "note": "профиль сходства немонотонен: увеличьте перекрытие детекторов (>= 0.5) или число слоёв"},
+            )
+    return encoder
+
+
+def _build_colorizer() -> EncoderCodeColorizer:
+    """Псевдоцвет всего кода: младший бит красный, старший фиолетовый (§5.14)."""
+    return EncoderCodeColorizer(
+        min_hue=LAYOUT_PSEUDO_COLOR_MIN_HUE,
+        max_hue=LAYOUT_PSEUDO_COLOR_MAX_HUE,
+    )
+
+
+def _build_extractor() -> MnistSobelAngleMap:
+    return MnistSobelAngleMap(
+        angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
+        grad_threshold=MNIST_GRAD_THRESHOLD,
+    )
+
+
+def _save_layout_images(
+    layout: Layout,
+    *,
+    image_path: str,
+    energies: Sequence[float] | None = None,
+) -> None:
+    """Карта в псевдоцветах кодов (§5.14), по компоненте угла (рис. 16) и с яркостью Ê (рис. 18)."""
+    from PIL import Image
+
+    directory = os.path.dirname(image_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    Image.fromarray(layout.render_image()).save(image_path)
+    stem = os.path.splitext(image_path)[0]
+    component_path = stem + LAYOUT_COMPONENT_IMAGE_SUFFIX
+    Image.fromarray(
+        layout.render_component_image(period=MNIST_ANGLE_MAX - MNIST_ANGLE_MIN)
+    ).save(component_path)
+    energy_path = None
+    if energies is not None:
+        energy_path = stem + LAYOUT_ENERGY_IMAGE_SUFFIX
+        Image.fromarray(layout.render_energy_image(energies)).save(energy_path)
+    LOGGER.event(
+        "layout.visual.save",
+        section=LAID_OUT_STRUCTURE,
+        data={
+            "image": image_path,
+            "component_image": component_path,
+            "energy_image": energy_path,
+            "points": len(layout.positions()),
+        },
     )
 
 
@@ -1384,6 +1223,7 @@ def _collect_codes(
         similarity=None,
         lambda_threshold=None,
         eta=None,
+        metadata={ENCODER_SIGNATURE_KEY: encoder.signature},
     )
     total_codes = 0
     found = 0
@@ -1453,30 +1293,47 @@ def _collect_samples(
             break
     return samples
 
-SPR = 32
 def _run_layout(
     codes: dict[float, list],
     params: TunedLayoutParams | None,
     *,
     count: int,
     total_codes: int,
+    colorizer: EncoderCodeColorizer | None = None,
+    expected_code_length: int | None = None,
 ) -> Layout:
     run_params = params or _default_layout_params()
     expected_pair_radius = _expected_pair_radius(total_codes, run_params)
     layout_path = _layout_json_path(count, expected_pair_radius)
-    cached_layout = _load_layout_from_file(layout_path, run_params)
+    cached_layout = _load_layout_from_file(
+        layout_path,
+        run_params,
+        expected_code_length=expected_code_length,
+        colorizer=colorizer,
+    )
     if cached_layout is not None:
         return cached_layout
+    LOGGER.event(
+        "layout.space_filling",
+        section=SPACE_FILLING,
+        data={"points": total_codes, "empty_ratio": LAYOUT_EMPTY_RATIO},
+    )
     layout = Layout(
         codes,
         empty_ratio=LAYOUT_EMPTY_RATIO,
         similarity=LAYOUT_SIMILARITY,
         lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
         eta=LAYOUT_ETA,
-        seed=0,
+        seed=LAYOUT_RANDOM_SEED,
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=run_params.long_subset_size,
         long_subset_refresh=run_params.long_subset_refresh,
+        colorizer=colorizer,
+        long_distance=LAYOUT_LONG_DISTANCE,
+        short_distance=LAYOUT_SHORT_DISTANCE,
+        long_kernel=LAYOUT_LONG_KERNEL,
+        long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
+        long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
     )
     step_offset = 1
     long_radius_start = max(
@@ -1488,6 +1345,11 @@ def _run_layout(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        geometric=LAYOUT_ADAPTIVE_RADIUS_GEOMETRIC,
+        temperature=LAYOUT_ANNEAL_TEMPERATURE,
+        temperature_radius_max=int(layout.width * LAYOUT_ANNEAL_RADIUS_MAX_FACTOR),
+        temperature_radius_min=LAYOUT_ANNEAL_RADIUS_MIN,
     )
     layout.run(
         steps=run_params.long_steps,
@@ -1524,6 +1386,7 @@ def _run_layout(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
     )
     short_optim = ShortLayoutOptimConfig(
         energy_radius=run_params.short_energy_radius,
@@ -1535,7 +1398,7 @@ def _run_layout(
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
     layout.run(
-        steps=150,
+        steps=run_params.short_steps,
         pairs_per_step=run_params.short_pairs_per_step,
         pair_radius=short_radius_start,
         mode="short",
@@ -1567,7 +1430,8 @@ class MnistLayoutRunner:
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
-        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+        self.colorizer = _build_colorizer()
+        self.extractor = _build_extractor()
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1577,6 +1441,7 @@ class MnistLayoutRunner:
             suffix=PIPELINE_CHECKPOINT_SUFFIX,
             version=PIPELINE_CHECKPOINT_VERSION,
         )
+        self._activation_metadata: dict[str, object] | None = None
 
     def _layout_cache_paths(self) -> list[str]:
         return _layout_cache_paths_for_count(self.count)
@@ -1602,7 +1467,13 @@ class MnistLayoutRunner:
                 )
                 continue
             tuned_params = self._tune_layout(total_points)
-            layout = _load_layout_from_file(path, tuned_params)
+            layout = _load_layout_from_file(
+                path,
+                tuned_params,
+                expected_code_length=self.encoder.code_length,
+                colorizer=self.colorizer,
+                expected_encoder_signature=self.encoder.signature,
+            )
             if layout is None:
                 LOGGER.event(
                     "layout.cache.mismatch",
@@ -1669,31 +1540,14 @@ class MnistLayoutRunner:
         layout_path: str | None = None,
         save_json: bool = True,
     ) -> None:
-        from PIL import Image
-
         resolved_layout_path = layout_path or _layout_json_path(self.count, layout.pair_radius)
         if save_json:
             layout.save_json(resolved_layout_path)
-        visual_layout = _load_layout_from_file(resolved_layout_path, run_params)
-        if visual_layout is None:
-            LOGGER.event(
-                "layout.export.json.error",
-                section=LAID_OUT_STRUCTURE,
-                data={"path": resolved_layout_path, "reason": "load_failed"},
-            )
-            raise RuntimeError("не удалось загрузить раскладку из json для визуализации")
-        image = visual_layout.render_image()
-        suffix = "auto" if visual_layout.pair_radius is None else str(visual_layout.pair_radius)
-        filename = f"data/{self.count}-{suffix}.png"
-        Image.fromarray(image).save(filename)
-        LOGGER.event(
-            "layout.visual.from_json",
-            section=LAID_OUT_STRUCTURE,
-            data={
-                "path": resolved_layout_path,
-                "image": filename,
-                "points": len(visual_layout.positions()),
-            },
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        _save_layout_images(
+            layout,
+            image_path=f"data/{self.count}-{suffix}.png",
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
         )
 
     def _run_activation(
@@ -1705,8 +1559,7 @@ class MnistLayoutRunner:
         stages: dict[str, bool],
         initial_embeddings: Sequence[EmbeddingRecord],
     ) -> list[EmbeddingRecord]:
-        energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
-        engine = _build_activation_engine(layout, energies)
+        energies = layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
         samples = _collect_samples(
             dataset,
             self._activation_samples,
@@ -1714,6 +1567,12 @@ class MnistLayoutRunner:
             self.extractor,
             label=self.label,
         )
+        engine, size = _calibrated_activation_engine(
+            layout,
+            energies,
+            [codes for _, codes in samples[:ACTIVATION_OUTPUT_CALIBRATION_SAMPLES]],
+        )
+        self._activation_metadata = _activation_metadata(size)
         embeddings = list(initial_embeddings[: len(samples)])
         start_index = len(embeddings)
         LOGGER.event(
@@ -1766,7 +1625,7 @@ class MnistLayoutRunner:
     def _save_embeddings(self, layout_path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
         if not layout_path:
             raise ValueError("layout_path must be provided to save embeddings")
-        self._embedding_store.save(layout_path, embeddings)
+        self._embedding_store.save(layout_path, embeddings, metadata=self._activation_metadata)
 
     def run(self) -> None:
         cached_layout = self._try_load_cached_layout()
@@ -1816,6 +1675,8 @@ class MnistLayoutRunner:
                 tuned_params,
                 count=self.count,
                 total_codes=total_codes,
+                colorizer=self.colorizer,
+                expected_code_length=self.encoder.code_length,
             )
             save_json = True
         checkpoint = self._checkpoint_store.load(layout_path)
@@ -1907,7 +1768,8 @@ class MnistDecodeRunner:
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
-        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+        self.colorizer = _build_colorizer()
+        self.extractor = _build_extractor()
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1935,7 +1797,13 @@ class MnistDecodeRunner:
                 start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
             )
             tuned_params = tuner.tune(total_points)
-            layout = _load_layout_from_file(path, tuned_params)
+            layout = _load_layout_from_file(
+                path,
+                tuned_params,
+                expected_code_length=self.encoder.code_length,
+                colorizer=self.colorizer,
+                expected_encoder_signature=self.encoder.signature,
+            )
             if layout is None:
                 continue
             LOGGER.event(
@@ -1955,10 +1823,12 @@ class MnistDecodeRunner:
         if self._decoder is not None:
             return self._decoder
         layout, layout_path, total_points = self._load_layout()
-        energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
+        energies = layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
         embeddings = _load_embeddings_from_file(layout_path)
-        if not embeddings:
-            embeddings = self._build_embeddings_for_layout(
+        metadata = self._embedding_store.load_metadata(layout_path)
+        activation_engine: ActivationEngine | None = None
+        if not embeddings or "output_bits" not in metadata:
+            embeddings, activation_engine = self._build_embeddings_for_layout(
                 layout,
                 layout_path,
                 energies,
@@ -1966,7 +1836,13 @@ class MnistDecodeRunner:
         labeled_embeddings = _embedding_records_to_labeled(embeddings)
         if not labeled_embeddings:
             raise RuntimeError("в раскладке нет базы эмбеддингов")
-        activation_engine = _build_activation_engine(layout, energies)
+        if activation_engine is None:
+            activation_engine = _activation_engine_from_size(
+                layout,
+                energies,
+                output_bits=int(metadata["output_bits"]),
+                saturation_limit=int(metadata["saturation_limit"]),
+            )
         database = EmbeddingDatabase(
             labeled_embeddings,
             DecoderConfig(
@@ -1974,9 +1850,9 @@ class MnistDecodeRunner:
                 temperature=DECODER_SOFTMAX_TEMPERATURE,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
-                knn_top_k=200,
-                top_k_per_class=20,
-                min_similarity=0.0,
+                knn_top_k=DECODER_KNN_TOP_K,
+                top_k_per_class=DECODER_TOP_K_PER_CLASS,
+                min_similarity=DECODER_MIN_SIMILARITY,
             ),
         )
         self._decoder = MnistDecoder(
@@ -2002,8 +1878,7 @@ class MnistDecodeRunner:
         layout: Layout,
         layout_path: str,
         energies: list[float],
-    ) -> list[EmbeddingRecord]:
-        engine = _build_activation_engine(layout, energies)
+    ) -> tuple[list[EmbeddingRecord], ActivationEngine]:
         dataset = self._build_dataset(train=True)
         samples = _collect_samples(
             dataset,
@@ -2011,6 +1886,11 @@ class MnistDecodeRunner:
             self.encoder,
             self.extractor,
             label=None,
+        )
+        engine, size = _calibrated_activation_engine(
+            layout,
+            energies,
+            [codes for _, codes in samples[:ACTIVATION_OUTPUT_CALIBRATION_SAMPLES]],
         )
         embeddings: list[EmbeddingRecord] = []
         for idx, (label, codes) in enumerate(samples):
@@ -2031,7 +1911,7 @@ class MnistDecodeRunner:
                     "bits": result.embedding.count(),
                 },
             )
-        self._embedding_store.save(layout_path, embeddings)
+        self._embedding_store.save(layout_path, embeddings, metadata=_activation_metadata(size))
         LOGGER.event(
             "decoder.base.generated",
             section=DETECTOR_INSERTION,
@@ -2041,7 +1921,7 @@ class MnistDecodeRunner:
                 "path": layout_path,
             },
         )
-        return embeddings
+        return embeddings, engine
 
     def predict_image(
         self,

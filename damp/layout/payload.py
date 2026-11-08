@@ -47,11 +47,13 @@ class LayoutPayloadBuilder:
         similarity: str | None,
         lambda_threshold: float | None,
         eta: float | None,
+        metadata: Mapping[str, object] | None = None,
     ) -> None:
         self._records: List[LayoutCodeRecord] = []
         self._similarity = similarity
         self._lambda_threshold = lambda_threshold
         self._eta = eta
+        self._metadata: Dict[str, object] = dict(metadata or {})
 
     @property
     def records(self) -> Sequence[LayoutCodeRecord]:
@@ -75,6 +77,7 @@ class LayoutPayloadBuilder:
 
     def base_payload(self) -> Mapping[str, object]:
         return {
+            **self._metadata,
             "width": None,
             "height": None,
             "points": len(self._records),

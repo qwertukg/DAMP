@@ -64,11 +64,11 @@ class DampLogger:
     def _console_log(self, message: str) -> None:
         stream = sys.stdout
         try:
-            print(message, file=stream)
+            print(message, file=stream, flush=True)
         except UnicodeEncodeError:
             encoding = getattr(stream, "encoding", None) or "utf-8"
             safe_message = message.encode(encoding, errors="backslashreplace").decode(encoding)
-            print(safe_message, file=stream)
+            print(safe_message, file=stream, flush=True)
 
     @staticmethod
     def _format_value(value: Any, *, max_items: int = 8, max_chars: int = 200) -> str:
