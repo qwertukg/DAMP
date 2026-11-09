@@ -50,11 +50,11 @@ class SingleImageLayoutRunner:
         damp_main.LAYOUT_SHORT_STEPS = 30
         damp_main.LAYOUT_SHORT_LOCAL_RADIUS = 1
         damp_main.LAYOUT_SHORT_ENERGY_RADIUS = 2
-        damp_main.LAYOUT_SHORT_ENERGY_MAX_POINTS = 24
         damp_main.LAYOUT_SHORT_PARTITIONS = 1
         damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF = None
         damp_main.LAYOUT_SHORT_WEIGHTED_FIRST = False
         damp_main.LAYOUT_MIN_SWAP_RATIO = 0.01
+        damp_main.LAYOUT_SHORT_MIN_SWAP_RATIO = 0.01
         damp_main.LAYOUT_MIN_SWAP_WINDOW = 5
         damp_main.LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.25
         damp_main.LAYOUT_LOG_VISUALS = False
@@ -73,11 +73,11 @@ class SingleImageLayoutRunner:
                 "short_pairs": damp_main.LAYOUT_SHORT_PAIRS_PER_STEP,
                 "short_local_radius": damp_main.LAYOUT_SHORT_LOCAL_RADIUS,
                 "short_energy_radius": damp_main.LAYOUT_SHORT_ENERGY_RADIUS,
-                "short_energy_max_points": damp_main.LAYOUT_SHORT_ENERGY_MAX_POINTS,
                 "short_partitions": damp_main.LAYOUT_SHORT_PARTITIONS,
                 "short_similarity_cutoff": damp_main.LAYOUT_SHORT_SIMILARITY_CUTOFF,
                 "short_weighted_first": damp_main.LAYOUT_SHORT_WEIGHTED_FIRST,
                 "min_swap_ratio": damp_main.LAYOUT_MIN_SWAP_RATIO,
+                "short_min_swap_ratio": damp_main.LAYOUT_SHORT_MIN_SWAP_RATIO,
                 "min_swap_window": damp_main.LAYOUT_MIN_SWAP_WINDOW,
                 "adaptive_radius_factor": damp_main.LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
                 "log_visuals": damp_main.LAYOUT_LOG_VISUALS,

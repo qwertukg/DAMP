@@ -4,27 +4,34 @@ from dataclasses import dataclass
 import json
 import os
 from collections import OrderedDict
-from typing import ClassVar, Sequence
+from typing import ClassVar, Mapping, Sequence
 import argparse
 
 from damp.article_refs import (
-    CODE_SPACE_ACTIVATION,
     DETECTOR_CONSTRUCTION,
-    DETECTOR_HIERARCHY,
-    DETECTOR_RADIUS,
-    DETECTOR_INSERTION,
-    ENERGY_CALC,
     LAYOUT_PARAMETERS,
-    LAYOUT_SYSTEM,
-    LAID_OUT_STRUCTURE,
+    OPTIM_SUBSET,
+    OUTSIDE_ARTICLE,
     STIMULUS_DETECTION,
-    ENCODING_SYSTEM,
-    GPU_IMPLEMENTATION,
-    PARALLEL_PROCESSING,
 )
-from damp.activation import ActivationEngine, Detector
-from damp.MnistSobelAngleMap import MnistSobelAngleMap
-from damp.encoding.damp_encoder import ClosedDimension, Detectors, Encoder, OpenedDimension
+from damp.activation import (
+    ActivationEngine,
+    DbscanClusterer,
+    Detector,
+    DetectorHierarchyBuilder,
+    DetectorLayerConfig,
+    DetectorOutputSizer,
+    OutputCodeSize,
+    reassign_output_bits,
+)
+from damp.MnistSobelAngleMap import MnistSobelAngleMap, UpscaledSobel
+from damp.encoding.damp_encoder import (
+    ClosedDimension,
+    Encoder,
+    EncoderCodeColorizer,
+    OpenedDimension,
+    geometric_detector_layers,
+)
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
 from damp.encoding.bitarray import BitArray
@@ -52,7 +59,6 @@ LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE = 10000
 LOG_INTERVAL_ACTIVATION_EMBEDDING = 100
 LOG_INTERVAL_ACTIVATION_COLOR_MERGE = 100
 LOG_INTERVAL_ACTIVATION_COVERAGE = 100
-LOG_INTERVAL_ACTIVATION_ENERGY_MAP = 1
 LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER = 1
 LOG_INTERVAL_ACTIVATION_SAMPLE = 100
 LOG_INTERVAL_ACTIVATION_VISUAL = 100
@@ -60,19 +66,135 @@ LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
-EMBEDDINGS_VERSION = 3
+EMBEDDINGS_VERSION = 5
+ACTIVATION_METADATA_KEY = "activation"
+# Детекторы иерархии (§6.3) сохраняются вместе с эмбеддингами: evaluate/predict не строят их заново.
+ACTIVATION_DETECTORS_KEY = "detectors"
+ENCODER_SIGNATURE_KEY = "encoder_signature"
+# Как получены стимулы раскладки (окно Собеля и режим углопозиций). В старых файлах этих ключей нет —
+# они собраны окнами 4×4 по среднему градиенту окна; кеш с другими значениями не подхватывается.
+PATCH_SIZE_KEY = "patch_size"
+STIMULUS_MODE_KEY = "stimulus_mode"
+LAYOUT_CACHE_LEGACY_STIMULUS = {PATCH_SIZE_KEY: 4, STIMULUS_MODE_KEY: "window"}
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
-PIPELINE_CHECKPOINT_VERSION = 2
+PIPELINE_CHECKPOINT_VERSION = 3
 
+# --- Первичное кодирование стимулов MNIST (угол, X, Y) по схеме Angle-Encoder:
+# случайный бит цветовой полосы у каждого детектора, слои от самого широкого к самому узкому
+# (§2.2.3, §3.2, §4.2.1, §4.4, §4.5).
+# §2.2.3: коды координат можно слить в общий код той же длины (OR, §2.2.1) или склеить (конкатенация).
+# True — общий код длины ENCODER_SHARED_CODE_LENGTH для угла и позиции; False — сегменты
+# MNIST_ANGLE_CODE_LENGTH + 2·MNIST_POSITION_CODE_LENGTH.
+ENCODER_SHARED_CODE = True
+ENCODER_SHARED_CODE_LENGTH = 512
+ENCODER_RANDOM_SEED = 0
+ENCODER_LOG_EVERY = 50
+ENCODER_LAYER_PHASE = True
+MNIST_ANGLE_IN_DEGREES = True
+MNIST_GRAD_THRESHOLD = 0.05
+# Сторона окна Собеля, по которому берётся углопозиция (вне статьи), — в пикселях картинки, на которой
+# считается Собель: стимула 28×28 или, при MNIST_SOBEL_UPSCALE_ENABLED, увеличенной (28·MNIST_SOBEL_UPSCALE).
+# Сетка окон — сторона // окно (без увеличения: 4 → 7×7, 3 → 9×9, 2 → 14×14; при ×8: 16 → 14×14, 3 → 74×74).
+# Остаток у правого и нижнего края в окна не попадает. При 3 ядро 3×3 совпадает с окном, меньше 3 — захватывает
+# соседей. X, Y углопозиции — индексы окон 0…сетка−1: диапазон MNIST_POSITION_MIN…MAX должен их покрывать.
+# После смены пересоберите раскладку: python main.py layout --rebuild (кеш на другом окне не подхватится).
+MNIST_PATCH_SIZE = 9   # при ×8: окно 9×9 увеличенных пикселей, сетка 224 // 9 = 24×24, X, Y ∈ 0…23
+# True — углопозиции только по контуру цифры: окно берётся, если через него проходит контур (пиксель штриха
+# ≥ MNIST_CONTOUR_LEVEL рядом с фоном), угол — по градиенту в пикселях контура. Залитая середина штриха и фон
+# пропускаются, контур не рвётся на границах окон. False — прежний режим: средний градиент по всему окну.
+MNIST_CONTOUR_ONLY = True
+MNIST_CONTOUR_LEVEL = 0.5
+# Окно даёт ровно одну углопозицию. Если края в окне смотрят в противоположные стороны (|Σg| / Σ|g| ниже
+# порога — тонкий штрих целиком в окне), их градиенты гасили бы друг друга — берётся сильнейший край.
+# 0.5 — наименьшая ошибка ориентации линий относительно контура на 1000 цифрах MNIST (0.3: 9.79°, 0.5: 9.58°,
+# 0.7: 9.61°, 0.9: 9.63°). Линия толщиной в пиксель (градиент в её середине гасится) берётся по окну с кольцом
+# соседних пикселей — на 3000 цифрах ни одного окна контура без углопозиции.
+MNIST_CONTOUR_TWO_EDGE_COHERENCE = 0.5
+# Предобработка перед Собелем как в process_image (Rust): увеличение ×MNIST_SOBEL_UPSCALE фильтром Lanczos3,
+# контраст MNIST_SOBEL_CONTRAST (image::imageops::contrast: отклонение от середины × ((100 + c) / 100)²),
+# Собель в целых числах. Контур и градиент ищутся на увеличенной картинке, окно MNIST_PATCH_SIZE — в её пикселях.
+# Отсечка ±255 из оригинала (u8-каналы картинки) — только у картинок gx, gy в Rerun: углы считаются по полному
+# отклику, иначе края с наклоном ~15…75° слипаются в 45° (на 1000 цифрах ошибка ориентации 13.6° против 8.9°).
+# Увеличенная картинка и отклики gx, gy (красный — плюс, синий — минус) — в Rerun, MNIST_SOBEL_ENTITY_PATH.
+# False — без предобработки; в digit_sketch.py и digits_contour_test.py переопределяется ключом --upscale.
+MNIST_SOBEL_UPSCALE_ENABLED = True
+MNIST_SOBEL_UPSCALE = 8
+MNIST_SOBEL_CONTRAST = 100.0
+MNIST_SOBEL_ENTITY_PATH = "/sobel"
+MNIST_ANGLE_MIN = 0.0
+MNIST_ANGLE_MAX = 360.0
+MNIST_ANGLE_CODE_LENGTH = 256
+MNIST_ANGLE_LAYERS = 22
+MNIST_ANGLE_WIDEST_DETECTORS = 2
+MNIST_ANGLE_NARROWEST_DETECTORS = 180
+MNIST_ANGLE_OVERLAP = 0.4
+# Позиции MNIST — индексы участков 0…6. Нижняя граница вынесена на шаг за край данных: детекторов за краями
+# отрезка нет (MNIST_POSITION_EDGE_DETECTORS = False), и при MIN = 0 участок 0 лежал на самой границе —
+# 22 бита вместо ~34 и J(0, 1) = 0,81 при ~0,57 у остальных соседей. С MIN = -1 перекрытие соседних
+# участков ровное (J = 0,55…0,61), их коды различимы одинаково (§4.2.1, §4.5).
+MNIST_POSITION_MIN = -1.0
+MNIST_POSITION_MAX = 28.0
+MNIST_POSITION_CODE_LENGTH = 128
+# 15 слоёв — минимальное уменьшение с 22, при котором в pinwheel-тесте (позиции 2×2, режим сглаживания)
+# пропадает дыра на стыке четырёх позиций: соседние позиции достаточно похожи, чтобы точки на стыке
+# получали энергию от чужих кластеров (22 слоя: 3–10 пустых ячеек в центре, 16: 0–5, 15: 1–2).
+MNIST_POSITION_LAYERS = 22
+MNIST_POSITION_WIDEST_DETECTORS = 2
+# Самый узкий слой позиции — 28 детекторов (самый широкий — MNIST_POSITION_WIDEST_DETECTORS = 2);
+# между ними слои растут геометрически, у каждого слоя своё число детекторов.
+MNIST_POSITION_NARROWEST_DETECTORS = 28
+# Перекрытие соседних позиционных детекторов слоя (§4.2.1: «detectors must overlap at each level»).
+MNIST_POSITION_OVERLAP = 0.4
+# False — в слое ровно MNIST_POSITION_WIDEST…NARROWEST детекторов внутри отрезка (2 … 14), без детекторов
+# за краями; True — детекторы заходят за концы отрезка, как в Angle-Encoder.
+MNIST_POSITION_EDGE_DETECTORS = False
+# Шаг сетки позиций (индексы участков): на нём проверяется дальний порядок кодов позиций (§4.5).
+MNIST_POSITION_STEP = 1.0
+
+# --- Псевдоцвета карт: младший бит красный, старший фиолетовый (§5.14);
+# диагностическая раскраска по углу стимула как на рис. 16 (§5.13.2).
+LAYOUT_PSEUDO_COLOR_MIN_HUE = 0.0
+LAYOUT_PSEUDO_COLOR_MAX_HUE = 300.0
+LAYOUT_COMPONENT_IMAGE_SUFFIX = ".angle.png"
+# Период угла для раскраски хода раскладки по углу стимула в Rerun (как pinwheel-тест, рис. 16).
+LAYOUT_COMPONENT_PERIOD = MNIST_ANGLE_MAX - MNIST_ANGLE_MIN
+LAYOUT_ENERGY_IMAGE_SUFFIX = ".energy.png"
+
+# --- Раскладка (§5.4, §7.1.6, §7.1.7): cosine, порог λ с сигмоидой η,
+# запас пустых ячеек ≈15%, дальняя энергия по всему пространству V (§5.5.1).
+# Сглаживание пространства между пинвилами (расширение статьи): гауссово ядро дальней фазы, старт радиуса
+# со всей карты, геометрическое убывание радиуса, фиксированный λ и слабый отжиг разворачивают соседние
+# пинвилы друг к другу и убирают складки на их границах (docs/ARTICLE_COMPLIANCE.md).
+# False — дальняя фаза строго по статье: φ = Σ s·d по всему V (§5.5.1), радиус пар линейно от d/2 к 1,
+# триггер 1 % обменов и рост λ ступенями (§7.1.7), жадное правило обмена без отжига (§5.6).
+LAYOUT_SMOOTH_PINWHEELS = True
+# Метка кеша раскладки: раскладки старых версий Encoder и другого режима дальней фазы не переиспользуются.
+LAYOUT_CACHE_TAG = "gauss-kernel-v1" if LAYOUT_SMOOTH_PINWHEELS else "article-kernel-v1"
 LAYOUT_SIMILARITY = "cosine"
+# Расстояние в парных энергиях: "euclidean" — d из §5.5, "squared" — d² без корня (§5.9.2).
+LAYOUT_LONG_DISTANCE = "euclidean"
+LAYOUT_SHORT_DISTANCE = "squared"
+# Ядро дальней энергии: "distance" — φ = Σ s·d по §5.5.1; "gauss" — расширение статьи: ограниченное
+# гауссово ядро окрестности радиуса r(t), r(t) следует за радиусом выбора пар (§7.1.7), не ниже минимума.
+# Ограниченное ядро даёт гладкую карту из нескольких пинвилов с чередованием закрутки (как в V1).
+LAYOUT_LONG_KERNEL = "gauss" if LAYOUT_SMOOTH_PINWHEELS else "distance"
+LAYOUT_LONG_KERNEL_RADIUS_MIN = 3
+LAYOUT_LONG_KERNEL_WIDTH = 1.0   # σ гауссова ядра = width · r(t); при σ = r связь через границы кластеров сильнее
 LAYOUT_LAMBDA_THRESHOLD = 0.65
-LAYOUT_ETA = 0
-LAYOUT_EMPTY_RATIO = 0.5
+# Крутизна сигмоиды порога (§5.4); None — жёсткий порог η = ∞, как в параметрах раскладки §7.1.7.
+LAYOUT_ETA = 10.0 if LAYOUT_SMOOTH_PINWHEELS else None
+LAYOUT_EMPTY_RATIO = 0.15
 LAYOUT_USE_GPU = True
+LAYOUT_RANDOM_SEED = 0
+LAYOUT_LONG_FULL_SPACE_MAX_POINTS = 8000
+# Подмножество B в гауссовой дальней фазе допустимо, пока в окрестность радиуса r(t) ожидаемо попадает
+# не меньше стольких точек B (иначе оценка локальной энергии шумная и обмены случайны); ниже — всё V.
+# На 100 цифрах (8 693 точки, |B| = 745) подмножество на всём протяжении фазы давало Ē 0.26 вместо 0.70.
+LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS = 50
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
-LAYOUT_LONG_SUBSET_SIZE = 1024
+LAYOUT_LONG_SUBSET_SIZE = None
 LAYOUT_LONG_SUBSET_REFRESH = 40
 
 LAYOUT_SHORT_PAIRS_PER_STEP = 100
@@ -80,7 +202,6 @@ LAYOUT_SHORT_STEPS = 4000
 LAYOUT_SHORT_LOCAL_RADIUS = 7
 LAYOUT_SHORT_ENERGY_RADIUS = 7
 LAYOUT_SHORT_ENERGY_RECALC_EVERY = 75
-LAYOUT_SHORT_ENERGY_MAX_POINTS = 256
 LAYOUT_SHORT_ENERGY_EPS = 1e-6
 LAYOUT_SHORT_WEIGHTED_FIRST = True
 LAYOUT_SHORT_SIMILARITY_CUTOFF = LAYOUT_LAMBDA_THRESHOLD
@@ -88,57 +209,115 @@ LAYOUT_SHORT_PARTITIONS = 8
 
 MPS_HIGH_WATERMARK_RATIO = 0.0
 
-ENCODER_LOG_EVERY = 50
 LAYOUT_LOG_EVERY_LONG = 150
 LAYOUT_LOG_EVERY_SHORT = 50
 LAYOUT_LOG_VISUALS = True
-LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 0.5
+# Стартовый радиус выбора пар в долях стороны карты: 0.5 — d/2 по §7.1.7; 1.0 — вся карта,
+# как начальная ширина окрестности в SOM (нужно гауссову ядру, иначе позиции распадаются на куски).
+LAYOUT_ADAPTIVE_RADIUS_START_FACTOR = 1.0 if LAYOUT_SMOOTH_PINWHEELS else 0.5
+# Расписание радиуса выбора пар: "swaps" — по статье, λ и r меняются, когда число обменов за шаг
+# падает до LAYOUT_ADAPTIVE_SWAP_TRIGGER от начального значения этапа (§7.1.7); "geometric" и "linear" —
+# расширение статьи: r убывает по номеру шага (геометрически в дальней фазе, линейно в ближней).
+LAYOUT_ADAPTIVE_RADIUS_SCHEDULE = "geometric" if LAYOUT_SMOOTH_PINWHEELS else "swaps"
+LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE = "linear" if LAYOUT_SMOOTH_PINWHEELS else "swaps"
+# Во сколько раз уменьшается r при срабатывании триггера (статья: «постепенно уменьшали до 1», §7.1.7).
+LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR = 0.5
+# Окно шагов, по которому усредняется число обменов («обмены в единицу времени», §7.1.7).
+LAYOUT_ADAPTIVE_SWAP_WINDOW = 10
+# Отжиг в дальней фазе (расширение статьи): температура принятия невыгодных обменов в долях rms|Δ|
+# на радиусах от LAYOUT_ANNEAL_RADIUS_MIN до LAYOUT_ANNEAL_RADIUS_MAX_FACTOR·d — масштаб, на котором
+# соседние кластеры согласуют закрутку и фазу; снимает замёрзшие складки между кластерами.
+# 0 — отжига нет, обмен только при выигрыше энергии (§5.6).
+LAYOUT_ANNEAL_TEMPERATURE = 0.1 if LAYOUT_SMOOTH_PINWHEELS else 0.0
+LAYOUT_ANNEAL_RADIUS_MAX_FACTOR = 0.4
+LAYOUT_ANNEAL_RADIUS_MIN = 5
 LAYOUT_ADAPTIVE_RADIUS_MIN = 1
-LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.01
-LAYOUT_ADAPTIVE_LAMBDA_STEP = 0.05
+# Триггер по доле обменов (1% от начальной, §7.1.7): 0 — расписание не ускоряется по обменам.
+LAYOUT_ADAPTIVE_SWAP_TRIGGER = 0.0 if LAYOUT_SMOOTH_PINWHEELS else 0.01
+# Рост λ ступенями до LAYOUT_ADAPTIVE_LAMBDA_MAX (§7.1.7); None — λ фиксирован: с гауссовым ядром
+# рост λ ослабляет связь через границы кластеров и оставляет складки.
+LAYOUT_ADAPTIVE_LAMBDA_STEP = None if LAYOUT_SMOOTH_PINWHEELS else 0.05
+# λ поднимают с 0.65 до 0.8 (§7.1.7).
+LAYOUT_ADAPTIVE_LAMBDA_MAX = 0.8
 LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR = 1.0
-LAYOUT_ENERGY_STABILITY_WINDOW = 20
-LAYOUT_ENERGY_STABILITY_DELTA = 0.0005
-LAYOUT_ENERGY_STABILITY_EVERY = 200
-LAYOUT_ENERGY_STABILITY_MAX_POINTS = 128
-LAYOUT_MIN_SWAP_RATIO = 0.003
-LAYOUT_MIN_SWAP_WINDOW = 1
+# Остановка (§5.6): число обменов за шаг ниже порога или качество Ē (§5.8) достигло заданного значения.
+# Ē считается каждые LAYOUT_ENERGY_EVAL_EVERY шагов дальней фазы по всем точкам V с нормировкой на E_max по V
+# (§5.7, §5.8); LAYOUT_ENERGY_TARGET = None — только по обменам.
+LAYOUT_ENERGY_EVAL_EVERY = 200
+# Радиус r_e энергии точки: одна матрица Ê для качества Ē (§5.8) и для детекторов (§6.3); «r_e ≤ 5 достаточно» (§5.7).
+LAYOUT_ENERGY_RADIUS = 3
+LAYOUT_ENERGY_TARGET = None
+LAYOUT_MIN_SWAP_RATIO = 0.0001
+LAYOUT_MIN_SWAP_WINDOW = 20
+# Отдельный порог остановки ближней фазы (вне статьи): средняя доля обменов за LAYOUT_MIN_SWAP_WINDOW шагов,
+# ниже которой фаза переходит к следующему этапу расписания радиуса, а на последнем — останавливается.
+# С общим 0.0001 (меньше 0.2 обмена на шаг) ближняя фаза почти всегда идёт все шаги, хотя уже почти ничего не меняет:
+# 100 цифр MNIST (окно 9, ×8, 8 693 точки) — доля обменов всю фазу 0.002…0.006, Ē после дальней фазы 0.69778;
+# порог 0.005 → 20 шагов, 14 с, Ē 0.69787; 0.003 → 71 шаг, 45 с, Ē 0.69794; 0.0001 → 160 шагов, 93 с, Ē 0.69393.
+# При LAYOUT_SMOOTH_PINWHEELS = False (расписание "swaps") порог сначала переводит фазу к следующему этапу r и λ.
+LAYOUT_SHORT_MIN_SWAP_RATIO = 0.005
 
-ACTIVATION_LAMBDA_THRESHOLD = 0.55
+# --- Детекторная иерархия (§6.3–§6.5, §7.1.10, §7.1.12). Порог активации λ_a
+# равен порогу нижнего слоя детекторов (§7.1.11); размер и насыщенность
+# выходного кода вычисляются по среднему числу активных детекторов (§6.6).
+ACTIVATION_LAMBDA_THRESHOLD = 0.7
 ACTIVATION_ETA = None
 ACTIVATION_ENERGY_THRESHOLD = 0.12
 ACTIVATION_DETECTOR_THRESHOLD = 0.5
-ACTIVATION_SATURATION_LIMIT = 50
-ACTIVATION_POINT_ENERGY_RADIUS = 3
-ACTIVATION_DETECTOR_RADIUS = 6
-ACTIVATION_DETECTOR_RADIUS_MIN = 1
-ACTIVATION_DETECTOR_TARGET_POINTS = 28
-ACTIVATION_DETECTOR_MIN_POINTS = 3
-ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR = 0.8
-ACTIVATION_DETECTOR_STEP_DENSITY = 6
-
-ACTIVATION_MAX_DETECTORS = 256
 ACTIVATION_OUTPUT_BITS = 256
-ACTIVATION_LAMBDA_LEVELS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.85)
+ACTIVATION_SATURATION_LIMIT = 50
+ACTIVATION_MAX_EMBEDDING_DENSITY = 0.25
+ACTIVATION_SATURATION_MIN = 16
+ACTIVATION_SATURATION_MAX = 128
+ACTIVATION_OUTPUT_CALIBRATION_SAMPLES = 100
+ACTIVATION_POINT_ENERGY_RADIUS = LAYOUT_ENERGY_RADIUS
+ACTIVATION_DETECTOR_RADIUS_MIN = 1
+# Слои иерархии (§7.1.10): порог λ_d, радиус активации r_a как доля стороны
+# карты (нижние слои — области и гиперкластеры, верхние — кластеры и секторы)
+# и минимальное число точек кластера.
+ACTIVATION_DETECTOR_LAYER_SPECS = (
+    (0.70, 0.35, 12),
+    (0.75, 0.28, 10),
+    (0.80, 0.22, 8),
+    (0.85, 0.16, 6),
+    (0.90, 0.12, 4),
+)
+ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 400
+ACTIVATION_DETECTOR_SEED = 0
+ACTIVATION_DBSCAN_EPS = 1.5
+ACTIVATION_DBSCAN_MIN_SAMPLES = 3
 ACTIVATION_USE_GPU = True
 ACTIVATION_PARALLEL_WORKERS = 4
 ACTIVATION_BATCH_SIZE = 10
 ACTIVATION_CHECKPOINT_EVERY = 10
 
+# --- Декодер: нечёткий поиск по базе эмбеддингов (§2.2.5).
+# J2 (§2.2.4.2); для битовых векторов Σa·b / Σmax(a², b²) = |a∧b| / |a∨b|, то есть совпадает с J.
 DECODER_SIMILARITY = "jaccard2"
 DECODER_SOFTMAX_TEMPERATURE = 0.35
 DECODER_MIN_CONFIDENCE = 0.05
 DECODER_EXPECTED_CLASSES = tuple(range(10))
+DECODER_KNN_TOP_K = 200
+DECODER_TOP_K_PER_CLASS = 20
+DECODER_MIN_SIMILARITY = 0.0
 DECODER_DATASET_LIMIT = 64
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
 
+# §5.10: пары шага считаются спекулятивно по старым позициям; это не влияет на результат, пока обменов
+# за шаг много меньше числа точек. В режиме статьи число пар за шаг (а значит, и обменов) ограничено
+# долей LAYOUT_PAIRS_POINT_FRACTION от числа точек в обеих фазах; None — без ограничения (режим сглаживания,
+# у которого расписание радиуса привязано к номеру шага и подобрано под прежний бюджет пар).
+LAYOUT_PAIRS_POINT_FRACTION = None if LAYOUT_SMOOTH_PINWHEELS else 0.1
 LAYOUT_TUNE_LONG_PAIR_FACTOR = 0.35
 LAYOUT_TUNE_LONG_PAIRS_MIN = 4000
 LAYOUT_TUNE_LONG_PAIRS_MAX = 20000
 LAYOUT_TUNE_LONG_STEPS_DIVISOR = 25
-LAYOUT_TUNE_LONG_STEPS_MIN = 300
-LAYOUT_TUNE_LONG_STEPS_MAX = 1500
+# При сглаживании бюджет задаёт пошаговое расписание радиуса; по статье дальняя фаза заканчивается по числу
+# обменов (§5.6), а при парах ≤ 0.1·N (§5.10) этапу §7.1.7 нужно ~10³ шагов независимо от N (каждая точка
+# попадает в пару ~0.2 раза за шаг) — бюджет только верхняя граница.
+LAYOUT_TUNE_LONG_STEPS_MIN = 2500 if LAYOUT_SMOOTH_PINWHEELS else 50000
+LAYOUT_TUNE_LONG_STEPS_MAX = 5000 if LAYOUT_SMOOTH_PINWHEELS else 50000
 LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER = 8
 LAYOUT_TUNE_LONG_SUBSET_MIN = 512
 LAYOUT_TUNE_LONG_SUBSET_MAX = 2048
@@ -149,13 +328,92 @@ LAYOUT_TUNE_SHORT_PAIR_FACTOR = 0.2
 LAYOUT_TUNE_SHORT_PAIRS_MIN = 1800
 LAYOUT_TUNE_SHORT_PAIRS_MAX = 12000
 LAYOUT_TUNE_SHORT_STEPS_FACTOR = 1.6
-LAYOUT_TUNE_SHORT_STEPS_MIN = 160
-LAYOUT_TUNE_SHORT_STEPS_MAX = 900
-LAYOUT_TUNE_SHORT_RADIUS_FACTOR = 0.05
-LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR = 0.04
+# При сглаживании радиус ближней фазы убывает по номеру шага, и бюджет задаёт расписание; по статье фаза
+# заканчивается по числу обменов (§5.6), и бюджет — только верхняя граница, которой должно хватить на r → 1.
+LAYOUT_TUNE_SHORT_STEPS_MIN = 160 if LAYOUT_SMOOTH_PINWHEELS else 2500
+LAYOUT_TUNE_SHORT_STEPS_MAX = 900 if LAYOUT_SMOOTH_PINWHEELS else 5000
+LAYOUT_TUNE_SHORT_RADIUS_FACTOR = 0.08
+LAYOUT_SHORT_LOCAL_RADIUS_MIN = 3
+LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR = 0.06
 LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR = 30
+
+# --- Тест MNIST-кодера: по 360 углов при двух позициях в сетке участков.
+# Код Angle || X || Y и параметры раскладки общие с MNIST (§2.2.3, §4.6, §5).
+PINWHEEL_ANGLE_COUNT = 360
+PINWHEEL_POSITION_X = (MNIST_POSITION_MIN + MNIST_POSITION_MAX) / 2.0
+PINWHEEL_POSITION_Y = (MNIST_POSITION_MIN + MNIST_POSITION_MAX) / 2.0
+PINWHEEL_POSITIONS = (
+    (10.0, 10.0),
+    (20.0, 10.0),
+    (10.0, 20.0),
+    (20.0, 20.0),
+
+)
+
+
+PINWHEEL_SMOOTH_DELTA = 15.0
+PINWHEEL_OUTPUT_PATH = "pinwheel_test.png"
+PINWHEEL_COMPONENT_OUTPUT_PATH = "pinwheel_test.angle.png"
+PINWHEEL_ENERGY_OUTPUT_PATH = "pinwheel_test.energy.png"
+PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
+
+# --- Визуализация первичных детекторов угла и позиции (detectors_visual.py): слои, рецептивные поля,
+# их перекрытие и цветовые полосы бит (§4.1, §4.2.1, §3.2). Детекторы, активные для примера стимула
+# (угол, X, Y), выделяются; остальные рисуются с прозрачностью DETECTORS_VIEW_INACTIVE_ALPHA.
+DETECTORS_VIEW_OUTPUT_PATH = "detectors_view.png"
+DETECTORS_VIEW_STIMULUS = (45.0, 14.0, 14.0)
+DETECTORS_VIEW_INACTIVE_ALPHA = 0.3
+DETECTORS_VIEW_DPI = 110
+DETECTORS_VIEW_WIDTH_INCHES = 18.0
+
+# --- Проверка, как цифра строится из углопозиций (digit_sketch.py): случайный стимул MNIST заданной цифры,
+# его углопозиции (угол, X, Y) от того же MnistSobelAngleMap, что и в конвейере (§4.4, §4.6), и по каждой —
+# отрезок длиной в окно Собеля, перпендикулярный градиенту (край штриха). Цвет отрезка — угол, как на рис. 16.
+# Размер окна — MNIST_PATCH_SIZE, у скрипта его можно переопределить ключом --patch-size.
+DIGIT_SKETCH_MNIST_ROOT = "./data"
+DIGIT_SKETCH_SPLIT = "train"
+DIGIT_SKETCH_LINE_SCALE = 1.0   # длина отрезка в сторонах окна: 1.0 — ровно окно
+DIGIT_SKETCH_LINE_RADIUS_SCALE = 0.1   # толщина (радиус) отрезка в сторонах окна
+# Окна, через которые проходит контур (MNIST_CONTOUR_LEVEL), но углопозиции нет, подсвечиваются
+# DIGIT_SKETCH_LOST_COLOR — там контур цифры рвётся.
+DIGIT_SKETCH_GRID_COLOR = (255, 255, 255, 50)
+DIGIT_SKETCH_LOST_COLOR = (255, 60, 60, 220)
+DIGIT_SKETCH_ENTITY_PATH = "/digit"
+
+# --- Тест «цифры из контуров» (digits_contour_test.py): по случайному стимулу каждой цифры — строка таблицы
+# «оригинал | цифра из линий углопозиций в режиме контура» для каждого окна из DIGITS_CONTOUR_PATCH_SIZES.
+# Режим контура включается в тесте всегда, независимо от MNIST_CONTOUR_ONLY; seed фиксирован — таблица
+# воспроизводится, ключ --seed выбирает другие стимулы. Цвета сетки и пропусков — DIGIT_SKETCH_*.
+DIGITS_CONTOUR_DIGITS = tuple(range(10))
+DIGITS_CONTOUR_PATCH_SIZES = (MNIST_PATCH_SIZE,)   # то же окно, что у конвейера
+DIGITS_CONTOUR_SEED = 0
+DIGITS_CONTOUR_SCALE = 16        # пикселей таблицы на пиксель стимула
+DIGITS_CONTOUR_LINE_WIDTH = 4
+DIGITS_CONTOUR_GAP = 10
+DIGITS_CONTOUR_OUTPUT_PATH = "digits_contour_test.png"
+DIGITS_CONTOUR_ENTITY_PATH = "/digits_contour"
+LOG_INTERVAL_ANGLE_LINES = 100
 LOG_INTERVALS = {
     "detectors.init": LOG_INTERVAL_INIT,
+    "detectors.geometric_layers": LOG_INTERVAL_INIT,
+    "encoder.random_bits": LOG_INTERVAL_INIT,
+    "encoder.colorizer.dimension": LOG_INTERVAL_INIT,
+    "encoder.code.color": LOG_INTERVAL_LAYOUT_PAIR,
+    "layout.similarity_threshold": LOG_INTERVAL_INIT,
+    "layout.point_energy.map": LOG_INTERVAL_INIT,
+    "layout.render_component_image": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.render_energy_image": LOG_INTERVAL_LAYOUT_VISUAL,
+    "layout.visual.save": LOG_INTERVAL_LAYOUT_EXPORT,
+    "activation.detector.builder.init": LOG_INTERVAL_INIT,
+    "activation.detector.levels": LOG_INTERVAL_INIT,
+    "activation.detector.hierarchy": LOG_INTERVAL_INIT,
+    "activation.detector.layer.filled": LOG_INTERVAL_INIT,
+    "activation.detector.cluster": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.cluster.noise": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.center": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.radius": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.detector.params": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
+    "activation.embedding.saturation": LOG_INTERVAL_ACTIVATION_EMBEDDING,
     "dimension.closed": LOG_INTERVAL_INIT,
     "dimension.init": LOG_INTERVAL_INIT,
     "encoder.code_length": LOG_INTERVAL_INIT,
@@ -166,7 +424,7 @@ LOG_INTERVALS = {
     "encoder.encode.normalized": LOG_INTERVAL_ENCODER_ENCODE,
     "encoder.init": LOG_INTERVAL_INIT,
     "encoder.layer": LOG_INTERVAL_INIT,
-    "encoder.random_bit": LOG_INTERVAL_INIT,
+    "encoder.colour_band": LOG_INTERVAL_INIT,
     "layout.codes": LOG_INTERVAL_INIT,
     "layout.distance_eps": LOG_INTERVAL_INIT,
     "layout.energy.average": LOG_INTERVAL_LAYOUT_AVG_ENERGY,
@@ -181,6 +439,7 @@ LOG_INTERVALS = {
     "layout.energy.short.tensor.empty_subset": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.progress": LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS,
+    "layout.energy.pairs.gpu": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
     "layout.gpu.disabled": LOG_INTERVAL_INIT,
@@ -207,10 +466,14 @@ LOG_INTERVALS = {
     "layout.adaptive.lambda": LOG_INTERVAL_INIT,
     "layout.run.done": LOG_INTERVAL_INIT,
     "layout.run.energy_monitor": LOG_INTERVAL_INIT,
-    "layout.run.energy_stability": LOG_INTERVAL_INIT,
-    "layout.run.energy_stability.stop": LOG_INTERVAL_INIT,
+    "layout.run.energy_target": LOG_INTERVAL_INIT,
+    "layout.run.energy_target.stop": LOG_INTERVAL_INIT,
+    "layout.adaptive.trigger": LOG_INTERVAL_INIT,
+    "layout.adaptive.stage.forced": LOG_INTERVAL_INIT,
+    "layout.adaptive.incomplete": LOG_INTERVAL_INIT,
     "layout.run.mode": LOG_INTERVAL_INIT,
     "layout.run.selection": LOG_INTERVAL_INIT,
+    "layout.run.speculative": LOG_INTERVAL_INIT,
     "layout.run.settings": LOG_INTERVAL_INIT,
     "layout.run.swap_monitor": LOG_INTERVAL_INIT,
     "layout.run.swap_ratio": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
@@ -230,6 +493,12 @@ LOG_INTERVALS = {
     "layout.export.json.error": LOG_INTERVAL_LAYOUT_EXPORT,
     "layout.load.cache": LOG_INTERVAL_INIT,
     "sobel_map.extract": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.contour": LOG_INTERVAL_SOBEL_IMAGE,
+    "sobel_map.contour_patches": LOG_INTERVAL_SOBEL_IMAGE,
+    "upscaled_sobel.init": LOG_INTERVAL_INIT,
+    "upscaled_sobel.apply": LOG_INTERVAL_SOBEL_IMAGE,
+    "angle_lines.angle_position": LOG_INTERVAL_ANGLE_LINES,
+    "angle_lines.segment": LOG_INTERVAL_ANGLE_LINES,
     "sobel_map.init": LOG_INTERVAL_INIT,
     "sobel_map.patch.angle": LOG_INTERVAL_SOBEL_PATCH,
     "sobel_map.patch.metrics": LOG_INTERVAL_SOBEL_PATCH,
@@ -239,6 +508,7 @@ LOG_INTERVALS = {
     "activation.backend.gpu_unavailable": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.backend.gpu_fallback": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.engine.init": LOG_INTERVAL_ACTIVATION_INIT,
+    "activation.map.init": LOG_INTERVAL_ACTIVATION_INIT,
     "activation.map": LOG_INTERVAL_ACTIVATION_MAP,
     "activation.detector.level": LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL,
     "activation.detector.active": LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE,
@@ -247,14 +517,16 @@ LOG_INTERVALS = {
     "activation.embedding": LOG_INTERVAL_ACTIVATION_EMBEDDING,
     "activation.color_merge": LOG_INTERVAL_ACTIVATION_COLOR_MERGE,
     "activation.detector.coverage": LOG_INTERVAL_ACTIVATION_COVERAGE,
-    "activation.energy.map": LOG_INTERVAL_ACTIVATION_ENERGY_MAP,
     "activation.sample": LOG_INTERVAL_ACTIVATION_SAMPLE,
     "activation.map.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.energy.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
 }
 
-LAYOUT_CACHE_PATTERNS = ("data/layout-{count}-*.json", "layout-{count}-*.json")
+LAYOUT_CACHE_PATTERNS = (
+    f"data/layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
+    f"layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
+)
 
 
 def _layout_cache_paths_for_count(count: int) -> list[str]:
@@ -268,36 +540,6 @@ def _layout_cache_paths_for_count(count: int) -> list[str]:
         )
     return sorted(set(paths), key=os.path.getmtime, reverse=True)
 
-
-def _load_layout_metadata_from_path(path: str) -> tuple[int, int | None, bool] | None:
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            data = json.load(fp)
-    except Exception as exc:
-        LOGGER.event(
-            "layout.cache.read_error",
-            section=LAID_OUT_STRUCTURE,
-            data={"path": path, "error": str(exc)},
-        )
-        return None
-    points_payload = data.get("layout", [])
-    total_points = int(data.get("points") or len(points_payload))
-    pair_radius = data.get("pair_radius")
-    has_positions = bool(points_payload) and all(
-        item.get("x") is not None and item.get("y") is not None for item in points_payload
-    )
-    ready = has_positions and data.get("width") not in (None, 0) and data.get("height") not in (None, 0)
-    LOGGER.event(
-        "layout.cache.inspect",
-        section=LAID_OUT_STRUCTURE,
-        data={
-            "path": path,
-            "points": total_points,
-            "pair_radius": pair_radius,
-            "ready": ready,
-        },
-    )
-    return total_points, pair_radius, ready
 
 
 def configure_logging() -> None:
@@ -325,7 +567,7 @@ class GpuEnvironment:
             mode = "set"
         LOGGER.event(
             "layout.gpu.mps.watermark",
-            section=GPU_IMPLEMENTATION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "mode": mode,
                 "value": value,
@@ -369,7 +611,13 @@ class EmbeddingStore:
         self._version_key = str(version_key)
         self._version = int(version)
 
-    def save(self, path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
+    def save(
+        self,
+        path: str,
+        embeddings: Sequence[EmbeddingRecord],
+        *,
+        metadata: Mapping[str, object] | None = None,
+    ) -> None:
         if not path:
             raise ValueError("path must be provided to save embeddings")
         directory = os.path.dirname(path)
@@ -383,7 +631,7 @@ class EmbeddingStore:
             except Exception as exc:
                 LOGGER.event(
                     "activation.embedding.save",
-                    section=DETECTOR_INSERTION,
+                    section=OUTSIDE_ARTICLE,
                     data={
                         "path": path,
                         "embeddings": len(embeddings),
@@ -394,11 +642,13 @@ class EmbeddingStore:
                 payload = {}
         payload[self._json_key] = [record.as_payload() for record in embeddings]
         payload[self._version_key] = self._version
+        if metadata is not None:
+            payload[ACTIVATION_METADATA_KEY] = dict(metadata)
         with open(path, "w", encoding="utf-8") as fp:
             json.dump(payload, fp, ensure_ascii=True, indent=2)
         LOGGER.event(
             "activation.embedding.save",
-            section=DETECTOR_INSERTION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "embeddings": len(embeddings),
@@ -406,51 +656,90 @@ class EmbeddingStore:
         },
     )
 
-
-def _load_embeddings_from_file(path: str) -> list["EmbeddingRecord"]:
-    if not path:
-        raise ValueError("path must be provided to load embeddings")
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    with open(path, "r", encoding="utf-8") as fp:
-        data = json.load(fp)
-    stored_version = data.get(EMBEDDINGS_VERSION_KEY)
-    if stored_version != EMBEDDINGS_VERSION:
+    def load(self, path: str) -> list["EmbeddingRecord"]:
+        """Эмбеддинги базы, сохранённые в JSON раскладки (вне статьи)."""
+        if not path:
+            raise ValueError("path must be provided to load embeddings")
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        stored_version = data.get(self._version_key)
+        if stored_version != self._version:
+            LOGGER.event(
+                "activation.embedding.incompatible",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "path": path,
+                    "stored_version": stored_version,
+                    "expected_version": self._version,
+                },
+            )
+            return []
+        raw_embeddings = data.get(self._json_key, [])
+        embeddings: list[EmbeddingRecord] = []
+        for item in raw_embeddings:
+            class_label = item.get("class", item.get("label"))
+            embedding_bits = item.get("embedding")
+            if class_label is None or embedding_bits is None:
+                continue
+            embeddings.append(
+                EmbeddingRecord(
+                    class_label=str(class_label),
+                    embedding_bits=str(embedding_bits),
+                )
+            )
+        classes = sorted({int(rec.class_label) for rec in embeddings})
         LOGGER.event(
-            "activation.embedding.incompatible",
-            section=DETECTOR_HIERARCHY,
+            "activation.embedding.load",
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
-                "stored_version": stored_version,
-                "expected_version": EMBEDDINGS_VERSION,
+                "embeddings": len(embeddings),
+                "classes": classes,
+                "json_key": self._json_key,
             },
         )
-        return []
-    raw_embeddings = data.get(EMBEDDINGS_JSON_KEY, [])
-    embeddings: list[EmbeddingRecord] = []
-    for item in raw_embeddings:
-        class_label = item.get("class", item.get("label"))
-        embedding_bits = item.get("embedding")
-        if class_label is None or embedding_bits is None:
-            continue
-        embeddings.append(
-            EmbeddingRecord(
-                class_label=str(class_label),
-                embedding_bits=str(embedding_bits),
+        return embeddings
+
+    @staticmethod
+    def to_labeled(records: Sequence["EmbeddingRecord"]) -> list[LabeledEmbedding]:
+        labeled: list[LabeledEmbedding] = []
+        for record in records:
+            bit_string = record.embedding_bits
+            bit_array = BitArray(len(bit_string))
+            for idx, char in enumerate(bit_string):
+                if char == "1":
+                    bit_array.set(idx, 1)
+            labeled.append(
+                LabeledEmbedding(
+                    label=int(record.class_label),
+                    embedding=bit_array,
+                )
             )
-        )
-    classes = sorted({int(rec.class_label) for rec in embeddings})
-    LOGGER.event(
-        "activation.embedding.load",
-        section=DETECTOR_HIERARCHY,
-        data={
-            "path": path,
-            "embeddings": len(embeddings),
-            "classes": classes,
-            "json_key": EMBEDDINGS_JSON_KEY,
-        },
-    )
-    return embeddings
+        if labeled:
+            LOGGER.event(
+                "decoder.base.prepare",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "embeddings": len(labeled),
+                    "classes": len({item.label for item in labeled}),
+                    "bit_length": len(labeled[0].embedding),
+                },
+            )
+        return labeled
+
+    def load_metadata(self, path: str) -> dict[str, object]:
+        """Размер выходного кода и насыщенность, сохранённые при обучении (§6.6)."""
+        if not path or not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        if data.get(self._version_key) != self._version:
+            return {}
+        metadata = data.get(ACTIVATION_METADATA_KEY)
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
 
 
 class PipelineCheckpointStore:
@@ -473,14 +762,14 @@ class PipelineCheckpointStore:
         except Exception as exc:
             LOGGER.event(
                 "pipeline.checkpoint.load.error",
-                section=PARALLEL_PROCESSING,
+                section=OUTSIDE_ARTICLE,
                 data={"path": path, "error": str(exc)},
             )
             return self._empty_payload()
         if payload.get("version") != self._version:
             LOGGER.event(
                 "pipeline.checkpoint.incompatible",
-                section=PARALLEL_PROCESSING,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "path": path,
                     "stored_version": payload.get("version"),
@@ -490,7 +779,7 @@ class PipelineCheckpointStore:
             return self._empty_payload()
         LOGGER.event(
             "pipeline.checkpoint.load",
-            section=PARALLEL_PROCESSING,
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "completed": len(payload.get("embeddings", [])),
@@ -522,7 +811,7 @@ class PipelineCheckpointStore:
         os.replace(temporary_path, path)
         LOGGER.event(
             "pipeline.checkpoint.save",
-            section=PARALLEL_PROCESSING,
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "completed": len(embeddings),
@@ -530,6 +819,10 @@ class PipelineCheckpointStore:
                 "stages": stages,
             },
         )
+
+    def reset(self, layout_path: str, *, target_samples: int) -> None:
+        """Пустой чекпоинт: этапы и эмбеддинги прошлого запуска не используются (запуск без кеша)."""
+        self.save(layout_path, stages={}, target_samples=target_samples, embeddings=[])
 
     def records(self, payload: dict[str, object]) -> list[EmbeddingRecord]:
         records: list[EmbeddingRecord] = []
@@ -546,32 +839,6 @@ class PipelineCheckpointStore:
     def _empty_payload(self) -> dict[str, object]:
         return {"version": self._version, "target_samples": 0, "stages": {}, "embeddings": []}
 
-
-def _embedding_records_to_labeled(records: Sequence["EmbeddingRecord"]) -> list[LabeledEmbedding]:
-    labeled: list[LabeledEmbedding] = []
-    for record in records:
-        bit_string = record.embedding_bits
-        bit_array = BitArray(len(bit_string))
-        for idx, char in enumerate(bit_string):
-            if char == "1":
-                bit_array.set(idx, 1)
-        labeled.append(
-            LabeledEmbedding(
-                label=int(record.class_label),
-                embedding=bit_array,
-            )
-        )
-    if labeled:
-        LOGGER.event(
-            "decoder.base.prepare",
-            section=DETECTOR_HIERARCHY,
-            data={
-                "embeddings": len(labeled),
-                "classes": len({item.label for item in labeled}),
-                "bit_length": len(labeled[0].embedding),
-            },
-        )
-    return labeled
 
 
 class LayoutParameterTuner:
@@ -596,10 +863,21 @@ class LayoutParameterTuner:
             LAYOUT_TUNE_LONG_STEPS_MIN,
             min(LAYOUT_TUNE_LONG_STEPS_MAX, int(total_points / LAYOUT_TUNE_LONG_STEPS_DIVISOR)),
         )
-        long_subset_size = min(
-            LAYOUT_TUNE_LONG_SUBSET_MAX,
-            max(LAYOUT_TUNE_LONG_SUBSET_MIN, int(math.sqrt(total_points) * LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER)),
-        )
+        if total_points <= LAYOUT_LONG_FULL_SPACE_MAX_POINTS:
+            # §5.5.1: дальняя энергия считается по всему пространству V.
+            long_subset_size: int | None = None
+        else:
+            # §5.9.4: для очень больших пространств допускается подмножество.
+            long_subset_size = min(
+                LAYOUT_TUNE_LONG_SUBSET_MAX,
+                max(LAYOUT_TUNE_LONG_SUBSET_MIN, int(math.sqrt(total_points) * LAYOUT_TUNE_LONG_SUBSET_MULTIPLIER)),
+            )
+            LOGGER.event(
+                "layout.tune.long_subset",
+                section=OPTIM_SUBSET,
+                data={"points": total_points, "long_subset_size": long_subset_size,
+                      "full_space_max_points": LAYOUT_LONG_FULL_SPACE_MAX_POINTS},
+            )
         long_subset_refresh = max(
             LAYOUT_TUNE_LONG_SUBSET_REFRESH_MIN,
             min(
@@ -611,15 +889,22 @@ class LayoutParameterTuner:
             LAYOUT_TUNE_SHORT_PAIRS_MIN,
             min(LAYOUT_TUNE_SHORT_PAIRS_MAX, int(total_points * LAYOUT_TUNE_SHORT_PAIR_FACTOR)),
         )
+        if LAYOUT_PAIRS_POINT_FRACTION is not None:
+            # §5.10: обменов за шаг много меньше числа точек — пар за шаг не больше доли точек.
+            pairs_cap = max(1, int(total_points * LAYOUT_PAIRS_POINT_FRACTION))
+            long_pairs = min(long_pairs, pairs_cap)
+            short_pairs = min(short_pairs, pairs_cap)
         short_steps = max(
             LAYOUT_TUNE_SHORT_STEPS_MIN,
             min(LAYOUT_TUNE_SHORT_STEPS_MAX, int(grid_size * LAYOUT_TUNE_SHORT_STEPS_FACTOR)),
         )
+        # §5.5.2: окрестность R должна содержать точки помимо самой пары,
+        # поэтому локальный радиус не опускается ниже LAYOUT_SHORT_LOCAL_RADIUS_MIN.
         short_local_radius = max(
-            LAYOUT_ADAPTIVE_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_RADIUS_FACTOR)
+            LAYOUT_SHORT_LOCAL_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_RADIUS_FACTOR)
         )
         short_energy_radius = max(
-            LAYOUT_ADAPTIVE_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR)
+            LAYOUT_SHORT_LOCAL_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR)
         )
         short_energy_recalc_every = max(LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR, short_steps // 6)
         LOGGER.event(
@@ -632,7 +917,8 @@ class LayoutParameterTuner:
                 "start_radius_factor": self._start_radius_factor,
                 "long_pairs_per_step": long_pairs,
                 "long_steps": long_steps,
-                "long_subset_size": long_subset_size,
+                "long_subset_size": -1 if long_subset_size is None else long_subset_size,
+                "long_subset_mode": "full_space" if long_subset_size is None else "subset",
                 "long_subset_refresh": long_subset_refresh,
                 "short_pairs_per_step": short_pairs,
                 "short_steps": short_steps,
@@ -672,7 +958,7 @@ def _default_layout_params() -> TunedLayoutParams:
 
 def _layout_json_path(count: int, pair_radius: int | None) -> str:
     suffix = "auto" if pair_radius is None else str(pair_radius)
-    return f"data/layout-{count}-{suffix}.json"
+    return f"data/layout-{count}-{suffix}-{LAYOUT_CACHE_TAG}.json"
 
 
 def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> int:
@@ -689,693 +975,507 @@ def _expected_pair_radius(total_points: int, run_params: TunedLayoutParams) -> i
     )
 
 
-def _points_in_radius(
-    center: tuple[int, int],
-    positions: list[tuple[int, int]],
-    radius_sq: float,
-) -> list[int]:
-    cy, cx = center
-    covered: list[int] = []
-    for idx, (y, x) in enumerate(positions):
-        dy = float(cy) - float(y)
-        dx = float(cx) - float(x)
-        if dy * dy + dx * dx <= radius_sq:
-            covered.append(idx)
-    return covered
-
-
-def _compute_point_energies(layout: Layout, radius: int) -> list[float]:
-    if radius <= 0:
-        raise ValueError("radius must be positive for activation energy map")
-    point_count = len(layout._positions)
-    if point_count == 0:
-        return []
-    radius_sq = radius * radius
-    energies: list[float] = []
-    pos_y = layout._pos_y
-    pos_x = layout._pos_x
-    row_occupied = layout._row_occupied
-    distance_eps = layout._distance_eps
-    sim_lambda = layout._sim_lambda_idx
-    for idx in range(point_count):
-        cy = pos_y[idx]
-        cx = pos_x[idx]
-        energy = 0.0
-        y_min = max(0, cy - radius)
-        y_max = min(layout.height - 1, cy + radius)
-        x_min = max(0, cx - radius)
-        x_max = min(layout.width - 1, cx + radius)
-        for y in range(y_min, y_max + 1):
-            dy = cy - y
-            dy_sq = dy * dy
-            occupied = row_occupied[y]
-            if not occupied:
-                continue
-            for x in occupied:
-                if x < x_min or x > x_max:
-                    continue
-                dx = cx - x
-                dist_sq = dy_sq + dx * dx
-                if dist_sq > radius_sq:
-                    continue
-                other_idx = layout.grid[y][x]
-                if other_idx is None or other_idx == idx:
-                    continue
-                sim = sim_lambda(idx, other_idx)
-                if sim <= 0.0:
-                    continue
-                energy += sim / (dist_sq + distance_eps)
-        energies.append(energy)
-    emax = max(energies)
-    normalized = [e / emax if emax > 0 else 0.0 for e in energies]
-    LOGGER.event(
-        "activation.energy.map",
-        section=ENERGY_CALC,
-        data={
-            "radius": radius,
-            "points": point_count,
-            "energy_max": emax,
-        },
+def _detector_layer_configs(layout: Layout) -> tuple[DetectorLayerConfig, ...]:
+    """Слои иерархии: один порог λ_d на слой, r_a и минимум точек (§6.4, §7.1.10)."""
+    extent = max(1, min(layout.width, layout.height))
+    return tuple(
+        DetectorLayerConfig(
+            lambda_threshold=float(level),
+            activation_radius=max(ACTIVATION_DETECTOR_RADIUS_MIN, int(round(extent * float(radius_factor)))),
+            min_points=int(min_points),
+        )
+        for level, radius_factor, min_points in ACTIVATION_DETECTOR_LAYER_SPECS
     )
-    return normalized
-
-
-def _build_detectors_from_layout_legacy(
-    layout: Layout,
-    energies: list[float],
-    *,
-    radius: int,
-    max_detectors: int,
-    output_bits: int,
-    lambda_levels: tuple[float, ...],
-) -> list[Detector]:
-    """
-    Построение иерархии детекторов "как в статье":
-    - несколько уровней λ (детекторная иерархия);
-    - радиус детектора выбирается адаптивно (приближение fill-factor) по целевому числу точек покрытия;
-    - центры детекторов выбираются из точек с высокой статической энергией и разреживаются (NMS);
-    - выходной код детектора — уникальный бит в своём слое (без коллизий).
-    """
-    if radius <= 0:
-        raise ValueError("detector radius must be positive")
-    if max_detectors <= 0:
-        raise ValueError("max_detectors must be positive")
-    if output_bits <= 0:
-        raise ValueError("output_bits must be positive")
-    if not lambda_levels:
-        raise ValueError("lambda_levels must be non-empty")
-    if len(energies) != len(layout._positions):
-        raise ValueError("energies size must match layout points")
-
-    layers = len(lambda_levels)
-    per_layer_limit = max(1, max_detectors // layers)
-    required_bits = per_layer_limit * layers
-    if output_bits < required_bits:
-        raise ValueError(
-            f"output_bits must be >= per_layer_limit*layers ({required_bits}), got {output_bits}"
-        )
-
-    # Предпочитаем точки с высокой статической энергией
-    sorted_indices = sorted(range(len(energies)), key=lambda i: energies[i], reverse=True)
-
-    # Быстрая выборка индексов по радиусу через grid/row_occupied (как в _compute_point_energies)
-    row_occupied = layout._row_occupied
-    grid = layout.grid
-    height = layout.height
-    width = layout.width
-    pos_y = layout._pos_y
-    pos_x = layout._pos_x
-
-    def covered_indices_for(center_idx: int, r: int) -> list[int]:
-        cy = pos_y[center_idx]
-        cx = pos_x[center_idx]
-        r_sq = r * r
-        covered: list[int] = []
-        y_min = max(0, cy - r)
-        y_max = min(height - 1, cy + r)
-        x_min = max(0, cx - r)
-        x_max = min(width - 1, cx + r)
-        for y in range(y_min, y_max + 1):
-            dy = cy - y
-            dy_sq = dy * dy
-            occupied = row_occupied[y]
-            if not occupied:
-                continue
-            for x in occupied:
-                if x < x_min or x > x_max:
-                    continue
-                dx = cx - x
-                if dy_sq + dx * dx > r_sq:
-                    continue
-                other_idx = grid[y][x]
-                if other_idx is None:
-                    continue
-                covered.append(other_idx)
-        return covered
-
-    # Адаптивный радиус (приближение подбора fill-factor)
-    r_min = ACTIVATION_DETECTOR_RADIUS_MIN
-    r_max = radius
-    target_points = max(1, ACTIVATION_DETECTOR_TARGET_POINTS)
-
-    def choose_radius(center_idx: int) -> tuple[int, list[int]]:
-        chosen_r = r_max
-        chosen_cov: list[int] = []
-        for r in range(r_min, r_max + 1):
-            cov = covered_indices_for(center_idx, r)
-            if len(cov) >= target_points:
-                return r, cov
-            # запомним лучший (самый большой) на случай, если до цели не дотянули
-            if len(cov) > len(chosen_cov):
-                chosen_cov = cov
-                chosen_r = r
-        return chosen_r, chosen_cov
-
-    # NMS: не даём центрам быть слишком близко (избегаем дубликатов детекторов)
-    min_dist = max(1.0, float(r_max) * float(ACTIVATION_DETECTOR_NMS_MIN_DIST_FACTOR))
-    min_dist_sq = min_dist * min_dist
-    detectors: list[Detector] = []
-
-    for layer_idx, lambda_value in enumerate(lambda_levels):
-        layer_detectors: list[Detector] = []
-        # §6.4.5 запрещает перекрытие только внутри одного слоя D_lambda.
-        chosen_centers: list[tuple[float, float]] = []
-        layer_offset = layer_idx * per_layer_limit
-
-        # Берём кандидатов плотнее, чем "строго per_layer_limit", чтобы NMS не выжигал слой
-        step = max(1, len(sorted_indices) // (per_layer_limit * max(1, int(ACTIVATION_DETECTOR_STEP_DENSITY))))
-
-        local_id = 0
-        for idx in sorted_indices[::step]:
-            if len(layer_detectors) >= per_layer_limit or len(detectors) >= max_detectors:
-                break
-
-            cy = pos_y[idx]
-            cx = pos_x[idx]
-            # NMS check
-            too_close = False
-            for (py, px) in chosen_centers:
-                dy = float(cy) - float(py)
-                dx = float(cx) - float(px)
-                if dy * dy + dx * dx < min_dist_sq:
-                    too_close = True
-                    break
-            if too_close:
-                continue
-
-            chosen_r, covered = choose_radius(idx)
-            if not covered:
-                continue
-
-            # §6.3: e_d = sum(a_ji * e_ji). Активация a_ji вычисляется
-            # кодом центра при пороге lambda данного слоя, а не заменяется единицей.
-            center_code = layout._points[idx].code
-            center_ones = layout._points[idx].ones
-            energy_sum = 0.0
-            active_points = 0
-            for i in covered:
-                point_energy = energies[i]
-                if point_energy < ACTIVATION_ENERGY_THRESHOLD:
-                    continue
-                point = layout._points[i]
-                denominator = math.sqrt(center_ones * point.ones)
-                if denominator <= 0.0:
-                    continue
-                activation = center_code.common(point.code) / denominator
-                if activation < lambda_value:
-                    continue
-                energy_sum += activation * point_energy
-                active_points += 1
-            if energy_sum <= 0.0 or active_points <= 0:
-                continue
-
-            # Уникальный бит в своём слое (без коллизий)
-            bit_index = layer_offset + local_id
-            if bit_index >= output_bits:
-                break
-            output_code = BitArray(output_bits)
-            output_code.set(bit_index, 1)
-            local_id += 1
-
-            center = (cy, cx)
-            detector = Detector(
-                center=center,
-                radius=float(chosen_r),
-                lambda_threshold=lambda_value,
-                energy=energy_sum,
-                points_count=active_points,
-                output_code=output_code,
-                label=f"λ={lambda_value:.2f}",
-            )
-
-            layer_detectors.append(detector)
-            detectors.append(detector)
-            chosen_centers.append((float(cy), float(cx)))
-
-        LOGGER.event(
-            "activation.detector.layer",
-            section=DETECTOR_CONSTRUCTION,
-            data={
-                "lambda": lambda_value,
-                "layer_detectors": len(layer_detectors),
-                "per_layer_limit": per_layer_limit,
-                "total_detectors": len(detectors),
-                "radius_min": r_min,
-                "radius_max": r_max,
-                "target_points": target_points,
-            },
-        )
-
-        if len(detectors) >= max_detectors:
-            break
-
-    if not detectors:
-        raise RuntimeError("не удалось построить ни одного детектора для активации")
-    return detectors
-
-
-@dataclass(frozen=True)
-class DetectorCandidate:
-    center: tuple[float, float]
-    radius: float
-    energy: float
-    points_count: int
-    fill_factor: float
-    insertion_density: float
-
-
-class DetectorHierarchyBuilder:
-    """Строит слои D_lambda по формулам §6.3–6.4.5."""
-
-    def __init__(
-        self,
-        *,
-        layout: Layout,
-        energies: Sequence[float],
-        radius: int,
-        radius_min: int,
-        min_points: int,
-        max_detectors: int,
-        output_bits: int,
-        lambda_levels: Sequence[float],
-        energy_threshold: float,
-        candidate_density: int,
-    ) -> None:
-        if radius <= 0 or radius_min <= 0 or radius_min > radius:
-            raise ValueError("invalid detector radius range")
-        if min_points <= 0:
-            raise ValueError("min_points must be positive")
-        if max_detectors <= 0 or output_bits <= 0:
-            raise ValueError("detector and output sizes must be positive")
-        if len(energies) != len(layout._positions):
-            raise ValueError("energies size must match layout points")
-        if not lambda_levels:
-            raise ValueError("lambda_levels must be non-empty")
-        self._layout = layout
-        self._energies = [float(value) for value in energies]
-        self._radius = int(radius)
-        self._radius_min = int(radius_min)
-        self._min_points = int(min_points)
-        self._max_detectors = int(max_detectors)
-        self._output_bits = int(output_bits)
-        self._lambda_levels = tuple(float(value) for value in lambda_levels)
-        self._energy_threshold = float(energy_threshold)
-        self._candidate_density = max(1, int(candidate_density))
-        self._sorted_indices = sorted(
-            range(len(self._energies)),
-            key=lambda index: self._energies[index],
-            reverse=True,
-        )
-
-    def build(self) -> list[Detector]:
-        per_layer_limit = max(1, self._max_detectors // len(self._lambda_levels))
-        if per_layer_limit * len(self._lambda_levels) > self._output_bits:
-            raise ValueError("output_bits is too small for detector hierarchy")
-        detectors: list[Detector] = []
-        for layer_index, lambda_value in enumerate(self._lambda_levels):
-            candidates = self._build_layer(lambda_value, per_layer_limit)
-            layer_offset = layer_index * per_layer_limit
-            for local_index, candidate in enumerate(candidates):
-                output_code = BitArray(self._output_bits)
-                output_code.set(layer_offset + local_index, 1)
-                detectors.append(
-                    Detector(
-                        center=candidate.center,
-                        radius=candidate.radius,
-                        lambda_threshold=lambda_value,
-                        energy=candidate.energy,
-                        points_count=candidate.points_count,
-                        output_code=output_code,
-                        label=f"λ={lambda_value:.2f}",
-                    )
-                )
-            LOGGER.event(
-                "activation.detector.layer",
-                section=DETECTOR_CONSTRUCTION,
-                data={
-                    "lambda": lambda_value,
-                    "layer_detectors": len(candidates),
-                    "per_layer_limit": per_layer_limit,
-                    "fill_min": min((item.fill_factor for item in candidates), default=0.0),
-                    "fill_max": max((item.fill_factor for item in candidates), default=0.0),
-                    "radius_min": min((item.radius for item in candidates), default=0.0),
-                    "radius_max": max((item.radius for item in candidates), default=0.0),
-                },
-            )
-        if not detectors:
-            raise RuntimeError("не удалось построить ни одного детектора для активации")
-        return detectors
-
-    def _build_layer(self, lambda_value: float, limit: int) -> list[DetectorCandidate]:
-        selected: list[DetectorCandidate] = []
-        step = max(1, len(self._sorted_indices) // (limit * self._candidate_density))
-        for center_index in self._sorted_indices[::step]:
-            candidate = self._make_candidate(center_index, lambda_value)
-            if candidate is None:
-                continue
-            overlaps = [
-                existing
-                for existing in selected
-                if self._overlaps(candidate, existing)
-            ]
-            if overlaps:
-                if any(
-                    existing.insertion_density >= candidate.insertion_density
-                    for existing in overlaps
-                ):
-                    continue
-                selected = [item for item in selected if item not in overlaps]
-            selected.append(candidate)
-        selected.sort(key=lambda item: item.insertion_density, reverse=True)
-        return selected[:limit]
-
-    def _make_candidate(
-        self,
-        center_index: int,
-        lambda_value: float,
-    ) -> DetectorCandidate | None:
-        if self._energies[center_index] < self._energy_threshold:
-            return None
-        center_point = self._layout._points[center_index]
-        center_y = self._layout._pos_y[center_index]
-        center_x = self._layout._pos_x[center_index]
-        active: dict[tuple[int, int], tuple[int, float]] = {}
-        for point_index in self._indices_in_radius(center_y, center_x, self._radius):
-            point_energy = self._energies[point_index]
-            if point_energy < self._energy_threshold:
-                continue
-            point = self._layout._points[point_index]
-            denominator = math.sqrt(center_point.ones * point.ones)
-            if denominator <= 0.0:
-                continue
-            activation = center_point.code.common(point.code) / denominator
-            if activation < lambda_value:
-                continue
-            position = (self._layout._pos_y[point_index], self._layout._pos_x[point_index])
-            active[position] = (point_index, activation * point_energy)
-        seed = (center_y, center_x)
-        if seed not in active:
-            return None
-        cluster_positions = self._connected_component(seed, active)
-        if len(cluster_positions) < self._min_points:
-            return None
-        weight_sum = sum(active[position][1] for position in cluster_positions)
-        if weight_sum <= 0.0:
-            return None
-        centroid_y = sum(position[0] * active[position][1] for position in cluster_positions) / weight_sum
-        centroid_x = sum(position[1] * active[position][1] for position in cluster_positions) / weight_sum
-        distances = sorted(
-            math.hypot(position[0] - centroid_y, position[1] - centroid_x)
-            for position in cluster_positions
-        )
-        best_radius = 0.0
-        best_fill = -1.0
-        for distance in distances:
-            candidate_radius = max(float(self._radius_min), distance)
-            if candidate_radius > self._radius:
-                continue
-            points_count = sum(1 for value in distances if value <= candidate_radius)
-            if points_count < self._min_points:
-                continue
-            fill_factor = points_count / (math.pi * candidate_radius * candidate_radius)
-            if fill_factor > best_fill:
-                best_fill = fill_factor
-                best_radius = candidate_radius
-        if best_radius <= 0.0:
-            return None
-        included = [
-            position
-            for position in cluster_positions
-            if math.hypot(position[0] - centroid_y, position[1] - centroid_x) <= best_radius
-        ]
-        detector_energy = sum(active[position][1] for position in included)
-        points_count = len(included)
-        if detector_energy <= 0.0 or points_count < self._min_points:
-            return None
-        return DetectorCandidate(
-            center=(centroid_y, centroid_x),
-            radius=best_radius,
-            energy=detector_energy,
-            points_count=points_count,
-            fill_factor=best_fill,
-            insertion_density=points_count / best_radius,
-        )
-
-    def _indices_in_radius(self, center_y: int, center_x: int, radius: int) -> list[int]:
-        indices: list[int] = []
-        radius_sq = radius * radius
-        for y in range(max(0, center_y - radius), min(self._layout.height - 1, center_y + radius) + 1):
-            dy_sq = (center_y - y) ** 2
-            for x in self._layout._row_occupied[y]:
-                if x < center_x - radius or x > center_x + radius:
-                    continue
-                if dy_sq + (center_x - x) ** 2 > radius_sq:
-                    continue
-                point_index = self._layout.grid[y][x]
-                if point_index is not None:
-                    indices.append(point_index)
-        return indices
-
-    @staticmethod
-    def _connected_component(
-        seed: tuple[int, int],
-        active: dict[tuple[int, int], tuple[int, float]],
-    ) -> list[tuple[int, int]]:
-        pending = [seed]
-        visited = {seed}
-        while pending:
-            y, x = pending.pop()
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    if dy == 0 and dx == 0:
-                        continue
-                    neighbour = (y + dy, x + dx)
-                    if neighbour in active and neighbour not in visited:
-                        visited.add(neighbour)
-                        pending.append(neighbour)
-        return list(visited)
-
-    @staticmethod
-    def _overlaps(left: DetectorCandidate, right: DetectorCandidate) -> bool:
-        distance = math.hypot(
-            left.center[0] - right.center[0],
-            left.center[1] - right.center[1],
-        )
-        return distance <= left.radius or distance <= right.radius
 
 
 def _build_detectors_from_layout(
     layout: Layout,
     energies: list[float],
     *,
-    radius: int,
-    max_detectors: int,
     output_bits: int,
-    lambda_levels: tuple[float, ...],
 ) -> list[Detector]:
     return DetectorHierarchyBuilder(
         layout=layout,
         energies=energies,
-        radius=radius,
+        layer_configs=_detector_layer_configs(layout),
         radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
-        min_points=ACTIVATION_DETECTOR_MIN_POINTS,
-        max_detectors=max_detectors,
         output_bits=output_bits,
-        lambda_levels=lambda_levels,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
-        candidate_density=ACTIVATION_DETECTOR_STEP_DENSITY,
+        eta=ACTIVATION_ETA,
+        attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
+        seed=ACTIVATION_DETECTOR_SEED,
+        clusterer=DbscanClusterer(
+            eps=ACTIVATION_DBSCAN_EPS,
+            min_samples=ACTIVATION_DBSCAN_MIN_SAMPLES,
+        ),
     ).build()
 
 
-def _build_activation_engine(layout: Layout, energies: list[float]) -> ActivationEngine:
-    detectors = _build_detectors_from_layout(
-        layout,
-        energies,
-        radius=ACTIVATION_DETECTOR_RADIUS,
-        max_detectors=ACTIVATION_MAX_DETECTORS,
-        output_bits=ACTIVATION_OUTPUT_BITS,
-        lambda_levels=ACTIVATION_LAMBDA_LEVELS,
-    )
-    eta_value = ACTIVATION_ETA
+def _build_activation_engine(
+    layout: Layout,
+    energies: list[float],
+    *,
+    detectors: Sequence[Detector] | None = None,
+    saturation_limit: int = ACTIVATION_SATURATION_LIMIT,
+) -> ActivationEngine:
+    if detectors is None:
+        detectors = _build_detectors_from_layout(
+            layout,
+            energies,
+            output_bits=ACTIVATION_OUTPUT_BITS,
+        )
     return ActivationEngine(
         layout=layout,
         detectors=detectors,
         lambda_threshold=ACTIVATION_LAMBDA_THRESHOLD,
-        eta=eta_value,
+        eta=ACTIVATION_ETA,
         energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
         detector_threshold=ACTIVATION_DETECTOR_THRESHOLD,
-        saturation_limit=ACTIVATION_SATURATION_LIMIT,
+        saturation_limit=saturation_limit,
         energy_map=energies,
         use_gpu=ACTIVATION_USE_GPU,
     )
 
 
-def _load_layout_from_file(path: str, run_params: TunedLayoutParams) -> Layout | None:
-    if not os.path.exists(path):
-        return None
-    with open(path, "r", encoding="utf-8") as fp:
-        data = json.load(fp)
-    points_payload = data.get("layout", [])
-    width = data.get("width")
-    height = data.get("height")
-    if width in (None, 0) or height in (None, 0):
+def _output_sizer() -> DetectorOutputSizer:
+    return DetectorOutputSizer(
+        max_density=ACTIVATION_MAX_EMBEDDING_DENSITY,
+        min_output_bits=ACTIVATION_OUTPUT_BITS,
+        min_saturation=ACTIVATION_SATURATION_MIN,
+        max_saturation=ACTIVATION_SATURATION_MAX,
+    )
+
+
+@dataclass(frozen=True)
+class CalibratedActivation:
+    """Движок после калибровки размера выхода и эмбеддинги калибровочных стимулов (§6.6)."""
+
+    engine: ActivationEngine
+    size: OutputCodeSize
+    embeddings: tuple[BitArray, ...]
+    active_counts: tuple[int, ...]
+
+
+def _calibrated_activation_engine(
+    layout: Layout,
+    energies: list[float],
+    calibration_batches: Sequence[Sequence[BitArray]],
+) -> CalibratedActivation:
+    """§6.6: строит детекторы, измеряет среднее число активных и задаёт размер выхода.
+
+    Калибровочные стимулы активируются один раз: уровни детекторов не зависят от выходных кодов и σ
+    (§6.5), поэтому после перевыдачи битов (§6.3) их эмбеддинги собираются из тех же уровней.
+    """
+    detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
+    provisional = _build_activation_engine(layout, energies, detectors=detectors)
+    size, active_lists = _output_sizer().measure_with_results(provisional, calibration_batches)
+    resized = reassign_output_bits(detectors, output_bits=size.output_bits, seed=ACTIVATION_DETECTOR_SEED)
+    engine = provisional.rebind(resized, saturation_limit=size.saturation_limit)
+    embeddings = tuple(engine.embedding_from_active(active) for active in active_lists)
+    return CalibratedActivation(
+        engine=engine,
+        size=size,
+        embeddings=embeddings,
+        active_counts=tuple(len(active) for active in active_lists),
+    )
+
+
+def _activation_engine_from_size(
+    layout: Layout,
+    energies: list[float],
+    *,
+    output_bits: int,
+    saturation_limit: int,
+    stored_detectors: Sequence[Mapping[str, object]] | None = None,
+) -> ActivationEngine:
+    """Восстанавливает детекторы и выходной код тех же размеров, что при обучении.
+
+    Если детекторы сохранены вместе с эмбеддингами, они читаются из файла; иначе строятся заново
+    с тем же seed (§6.4 — построение стохастическое, но воспроизводимое).
+    """
+    if stored_detectors:
+        resized = _detectors_from_payload(stored_detectors, output_bits=output_bits)
         LOGGER.event(
-            "layout.cache.incomplete",
-            section=LAID_OUT_STRUCTURE,
-            data={"path": path, "reason": "missing_size"},
+            "activation.detectors.restored",
+            section=DETECTOR_CONSTRUCTION,
+            data={"detectors": len(resized), "output_bits": output_bits},
         )
-        return None
-    pair_radius_saved = data.get("pair_radius")
-    total_points = int(data.get("points") or len(points_payload))
-    if total_points <= 0:
-        LOGGER.event(
-            "layout.cache.incomplete",
-            section=LAID_OUT_STRUCTURE,
-            data={"path": path, "reason": "empty"},
-        )
-        return None
-    expected_pair_radius = _expected_pair_radius(total_points, run_params)
-    if pair_radius_saved is not None and pair_radius_saved != expected_pair_radius:
-        return None
-    if not points_payload:
-        return None
-    if any(item.get("x") is None or item.get("y") is None for item in points_payload):
-        LOGGER.event(
-            "layout.cache.incomplete",
-            section=LAID_OUT_STRUCTURE,
-            data={"path": path, "reason": "missing_positions"},
-        )
-        return None
-    codes: "OrderedDict[float, list[LayoutEncodedCode]]" = OrderedDict()
-    sorted_points = sorted(points_payload, key=lambda item: int(item["index"]))
-    for item in sorted_points:
-        try:
-            hue_value = float(item["hue"])
-        except Exception:
-            continue
-        bit_string = str(item["value"])
-        bit_array = BitArray(len(bit_string))
-        for idx, ch in enumerate(bit_string):
-            if ch == "1":
-                bit_array.set(idx, 1)
-        bucket = codes.setdefault(hue_value, [])
-        bucket.append(
-            LayoutEncodedCode(
-                code=bit_array,
-                label=str(item.get("label", "")),
+    else:
+        detectors = _build_detectors_from_layout(layout, energies, output_bits=ACTIVATION_OUTPUT_BITS)
+        resized = reassign_output_bits(detectors, output_bits=output_bits, seed=ACTIVATION_DETECTOR_SEED)
+    return _build_activation_engine(layout, energies, detectors=resized, saturation_limit=saturation_limit)
+
+
+def _detectors_payload(detectors: Sequence[Detector]) -> list[dict[str, object]]:
+    """Детекторы (§6.3) в JSON: центр, радиус, λ_d, e_d, n_d, единичные биты b_d."""
+    return [
+        {
+            "center": [float(detector.center[0]), float(detector.center[1])],
+            "radius": float(detector.radius),
+            "lambda": float(detector.lambda_threshold),
+            "energy": float(detector.energy),
+            "points": int(detector.points_count),
+            "bits": [int(bit) for bit in detector.output_code.active_indices()],
+            "label": detector.label,
+        }
+        for detector in detectors
+    ]
+
+
+def _detectors_from_payload(items: Sequence[Mapping[str, object]], *, output_bits: int) -> list[Detector]:
+    detectors: list[Detector] = []
+    for item in items:
+        center = item["center"]
+        detectors.append(
+            Detector(
+                center=(float(center[0]), float(center[1])),
+                radius=float(item["radius"]),
+                lambda_threshold=float(item["lambda"]),
+                energy=float(item["energy"]),
+                points_count=int(item["points"]),
+                output_code=BitArray.from_indices(output_bits, [int(bit) for bit in item["bits"]]),
+                label=None if item.get("label") is None else str(item["label"]),
             )
         )
-    layout = Layout(
-        codes,
-        grid_size=int(width),
-        empty_ratio=LAYOUT_EMPTY_RATIO,
-        similarity=data.get("similarity", LAYOUT_SIMILARITY),
-        lambda_threshold=data.get("lambda_threshold", LAYOUT_LAMBDA_THRESHOLD),
-        eta=data.get("eta", LAYOUT_ETA),
-        seed=0,
-        use_gpu=LAYOUT_USE_GPU,
-        long_subset_size=None,
-        long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
-    )
-    if len(layout._positions) != len(sorted_points):
-        raise RuntimeError("layout load mismatch: points count differs")
-    layout.grid = [[None for _ in range(layout.width)] for _ in range(layout.height)]
-    layout._row_occupied = [set() for _ in range(layout.height)]
-    positions: list[tuple[int, int]] = [(-1, -1)] * len(sorted_points)
-    for item in sorted_points:
-        idx = int(item["index"])
-        y = int(item["y"])
-        x = int(item["x"])
-        positions[idx] = (y, x)
-        layout.grid[y][x] = idx
-        layout._row_occupied[y].add(x)
-    layout._positions = positions
-    layout._pos_y = [p[0] for p in positions]
-    layout._pos_x = [p[1] for p in positions]
-    layout.pair_radius = pair_radius_saved
-    LOGGER.event(
-        "layout.load.cache",
-        section=LAID_OUT_STRUCTURE,
-        data={
-            "path": path,
-            "points": len(positions),
-            "pair_radius": pair_radius_saved,
-            "width": width,
-            "height": height,
-        },
-    )
-    return layout
+    return detectors
+
+
+def _activation_metadata(size: OutputCodeSize, detectors: Sequence[Detector] | None = None) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "output_bits": int(size.output_bits),
+        "saturation_limit": int(size.saturation_limit),
+        "mean_active_detectors": float(size.mean_active_detectors),
+        "calibration_samples": int(size.samples),
+    }
+    if detectors is not None:
+        metadata[ACTIVATION_DETECTORS_KEY] = _detectors_payload(detectors)
+    return metadata
+
+
+class LayoutCacheFile:
+    """JSON раскладки на диске: проверка совместимости и восстановление Layout (вне статьи)."""
+
+    @staticmethod
+    def inspect(path: str) -> tuple[int, int | None, bool] | None:
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+        except Exception as exc:
+            LOGGER.event(
+                "layout.cache.read_error",
+                section=OUTSIDE_ARTICLE,
+                data={"path": path, "error": str(exc)},
+            )
+            return None
+        points_payload = data.get("layout", [])
+        total_points = int(data.get("points") or len(points_payload))
+        pair_radius = data.get("pair_radius")
+        has_positions = bool(points_payload) and all(
+            item.get("x") is not None and item.get("y") is not None for item in points_payload
+        )
+        ready = has_positions and data.get("width") not in (None, 0) and data.get("height") not in (None, 0)
+        LOGGER.event(
+            "layout.cache.inspect",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "path": path,
+                "points": total_points,
+                "pair_radius": pair_radius,
+                "ready": ready,
+            },
+        )
+        return total_points, pair_radius, ready
+
+    @staticmethod
+    def load(
+        path: str,
+        run_params: TunedLayoutParams,
+        *,
+        expected_code_length: int | None = None,
+        colorizer: EncoderCodeColorizer | None = None,
+        expected_encoder_signature: str | None = None,
+        expected_stimulus: Mapping[str, object] | None = None,
+    ) -> Layout | None:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        points_payload = data.get("layout", [])
+        stored_signature = data.get(ENCODER_SIGNATURE_KEY)
+        if (
+            expected_encoder_signature is not None
+            and stored_signature is not None
+            and str(stored_signature) != expected_encoder_signature
+        ):
+            LOGGER.event(
+                "layout.cache.incompatible",
+                section=OUTSIDE_ARTICLE,
+                data={"path": path, "reason": "encoder_signature"},
+            )
+            return None
+        for key, expected_value in (expected_stimulus or {}).items():
+            stored_value = data.get(key, LAYOUT_CACHE_LEGACY_STIMULUS.get(key))
+            if stored_value != expected_value:
+                LOGGER.event(
+                    "layout.cache.incompatible",
+                    section=OUTSIDE_ARTICLE,
+                    data={"path": path, "reason": key, "stored": str(stored_value), "expected": str(expected_value)},
+                )
+                return None
+        if expected_code_length is not None and points_payload:
+            stored_length = len(str(points_payload[0].get("value", "")))
+            if stored_length != expected_code_length:
+                LOGGER.event(
+                    "layout.cache.incompatible",
+                    section=OUTSIDE_ARTICLE,
+                    data={
+                        "path": path,
+                        "stored_code_length": stored_length,
+                        "expected_code_length": expected_code_length,
+                    },
+                )
+                return None
+        width = data.get("width")
+        height = data.get("height")
+        if width in (None, 0) or height in (None, 0):
+            LOGGER.event(
+                "layout.cache.incomplete",
+                section=OUTSIDE_ARTICLE,
+                data={"path": path, "reason": "missing_size"},
+            )
+            return None
+        pair_radius_saved = data.get("pair_radius")
+        total_points = int(data.get("points") or len(points_payload))
+        if total_points <= 0:
+            LOGGER.event(
+                "layout.cache.incomplete",
+                section=OUTSIDE_ARTICLE,
+                data={"path": path, "reason": "empty"},
+            )
+            return None
+        expected_pair_radius = _expected_pair_radius(total_points, run_params)
+        if pair_radius_saved is not None and pair_radius_saved != expected_pair_radius:
+            return None
+        if not points_payload:
+            return None
+        if any(item.get("x") is None or item.get("y") is None for item in points_payload):
+            LOGGER.event(
+                "layout.cache.incomplete",
+                section=OUTSIDE_ARTICLE,
+                data={"path": path, "reason": "missing_positions"},
+            )
+            return None
+        codes: "OrderedDict[float, list[LayoutEncodedCode]]" = OrderedDict()
+        sorted_points = sorted(points_payload, key=lambda item: int(item["index"]))
+        for item in sorted_points:
+            try:
+                hue_value = float(item["hue"])
+            except Exception:
+                continue
+            bit_string = str(item["value"])
+            bit_array = BitArray(len(bit_string))
+            for idx, ch in enumerate(bit_string):
+                if ch == "1":
+                    bit_array.set(idx, 1)
+            bucket = codes.setdefault(hue_value, [])
+            bucket.append(
+                LayoutEncodedCode(
+                    code=bit_array,
+                    label=str(item.get("label", "")),
+                )
+            )
+        layout = Layout(
+            codes,
+            grid_size=int(width),
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            similarity=data.get("similarity", LAYOUT_SIMILARITY),
+            lambda_threshold=data.get("lambda_threshold", LAYOUT_LAMBDA_THRESHOLD),
+            eta=data.get("eta", LAYOUT_ETA),
+            seed=LAYOUT_RANDOM_SEED,
+            use_gpu=LAYOUT_USE_GPU,
+            long_subset_size=None,
+            long_subset_refresh=LAYOUT_LONG_SUBSET_REFRESH,
+            colorizer=colorizer,
+            long_distance=LAYOUT_LONG_DISTANCE,
+            short_distance=LAYOUT_SHORT_DISTANCE,
+            long_kernel=LAYOUT_LONG_KERNEL,
+            long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
+            long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
+            component_period=LAYOUT_COMPONENT_PERIOD,
+        )
+        if len(layout.positions()) != len(sorted_points):
+            raise RuntimeError("layout load mismatch: points count differs")
+        positions: list[tuple[int, int]] = [(-1, -1)] * len(sorted_points)
+        for item in sorted_points:
+            positions[int(item["index"])] = (int(item["y"]), int(item["x"]))
+        layout.restore_positions(positions)
+        layout.pair_radius = pair_radius_saved
+        LOGGER.event(
+            "layout.load.cache",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "path": path,
+                "points": len(positions),
+                "pair_radius": pair_radius_saved,
+                "width": width,
+                "height": height,
+            },
+        )
+        return layout
 
 
 def _build_encoder() -> Encoder:
-    return Encoder(
-        # Angle
+    """Кодер MNIST-стимула (угол, X, Y): общий код или конкатенация сегментов (§2.2.3, §4.2.1, §4.4)."""
+    angle_layers = geometric_detector_layers(
+        layers_count=MNIST_ANGLE_LAYERS,
+        widest_detectors=MNIST_ANGLE_WIDEST_DETECTORS,
+        narrowest_detectors=MNIST_ANGLE_NARROWEST_DETECTORS,
+        overlap=MNIST_ANGLE_OVERLAP,
+    )
+    position_layers = geometric_detector_layers(
+        layers_count=MNIST_POSITION_LAYERS,
+        widest_detectors=MNIST_POSITION_WIDEST_DETECTORS,
+        narrowest_detectors=MNIST_POSITION_NARROWEST_DETECTORS,
+        overlap=MNIST_POSITION_OVERLAP,
+    )
+    angle_length = ENCODER_SHARED_CODE_LENGTH if ENCODER_SHARED_CODE else MNIST_ANGLE_CODE_LENGTH
+    position_length = ENCODER_SHARED_CODE_LENGTH if ENCODER_SHARED_CODE else MNIST_POSITION_CODE_LENGTH
+    encoder = Encoder(
         ClosedDimension(
             "Angle",
-            (0.0, 360.0),
-            [
-                #Detectors(360, 0.4),
-                #Detectors(180, 0.4),
-                Detectors(90, 0.7),
-                Detectors(45, 0.7),
-                Detectors(30, 0.7),
-                Detectors(10, 0.7),
-                #Detectors(5, 0.4),
-            ],
+            (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
+            angle_layers,
+            code_length=angle_length,
         ),
-        # X
         OpenedDimension(
             "X",
-            (0, 6),
-            [
-                Detectors(7, 0.7),
-                Detectors(6, 0.7),
-                Detectors(5, 0.7),
-                Detectors(4, 0.7),
-                Detectors(3, 0.7),
-                Detectors(2, 0.7),
-            ],
+            (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
+            position_layers,
+            code_length=position_length,
+            edge_detectors=MNIST_POSITION_EDGE_DETECTORS,
         ),
-        # Y
         OpenedDimension(
             "Y",
-            (0, 6),
-            [
-                Detectors(7, 0.7),
-                Detectors(6, 0.7),
-                Detectors(5, 0.7),
-                Detectors(4, 0.7),
-                Detectors(3, 0.7),
-                Detectors(2, 0.7),
-            ],
+            (MNIST_POSITION_MIN, MNIST_POSITION_MAX),
+            position_layers,
+            code_length=position_length,
+            edge_detectors=MNIST_POSITION_EDGE_DETECTORS,
         ),
+        random_seed=ENCODER_RANDOM_SEED,
         log_every=ENCODER_LOG_EVERY,
+        layer_phase=ENCODER_LAYER_PHASE,
+        shared_code=ENCODER_SHARED_CODE,
+    )
+    # §4.5, §5.13.1: у каждой координаты сходство кодов должно убывать с расстоянием
+    # на всём диапазоне, иначе раскладка не воспроизведёт её топологию.
+    for dimension in encoder.dimensions:
+        step = None if dimension.closed else MNIST_POSITION_STEP
+        # Encoder.long_range_order сам логирует профиль и предупреждение (§4.5, §5.13.1).
+        encoder.long_range_order(dimension.title, step=step)
+    return encoder
+
+
+def _build_colorizer() -> EncoderCodeColorizer:
+    """Псевдоцвет всего кода: младший бит красный, старший фиолетовый (§5.14)."""
+    return EncoderCodeColorizer(
+        min_hue=LAYOUT_PSEUDO_COLOR_MIN_HUE,
+        max_hue=LAYOUT_PSEUDO_COLOR_MAX_HUE,
     )
 
 
+def _build_extractor(
+    patch_size: int = MNIST_PATCH_SIZE,
+    *,
+    contour_only: bool = MNIST_CONTOUR_ONLY,
+    upscale: bool = MNIST_SOBEL_UPSCALE_ENABLED,
+) -> MnistSobelAngleMap:
+    upscaled = None
+    if upscale:
+        upscaled = UpscaledSobel(
+            scale=MNIST_SOBEL_UPSCALE,
+            contrast=MNIST_SOBEL_CONTRAST,
+            entity_path=MNIST_SOBEL_ENTITY_PATH,
+        )
+    return MnistSobelAngleMap(
+        angle_in_degrees=MNIST_ANGLE_IN_DEGREES,
+        grad_threshold=MNIST_GRAD_THRESHOLD,
+        patch_size=patch_size,
+        contour_only=contour_only,
+        contour_level=MNIST_CONTOUR_LEVEL,
+        two_edge_coherence=MNIST_CONTOUR_TWO_EDGE_COHERENCE,
+        upscaled=upscaled,
+    )
+
+
+def _stimulus_metadata(extractor: MnistSobelAngleMap) -> dict[str, object]:
+    """Параметры получения стимулов, без совпадения которых кеш раскладки не подходит."""
+    return {PATCH_SIZE_KEY: extractor.patch_size, STIMULUS_MODE_KEY: extractor.stimulus_mode}
+
+
+
+@dataclass(frozen=True)
+class DigitCodes:
+    """Одна цифра набора: метка, углы её углопозиций и их коды (§4.4, §4.6)."""
+
+    label: int
+    angles: tuple[float, ...]
+    codes: tuple[BitArray, ...]
+
+
+class StimulusCodeCache:
+    """Углопозиции и коды цифр считаются один раз: раскладка, калибровка и база эмбеддингов берут их отсюда.
+
+    Цифры идут в порядке набора; все углопозиции цифры кодируются одним батчем (Encoder.encode_batch).
+    Цифры без углопозиций остаются в списке пустыми: раскладка учитывает их в счётчике цифр, а база
+    эмбеддингов пропускает — как и раньше, когда каждый потребитель читал набор заново (вне статьи).
+    """
+
+    def __init__(self, dataset, encoder: Encoder, extractor: MnistSobelAngleMap, *, label: int | None) -> None:
+        self._iterator = iter(dataset)
+        self._encoder = encoder
+        self._extractor = extractor
+        self._label = label
+        self._items: list[DigitCodes] = []
+        self._exhausted = False
+
+    def _load_next(self) -> bool:
+        for img_tensor, digit in self._iterator:
+            if self._label is not None and int(digit) != self._label:
+                continue
+            img = img_tensor.squeeze(0).numpy()
+            measurements = self._extractor.extract(img, digit)[int(digit)]
+            codes: tuple[BitArray, ...] = ()
+            if measurements:
+                encoded = self._encoder.encode_batch(
+                    [(float(a), float(x), float(y)) for a, x, y in measurements],
+                    log_image=img,
+                    log_label=int(digit),
+                    log_measurements=measurements,
+                )
+                codes = tuple(code for _, code in encoded)
+            self._items.append(
+                DigitCodes(label=int(digit), angles=tuple(float(a) for a, _, _ in measurements), codes=codes)
+            )
+            return True
+        self._exhausted = True
+        return False
+
+    def take(self, count: int) -> list[DigitCodes]:
+        """Первые count цифр набора (включая цифры без углопозиций)."""
+        while len(self._items) < count and not self._exhausted:
+            self._load_next()
+        return self._items[:count]
+
+    def take_nonempty(self, count: int) -> list[DigitCodes]:
+        """Первые count цифр, у которых есть хотя бы одна углопозиция."""
+        while sum(1 for item in self._items if item.codes) < count and not self._exhausted:
+            self._load_next()
+        result = [item for item in self._items if item.codes]
+        return result[:count]
+
+
 def _collect_codes(
-    dataset,
-    label: int | None,
+    cache: StimulusCodeCache,
     count: int,
     encoder: Encoder,
     extractor: MnistSobelAngleMap,
@@ -1384,99 +1484,60 @@ def _collect_codes(
         similarity=None,
         lambda_threshold=None,
         eta=None,
+        metadata={ENCODER_SIGNATURE_KEY: encoder.signature, **_stimulus_metadata(extractor)},
     )
     total_codes = 0
-    found = 0
-
-    for img_tensor, digit in dataset:
-        if label is not None and int(digit) != label:
-            continue
-        found += 1
-        if found > count:
-            break
-        img = img_tensor.squeeze(0).numpy()
-        digit_values = extractor.extract(img, digit)
-        measurements = digit_values[int(digit)]
-        first = True
-        for (a, x, y) in measurements:
-            log_image = img if first else None
-            log_label = int(digit) if first else None
-            log_measurements = measurements if first else None
-            _, code = encoder.encode(
-                float(a),
-                float(x),
-                float(y),
-                log_image=log_image,
-                log_label=log_label,
-                log_measurements=log_measurements,
-            )
-            payload.add_code(label=int(digit), hue=float(a), code=code)
+    for item in cache.take(count):
+        for angle, code in zip(item.angles, item.codes):
+            payload.add_code(label=item.label, hue=angle, code=code)
             total_codes += 1
-            first = False
     return payload, total_codes
 
 
-def _collect_samples(
-    dataset,
-    sample_count: int,
-    encoder: Encoder,
-    extractor: MnistSobelAngleMap,
-    *,
-    label: int | None,
-) -> list[tuple[int, list[BitArray]]]:
-    samples: list[tuple[int, list[BitArray]]] = []
-    for img_tensor, digit in dataset:
-        if label is not None and int(digit) != label:
-            continue
-        img = img_tensor.squeeze(0).numpy()
-        digit_values = extractor.extract(img, digit)
-        measurements = digit_values[int(digit)]
-        codes: list[BitArray] = []
-        first = True
-        for (a, x, y) in measurements:
-            log_image = img if first else None
-            log_label = int(digit) if first else None
-            log_measurements = measurements if first else None
-            _, code = encoder.encode(
-                float(a),
-                float(x),
-                float(y),
-                log_image=log_image,
-                log_label=log_label,
-                log_measurements=log_measurements,
-            )
-            codes.append(code)
-            first = False
-        if codes:
-            samples.append((int(digit), codes))
-        if len(samples) >= sample_count:
-            break
-    return samples
+def _collect_samples(cache: StimulusCodeCache, sample_count: int) -> list[tuple[int, list[BitArray]]]:
+    return [(item.label, list(item.codes)) for item in cache.take_nonempty(sample_count)]
 
-SPR = 32
+
 def _run_layout(
     codes: dict[float, list],
     params: TunedLayoutParams | None,
     *,
     count: int,
     total_codes: int,
+    colorizer: EncoderCodeColorizer | None = None,
+    expected_code_length: int | None = None,
+    use_cache: bool = True,
 ) -> Layout:
     run_params = params or _default_layout_params()
     expected_pair_radius = _expected_pair_radius(total_codes, run_params)
     layout_path = _layout_json_path(count, expected_pair_radius)
-    cached_layout = _load_layout_from_file(layout_path, run_params)
-    if cached_layout is not None:
-        return cached_layout
+    if use_cache:
+        cached_layout = LayoutCacheFile.load(
+            layout_path,
+            run_params,
+            expected_code_length=expected_code_length,
+            colorizer=colorizer,
+        )
+        if cached_layout is not None:
+            return cached_layout
     layout = Layout(
         codes,
         empty_ratio=LAYOUT_EMPTY_RATIO,
         similarity=LAYOUT_SIMILARITY,
         lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
         eta=LAYOUT_ETA,
-        seed=0,
+        seed=LAYOUT_RANDOM_SEED,
         use_gpu=LAYOUT_USE_GPU,
         long_subset_size=run_params.long_subset_size,
         long_subset_refresh=run_params.long_subset_refresh,
+        colorizer=colorizer,
+        long_distance=LAYOUT_LONG_DISTANCE,
+        short_distance=LAYOUT_SHORT_DISTANCE,
+        long_kernel=LAYOUT_LONG_KERNEL,
+        long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
+        long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
+        component_period=LAYOUT_COMPONENT_PERIOD,
+        long_subset_min_neighbours=LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS,
     )
     step_offset = 1
     long_radius_start = max(
@@ -1488,6 +1549,13 @@ def _run_layout(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        radius_schedule=LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
+        radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
+        swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
+        temperature=LAYOUT_ANNEAL_TEMPERATURE,
+        temperature_radius_max=int(layout.width * LAYOUT_ANNEAL_RADIUS_MAX_FACTOR),
+        temperature_radius_min=LAYOUT_ANNEAL_RADIUS_MIN,
     )
     layout.run(
         steps=run_params.long_steps,
@@ -1498,11 +1566,9 @@ def _run_layout(
         min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_LONG,
         step_offset=step_offset,
-        energy_radius=None,
-        energy_stability_window=LAYOUT_ENERGY_STABILITY_WINDOW,
-        energy_stability_delta=LAYOUT_ENERGY_STABILITY_DELTA,
-        energy_stability_every=LAYOUT_ENERGY_STABILITY_EVERY,
-        energy_stability_max_points=LAYOUT_ENERGY_STABILITY_MAX_POINTS,
+        energy_radius=LAYOUT_ENERGY_RADIUS,
+        energy_every=LAYOUT_ENERGY_EVAL_EVERY,
+        energy_target=LAYOUT_ENERGY_TARGET,
         log_visuals=LAYOUT_LOG_VISUALS,
         adaptive_params=adaptive_long,
         save_on_stop_path=layout_path,
@@ -1524,10 +1590,13 @@ def _run_layout(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        radius_schedule=LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE,
+        radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
+        swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
     )
     short_optim = ShortLayoutOptimConfig(
         energy_radius=run_params.short_energy_radius,
-        energy_max_points=LAYOUT_SHORT_ENERGY_MAX_POINTS,
         energy_recalc_every=run_params.short_energy_recalc_every,
         energy_eps=LAYOUT_SHORT_ENERGY_EPS,
         use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
@@ -1535,12 +1604,12 @@ def _run_layout(
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
     layout.run(
-        steps=150,
+        steps=run_params.short_steps,
         pairs_per_step=run_params.short_pairs_per_step,
         pair_radius=short_radius_start,
         mode="short",
         local_radius=run_params.short_local_radius,
-        min_swap_ratio=LAYOUT_MIN_SWAP_RATIO,
+        min_swap_ratio=LAYOUT_SHORT_MIN_SWAP_RATIO,
         min_swap_window=LAYOUT_MIN_SWAP_WINDOW,
         log_every=LAYOUT_LOG_EVERY_SHORT,
         step_offset=step_offset,
@@ -1551,15 +1620,53 @@ def _run_layout(
 
 
 class MnistLayoutRunner:
+    @staticmethod
+    def _save_layout_images(
+        layout: Layout,
+        *,
+        image_path: str,
+        energies: Sequence[float] | None = None,
+    ) -> None:
+        """Карта в псевдоцветах кодов (§5.14), по компоненте угла (рис. 16) и с яркостью Ê (рис. 18)."""
+        from PIL import Image
+
+        directory = os.path.dirname(image_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        Image.fromarray(layout.render_image()).save(image_path)
+        stem = os.path.splitext(image_path)[0]
+        component_path = stem + LAYOUT_COMPONENT_IMAGE_SUFFIX
+        Image.fromarray(
+            layout.render_component_image(period=MNIST_ANGLE_MAX - MNIST_ANGLE_MIN)
+        ).save(component_path)
+        energy_path = None
+        if energies is not None:
+            energy_path = stem + LAYOUT_ENERGY_IMAGE_SUFFIX
+            Image.fromarray(layout.render_energy_image(energies)).save(energy_path)
+        LOGGER.event(
+            "layout.visual.save",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "image": image_path,
+                "component_image": component_path,
+                "energy_image": energy_path,
+                "points": len(layout.positions()),
+            },
+        )
+
     def __init__(
         self,
         *,
         count: int,
         label: int | None = None,
         activation_samples: int | None = None,
+        reuse_cache: bool = True,
     ) -> None:
         self.count = count
         self.label = label
+        # False (--rebuild) — готовые раскладка, чекпоинт и эмбеддинги игнорируются, всё считается заново
+        # и записывается в кеш поверх старого.
+        self._reuse_cache = bool(reuse_cache)
         resolved_activation_samples = count if activation_samples is None else int(activation_samples)
         if resolved_activation_samples <= 0:
             raise ValueError("activation_samples must be positive")
@@ -1567,7 +1674,9 @@ class MnistLayoutRunner:
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
-        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+        self.colorizer = _build_colorizer()
+        self.extractor = _build_extractor()
+        self._codes: StimulusCodeCache | None = None
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1577,12 +1686,13 @@ class MnistLayoutRunner:
             suffix=PIPELINE_CHECKPOINT_SUFFIX,
             version=PIPELINE_CHECKPOINT_VERSION,
         )
+        self._activation_metadata: dict[str, object] | None = None
 
     def _layout_cache_paths(self) -> list[str]:
         return _layout_cache_paths_for_count(self.count)
 
     def _load_layout_metadata(self, path: str) -> tuple[int, int | None, bool] | None:
-        return _load_layout_metadata_from_path(path)
+        return LayoutCacheFile.inspect(path)
 
     def _try_load_cached_layout(self) -> tuple[Layout, TunedLayoutParams, int, str] | None:
         for path in self._layout_cache_paths():
@@ -1593,7 +1703,7 @@ class MnistLayoutRunner:
             if not ready:
                 LOGGER.event(
                     "layout.cache.incomplete",
-                    section=LAID_OUT_STRUCTURE,
+                    section=OUTSIDE_ARTICLE,
                     data={
                         "path": path,
                         "points": total_points,
@@ -1602,11 +1712,18 @@ class MnistLayoutRunner:
                 )
                 continue
             tuned_params = self._tune_layout(total_points)
-            layout = _load_layout_from_file(path, tuned_params)
+            layout = LayoutCacheFile.load(
+                path,
+                tuned_params,
+                expected_code_length=self.encoder.code_length,
+                colorizer=self.colorizer,
+                expected_encoder_signature=self.encoder.signature,
+                expected_stimulus=_stimulus_metadata(self.extractor),
+            )
             if layout is None:
                 LOGGER.event(
                     "layout.cache.mismatch",
-                    section=LAYOUT_PARAMETERS,
+                    section=OUTSIDE_ARTICLE,
                     data={
                         "path": path,
                         "pair_radius": pair_radius,
@@ -1616,7 +1733,7 @@ class MnistLayoutRunner:
                 continue
             LOGGER.event(
                 "layout.cache.hit",
-                section=LAID_OUT_STRUCTURE,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "path": path,
                     "points": total_points,
@@ -1626,7 +1743,7 @@ class MnistLayoutRunner:
             return layout, tuned_params, total_points, path
         LOGGER.event(
             "layout.cache.miss",
-            section=LAYOUT_PARAMETERS,
+            section=OUTSIDE_ARTICLE,
             data={"count": self.count, "label": self.label},
         )
         return None
@@ -1642,6 +1759,12 @@ class MnistLayoutRunner:
             transform=transforms.ToTensor(),
         )
 
+    def _code_cache(self, dataset) -> StimulusCodeCache:
+        """Коды цифр набора — один общий кеш для раскладки и активации."""
+        if self._codes is None:
+            self._codes = StimulusCodeCache(dataset, self.encoder, self.extractor, label=self.label)
+        return self._codes
+
     def _tune_layout(self, total_codes: int) -> TunedLayoutParams:
         tuner = LayoutParameterTuner(
             empty_ratio=LAYOUT_EMPTY_RATIO,
@@ -1652,7 +1775,7 @@ class MnistLayoutRunner:
     def _log_dataset(self, angles: int, total_codes: int) -> None:
         LOGGER.event(
             "mnist.codes",
-            section=LAYOUT_SYSTEM,
+            section=OUTSIDE_ARTICLE,
             data={
                 "count": self.count,
                 "label": "all" if self.label is None else int(self.label),
@@ -1669,31 +1792,14 @@ class MnistLayoutRunner:
         layout_path: str | None = None,
         save_json: bool = True,
     ) -> None:
-        from PIL import Image
-
         resolved_layout_path = layout_path or _layout_json_path(self.count, layout.pair_radius)
         if save_json:
             layout.save_json(resolved_layout_path)
-        visual_layout = _load_layout_from_file(resolved_layout_path, run_params)
-        if visual_layout is None:
-            LOGGER.event(
-                "layout.export.json.error",
-                section=LAID_OUT_STRUCTURE,
-                data={"path": resolved_layout_path, "reason": "load_failed"},
-            )
-            raise RuntimeError("не удалось загрузить раскладку из json для визуализации")
-        image = visual_layout.render_image()
-        suffix = "auto" if visual_layout.pair_radius is None else str(visual_layout.pair_radius)
-        filename = f"data/{self.count}-{suffix}.png"
-        Image.fromarray(image).save(filename)
-        LOGGER.event(
-            "layout.visual.from_json",
-            section=LAID_OUT_STRUCTURE,
-            data={
-                "path": resolved_layout_path,
-                "image": filename,
-                "points": len(visual_layout.positions()),
-            },
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        self._save_layout_images(
+            layout,
+            image_path=f"data/{self.count}-{suffix}.png",
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
         )
 
     def _run_activation(
@@ -1705,35 +1811,54 @@ class MnistLayoutRunner:
         stages: dict[str, bool],
         initial_embeddings: Sequence[EmbeddingRecord],
     ) -> list[EmbeddingRecord]:
-        energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
-        engine = _build_activation_engine(layout, energies)
-        samples = _collect_samples(
-            dataset,
-            self._activation_samples,
-            self.encoder,
-            self.extractor,
-            label=self.label,
+        energies = layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
+        samples = _collect_samples(self._code_cache(dataset), self._activation_samples)
+        calibrated = _calibrated_activation_engine(
+            layout,
+            energies,
+            [codes for _, codes in samples[:ACTIVATION_OUTPUT_CALIBRATION_SAMPLES]],
         )
+        engine = calibrated.engine
+        self._activation_metadata = _activation_metadata(calibrated.size, detectors=engine.detectors)
         embeddings = list(initial_embeddings[: len(samples)])
         start_index = len(embeddings)
+        # Калибровочные стимулы уже активированы (§6.6): их эмбеддинги готовы, повторно не считаются.
+        precomputed: dict[int, tuple[BitArray, int]] = {
+            index: (embedding, count)
+            for index, (embedding, count) in enumerate(zip(calibrated.embeddings, calibrated.active_counts))
+            if index >= start_index
+        }
         LOGGER.event(
             "activation.resume",
-            section=PARALLEL_PROCESSING,
+            section=OUTSIDE_ARTICLE,
             data={
                 "completed": start_index,
                 "target": len(samples),
+                "precomputed": len(precomputed),
                 "workers": ACTIVATION_PARALLEL_WORKERS,
                 "batch_size": ACTIVATION_BATCH_SIZE,
             },
         )
         for batch_start in range(start_index, len(samples), ACTIVATION_BATCH_SIZE):
             batch = samples[batch_start : batch_start + ACTIVATION_BATCH_SIZE]
-            results = engine.activate_many(
-                [codes for _, codes in batch],
-                max_workers=ACTIVATION_PARALLEL_WORKERS,
-            )
-            for offset, ((label, codes), result) in enumerate(zip(batch, results)):
+            pending = [
+                (batch_start + offset, codes)
+                for offset, (_, codes) in enumerate(batch)
+                if batch_start + offset not in precomputed
+            ]
+            computed: dict[int, tuple[BitArray, int]] = {}
+            if pending:
+                results = engine.activate_many(
+                    [codes for _, codes in pending],
+                    max_workers=ACTIVATION_PARALLEL_WORKERS,
+                )
+                computed = {
+                    index: (result.embedding, len(result.active_detectors))
+                    for (index, _), result in zip(pending, results)
+                }
+            for offset, (label, codes) in enumerate(batch):
                 index = batch_start + offset
+                embedding, active_count = precomputed.get(index) or computed[index]
                 LOGGER.event(
                     "activation.sample",
                     section=STIMULUS_DETECTION,
@@ -1741,14 +1866,15 @@ class MnistLayoutRunner:
                         "index": index,
                         "sample_label": str(int(label)),
                         "stimuli": len(codes),
-                        "active_detectors": len(result.active_detectors),
-                        "embedding_bits": result.embedding.count(),
+                        "active_detectors": active_count,
+                        "embedding_bits": embedding.count(),
+                        "from_calibration": index in precomputed,
                     },
                 )
                 embeddings.append(
                     EmbeddingRecord(
                         class_label=str(int(label)),
-                        embedding_bits=result.embedding.to01(),
+                        embedding_bits=embedding.to01(),
                     )
                 )
             if (
@@ -1766,10 +1892,18 @@ class MnistLayoutRunner:
     def _save_embeddings(self, layout_path: str, embeddings: Sequence[EmbeddingRecord]) -> None:
         if not layout_path:
             raise ValueError("layout_path must be provided to save embeddings")
-        self._embedding_store.save(layout_path, embeddings)
+        self._embedding_store.save(layout_path, embeddings, metadata=self._activation_metadata)
 
     def run(self) -> None:
-        cached_layout = self._try_load_cached_layout()
+        if self._reuse_cache:
+            cached_layout = self._try_load_cached_layout()
+        else:
+            cached_layout = None
+            LOGGER.event(
+                "layout.cache.rebuild",
+                section=OUTSIDE_ARTICLE,
+                data={"count": self.count, "note": "--rebuild: готовый кеш игнорируется, новый записывается поверх"},
+            )
         dataset = self._build_dataset()
         if cached_layout is not None:
             layout, tuned_params, total_codes, layout_path = cached_layout
@@ -1777,7 +1911,7 @@ class MnistLayoutRunner:
             self._log_dataset(angles, total_codes)
             LOGGER.event(
                 "mnist.encoding.skip",
-                section=ENCODING_SYSTEM,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "count": self.count,
                     "label": "all" if self.label is None else int(self.label),
@@ -1789,8 +1923,7 @@ class MnistLayoutRunner:
             save_json = False
         else:
             payload, total_codes = _collect_codes(
-                dataset,
-                self.label,
+                self._code_cache(dataset),
                 self.count,
                 self.encoder,
                 self.extractor,
@@ -1802,6 +1935,8 @@ class MnistLayoutRunner:
             expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
             layout_path = _layout_json_path(self.count, expected_pair_radius)
             payload.save_base(layout_path)
+            if not self._reuse_cache:
+                self._checkpoint_store.reset(layout_path, target_samples=self._activation_samples)
             encoding_checkpoint = self._checkpoint_store.load(layout_path)
             encoding_stages = dict(encoding_checkpoint.get("stages", {}))
             encoding_stages["encoding"] = True
@@ -1816,6 +1951,9 @@ class MnistLayoutRunner:
                 tuned_params,
                 count=self.count,
                 total_codes=total_codes,
+                colorizer=self.colorizer,
+                expected_code_length=self.encoder.code_length,
+                use_cache=self._reuse_cache,
             )
             save_json = True
         checkpoint = self._checkpoint_store.load(layout_path)
@@ -1830,7 +1968,7 @@ class MnistLayoutRunner:
             embeddings=checkpoint_embeddings,
         )
         try:
-            cached_embeddings = _load_embeddings_from_file(layout_path)
+            cached_embeddings = self._embedding_store.load(layout_path)
         except FileNotFoundError:
             cached_embeddings = []
         resume_embeddings = (
@@ -1842,7 +1980,7 @@ class MnistLayoutRunner:
             embeddings = resume_embeddings[: self._activation_samples]
             LOGGER.event(
                 "activation.embedding.skip",
-                section=DETECTOR_INSERTION,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "path": layout_path,
                     "embeddings": len(embeddings),
@@ -1875,28 +2013,6 @@ class MnistLayoutRunner:
         )
 
 
-def _load_image_from_path(path: str) -> "np.ndarray":
-    from PIL import Image
-    import numpy as np
-
-    target_h, target_w = MnistSobelAngleMap.EXPECTED_SHAPE
-    image = Image.open(path).convert("L")
-    image = image.resize((target_w, target_h))
-    array = np.asarray(image, dtype="float32")
-    if array.max() > 1.5:
-        array = array / 255.0
-    LOGGER.event(
-        "decoder.image.load",
-        section=STIMULUS_DETECTION,
-        data={
-            "path": path,
-            "shape": array.shape,
-            "max": float(array.max()) if array.size else 0.0,
-            "min": float(array.min()) if array.size else 0.0,
-        },
-    )
-    return array
-
 
 class MnistDecodeRunner:
     def __init__(self, *, count: int, layout_path: str | None = None) -> None:
@@ -1907,7 +2023,8 @@ class MnistDecodeRunner:
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.encoder = _build_encoder()
-        self.extractor = MnistSobelAngleMap(angle_in_degrees=True, grad_threshold=0.05)
+        self.colorizer = _build_colorizer()
+        self.extractor = _build_extractor()
         self._embedding_store = EmbeddingStore(
             json_key=EMBEDDINGS_JSON_KEY,
             version_key=EMBEDDINGS_VERSION_KEY,
@@ -1924,7 +2041,7 @@ class MnistDecodeRunner:
             if not path or path in seen or not os.path.exists(path):
                 continue
             seen.add(path)
-            metadata = _load_layout_metadata_from_path(path)
+            metadata = LayoutCacheFile.inspect(path)
             if metadata is None:
                 continue
             total_points, pair_radius, ready = metadata
@@ -1935,12 +2052,19 @@ class MnistDecodeRunner:
                 start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
             )
             tuned_params = tuner.tune(total_points)
-            layout = _load_layout_from_file(path, tuned_params)
+            layout = LayoutCacheFile.load(
+                path,
+                tuned_params,
+                expected_code_length=self.encoder.code_length,
+                colorizer=self.colorizer,
+                expected_encoder_signature=self.encoder.signature,
+                expected_stimulus=_stimulus_metadata(self.extractor),
+            )
             if layout is None:
                 continue
             LOGGER.event(
                 "decoder.layout.use",
-                section=LAID_OUT_STRUCTURE,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "path": path,
                     "points": total_points,
@@ -1955,18 +2079,27 @@ class MnistDecodeRunner:
         if self._decoder is not None:
             return self._decoder
         layout, layout_path, total_points = self._load_layout()
-        energies = _compute_point_energies(layout, ACTIVATION_POINT_ENERGY_RADIUS)
-        embeddings = _load_embeddings_from_file(layout_path)
-        if not embeddings:
-            embeddings = self._build_embeddings_for_layout(
+        energies = layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
+        embeddings = self._embedding_store.load(layout_path)
+        metadata = self._embedding_store.load_metadata(layout_path)
+        activation_engine: ActivationEngine | None = None
+        if not embeddings or "output_bits" not in metadata:
+            embeddings, activation_engine = self._build_embeddings_for_layout(
                 layout,
                 layout_path,
                 energies,
             )
-        labeled_embeddings = _embedding_records_to_labeled(embeddings)
+        labeled_embeddings = EmbeddingStore.to_labeled(embeddings)
         if not labeled_embeddings:
             raise RuntimeError("в раскладке нет базы эмбеддингов")
-        activation_engine = _build_activation_engine(layout, energies)
+        if activation_engine is None:
+            activation_engine = _activation_engine_from_size(
+                layout,
+                energies,
+                output_bits=int(metadata["output_bits"]),
+                saturation_limit=int(metadata["saturation_limit"]),
+                stored_detectors=metadata.get(ACTIVATION_DETECTORS_KEY),
+            )
         database = EmbeddingDatabase(
             labeled_embeddings,
             DecoderConfig(
@@ -1974,9 +2107,9 @@ class MnistDecodeRunner:
                 temperature=DECODER_SOFTMAX_TEMPERATURE,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
-                knn_top_k=200,
-                top_k_per_class=20,
-                min_similarity=0.0,
+                knn_top_k=DECODER_KNN_TOP_K,
+                top_k_per_class=DECODER_TOP_K_PER_CLASS,
+                min_similarity=DECODER_MIN_SIMILARITY,
             ),
         )
         self._decoder = MnistDecoder(
@@ -1987,7 +2120,7 @@ class MnistDecodeRunner:
         )
         LOGGER.event(
             "decoder.build",
-            section=STIMULUS_DETECTION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "layout_path": layout_path,
                 "embeddings": len(labeled_embeddings),
@@ -2002,46 +2135,51 @@ class MnistDecodeRunner:
         layout: Layout,
         layout_path: str,
         energies: list[float],
-    ) -> list[EmbeddingRecord]:
-        engine = _build_activation_engine(layout, energies)
+    ) -> tuple[list[EmbeddingRecord], ActivationEngine]:
         dataset = self._build_dataset(train=True)
-        samples = _collect_samples(
-            dataset,
-            DECODER_DATASET_LIMIT,
-            self.encoder,
-            self.extractor,
-            label=None,
+        cache = StimulusCodeCache(dataset, self.encoder, self.extractor, label=None)
+        samples = _collect_samples(cache, DECODER_DATASET_LIMIT)
+        calibrated = _calibrated_activation_engine(
+            layout,
+            energies,
+            [codes for _, codes in samples[:ACTIVATION_OUTPUT_CALIBRATION_SAMPLES]],
         )
+        engine = calibrated.engine
         embeddings: list[EmbeddingRecord] = []
         for idx, (label, codes) in enumerate(samples):
-            result = engine.activate(codes)
+            if idx < len(calibrated.embeddings):
+                embedding = calibrated.embeddings[idx]
+            else:
+                embedding = engine.activate(codes).embedding
             embeddings.append(
                 EmbeddingRecord(
                     class_label=str(int(label)),
-                    embedding_bits=result.embedding.to01(),
+                    embedding_bits=embedding.to01(),
                 )
             )
             LOGGER.event(
                 "decoder.base.generate",
-                section=DETECTOR_INSERTION,
+                section=STIMULUS_DETECTION,
                 data={
                     "index": idx,
                     "label": int(label),
                     "stimuli": len(codes),
-                    "bits": result.embedding.count(),
+                    "bits": embedding.count(),
                 },
             )
-        self._embedding_store.save(layout_path, embeddings)
+        self._embedding_store.save(
+            layout_path, embeddings, metadata=_activation_metadata(calibrated.size, detectors=engine.detectors)
+        )
         LOGGER.event(
             "decoder.base.generated",
-            section=DETECTOR_INSERTION,
+            section=STIMULUS_DETECTION,
             data={
                 "embeddings": len(embeddings),
                 "classes": len({int(item.class_label) for item in embeddings}),
                 "path": layout_path,
             },
         )
-        return embeddings
+        return embeddings, engine
 
     def predict_image(
         self,
@@ -2068,7 +2206,7 @@ class MnistDecodeRunner:
         temperature: float | None = None,
         log_image: bool = False,
     ) -> PredictionResult:
-        image = _load_image_from_path(path)
+        image = MnistSobelAngleMap.load_image(path)
         return self.predict_image(image, temperature=temperature, log_image=log_image)
 
     def _build_dataset(self, *, train: bool):
@@ -2107,7 +2245,7 @@ class MnistDecodeRunner:
         )
         LOGGER.event(
             "decoder.dataset.eval",
-            section=STIMULUS_DETECTION,
+            section=OUTSIDE_ARTICLE,
             data={
                 "split": split,
                 "samples": len(results),
@@ -2133,7 +2271,7 @@ class MnistDecodeRunner:
             self._temperature_override = best_temp
             LOGGER.event(
                 "decoder.calibrate",
-                section=SIMILARITY_MEASURES,
+                section=OUTSIDE_ARTICLE,
                 data={
                     "split": split,
                     "samples": 0,
@@ -2159,7 +2297,7 @@ class MnistDecodeRunner:
         self._temperature_override = best_temp
         LOGGER.event(
             "decoder.calibrate",
-            section=SIMILARITY_MEASURES,
+            section=OUTSIDE_ARTICLE,
             data={
                 "split": split,
                 "samples": len(images),
@@ -2182,6 +2320,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="количество эмбеддингов; по умолчанию равно --count",
+    )
+    layout_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="игнорировать готовую раскладку и эмбеддинги в data/: посчитать заново и записать новый кеш "
+        "(ход раскладки виден в Rerun)",
     )
     predict_parser = subparsers.add_parser("predict", help="декодирование картинки или батча")
     predict_parser.add_argument("--layout-path", type=str, default=None)
@@ -2209,6 +2353,7 @@ def main() -> None:
             count=args.count,
             label=args.label,
             activation_samples=args.activation_samples,
+            reuse_cache=not args.rebuild,
         )
         runner.run()
         return

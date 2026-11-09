@@ -6,7 +6,9 @@ import json
 import os
 from typing import Dict, List, Mapping, Sequence
 
-from damp.article_refs import LAID_OUT_STRUCTURE
+from damp.article_refs import (
+    OUTSIDE_ARTICLE,
+)
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 
@@ -47,11 +49,13 @@ class LayoutPayloadBuilder:
         similarity: str | None,
         lambda_threshold: float | None,
         eta: float | None,
+        metadata: Mapping[str, object] | None = None,
     ) -> None:
         self._records: List[LayoutCodeRecord] = []
         self._similarity = similarity
         self._lambda_threshold = lambda_threshold
         self._eta = eta
+        self._metadata: Dict[str, object] = dict(metadata or {})
 
     @property
     def records(self) -> Sequence[LayoutCodeRecord]:
@@ -75,6 +79,7 @@ class LayoutPayloadBuilder:
 
     def base_payload(self) -> Mapping[str, object]:
         return {
+            **self._metadata,
             "width": None,
             "height": None,
             "points": len(self._records),
@@ -96,7 +101,7 @@ class LayoutPayloadBuilder:
             json.dump(payload, fp, ensure_ascii=True, indent=2)
         LOGGER.event(
             "layout.payload.base",
-            section=LAID_OUT_STRUCTURE,
+            section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "points": len(self._records),
