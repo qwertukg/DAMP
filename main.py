@@ -167,7 +167,7 @@ LAYOUT_ENERGY_IMAGE_SUFFIX = ".energy.png"
 # пинвилы друг к другу и убирают складки на их границах (docs/ARTICLE_COMPLIANCE.md).
 # False — дальняя фаза строго по статье: φ = Σ s·d по всему V (§5.5.1), радиус пар линейно от d/2 к 1,
 # триггер 1 % обменов и рост λ ступенями (§7.1.7), жадное правило обмена без отжига (§5.6).
-LAYOUT_SMOOTH_PINWHEELS = True
+LAYOUT_SMOOTH_PINWHEELS = False
 # Метка кеша раскладки: раскладки старых версий Encoder и другого режима дальней фазы не переиспользуются.
 LAYOUT_CACHE_TAG = "gauss-kernel-v1" if LAYOUT_SMOOTH_PINWHEELS else "article-kernel-v1"
 LAYOUT_SIMILARITY = "cosine"
