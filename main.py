@@ -50,6 +50,9 @@ LOG_INTERVAL_LAYOUT_AVG_ENERGY = 200
 LOG_INTERVAL_LAYOUT_VISUAL = 1
 LOG_INTERVAL_LAYOUT_ADAPTIVE = 200
 LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
+# Выборка пар ближней фазы по плиткам (§5.10): событие на каждую плитку каждого шага — раз в столько вызовов.
+LOG_INTERVAL_LAYOUT_SHORT_SAMPLING = 500
+LOG_INTERVAL_LAYOUT_SHORT_TILES = 50
 LOG_INTERVAL_LAYOUT_EXPORT = 1
 LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS = 1
 LOG_INTERVAL_ACTIVATION_INIT = 1
@@ -191,12 +194,35 @@ LAYOUT_RANDOM_SEED = 0
 # ~1 % случайных пар всегда «выгодны», обмены не падают до 1 % от стартовых, триггер не срабатывает,
 # λ = 0.65 и r = d/2 все 50 000 шагов — расписание доделывала ближняя фаза. С полным V на 100 цифрах
 # расписание завершается к шагу ~18 000, ближняя фаза только полирует (подбор 2026-11-10).
-# Цена: шаг стоит p·N·512 произведений; на 88k точек ≈ 1 с/шаг — там нужна ветка layout-speedup (моменты).
+# Цена плотного прохода: шаг стоит p·N·512 произведений (на 88k точек ≈ 1.1 с/шаг); при жёстком пороге шаг
+# считается по ненулевым sim_λ (LAYOUT_SPARSE_LONG) с тем же результатом.
 LAYOUT_LONG_FULL_SPACE_MAX_POINTS = 100000
 # Подмножество B в гауссовой дальней фазе допустимо, пока в окрестность радиуса r(t) ожидаемо попадает
 # не меньше стольких точек B (иначе оценка локальной энергии шумная и обмены случайны); ниже — всё V.
 # На 100 цифрах (8 693 точки, |B| = 745) подмножество на всём протяжении фазы давало Ē 0.26 вместо 0.70.
 LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS = 50
+# Энергии по ненулевым sim_λ (§5.5.1, §5.5.2, §5.7, §5.9.5). При жёстком пороге (η = ∞, §7.1.7) sim_λ(a, v) = 0
+# для всех v с sim < λ, поэтому суммы по всему V, по окрестности пары и энергии точек сводятся к точкам,
+# похожим на a или b: строки сходства строятся один раз, прореживаются при росте λ, шаг стоит O(p·k)
+# вместо O(p·N) (k — число похожих точек). Суммы φ_c, φ_s побитово те же, что у исходных проходов (та же
+# редукция float32 той же формы), поэтому раскладка совпадает шаг в шаг (docs/ARTICLE_COMPLIANCE.md,
+# «Ускорение без изменения результата»). False — всегда исходные проходы по всему V и по окну ячеек.
+LAYOUT_SPARSE_LONG = True
+# Наибольшее число ненулевых элементов строк сходства (8 байт на элемент); больше — плотный проход.
+LAYOUT_SPARSE_MAX_EDGES = 400_000_000
+# Доля свободной памяти устройства, которую могут занять строки сходства.
+LAYOUT_SPARSE_MEMORY_FRACTION = 0.5
+# Память под буферы плотной редукции (участки [порция пар, N] для φ_c и φ_s).
+LAYOUT_SPARSE_BUFFER_BYTES = 256 * 1024 * 1024
+# Предел элементов (строки точек × наибольшая степень) на один блок расчёта слагаемых.
+LAYOUT_SPARSE_ENTRY_BUDGET = 4_000_000
+# С этого числа порций плотного прохода на шаг пары сначала отсеиваются по оценке ошибки суммирования
+# float32: знак φ_c − φ_s известен без плотной редукции, она остаётся только парам с разностью у нуля.
+LAYOUT_SPARSE_SCREEN_MIN_CHUNKS = 1
+# Сверка с плотным проходом: после построения и каждого прореживания строк и затем раз в столько шагов
+# шаг считается обоими способами (в раскладку идёт результат исходного прохода); при расхождении расчёт
+# по строкам отключается. 0 — сверка только после построения и прореживания.
+LAYOUT_SPARSE_VERIFY_EVERY = 2000
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
@@ -446,6 +472,18 @@ LOG_INTERVALS = {
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.progress": LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS,
     "layout.energy.pairs.gpu": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.sparse.energy.pairs": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.sparse.energy.neighbourhood": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.short.pair_sampling": LOG_INTERVAL_LAYOUT_SHORT_SAMPLING,
+    "layout.short.tiles": LOG_INTERVAL_LAYOUT_SHORT_TILES,
+    "layout.short.partition_pairs": LOG_INTERVAL_LAYOUT_SHORT_TILES,
+    "layout.pair_sampling.merged_draws": LOG_INTERVAL_INIT,
+    "layout.sparse.energy.init": LOG_INTERVAL_INIT,
+    "layout.sparse.energy.verify": LOG_INTERVAL_INIT,
+    "layout.sparse.energy.disabled": LOG_INTERVAL_INIT,
+    "layout.sparse.rows.build": LOG_INTERVAL_INIT,
+    "layout.sparse.rows.prune": LOG_INTERVAL_INIT,
+    "layout.sparse.rows.skipped": LOG_INTERVAL_INIT,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
     "layout.gpu.disabled": LOG_INTERVAL_INIT,
@@ -948,6 +986,19 @@ class LayoutParameterTuner:
         )
 
 
+def _sparse_layout_options() -> dict[str, object]:
+    """Параметры Layout для расчёта энергий по ненулевым sim_λ (§5.5.1, §5.5.2, §5.9.5): общие для MNIST и pinwheel."""
+    return {
+        "sparse_long": LAYOUT_SPARSE_LONG,
+        "sparse_max_edges": LAYOUT_SPARSE_MAX_EDGES,
+        "sparse_memory_fraction": LAYOUT_SPARSE_MEMORY_FRACTION,
+        "sparse_buffer_bytes": LAYOUT_SPARSE_BUFFER_BYTES,
+        "sparse_entry_budget": LAYOUT_SPARSE_ENTRY_BUDGET,
+        "sparse_screen_min_chunks": LAYOUT_SPARSE_SCREEN_MIN_CHUNKS,
+        "sparse_verify_every": LAYOUT_SPARSE_VERIFY_EVERY,
+    }
+
+
 def _default_layout_params() -> TunedLayoutParams:
     return TunedLayoutParams(
         long_pairs_per_step=LAYOUT_LONG_PAIRS_PER_STEP,
@@ -1308,6 +1359,7 @@ class LayoutCacheFile:
             long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
             long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
             component_period=LAYOUT_COMPONENT_PERIOD,
+            **_sparse_layout_options(),
         )
         if len(layout.positions()) != len(sorted_points):
             raise RuntimeError("layout load mismatch: points count differs")
@@ -1544,6 +1596,7 @@ def _run_layout(
         long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
         component_period=LAYOUT_COMPONENT_PERIOD,
         long_subset_min_neighbours=LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS,
+        **_sparse_layout_options(),
     )
     step_offset = 1
     long_radius_start = max(

@@ -77,6 +77,7 @@ from main import (
     LayoutParameterTuner,
     TunedLayoutParams,
     _build_encoder,
+    _sparse_layout_options,
     configure_logging,
 )
 
@@ -279,6 +280,7 @@ class PinwheelExperiment:
             long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
             long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
             component_period=MNIST_ANGLE_MAX - MNIST_ANGLE_MIN,
+            **_sparse_layout_options(),
         )
 
     def run(self, *, save: bool = True) -> tuple[Layout, PinwheelQuality]:
