@@ -672,8 +672,13 @@ class SparseLongEnergy:
         pb: "np.ndarray",
         *,
         signs_only: bool,
+        pending: "np.ndarray | None" = None,
     ) -> tuple["np.ndarray", "np.ndarray", int, bool]:
-        """(φ_c, φ_s, число пар с плотной редукцией, был ли отсев) для заданной формы редукции."""
+        """(φ_c, φ_s, число пар с плотной редукцией, был ли отсев) для заданной формы редукции.
+
+        pending — номера пар, которым нужны суммы редукции исходной формы (остальные уже решены вызывающим,
+        например ядром PairSignKernel): отсев не выполняется, у остальных пар возвращаются нули.
+        """
         pair_count = int(ia.size)
         energy_c = np.zeros(pair_count, dtype=np.float32)
         energy_s = np.zeros(pair_count, dtype=np.float32)
@@ -686,10 +691,13 @@ class SparseLongEnergy:
         # отдельного тензора, поэтому редукция по участку идёт тем же порядком, что по порции исходного прохода.
         stride = -(-(chunk * width) // 128) * 128
         max_slots = max(1, self._buffer_bytes // (sides * 4 * stride))
-        screened = signs_only and sides == 2 and chunks >= self._screen_min_chunks
-        all_rows = _PairRows(ia, ib, pa, pb, self._rows)
+        screened = pending is not None or (signs_only and sides == 2 and chunks >= self._screen_min_chunks)
+        all_rows: _PairRows | None = None
         cache: _TermsCache | None = None
-        if screened:
+        if pending is not None:
+            pending = np.asarray(pending, dtype=np.int64)
+        elif screened:
+            all_rows = _PairRows(ia, ib, pa, pb, self._rows)
             pending, cache = self._screen(reduction, all_rows, ia, ib, energy_c=energy_c, energy_s=energy_s)
         else:
             pending = np.arange(pair_count, dtype=np.int64)
@@ -729,6 +737,8 @@ class SparseLongEnergy:
                 if cache is not None:
                     blocks = self._cached_block(cache, select, place)
                 elif select.size == pair_count:
+                    if all_rows is None:
+                        all_rows = _PairRows(ia, ib, pa, pb, self._rows)
                     blocks = self._row_blocks(reduction, all_rows, place)
                 else:
                     blocks = self._row_blocks(reduction, _PairRows(ia, ib, pa, pb, self._rows, select), place)
@@ -760,6 +770,7 @@ class SparseLongEnergy:
         *,
         euclidean: bool,
         signs_only: bool,
+        pending: "np.ndarray | None" = None,
     ) -> tuple[Any, Any]:
         """(φ_c, φ_s) пар дальней фазы (§5.5.1) по всему V; numpy float32.
 
@@ -767,6 +778,8 @@ class SparseLongEnergy:
         signs_only = True (жадное правило §5.6, нужен только знак φ_c − φ_s): у пар, знак разности которых
         следует из оценки ошибки суммирования, возвращаются суммы float64, округлённые до float32, — знак
         разности тот же, что у плотного прохода; у остальных пар — побитово те же суммы.
+        pending — номера пар, которым нужны суммы плотной редукции (знак остальных уже известен вызывающему):
+        у этих пар суммы побитово те же, что у плотного прохода, у остальных — нули.
         """
         ia, ib, pa, pb = self._pair_arrays(idx_a, idx_b, pos_a, pos_b)
         if ia.size == 0:
@@ -778,20 +791,25 @@ class SparseLongEnergy:
             terms=lambda pair_rows, batch: self._long_terms(pair_rows, batch, euclidean=euclidean),
         )
         with self._torch.no_grad():
-            energy_c, energy_s, reduced, screened = self._energies(reduction, ia, ib, pa, pb, signs_only=signs_only)
-        LOGGER.event(
-            "layout.sparse.energy.pairs",
-            section=ENERGY_LONG,
-            data={
-                "pairs": int(ia.size),
-                "points": self._engine.point_count,
-                "screened": screened,
-                "reduced_pairs": reduced,
-                "lambda_threshold": self._rows.lambda_threshold,
-                "note": "φ_c = Σ s1·d1 + s2·d2, φ_s = Σ s2·d1 + s1·d2 по ненулевым sim_λ (§5.5.1); "
-                "reduced_pairs — пары, суммы которых взяты плотной редукцией float32",
-            },
-        )
+            energy_c, energy_s, reduced, screened = self._energies(
+                reduction, ia, ib, pa, pb, signs_only=signs_only, pending=pending
+            )
+        event = "layout.sparse.energy.pairs"
+        if LOGGER.should_log(event):
+            LOGGER.event(
+                event,
+                section=ENERGY_LONG,
+                data={
+                    "pairs": int(ia.size),
+                    "points": self._engine.point_count,
+                    "screened": screened,
+                    "reduced_pairs": reduced,
+                    "lambda_threshold": self._rows.lambda_threshold,
+                    "note": "φ_c = Σ s1·d1 + s2·d2, φ_s = Σ s2·d1 + s1·d2 по ненулевым sim_λ (§5.5.1); "
+                    "reduced_pairs — пары, суммы которых взяты плотной редукцией float32",
+                },
+                force=True,
+            )
         return energy_c, energy_s
 
     # ------------------------------------------------------------------ энергии окрестности
@@ -809,6 +827,7 @@ class SparseLongEnergy:
         kernel_width: float,
         signs_only: bool,
         need_swapped: bool = True,
+        pending: "np.ndarray | None" = None,
     ) -> tuple[Any, Any] | None:
         """(φ_c, φ_s) окрестности пар (§5.5.2) и энергии точек (§5.7, idx_b = −1); numpy float32.
 
@@ -816,6 +835,8 @@ class SparseLongEnergy:
         ячеек, а если окно не меньше всего V (у пары далёкая вторая ячейка) — проход по всем точкам.
         None — расчёт по строкам здесь невыгоден (слагаемых больше, чем стоят ячейки окна): окрестность
         считает сам движок.
+        pending — номера пар, которым нужны суммы редукции исходной формы (знак остальных уже известен
+        вызывающему): у этих пар суммы побитово те же, что у исходного прохода, у остальных — нули.
         """
         torch = self._torch
         ia, ib, pa, pb = self._pair_arrays(idx_a, idx_b, pos_a, pos_b)
@@ -831,7 +852,7 @@ class SparseLongEnergy:
             cells = (2 * reach + 1) ** 2
             # Окно не меньше всего V: исходный проход суммирует по всем точкам порциями плотного прохода.
             whole_space = cells >= engine.point_count
-            if not whole_space and entries > self.WINDOW_CELL_COST * pair_count * cells:
+            if pending is None and not whole_space and entries > self.WINDOW_CELL_COST * pair_count * cells:
                 return None
             base = None if whole_space else torch.floor(centre).to(torch.long)
             sides = 2 if need_swapped else 1
@@ -844,23 +865,28 @@ class SparseLongEnergy:
                     kernel=kernel, euclidean=euclidean, distance_eps=distance_eps, kernel_width=kernel_width,
                 ),
             )
-            energy_c, energy_s, reduced, screened = self._energies(reduction, ia, ib, pa, pb, signs_only=signs_only)
-        LOGGER.event(
-            "layout.sparse.energy.neighbourhood",
-            section=ENERGY_SHORT if need_swapped else POINT_ENERGY,
-            data={
-                "pairs": pair_count,
-                "window_cells": cells,
-                "whole_space": whole_space,
-                "entries": entries,
-                "screened": screened,
-                "reduced_pairs": reduced,
-                "kernel": kernel,
-                "lambda_threshold": self._rows.lambda_threshold,
-                "note": "φ = Σ s/d по точкам окрестности с sim ≥ λ (§5.5.2, §5.7): слагаемые по строкам сходства "
-                "вместо всех ячеек окна, суммы те же",
-            },
-        )
+            energy_c, energy_s, reduced, screened = self._energies(
+                reduction, ia, ib, pa, pb, signs_only=signs_only, pending=pending
+            )
+        event = "layout.sparse.energy.neighbourhood"
+        if LOGGER.should_log(event):
+            LOGGER.event(
+                event,
+                section=ENERGY_SHORT if need_swapped else POINT_ENERGY,
+                data={
+                    "pairs": pair_count,
+                    "window_cells": cells,
+                    "whole_space": whole_space,
+                    "entries": entries,
+                    "screened": screened,
+                    "reduced_pairs": reduced,
+                    "kernel": kernel,
+                    "lambda_threshold": self._rows.lambda_threshold,
+                    "note": "φ = Σ s/d по точкам окрестности с sim ≥ λ (§5.5.2, §5.7): слагаемые по строкам "
+                    "сходства вместо всех ячеек окна, суммы те же",
+                },
+                force=True,
+            )
         return energy_c, energy_s
 
     # ------------------------------------------------------------------ сверка

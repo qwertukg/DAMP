@@ -41,6 +41,10 @@ from damp.article_refs import (
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import EncoderCodeColorizer
 from damp.layout.pair_energy_gpu import TorchPairEnergyEngine
+from damp.layout.pair_sampler import CompiledPairSampler
+from damp.layout.pair_sign_kernel import PairSignKernel
+from damp.layout.potential_bounds import PotentialBounds
+from damp.layout.reduction_replica import ReductionReplica
 from damp.layout.payload import LayoutEncodedCode
 from damp.layout.sparse_long_energy import SimilarityRows, SparseLongEnergy
 from damp.logging import LOGGER
@@ -1389,6 +1393,8 @@ class Layout:
     # Пока пар без второй ячейки не больше этого числа, попытка выбора проверяется поэлементно (§5.3):
     # на таких массивах вызовы numpy стоят больше самой проверки.
     _SAMPLE_SCALAR_LIMIT = 48
+    # Скомпилированная выборка пар сверяется с выборкой numpy на стольких первых вызовах каждой фазы.
+    _SAMPLER_VERIFY_FIRST = 3
     # Можно ли брать смещения dy и dx одной попытки одним запросом к генератору (проверяется один раз).
     _MERGED_OFFSET_DRAWS: bool | None = None
 
@@ -1457,6 +1463,15 @@ class Layout:
         sparse_entry_budget: int = 4_000_000,
         sparse_screen_min_chunks: int = 1,
         sparse_verify_every: int = 2000,
+        sparse_verify_chunks: int = 1,
+        pair_kernel: bool = True,
+        pair_kernel_segment: int = 16,
+        compiled_sampler: bool = True,
+        sampler_verify_every: int = 1000,
+        potential_bounds: bool = True,
+        potential_bounds_grid: int = 8,
+        reduction_replica: bool = True,
+        replica_max_bytes: int = 1 << 30,
     ) -> None:
         if not codes:
             raise ValueError("codes must be non-empty")
@@ -1466,6 +1481,12 @@ class Layout:
             raise ValueError("sparse_buffer_bytes and sparse_entry_budget must be positive")
         if sparse_screen_min_chunks <= 0 or sparse_verify_every < 0:
             raise ValueError("sparse_screen_min_chunks must be positive and sparse_verify_every >= 0")
+        if sparse_verify_chunks < 0 or pair_kernel_segment <= 0 or sampler_verify_every < 0:
+            raise ValueError(
+                "sparse_verify_chunks and sampler_verify_every must be >= 0, pair_kernel_segment must be positive"
+            )
+        if potential_bounds_grid <= 0:
+            raise ValueError("potential_bounds_grid must be positive")
         if component_period is not None and component_period <= 0.0:
             raise ValueError("component_period must be positive when set")
         if long_kernel not in _LONG_KERNELS:
@@ -1526,6 +1547,8 @@ class Layout:
             max_hue=_DEFAULT_PSEUDO_COLOR_MAX_HUE,
         )
         self._colors_rgb_cache: tuple[tuple[int, int, int], ...] | None = None
+        self._colors_rgb_array_cache: "np.ndarray | None" = None
+        self._component_colors_cache: dict[float | None, "np.ndarray"] = {}
         self._rng = random.Random(seed)
         # Векторная выборка пар (§5.3, §5.9.1, §5.9.3) — отдельный генератор numpy с тем же seed.
         self._np_rng = np.random.default_rng(seed)
@@ -1564,6 +1587,39 @@ class Layout:
         # Сверка с исходным проходом — отдельно для дальней энергии, окрестности пар и энергий точек.
         self._sparse_steps_since_verify = {"long": 0, "neighbourhood": 0, "points": 0}
         self._sparse_verify_pending = {"long": True, "neighbourhood": True, "points": True}
+        # Сверка пар идёт на первых порциях исходного прохода (0 — на всех парах шага).
+        self._sparse_verify_chunks = int(sparse_verify_chunks)
+        # Знак φ_c − φ_s пар одним проходом ядра по строкам сходства (§5.6, §5.12): создаётся вместе со строками.
+        self._pair_kernel_enabled = bool(pair_kernel)
+        self._pair_kernel_segment = int(pair_kernel_segment)
+        self._pair_kernel: PairSignKernel | None = None
+        # Сколько шагов и пар потребовали сумм редукции исходной формы (разность в пределах ошибки суммирования).
+        self._undecided_steps = 0
+        self._undecided_pairs = 0
+        # Нижняя граница потенциала точки (§5.5.1): пары дальней фазы, которым обмен заведомо невыгоден,
+        # не считаются по строкам сходства. Суммы границы ведутся, пока обменов на шаг мало.
+        self._bounds_enabled = bool(potential_bounds)
+        self._bounds_grid = int(potential_bounds_grid)
+        self._bounds: PotentialBounds | None = None
+        self._bounds_on = False
+        self._bounds_move_limit = 0
+        self._bounds_cooldown = 0
+        self._bounds_window = [0, 0, 0]
+        self._bounded_pairs = 0
+        self._last_moved_points = 0
+        # Суммы пар у нуля разности на хосте в порядке сложения редукции исходного прохода (ReductionReplica).
+        self._replica_enabled = bool(reduction_replica)
+        self._replica_max_bytes = int(replica_max_bytes)
+        self._replica: ReductionReplica | None = None
+        self._replica_pairs = 0
+        # Скомпилированная выборка пар (§5.3, §5.9.1, §5.9.3): создаётся после расстановки точек.
+        self._compiled_sampler_enabled = bool(compiled_sampler)
+        self._compiled_sampler: CompiledPairSampler | None = None
+        self._sampler_verify_every = int(sampler_verify_every)
+        self._sampler_calls = {"long": 0, "short": 0}
+        self._ones_float64 = None if self._ones_array is None else self._ones_array.astype(np.float64)
+        # Класс одинаковых кодов каждой точки: у пары точек одного класса φ_c = φ_s точно (PairSignKernel).
+        self._code_class = self._code_classes()
         # Списки расстановки — источник истины (§5.1.2); массивы _pos_np, _grid_np повторяют их для векторных
         # выборки пар и расчёта энергий. True — списки могли измениться в обход обменов, массивы пересобираются.
         self._arrays_stale = True
@@ -1733,8 +1789,10 @@ class Layout:
         self._torch_engine: TorchPairEnergyEngine | None = None
         self._torch_positions_version = -1
         # Точки и ячейки, изменившиеся с последней загрузки на устройство: после шага загружаются только они.
-        self._torch_dirty_points: set[int] = set()
-        self._torch_dirty_cells: dict[tuple[int, int], int] = {}
+        # Ячейки (y·ширина + x), содержимое которых обмены изменили с последней загрузки на устройство.
+        self._torch_dirty_cells: list[int] = []
+        # Сдвинутые теми же обменами точки тройками (точка, старая ячейка, новая ячейка) — для сумм PotentialBounds.
+        self._torch_moves: list[int] = []
         self._gpu_positions_dirty = True
         if self._use_gpu:
             # Основной путь: энергии пар и точек на torch со сходством из кодов (§5.9.5, §5.12);
@@ -1776,6 +1834,8 @@ class Layout:
         self._sim_base: list[list[float]] | None = None
         if precompute_similarity and self._point_count <= max_precompute:
             self._build_similarity_cache()
+        if self._compiled_sampler_enabled and self._merged_offset_draws():
+            self._compiled_sampler = CompiledPairSampler.create(height=self.height, width=self.width)
 
     # ------------------------------------------------------------------ списки расстановки
     # grid, _positions, _pos_y, _pos_x, _row_occupied — источник истины раскладки (§5.1.2). Обмены меняют
@@ -2359,8 +2419,9 @@ class Layout:
         visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT or not log_visuals
         visuals: list = []
         if log_visuals and not visuals_skipped:
-            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
-            colors = self.colors_rgb()
+            # Центры ячеек и цвета точек — массивами: те же числа, что давал обход точек по одной.
+            positions = self._cell_centres()
+            colors = self._colors_rgb_array()
             image = self._build_image(colors)
             visuals = [
                 LOGGER.visual_image(
@@ -2376,7 +2437,7 @@ class Layout:
             ]
             if self._component_period is not None:
                 # Та же карта, раскрашенная по углу стимула, как в pinwheel-тесте (рис. 16, §5.13.2).
-                component_colors = self.component_colors_rgb(period=self._component_period)
+                component_colors = self._component_colors_array(self._component_period)
                 visuals += [
                     LOGGER.visual_image(f"{path}/angle", self._build_image(component_colors)),
                     LOGGER.visual_points2d(f"{path}/angle", positions, colors=component_colors, radii=0.5),
@@ -2706,25 +2767,38 @@ class Layout:
             return
         if self._torch_positions_version == self._positions_version:
             return
+        dirty = self._torch_dirty_cells
+        moves = self._torch_moves
         incremental = (
             self._torch_positions_version >= 0
             and self._torch_positions_version + 1 == self._positions_version
-            and 0 < len(self._torch_dirty_points) <= max(1, self._point_count // 4)
+            and 0 < len(dirty) <= max(2, self._point_count // 2)
         )
-        pos_y = self._pos_y_list
-        pos_x = self._pos_x_list
+        bounds = self._bounds
+        moved = len(moves) // 3
         if incremental:
-            indices = sorted(self._torch_dirty_points)
-            self._torch_engine.update_points(
-                indices,
-                [pos_y[idx] for idx in indices],
-                [pos_x[idx] for idx in indices],
-                [(y, x, occupant) for (y, x), occupant in self._torch_dirty_cells.items()],
-            )
+            # Изменились только ячейки обменов шага: на устройство уходят они и их нынешние жильцы.
+            self._sync_arrays()
+            # Обмены одного шага не делят ячеек (§5.10: ячейка участвует не больше чем в одном обмене шага),
+            # поэтому изменившиеся ячейки в списке не повторяются.
+            cells = np.asarray(dirty, dtype=np.int64)
+            occupants = self._grid_np.reshape(-1)[cells]
+            if bounds is not None and self._bounds_on and bounds.valid and moved <= self._bounds_move_limit:
+                # Суммы границы потенциала обновляются вместе с позициями: проход по строкам сдвинутых точек.
+                bounds.apply_moves(cells, occupants, np.asarray(moves, dtype=np.int64).reshape(-1, 3))
+            else:
+                if bounds is not None:
+                    # Обменов слишком много (их учёт дороже расчёта строк) либо суммы не ведутся.
+                    self._bounds_on = False
+                    bounds.invalidate()
+                self._torch_engine.update_cells(cells, occupants)
         else:
-            self._torch_engine.update_positions(pos_y, pos_x)
-        self._torch_dirty_points.clear()
-        self._torch_dirty_cells.clear()
+            if bounds is not None:
+                bounds.invalidate()
+            self._torch_engine.update_positions(self._pos_y_list, self._pos_x_list)
+        self._last_moved_points = moved
+        dirty.clear()
+        moves.clear()
         self._torch_positions_version = self._positions_version
 
     def _sample_nearby_np(
@@ -2858,8 +2932,51 @@ class Layout:
             idx = idx[~ok]
         return y2, x2
 
+    def _sampler_check_due(self, kind: str) -> bool:
+        """Пора ли сверить скомпилированную выборку пар с выборкой numpy: первые вызовы и затем периодически."""
+        calls = self._sampler_calls[kind]
+        self._sampler_calls[kind] = calls + 1
+        if calls < self._SAMPLER_VERIFY_FIRST:
+            return True
+        return self._sampler_verify_every > 0 and calls % self._sampler_verify_every == 0
+
+    def _sampler_checked(self, kind: str, matched: bool) -> None:
+        """Итог сверки выборок (§5.3): при расхождении скомпилированная выборка отключается до конца работы."""
+        LOGGER.event(
+            "layout.pair_sampling.compiled.verify",
+            section=PAIR_SELECTION,
+            data={
+                "kind": kind,
+                "call": self._sampler_calls[kind] - 1,
+                "identical": matched,
+                "note": "скомпилированная выборка пар сверена с выборкой numpy: те же пары и то же состояние "
+                "генератора (§5.3, §5.9.1, §5.9.3)",
+            },
+        )
+        if not matched and self._compiled_sampler is not None:
+            self._compiled_sampler.log_mismatch(kind=kind, step=None)
+            self._compiled_sampler = None
+
     def _sample_pairs_long_np(self, count: int, radius: int | None) -> "np.ndarray":
         """Пары дальней фазы (§5.3): первая точка — любая, вторая — ячейка в радиусе r; массив count × 4."""
+        sampler = self._compiled_sampler
+        if sampler is None:
+            return self._sample_pairs_long_numpy(count, radius)
+        if not self._sampler_check_due("long"):
+            return sampler.long_pairs(self._np_rng, self._pos_np, count, radius)
+        # Сверка: выборка numpy идёт на рабочем генераторе (её пары и уходят в шаг), скомпилированная — на копии.
+        clone = sampler.clone_generator(self._np_rng)
+        reference = self._sample_pairs_long_numpy(count, radius)
+        compiled = sampler.long_pairs(clone, self._pos_np, count, radius)
+        self._sampler_checked(
+            "long",
+            bool(np.array_equal(reference, compiled))
+            and clone.bit_generator.state == self._np_rng.bit_generator.state,
+        )
+        return reference
+
+    def _sample_pairs_long_numpy(self, count: int, radius: int | None) -> "np.ndarray":
+        """Пары дальней фазы (§5.3) выборкой numpy: эталон для скомпилированной выборки."""
         idx_a = self._np_rng.integers(0, self._point_count, count)
         y1 = self._pos_np[idx_a, 0]
         x1 = self._pos_np[idx_a, 1]
@@ -2910,7 +3027,8 @@ class Layout:
         )
         if candidates.size == 0:
             return np.zeros((0, 4), dtype=np.int64)
-        probabilities = None
+        weights = None
+        total = 0.0
         if weighted_first and self._short_energy_weights:
             if self._short_weights_source is not self._short_energy_weights:
                 # Веса меняются раз в energy_recalc_every шагов (§5.9.3): массив строится один раз на список.
@@ -2918,8 +3036,84 @@ class Layout:
                 self._short_weights_source = self._short_energy_weights
             weights = self._short_weights_np[candidates]
             total = float(weights.sum())
-            if total > 0.0:
-                probabilities = weights / total
+            if not total > 0.0:
+                weights = None
+        sampler = self._compiled_sampler if self._packed_codes is not None else None
+
+        def probabilities_of() -> "np.ndarray | None":
+            """Вероятности первых точек P(p) ∝ −ln Ê (§5.9.3) для выборки numpy."""
+            return None if weights is None else weights / total
+
+        if sampler is None:
+            pairs, rejected_similarity, attempts = self._short_tile_pairs_numpy(
+                count, candidates, probabilities_of(), pair_radius, similarity_cutoff, bounds
+            )
+        else:
+            compiled_arguments = dict(
+                pos=self._pos_np,
+                grid=self._grid_np,
+                packed_codes=self._packed_codes,
+                ones=self._ones_float64,
+                cosine=self._similarity == "cosine",
+                similarity_cutoff=similarity_cutoff,
+                count=count,
+                radius=pair_radius,
+                bounds=bounds,
+            )
+            if not self._sampler_check_due("short"):
+                pairs, rejected_similarity, attempts = sampler.short_tile_pairs(
+                    self._np_rng, candidates, weights, total, **compiled_arguments
+                )
+            else:
+                # Сверка: выборка numpy идёт на рабочем генераторе (её пары и уходят в шаг), скомпилированная — на копии.
+                clone = sampler.clone_generator(self._np_rng)
+                pairs, rejected_similarity, attempts = self._short_tile_pairs_numpy(
+                    count, candidates, probabilities_of(), pair_radius, similarity_cutoff, bounds
+                )
+                compiled = sampler.short_tile_pairs(clone, candidates, weights, total, **compiled_arguments)
+                self._sampler_checked(
+                    "short",
+                    bool(np.array_equal(pairs, compiled[0]))
+                    and (rejected_similarity, attempts) == compiled[1:]
+                    and clone.bit_generator.state == self._np_rng.bit_generator.state,
+                )
+        if pairs.shape[0] < count:
+            pairs = np.concatenate([pairs, self._sample_pairs_long_np(count - pairs.shape[0], pair_radius)], axis=0)
+        event = "layout.short.pair_sampling"
+        if LOGGER.should_log(event):
+            LOGGER.event(
+                event,
+                section=OPTIM_PAIR_SELECTION,
+                data={
+                    "pairs_requested": count,
+                    "pairs_generated": int(pairs.shape[0]),
+                    "rejected_similarity": rejected_similarity,
+                    "attempts": attempts,
+                    "pair_radius": "auto" if pair_radius is None else pair_radius,
+                    "step": 0 if step_index is None else step_index,
+                    "weighted": weighted_first,
+                    "similarity_cutoff": similarity_cutoff,
+                    "candidate_indices": -1 if candidate_indices is None else int(candidates.size),
+                    "bounds": bounds,
+                },
+                force=True,
+            )
+        return pairs
+
+    def _short_tile_pairs_numpy(
+        self,
+        count: int,
+        candidates: "np.ndarray",
+        probabilities: "np.ndarray | None",
+        pair_radius: int | None,
+        similarity_cutoff: float | None,
+        bounds: tuple[int, int, int, int] | None,
+    ) -> tuple["np.ndarray", int, int]:
+        """Пары ближней фазы одной плитки выборкой numpy (§5.3, §5.9.1, §5.9.3): (пары, отброшено, попыток).
+
+        Эталон для скомпилированной выборки: первая точка по весам, вторая рядом, пары с sim < отсечки
+        отбрасываются, пока не набрано count пар или не исчерпано 5·count попыток.
+        """
         rows: list["np.ndarray"] = []
         collected = 0
         attempts = 0
@@ -2944,25 +3138,7 @@ class Layout:
             rows.append(np.stack([y1[keep], x1[keep], y2[keep], x2[keep]], axis=1))
             collected += int(keep.sum())
         pairs = np.concatenate(rows, axis=0)[:count] if rows else np.zeros((0, 4), dtype=np.int64)
-        if pairs.shape[0] < count:
-            pairs = np.concatenate([pairs, self._sample_pairs_long_np(count - pairs.shape[0], pair_radius)], axis=0)
-        LOGGER.event(
-            "layout.short.pair_sampling",
-            section=OPTIM_PAIR_SELECTION,
-            data={
-                "pairs_requested": count,
-                "pairs_generated": int(pairs.shape[0]),
-                "rejected_similarity": rejected_similarity,
-                "attempts": attempts,
-                "pair_radius": "auto" if pair_radius is None else pair_radius,
-                "step": 0 if step_index is None else step_index,
-                "weighted": weighted_first,
-                "similarity_cutoff": similarity_cutoff,
-                "candidate_indices": -1 if candidate_indices is None else int(candidates.size),
-                "bounds": bounds,
-            },
-        )
-        return pairs
+        return pairs, rejected_similarity, attempts
 
     def _sample_pairs_short_np(
         self,
@@ -2989,10 +3165,16 @@ class Layout:
         segments_x = self._random_segments(self.width, col_parts)
         y_ends = np.asarray([end for _, end in segments_y], dtype=np.int64)
         x_ends = np.asarray([end for _, end in segments_x], dtype=np.int64)
-        tile_row = np.searchsorted(y_ends, self._pos_np[:, 0], side="left")
-        tile_col = np.searchsorted(x_ends, self._pos_np[:, 1], side="left")
-        tile_of_point = tile_row * col_parts + tile_col
         tile_count = row_parts * col_parts
+        sampler = self._compiled_sampler
+        if sampler is not None:
+            # Точки каждой плитки по возрастанию номера — те же списки, что даёт отбор по номеру плитки ниже.
+            grouped, group_starts = sampler.tile_groups(self._pos_np, y_ends, x_ends, col_parts, tile_count)
+            tile_of_point = None
+        else:
+            tile_row = np.searchsorted(y_ends, self._pos_np[:, 0], side="left")
+            tile_col = np.searchsorted(x_ends, self._pos_np[:, 1], side="left")
+            tile_of_point = tile_row * col_parts + tile_col
         LOGGER.event(
             "layout.short.tiles",
             section=PARALLEL_PROCESSING,
@@ -3015,7 +3197,10 @@ class Layout:
             quota = base + (1 if position < extra else 0)
             if quota <= 0:
                 continue
-            candidates = np.flatnonzero(tile_of_point == tile_idx)
+            if tile_of_point is None:
+                candidates = grouped[group_starts[tile_idx] : group_starts[tile_idx + 1]]
+            else:
+                candidates = np.flatnonzero(tile_of_point == tile_idx)
             if candidates.size == 0:
                 continue
             y_start, y_end = segments_y[tile_idx // col_parts]
@@ -3068,16 +3253,23 @@ class Layout:
         engine = self._torch_engine
         if engine is None or pairs_np.shape[0] == 0:
             return [] if engine is not None else None
-        y1, x1, y2, x2 = (pairs_np[:, i].copy() for i in range(4))
-        idx_a = self._grid_np[y1, x1]
-        idx_b = self._grid_np[y2, x2]
-        keep = (idx_a >= 0) | (idx_b >= 0)
-        y1, x1, y2, x2, idx_a, idx_b = (arr[keep] for arr in (y1, x1, y2, x2, idx_a, idx_b))
-        # Непустая точка всегда первая (вторая ячейка может быть пустой: перенос в пустую клетку).
-        flip = idx_a < 0
-        idx_a, idx_b = np.where(flip, idx_b, idx_a), np.where(flip, idx_a, idx_b)
-        y1, y2 = np.where(flip, y2, y1), np.where(flip, y1, y2)
-        x1, x2 = np.where(flip, x2, x1), np.where(flip, x1, x2)
+        sampler = self._compiled_sampler
+        occupied: "np.ndarray | None" = None
+        if sampler is not None:
+            # Те же пары, что даёт отбор numpy ниже: без пар из двух пустых ячеек, непустая точка первая.
+            occupied = sampler.occupied_pairs(np.ascontiguousarray(pairs_np, dtype=np.int64), self._grid_np)
+            idx_a, idx_b, y1, x1, y2, x2 = (occupied[:, column] for column in range(6))
+        else:
+            y1, x1, y2, x2 = (pairs_np[:, i].copy() for i in range(4))
+            idx_a = self._grid_np[y1, x1]
+            idx_b = self._grid_np[y2, x2]
+            keep = (idx_a >= 0) | (idx_b >= 0)
+            y1, x1, y2, x2, idx_a, idx_b = (arr[keep] for arr in (y1, x1, y2, x2, idx_a, idx_b))
+            # Непустая точка всегда первая (вторая ячейка может быть пустой: перенос в пустую клетку).
+            flip = idx_a < 0
+            idx_a, idx_b = np.where(flip, idx_b, idx_a), np.where(flip, idx_a, idx_b)
+            y1, y2 = np.where(flip, y2, y1), np.where(flip, y1, y2)
+            x1, x2 = np.where(flip, x2, x1), np.where(flip, x1, x2)
         eval_indices: list[int] | None = None
         if mode == "long" and self._long_subset_size is not None and self._point_count > self._long_subset_size:
             if eval_short:
@@ -3090,16 +3282,22 @@ class Layout:
                     eval_indices = self._ensure_long_subset(step_index)
             else:
                 eval_indices = self._ensure_long_subset(step_index)
-        pos_a = np.stack([y1, x1], axis=1)
-        pos_b = np.stack([y2, x2], axis=1)
+        if occupied is not None:
+            pos_a = occupied[:, 2:4]
+            pos_b = occupied[:, 4:6]
+        else:
+            pos_a = np.stack([y1, x1], axis=1)
+            pos_b = np.stack([y2, x2], axis=1)
         euclidean = self._distance_mode("short" if eval_short else "long") == "euclidean"
 
-        def dense_energies() -> tuple["np.ndarray", "np.ndarray"]:
+        def dense_energies(limit: int | None = None) -> tuple["np.ndarray", "np.ndarray"]:
+            """Исходный проход движка; limit — только первые пары шага (сверка на первых порциях)."""
+            head = slice(None, limit)
             return engine.pair_energies(
-                idx_a,
-                idx_b,
-                pos_a,
-                pos_b,
+                idx_a[head],
+                idx_b[head],
+                pos_a[head],
+                pos_b[head],
                 neighbourhood=eval_short,
                 local_radius=local_radius if eval_short else None,
                 kernel=kernel,
@@ -3111,6 +3309,23 @@ class Layout:
                 eval_indices=eval_indices,
             )
 
+        def sparse_energies(signs_only: bool, limit: int | None = None) -> tuple["np.ndarray", "np.ndarray"] | None:
+            """φ_c, φ_s по строкам сходства: знак — ядром PairSignKernel, суммы — редукцией исходной формы."""
+            head = slice(None, limit)
+            return self._sparse_pair_energies(
+                sparse,
+                idx_a[head],
+                idx_b[head],
+                pos_a[head],
+                pos_b[head],
+                occupied=None if occupied is None else occupied[head],
+                neighbourhood=eval_short,
+                local_radius=local_radius,
+                kernel=kernel,
+                euclidean=euclidean,
+                signs_only=signs_only,
+            )
+
         try:
             self._ensure_torch_positions()
             # При жёстком пороге суммы по всему V (§5.5.1) и по окрестности (§5.5.2) сводятся к ненулевым sim_λ:
@@ -3118,27 +3333,14 @@ class Layout:
             sparse = self._sparse_long_engine() if eval_indices is None and idx_a.size else None
             if sparse is None:
                 energy_c, energy_s = dense_energies()
-            elif eval_short:
-                energy_c, energy_s = self._sparse_checked(
-                    "neighbourhood",
-                    lambda signs_only: sparse.neighbourhood_energies(
-                        idx_a, idx_b, pos_a, pos_b,
-                        local_radius=local_radius, kernel=kernel, euclidean=euclidean,
-                        distance_eps=self._distance_eps, kernel_width=self._long_kernel_width, signs_only=signs_only,
-                    ),
-                    dense_energies,
-                    step_index=step_index,
-                    swap_when_greater=True,
-                )
             else:
                 energy_c, energy_s = self._sparse_checked(
-                    "long",
-                    lambda signs_only: sparse.pair_energies(
-                        idx_a, idx_b, pos_a, pos_b, euclidean=euclidean, signs_only=signs_only
-                    ),
+                    "neighbourhood" if eval_short else "long",
+                    sparse_energies,
                     dense_energies,
                     step_index=step_index,
-                    swap_when_greater=False,
+                    swap_when_greater=eval_short,
+                    pair_count=int(idx_a.size),
                 )
         except Exception as exc:  # noqa: BLE001
             LOGGER.event(
@@ -3150,20 +3352,23 @@ class Layout:
             return None
         # Окрестность (§5.5.2, и gauss-дальняя): обмен выгоден при φ_s > φ_c; дальняя §5.5.1: при φ_s < φ_c.
         deltas = (energy_s - energy_c) if eval_short else (energy_c - energy_s)
-        LOGGER.event(
-            "layout.energy.pairs.gpu",
-            section=GPU_IMPLEMENTATION,
-            data={
-                "step": 0 if step_index is None else step_index,
-                "mode": mode,
-                "pairs": int(idx_a.size),
-                "eval_points": self._point_count if eval_indices is None else len(eval_indices),
-                "kernel": kernel if eval_short else "distance",
-                "local_radius": local_radius if eval_short else None,
-                "favourable": int((deltas > 0.0).sum()),
-                "device": engine.device,
-            },
-        )
+        event = "layout.energy.pairs.gpu"
+        if LOGGER.should_log(event):
+            LOGGER.event(
+                event,
+                section=GPU_IMPLEMENTATION,
+                data={
+                    "step": 0 if step_index is None else step_index,
+                    "mode": mode,
+                    "pairs": int(idx_a.size),
+                    "eval_points": self._point_count if eval_indices is None else len(eval_indices),
+                    "kernel": kernel if eval_short else "distance",
+                    "local_radius": local_radius if eval_short else None,
+                    "favourable": int((deltas > 0.0).sum()),
+                    "device": engine.device,
+                },
+                force=True,
+            )
         deltas = deltas.astype(np.float64)
         if self._swap_temperature <= 0.0:
             # Жадное правило §5.6: в список обменов идут только пары с выгодной энергией — тот же список,
@@ -3214,6 +3419,256 @@ class Layout:
         self._sparse_verify_pending = dict.fromkeys(self._sparse_verify_pending, True)
         return self._sparse_long
 
+    def _pair_sign_kernel(self, sparse: SparseLongEnergy) -> PairSignKernel | None:
+        """Ядро знака φ_c − φ_s пар (§5.6, §5.12) по строкам сходства sparse; None — недоступно или отключено."""
+        engine = self._torch_engine
+        if not self._pair_kernel_enabled or engine is None:
+            return None
+        kernel = self._pair_kernel
+        if kernel is None or kernel.rows is not sparse.rows:
+            if not PairSignKernel.supported(engine):
+                self._pair_kernel_enabled = False
+                return None
+            kernel = PairSignKernel(engine, sparse.rows, segment=self._pair_kernel_segment)
+            self._pair_kernel = kernel
+        return kernel
+
+    def _sparse_pair_energies(
+        self,
+        sparse: SparseLongEnergy,
+        idx_a: "np.ndarray",
+        idx_b: "np.ndarray",
+        pos_a: "np.ndarray",
+        pos_b: "np.ndarray",
+        *,
+        occupied: "np.ndarray | None",
+        neighbourhood: bool,
+        local_radius: int | None,
+        kernel: str,
+        euclidean: bool,
+        signs_only: bool,
+    ) -> tuple["np.ndarray", "np.ndarray"] | None:
+        """φ_c, φ_s пар по строкам сходства (§5.5.1, §5.5.2): знак разности — ядром, суммы — редукцией SparseLongEnergy.
+
+        signs_only = True (жадное правило §5.6): знак φ_c − φ_s большинства пар выносит PairSignKernel; им
+        возвращаются условные значения 1 и 0 с тем же знаком разности, что у исходного прохода. Парам, у которых
+        разность лежит в пределах ошибки суммирования float32, суммы считает редукция исходной формы — как
+        и всем парам при signs_only = False. None — расчёт по строкам на этих парах неприменим.
+        """
+        sign_kernel = self._pair_sign_kernel(sparse) if signs_only and (not neighbourhood or kernel == "inverse") else None
+        if sign_kernel is None:
+            if neighbourhood:
+                return sparse.neighbourhood_energies(
+                    idx_a, idx_b, pos_a, pos_b,
+                    local_radius=local_radius, kernel=kernel, euclidean=euclidean,
+                    distance_eps=self._distance_eps, kernel_width=self._long_kernel_width, signs_only=signs_only,
+                )
+            return sparse.pair_energies(idx_a, idx_b, pos_a, pos_b, euclidean=euclidean, signs_only=signs_only)
+        pairs = int(idx_a.size)
+        sampler = self._compiled_sampler
+        if occupied is not None and sampler is not None:
+            table, widest = sampler.row_table(
+                np.ascontiguousarray(occupied), sparse.rows.degree_np, self._code_class, sign_kernel.stage(pairs)
+            )
+        else:
+            table, widest = sign_kernel.pair_table(idx_a, idx_b, pos_a, pos_b, self._code_class)
+        bounds = None if neighbourhood else self._potential_bounds(sparse, pairs, euclidean)
+        if neighbourhood:
+            # Ближняя фаза считает окрестность (§5.5.2): суммы границы дальней энергии больше не ведутся.
+            self._bounds_on = False
+        status = sign_kernel.status_from_table(
+            table,
+            pairs,
+            widest,
+            kind="neighbourhood" if neighbourhood else "long",
+            euclidean=euclidean,
+            local_radius=0.0 if local_radius is None else float(local_radius),
+            distance_eps=self._distance_eps,
+            bounds=bounds,
+        )
+        sign_kernel.log_status(status, kind="neighbourhood" if neighbourhood else "long")
+        bounded = status == PairSignKernel.BOUNDED
+        if bounds is not None:
+            self._bounds_used(int(bounded.sum()), pairs)
+        energy_c = (status == 1).astype(np.float32)
+        energy_s = ((status == -1) | bounded).astype(np.float32)
+        undecided = np.flatnonzero(status == 0)
+        if undecided.size:
+            self._undecided_steps += 1
+            self._undecided_pairs += int(undecided.size)
+
+            def portion_sums() -> tuple["np.ndarray", "np.ndarray"]:
+                """Суммы пар «не определено» по порциям исходной формы (SparseLongEnergy)."""
+                if neighbourhood:
+                    exact = sparse.neighbourhood_energies(
+                        idx_a, idx_b, pos_a, pos_b,
+                        local_radius=local_radius, kernel=kernel, euclidean=euclidean,
+                        distance_eps=self._distance_eps, kernel_width=self._long_kernel_width, signs_only=True,
+                        pending=undecided,
+                    )
+                else:
+                    exact = sparse.pair_energies(
+                        idx_a, idx_b, pos_a, pos_b, euclidean=euclidean, signs_only=True, pending=undecided
+                    )
+                return exact[0][undecided], exact[1][undecided]
+
+            kind_name = "neighbourhood" if neighbourhood else "long"
+
+            def device_sums() -> tuple["np.ndarray", "np.ndarray"]:
+                """Те же суммы float32 на устройстве: по малым участкам редукции (первые расчёты сверяются)."""
+                slot_sums = sign_kernel.reference_sums(
+                    idx_a, idx_b, pos_a, pos_b, undecided,
+                    kind=kind_name, euclidean=euclidean,
+                    local_radius=local_radius, distance_eps=self._distance_eps,
+                )
+                if slot_sums is None:
+                    return portion_sums()
+                if sign_kernel.reference_check_due():
+                    expected = portion_sums()
+                    sign_kernel.reference_checked(
+                        bool(np.array_equal(slot_sums[0], expected[0]) and np.array_equal(slot_sums[1], expected[1])),
+                        kind=kind_name, pairs=int(undecided.size),
+                    )
+                    return expected
+                return slot_sums
+
+            # Сначала — на хосте, в порядке сложения редукции исходного прохода (без обращения к устройству).
+            sums = None
+            replica = self._reduction_replica(sparse)
+            if replica is not None:
+                sums = replica.pair_sums(
+                    idx_a, idx_b, pos_a, pos_b, undecided, self._pos_np,
+                    kind=kind_name, euclidean=euclidean,
+                    geometry=sign_kernel.reference_geometry(pos_a, pos_b, kind=kind_name, local_radius=local_radius),
+                    local_radius=local_radius, distance_eps=self._distance_eps,
+                )
+                if sums is not None:
+                    self._replica_pairs += int(undecided.size)
+                    if replica.check_due():
+                        expected = device_sums()
+                        replica.checked(
+                            bool(np.array_equal(sums[0], expected[0]) and np.array_equal(sums[1], expected[1])),
+                            kind=kind_name, pairs=int(undecided.size),
+                        )
+                        sums = expected
+            if sums is None:
+                sums = device_sums()
+            energy_c[undecided] = sums[0]
+            energy_s[undecided] = sums[1]
+        return energy_c, energy_s
+
+    def _reduction_replica(self, sparse: SparseLongEnergy) -> ReductionReplica | None:
+        """Реплика редукции float32 исходного прохода для строк сходства sparse; None — недоступна или отключена."""
+        engine = self._torch_engine
+        if not self._replica_enabled or engine is None:
+            return None
+        replica = self._replica
+        if replica is None or replica.rows is not sparse.rows:
+            replica = ReductionReplica.create(engine, sparse.rows, max_bytes=self._replica_max_bytes)
+            if replica is None:
+                self._replica_enabled = False
+                return None
+            self._replica = replica
+        return replica if replica.enabled else None
+
+    # Суммы границы потенциала включаются, когда сдвинутых за шаг точек не больше пары / _BOUNDS_ON_DIVISOR,
+    # и выключаются, когда их больше пары / _BOUNDS_OFF_DIVISOR: до этого их учёт дороже расчёта строк.
+    _BOUNDS_ON_DIVISOR = 8
+    _BOUNDS_OFF_DIVISOR = 4
+    # Доля снятых границей пар проверяется раз в столько расчётов; ниже _BOUNDS_MIN_SHARE граница
+    # выключается на _BOUNDS_COOLDOWN расчётов (пространство ещё не упорядочено).
+    _BOUNDS_WINDOW = 64
+    _BOUNDS_MIN_SHARE = 0.25
+    _BOUNDS_COOLDOWN = 512
+    # Граница окупается, когда строк много: с этого числа слагаемых шага (пары × 2 × средняя степень строки)
+    # расчёт строк дороже проверки границы и учёта обменов (три запуска ядер на шаг).
+    _BOUNDS_MIN_ENTRIES = 3_000_000
+
+    def _potential_bounds(self, sparse: SparseLongEnergy, pairs: int, euclidean: bool) -> PotentialBounds | None:
+        """Действующая граница потенциала точек (§5.5.1) для пар дальней фазы; None — выключена или неприменима.
+
+        Граница требует евклидова расстояния (§5.5) и сумм, согласованных с позициями на устройстве: суммы
+        строятся при включении, при смене λ (§7.1.7) и периодически, а между этим обновляются обменами шага.
+        """
+        engine = self._torch_engine
+        if not self._bounds_enabled or not euclidean or engine is None:
+            return None
+        self._bounds_move_limit = max(8, pairs // self._BOUNDS_OFF_DIVISOR)
+        entries = 2.0 * pairs * sparse.rows.edges / max(1, self._point_count)
+        if self._bounds_cooldown > 0 or entries < self._BOUNDS_MIN_ENTRIES:
+            # Граница не используется: её суммы перестают обновляться обменами шага.
+            self._bounds_cooldown = max(0, self._bounds_cooldown - 1)
+            self._bounds_on = False
+            return None
+        bounds = self._bounds
+        if bounds is None or bounds.rows is not sparse.rows:
+            if not PotentialBounds.supported(engine, (self.height, self.width)):
+                self._bounds_enabled = False
+                return None
+            bounds = PotentialBounds(
+                engine,
+                sparse.rows,
+                grid=self._bounds_grid,
+                segment=self._pair_kernel_segment,
+                similarity=self._similarity,
+                grid_shape=(self.height, self.width),
+            )
+            self._bounds = bounds
+            self._bounds_on = False
+        if not self._bounds_on:
+            if self._last_moved_points > max(4, pairs // self._BOUNDS_ON_DIVISOR):
+                return None
+            self._bounds_on = True
+            self._bounds_window = [0, 0, 0]
+        if bounds.rebuild_due:
+            bounds.rebuild()
+        return bounds
+
+    def _bounds_used(self, bounded: int, pairs: int) -> None:
+        """Учёт работы границы потенциала: при малой доле снятых пар она выключается на время."""
+        self._bounded_pairs += bounded
+        window = self._bounds_window
+        window[0] += 1
+        window[1] += bounded
+        window[2] += pairs
+        if window[0] < self._BOUNDS_WINDOW:
+            return
+        share = window[1] / max(1, window[2])
+        self._bounds_window = [0, 0, 0]
+        event = "layout.bounds.share"
+        if LOGGER.should_log(event):
+            LOGGER.event(
+                event,
+                section=ENERGY_LONG,
+                data={
+                    "pairs": window[2],
+                    "bounded": window[1],
+                    "share": share,
+                    "lambda_threshold": self._lambda,
+                    "note": "доля пар дальней фазы, у которых φ_c < φ_s следует из нижней границы потенциала точек "
+                    "(§5.5.1): их строки сходства не считались",
+                },
+                force=True,
+            )
+        if share < self._BOUNDS_MIN_SHARE and self._bounds is not None:
+            self._bounds_on = False
+            self._bounds.invalidate()
+            self._bounds_cooldown = self._BOUNDS_COOLDOWN
+            self._bounds.log_disabled(reason=f"share {share:.3f} below {self._BOUNDS_MIN_SHARE}")
+
+    def _sparse_verify_limit(self, kind: str, pair_count: int | None) -> int | None:
+        """Число первых пар шага, на которых расчёт по строкам сверяется с исходным проходом; None — на всех.
+
+        Сверка на первых sparse_verify_chunks порциях исходного прохода: у этих пар форма порции та же, что
+        в проходе по всем парам шага, а стоимость сверки не растёт с числом пар.
+        """
+        engine = self._torch_engine
+        if pair_count is None or engine is None or self._sparse_verify_chunks <= 0:
+            return None
+        rows = engine.local_chunk_rows() if kind == "neighbourhood" else engine.dense_chunk_rows()
+        limit = rows * self._sparse_verify_chunks
+        return None if limit >= pair_count else limit
+
     def _sparse_checked(
         self,
         kind: str,
@@ -3223,13 +3678,16 @@ class Layout:
         step_index: int | None,
         swap_when_greater: bool,
         values_needed: bool = False,
+        pair_count: int | None = None,
     ) -> tuple["np.ndarray", "np.ndarray"]:
         """φ_c, φ_s по ненулевым sim_λ со сверкой с исходным проходом движка (§5.5.1, §5.5.2, §5.7).
 
-        sparse_energies(signs_only) — расчёт по строкам сходства (None — на этих парах он неприменим),
-        dense_energies() — исходный проход. Сверка — после построения и каждого прореживания строк и затем
-        раз в sparse_verify_every вызовов: шаг считается обоими способами, в раскладку идёт результат
-        исходного прохода. При расхождении расчёт по строкам отключается до конца работы.
+        sparse_energies(signs_only[, limit]) — расчёт по строкам сходства (None — на этих парах он неприменим),
+        dense_energies([limit]) — исходный проход; limit — только первые пары. Сверка — после построения
+        и каждого прореживания строк и затем раз в sparse_verify_every вызовов. Если задано pair_count, оба
+        способа сравниваются на первых порциях пар шага (_sparse_verify_limit), а шаг считается по строкам;
+        иначе сравниваются все пары и в раскладку идёт результат исходного прохода. При расхождении расчёт
+        по строкам отключается до конца работы, шаг пересчитывается исходным проходом.
         """
         # При жадном правиле §5.6 нужен только знак φ_c − φ_s; при отжиге и для энергий точек — сами значения.
         signs_only = not values_needed and self._swap_temperature <= 0.0
@@ -3237,7 +3695,7 @@ class Layout:
             self._sparse_verify_every > 0 and self._sparse_steps_since_verify[kind] >= self._sparse_verify_every
         )
         sparse = self._sparse_long
-        dense: tuple["np.ndarray", "np.ndarray"] | None = None
+        energies: tuple["np.ndarray", "np.ndarray"] | None = None
         try:
             if not verify:
                 energies = sparse_energies(signs_only)
@@ -3245,15 +3703,20 @@ class Layout:
                     return dense_energies()
                 self._sparse_steps_since_verify[kind] += 1
                 return energies
-            exact = sparse_energies(False)
+            limit = self._sparse_verify_limit(kind, pair_count)
+            head = () if limit is None else (limit,)
+            exact = sparse_energies(False, *head)
             if exact is None:
                 return dense_energies()
-            screened = sparse_energies(True) if signs_only else None
-            dense = dense_energies()
+            screened = sparse_energies(True, *head) if signs_only else None
+            dense = dense_energies(*head)
             matched = sparse.matches(
                 exact, screened, dense, kind=kind, step=step_index, swap_when_greater=swap_when_greater
             )
             failure = None if matched else "sparse energies differ from the reference pass"
+            if matched:
+                # Сверка на всех парах: в раскладку идёт исходный проход; на первых порциях — шаг по строкам.
+                energies = dense if limit is None else sparse_energies(signs_only)
         except Exception as exc:  # noqa: BLE001
             matched = False
             failure = str(exc)
@@ -3262,6 +3725,10 @@ class Layout:
         if not matched:
             self._sparse_long_enabled = False
             self._sparse_long = None
+            self._pair_kernel = None
+            self._bounds = None
+            self._bounds_on = False
+            self._replica = None
             LOGGER.event(
                 "layout.sparse.energy.disabled",
                 section=GPU_IMPLEMENTATION,
@@ -3273,7 +3740,7 @@ class Layout:
                 },
                 force=True,
             )
-        return dense if dense is not None else dense_energies()
+        return energies if energies is not None else dense_energies()
 
     def positions(self) -> list[tuple[int, int]]:
         return list(self._positions)
@@ -3369,6 +3836,28 @@ class Layout:
             )
         return list(self._colors_rgb_cache)
 
+    def _colors_rgb_array(self) -> "np.ndarray":
+        """Псевдоцвета точек (§5.14) массивом N × 3 uint8 — те же значения, что у colors_rgb()."""
+        if self._colors_rgb_array_cache is None:
+            self._colors_rgb_array_cache = np.asarray(self.colors_rgb(), dtype=np.uint8).reshape(-1, 3)
+        return self._colors_rgb_array_cache
+
+    def _component_colors_array(self, period: float | None) -> "np.ndarray":
+        """Цвета точек по известной компоненте стимула (рис. 16) массивом N × 3 uint8; от расстановки не зависят."""
+        cached = self._component_colors_cache.get(period)
+        if cached is None:
+            cached = np.asarray(self.component_colors_rgb(period=period), dtype=np.uint8).reshape(-1, 3)
+            self._component_colors_cache[period] = cached
+        return cached
+
+    def _cell_centres(self) -> "np.ndarray":
+        """Центры ячеек точек (x + 0.5, y + 0.5) массивом N × 2 — координаты точек на картинке раскладки."""
+        self._sync_arrays()
+        centres = np.empty((self._point_count, 2), dtype=np.float64)
+        centres[:, 0] = self._pos_np[:, 1] + 0.5
+        centres[:, 1] = self._pos_np[:, 0] + 0.5
+        return centres
+
     def component_colors_rgb(self, *, period: float | None = None) -> list[tuple[int, int, int]]:
         """Диагностическая раскраска по известной компоненте стимула (рис. 13–16).
 
@@ -3401,10 +3890,10 @@ class Layout:
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
         """Карта раскладки в псевдоцветах кодов (§5.14)."""
-        colors = self.colors_rgb()
+        colors = self._colors_rgb_array()
         image = self._build_image(colors)
         if log:
-            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+            positions = self._cell_centres()
             LOGGER.event(
                 "layout.render_image",
                 section=LAID_OUT_STRUCTURE,
@@ -3432,14 +3921,12 @@ class Layout:
         """Композиция V и Ê: цвет точки по коду, яркость по энергии (рис. 18, §5.14)."""
         if len(energies) != self._point_count:
             raise ValueError("energies must match the number of layout points")
-        colors = self.colors_rgb()
-        shaded: list[tuple[int, int, int]] = []
-        for color, energy in zip(colors, energies):
-            brightness = max(0.0, min(1.0, float(energy)))
-            shaded.append(tuple(int(round(channel * brightness)) for channel in color))
+        # Яркость точки — её энергия Ê в [0, 1]; округление до ближайшего целого с половиной к чётному, как round().
+        brightness = np.clip(np.asarray(energies, dtype=np.float64), 0.0, 1.0)
+        shaded = np.rint(self._colors_rgb_array().astype(np.float64) * brightness[:, None]).astype(np.uint8)
         image = self._build_image(shaded)
         if log:
-            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+            positions = self._cell_centres()
             LOGGER.event(
                 "layout.render_energy_image",
                 section=LAID_OUT_STRUCTURE,
@@ -3470,10 +3957,10 @@ class Layout:
         self, *, period: float | None = None, log: bool = True
     ) -> "numpy.ndarray":
         """Карта раскладки в цветах известной компоненты стимула (ср. рис. 16, §5.13.2)."""
-        colors = self.component_colors_rgb(period=period)
+        colors = self._component_colors_array(period)
         image = self._build_image(colors)
         if log:
-            positions = [(x + 0.5, y + 0.5) for y, x in self._positions]
+            positions = self._cell_centres()
             LOGGER.event(
                 "layout.render_component_image",
                 section=MAPPING_CONTINUITY,
@@ -3514,12 +4001,17 @@ class Layout:
             )
             return []
 
-        if colors is None:
-            colors = self.colors_rgb()
+        colour_array = self._colors_rgb_array() if colors is None else np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
         image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        for idx, (y, x) in enumerate(self._positions):
-            if 0 <= y < self.height and 0 <= x < self.width:
-                image[y, x] = colors[idx]
+        # Одна точка в ячейке (§5.1.2): цвет точки записывается в её ячейку — то же, что обход точек по одной.
+        self._sync_arrays()
+        rows = self._pos_np[:, 0]
+        columns = self._pos_np[:, 1]
+        inside = (rows >= 0) & (rows < self.height) & (columns >= 0) & (columns < self.width)
+        if bool(inside.all()):
+            image[rows, columns] = colour_array
+        else:
+            image[rows[inside], columns[inside]] = colour_array[inside]
         return image
 
     def average_local_energy(self, radius: int) -> float:
@@ -3530,7 +4022,12 @@ class Layout:
             return 0.0
         energies, mode = self._point_energies_with_mode(radius)
         emax = max(energies)
-        avg_energy = 0.0 if emax <= 0.0 else sum(e / emax for e in energies) / len(energies)
+        # Ê = E / E_max поэлементно (то же деление float64) и та же сумма Python, но без обхода точек по одной.
+        avg_energy = (
+            0.0
+            if emax <= 0.0
+            else sum((np.asarray(energies, dtype=np.float64) / emax).tolist()) / len(energies)
+        )
         LOGGER.event(
             "layout.energy.average",
             section=QUALITY_ASSESS,
@@ -3670,14 +4167,24 @@ class Layout:
                     indices = np.arange(self._point_count, dtype=np.int64)
                     absent = np.full(self._point_count, -1, dtype=np.int64)
                     cells = self._pos_np
-                    torch_energies = self._sparse_checked(
-                        "points",
-                        lambda signs_only: sparse.neighbourhood_energies(
+                    sign_kernel = self._pair_sign_kernel(sparse)
+
+                    def row_energies(signs_only: bool) -> tuple["np.ndarray", "np.ndarray"] | None:
+                        """E(c, r) по строкам сходства: слагаемые раскладывает ядро, суммирует редукция окна."""
+                        if sign_kernel is not None:
+                            energies = sign_kernel.point_energies(cells, float(radius), distance_eps=self._distance_eps)
+                            if energies is not None:
+                                return energies, np.zeros(len(energies), dtype=np.float32)
+                        return sparse.neighbourhood_energies(
                             indices, absent, cells, cells,
                             local_radius=float(radius), kernel="inverse", euclidean=True,
                             distance_eps=self._distance_eps, kernel_width=1.0,
                             signs_only=False, need_swapped=False,
-                        ),
+                        )
+
+                    torch_energies = self._sparse_checked(
+                        "points",
+                        row_energies,
                         window_energies,
                         step_index=None,
                         swap_when_greater=True,
@@ -3692,7 +4199,8 @@ class Layout:
                 self._torch_engine = None
                 torch_energies = None
             if torch_energies is not None and len(torch_energies) == self._point_count:
-                return [float(value) for value in torch_energies], "gpu"
+                # float32 → float числа Python: те же значения, что float(value) по одному.
+                return np.asarray(torch_energies, dtype=np.float64).tolist(), "gpu"
         if (
             self._gpu_engine is not None
             and self._ensure_gpu_similarity()
@@ -4836,6 +5344,9 @@ class Layout:
         grid_np = self._grid_np
         pos_np = self._pos_np
         arrays_live = not self._arrays_stale and grid_np is not None and pos_np is not None
+        dirty_cells = self._torch_dirty_cells
+        moves = self._torch_moves
+        width = self.width
         for y1, x1, y2, x2 in swaps:
             if (y1, x1) in used or (y2, x2) in used:
                 continue
@@ -4868,12 +5379,14 @@ class Layout:
             used.add((y1, x1))
             used.add((y2, x2))
             applied += 1
+            cell_1 = y1 * width + x1
+            cell_2 = y2 * width + x2
+            dirty_cells.append(cell_1)
+            dirty_cells.append(cell_2)
             if idx_a is not None:
-                self._torch_dirty_points.add(idx_a)
+                moves.extend((idx_a, cell_1, cell_2))
             if idx_b is not None:
-                self._torch_dirty_points.add(idx_b)
-            self._torch_dirty_cells[(y1, x1)] = -1 if idx_b is None else idx_b
-            self._torch_dirty_cells[(y2, x2)] = -1 if idx_a is None else idx_a
+                moves.extend((idx_b, cell_2, cell_1))
             if mode == "long":
                 self._register_long_swap_radius(y1, x1, y2, x2)
         if applied:
@@ -5155,6 +5668,25 @@ class Layout:
             },
         )
         return matrix, ones
+
+    def _code_classes(self) -> "np.ndarray":
+        """Номер класса одинаковых кодов каждой точки (§2.2.4: сходство — функция кодов); int32, длина N."""
+        codes = self._packed_codes if self._packed_codes is not None else self._code_matrix
+        if codes is None:
+            return np.arange(self._point_count, dtype=np.int32)
+        _, inverse = np.unique(codes, axis=0, return_inverse=True)
+        classes = np.ascontiguousarray(inverse.reshape(-1).astype(np.int32))
+        LOGGER.event(
+            "layout.codes.classes",
+            section=SIMILARITY_MEASURES,
+            data={
+                "points": self._point_count,
+                "distinct_codes": int(classes.max()) + 1 if classes.size else 0,
+                "note": "точки с одинаковыми кодами имеют одинаковые строки sim_λ (§2.2.4, §5.4): у пары таких "
+                "точек φ_c = φ_s точно, обмена нет (§5.6)",
+            },
+        )
+        return classes
 
     @staticmethod
     def _pack_codes(code_matrix: "np.ndarray | None") -> "np.ndarray | None":

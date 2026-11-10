@@ -24,6 +24,7 @@ import math
 from typing import Any, Sequence
 
 from damp.article_refs import GPU_IMPLEMENTATION, OPTIM_SIM_MATRIX, OPTIM_SUBSET
+from damp.layout.device_kernel import DeviceKernel
 from damp.logging import LOGGER
 
 
@@ -66,6 +67,7 @@ class TorchPairEnergyEngine:
         self._pos = torch_mod.zeros((self._point_count, 2), dtype=torch_mod.float32, device=device)
         self._grid = torch_mod.full((self._height, self._width), -1, dtype=torch_mod.long, device=device)
         self._all_indices = torch_mod.arange(self._point_count, device=device)
+        self._cell_index: Any = None
         LOGGER.event(
             "layout.gpu.pair_energy.init",
             section=GPU_IMPLEMENTATION,
@@ -149,6 +151,16 @@ class TorchPairEnergyEngine:
     def positions(self) -> Any:
         """Позиции точек на устройстве (N×2 float32, (y, x))."""
         return self._pos
+
+    @property
+    def ones(self) -> Any:
+        """Число единиц кода каждой точки на устройстве (N, float32)."""
+        return self._ones
+
+    @property
+    def grid(self) -> Any:
+        """Сетка ячеек на устройстве: номер точки в ячейке или −1 (высота × ширина, int64)."""
+        return self._grid
 
     def local_chunk_rows(self) -> int:
         """Число пар в одной порции редукции пути по окну ячеек (форма порции [пары, ячейки окна])."""
@@ -324,6 +336,69 @@ class TorchPairEnergyEngine:
         if changed:
             self._grid[device_table[moved:, 0], device_table[moved:, 1]] = device_table[moved:, 2]
 
+    # Ядро обновления ячеек (CUDA): компилируется при первом обновлении, общее для всех движков процесса.
+    _CELL_KERNEL: Any = None
+
+    @classmethod
+    def _cell_kernel(cls) -> DeviceKernel:
+        """Ядро «в ячейке теперь эта точка»: пишет жильца в сетку и позицию жильца в таблицу позиций."""
+        if cls._CELL_KERNEL is None:
+            from torch.cuda.jiterator import _create_jit_fn
+
+            source = (
+                "template <typename T> T damp_cell_update(T index, long long table_ptr, long long grid_ptr,\n"
+                "    long long pos_ptr, long long width) {\n"
+                "  const int* item = (const int*)table_ptr + 2 * (long long)index;\n"
+                "  long long cell = item[0];\n"
+                "  int occupant = item[1];\n"
+                "  ((long long*)grid_ptr)[cell] = occupant;\n"
+                "  if (0 <= occupant) {\n"
+                "    float* place = (float*)pos_ptr + 2 * (long long)occupant;\n"
+                "    place[0] = (float)(cell / width);\n"
+                "    place[1] = (float)(cell % width);\n"
+                "  }\n"
+                "  return (T)0;\n"
+                "}\n"
+            )
+            cls._CELL_KERNEL = DeviceKernel(_create_jit_fn(source, table_ptr=0, grid_ptr=0, pos_ptr=0, width=1))
+        return cls._CELL_KERNEL
+
+    def update_cells(self, cells: Any, occupants: Any) -> None:
+        """Изменившиеся ячейки после обменов шага: в ячейке cells[i] (y·ширина + x) теперь точка occupants[i].
+
+        −1 — ячейка пуста. Позиция точки-жильца меняется вместе с ячейкой; ячейки в списке не повторяются.
+        На CUDA — одна загрузка таблицы и один запуск ядра вместо нескольких операций над индексами.
+        """
+        torch = self._torch
+        import numpy as np
+
+        count = int(cells.size)
+        if count == 0:
+            return
+        if self._device.type == "cuda" and self._height * self._width < 2**31:
+            table = np.empty((count, 2), dtype=np.int32)
+            table[:, 0] = cells
+            table[:, 1] = occupants
+            device_table = torch.as_tensor(table, device=self._device)
+            if self._cell_index is None or int(self._cell_index.numel()) < count:
+                self._cell_index = torch.arange(max(count, 4096), dtype=torch.int32, device=self._device)
+            self._cell_kernel()(
+                self._cell_index[:count],
+                table_ptr=device_table.data_ptr(),
+                grid_ptr=self._grid.data_ptr(),
+                pos_ptr=self._pos.data_ptr(),
+                width=self._width,
+            )
+            return
+        device_cells = torch.as_tensor(np.asarray(cells, dtype=np.int64), device=self._device)
+        device_occupants = torch.as_tensor(np.asarray(occupants, dtype=np.int64), device=self._device)
+        self._grid.view(-1)[device_cells] = device_occupants
+        moved = device_occupants >= 0
+        points = device_occupants[moved]
+        places = device_cells[moved]
+        self._pos[points, 0] = torch.div(places, self._width, rounding_mode="floor").to(torch.float32)
+        self._pos[points, 1] = (places % self._width).to(torch.float32)
+
     def pair_energies(
         self,
         idx_a: Sequence[int],
@@ -464,7 +539,7 @@ class TorchPairEnergyEngine:
         # Порция редукции (пар на одну сумму по окну) и блок арифметики из целого числа порций.
         chunk = self.local_chunk_rows()
         cells = int(dy_off.numel())
-        block = chunk * max(1, self.LOCAL_BLOCK_ELEMENTS // max(1, chunk * cells))
+        block = self.window_block_rows(cells)
         energy_c = torch.zeros(pair_count, dtype=torch.float32, device=device)
         energy_s = torch.zeros(pair_count, dtype=torch.float32, device=device)
         base_y = torch.floor(centre[:, 0]).to(torch.long)
@@ -521,6 +596,15 @@ class TorchPairEnergyEngine:
             if need_swapped:
                 energy_s[start:stop] = self._sum_rows_by_chunks(s2 * w1 + s1 * w2, chunk)
         return energy_c.cpu().numpy(), energy_s.cpu().numpy()
+
+    def window_block_rows(self, cells: int) -> int:
+        """Число строк одного блока арифметики пути по окну ячеек: целое число порций редукции."""
+        chunk = self.local_chunk_rows()
+        return chunk * max(1, self.LOCAL_BLOCK_ELEMENTS // max(1, chunk * cells))
+
+    def sum_rows_by_chunks(self, terms: Any, chunk: int) -> Any:
+        """Суммы строк блока слагаемых [строки, ячейки окна] той же редукцией, что в проходе по окну ячеек."""
+        return self._sum_rows_by_chunks(terms, chunk)
 
     def _sum_rows_by_chunks(self, terms: Any, chunk: int) -> Any:
         """Суммы по строкам тензора [пары, K] порциями по chunk пар — те же числа float32, что даёт sum(dim=1)

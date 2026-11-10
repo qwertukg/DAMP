@@ -223,6 +223,38 @@ LAYOUT_SPARSE_SCREEN_MIN_CHUNKS = 1
 # шаг считается обоими способами (в раскладку идёт результат исходного прохода); при расхождении расчёт
 # по строкам отключается. 0 — сверка только после построения и прореживания.
 LAYOUT_SPARSE_VERIFY_EVERY = 2000
+# Сверка пар шага идёт на стольких первых порциях исходного прохода (порция плотного прохода — 4 млн элементов
+# «пары × точки»): форма порции та же, что в проходе по всем парам, а цена сверки не растёт с числом пар
+# (на 59 тыс. точек проход по всем парам шага — 0.5 с). 0 — сверка на всех парах шага.
+LAYOUT_SPARSE_VERIFY_CHUNKS = 1
+# Знак φ_c − φ_s пар шага (§5.6) одним проходом ядра устройства по строкам сходства (§5.12): поток на отрезок
+# строки из LAYOUT_PAIR_KERNEL_SEGMENT слагаемых, частичные суммы float32, решение — по оценке ошибки
+# суммирования. Пары, у которых разность сумм лежит в пределах этой ошибки (единицы на шаг), считаются
+# редукцией исходного прохода, поэтому обмены те же шаг в шаг. False — знак по суммам блоков строк torch.
+LAYOUT_PAIR_KERNEL = True
+LAYOUT_PAIR_KERNEL_SEGMENT = 16
+# Выборка пар шага (§5.3, §5.9.1, §5.9.3) скомпилированными циклами numba на том же генераторе numpy: те же
+# запросы в том же порядке — те же пары и то же состояние генератора. Сверка с выборкой numpy — на первых
+# вызовах и затем раз в LAYOUT_SAMPLER_VERIFY_EVERY вызовов (0 — только на первых); при расхождении и без
+# numba пары выбирает numpy.
+LAYOUT_COMPILED_SAMPLER = True
+LAYOUT_SAMPLER_VERIFY_EVERY = 1000
+# Отсев пар дальней фазы по нижней границе потенциала точки (§5.5.1, §5.9.4 — по духу: агрегаты вместо всех точек,
+# но без приближения): похожие точки каждой точки сведены в группы по ячейкам грубой сетки
+# LAYOUT_POTENTIAL_BOUNDS_GRID × LAYOUT_POTENTIAL_BOUNDS_GRID (масса и центр масс группы). По неравенству Йенсена
+# U_a(p) ≥ Σ_групп M·‖p − центр‖; если из этого следует φ_c < φ_s с запасом на ошибку суммирования float32,
+# обмена нет (§5.6) и строки сходства пары не считаются. В разложенном пространстве так снимается 94–98 % пар
+# шага; остальные считаются как раньше, поэтому обмены те же шаг в шаг. False — все пары считаются по строкам.
+LAYOUT_POTENTIAL_BOUNDS = True
+LAYOUT_POTENTIAL_BOUNDS_GRID = 8
+# Пары, у которых φ_c − φ_s лежит в пределах ошибки суммирования float32 (единицы на шаг), решает само число
+# редукции исходного прохода. True — оно считается на хосте в том же порядке сложения, что у редукции устройства
+# (порядок сверяется с устройством для каждой формы порции и затем периодически): без загрузки, запуска ядер
+# и выгрузки на каждом таком шаге. Для этого строки сходства копируются на хост, пока занимают не больше
+# LAYOUT_REPLICA_MAX_BYTES (8 байт на элемент; 59 тыс. точек при λ = 0.65 — 0.73 ГБ). False или больший объём —
+# такие пары считает устройство.
+LAYOUT_REDUCTION_REPLICA = True
+LAYOUT_REPLICA_MAX_BYTES = 1 << 30
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
@@ -478,6 +510,25 @@ LOG_INTERVALS = {
     "layout.short.tiles": LOG_INTERVAL_LAYOUT_SHORT_TILES,
     "layout.short.partition_pairs": LOG_INTERVAL_LAYOUT_SHORT_TILES,
     "layout.pair_sampling.merged_draws": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled.unavailable": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled.verify": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled.mismatch": LOG_INTERVAL_INIT,
+    "layout.pair_kernel.init": LOG_INTERVAL_INIT,
+    "layout.pair_kernel.status": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.pair_kernel.calibration": LOG_INTERVAL_INIT,
+    "layout.pair_kernel.reference.verify": LOG_INTERVAL_INIT,
+    "layout.replica.init": LOG_INTERVAL_INIT,
+    "layout.replica.calibration": LOG_INTERVAL_INIT,
+    "layout.replica.rows": LOG_INTERVAL_INIT,
+    "layout.replica.rows.skipped": LOG_INTERVAL_INIT,
+    "layout.replica.verify": LOG_INTERVAL_INIT,
+    "layout.bounds.init": LOG_INTERVAL_INIT,
+    "layout.bounds.rebuild": LOG_INTERVAL_INIT,
+    "layout.bounds.disabled": LOG_INTERVAL_INIT,
+    "layout.bounds.share": LOG_INTERVAL_LAYOUT_ADAPTIVE,
+    "layout.codes.classes": LOG_INTERVAL_INIT,
+    "layout.kernel.cache": LOG_INTERVAL_INIT,
     "layout.sparse.energy.init": LOG_INTERVAL_INIT,
     "layout.sparse.energy.verify": LOG_INTERVAL_INIT,
     "layout.sparse.energy.disabled": LOG_INTERVAL_INIT,
@@ -996,6 +1047,15 @@ def _sparse_layout_options() -> dict[str, object]:
         "sparse_entry_budget": LAYOUT_SPARSE_ENTRY_BUDGET,
         "sparse_screen_min_chunks": LAYOUT_SPARSE_SCREEN_MIN_CHUNKS,
         "sparse_verify_every": LAYOUT_SPARSE_VERIFY_EVERY,
+        "sparse_verify_chunks": LAYOUT_SPARSE_VERIFY_CHUNKS,
+        "pair_kernel": LAYOUT_PAIR_KERNEL,
+        "pair_kernel_segment": LAYOUT_PAIR_KERNEL_SEGMENT,
+        "compiled_sampler": LAYOUT_COMPILED_SAMPLER,
+        "sampler_verify_every": LAYOUT_SAMPLER_VERIFY_EVERY,
+        "potential_bounds": LAYOUT_POTENTIAL_BOUNDS,
+        "potential_bounds_grid": LAYOUT_POTENTIAL_BOUNDS_GRID,
+        "reduction_replica": LAYOUT_REDUCTION_REPLICA,
+        "replica_max_bytes": LAYOUT_REPLICA_MAX_BYTES,
     }
 
 
@@ -1720,12 +1780,16 @@ class MnistLayoutRunner:
         label: int | None = None,
         activation_samples: int | None = None,
         reuse_cache: bool = True,
+        layout_only: bool = False,
     ) -> None:
         self.count = count
         self.label = label
         # False (--rebuild) — готовые раскладка, чекпоинт и эмбеддинги игнорируются, всё считается заново
         # и записывается в кеш поверх старого.
         self._reuse_cache = bool(reuse_cache)
+        # True (--layout-only) — конвейер заканчивается раскладкой: JSON и картинки сохраняются,
+        # активация и эмбеддинги не считаются.
+        self._layout_only = bool(layout_only)
         resolved_activation_samples = count if activation_samples is None else int(activation_samples)
         if resolved_activation_samples <= 0:
             raise ValueError("activation_samples must be positive")
@@ -1953,6 +2017,26 @@ class MnistLayoutRunner:
             raise ValueError("layout_path must be provided to save embeddings")
         self._embedding_store.save(layout_path, embeddings, metadata=self._activation_metadata)
 
+    def _export_stage(
+        self,
+        layout: Layout,
+        run_params: TunedLayoutParams,
+        *,
+        layout_path: str,
+        save_json: bool,
+        stages: dict[str, bool],
+        embeddings: Sequence[EmbeddingRecord],
+    ) -> None:
+        """Последний этап конвейера: JSON и картинки раскладки, отметка этапа в чекпоинте (вне статьи)."""
+        self._export_layout(layout, run_params, layout_path=layout_path, save_json=save_json)
+        stages["export"] = True
+        self._checkpoint_store.save(
+            layout_path,
+            stages=stages,
+            target_samples=self._activation_samples,
+            embeddings=embeddings,
+        )
+
     def run(self) -> None:
         if self._reuse_cache:
             cached_layout = self._try_load_cached_layout()
@@ -2026,6 +2110,28 @@ class MnistLayoutRunner:
             target_samples=self._activation_samples,
             embeddings=checkpoint_embeddings,
         )
+        if self._layout_only:
+            # Эмбеддинги чекпоинта остаются как были: обычный запуск возьмёт эту раскладку из кеша
+            # и продолжит с активации.
+            LOGGER.event(
+                "activation.skip",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "path": layout_path,
+                    "reason": "layout_only",
+                    "embeddings": len(checkpoint_embeddings),
+                    "note": "--layout-only: активация и эмбеддинги не считаются",
+                },
+            )
+            self._export_stage(
+                layout,
+                tuned_params,
+                layout_path=layout_path,
+                save_json=save_json,
+                stages=stages,
+                embeddings=checkpoint_embeddings,
+            )
+            return
         try:
             cached_embeddings = self._embedding_store.load(layout_path)
         except FileNotFoundError:
@@ -2062,12 +2168,12 @@ class MnistLayoutRunner:
             target_samples=self._activation_samples,
             embeddings=embeddings,
         )
-        self._export_layout(layout, tuned_params, layout_path=layout_path, save_json=save_json)
-        stages["export"] = True
-        self._checkpoint_store.save(
-            layout_path,
+        self._export_stage(
+            layout,
+            tuned_params,
+            layout_path=layout_path,
+            save_json=save_json,
             stages=stages,
-            target_samples=self._activation_samples,
             embeddings=embeddings,
         )
 
@@ -2386,6 +2492,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="игнорировать готовую раскладку и эмбеддинги в data/: посчитать заново и записать новый кеш "
         "(ход раскладки виден в Rerun)",
     )
+    layout_parser.add_argument(
+        "--layout-only",
+        action="store_true",
+        help="только раскладка: сохранить JSON и картинки раскладки в data/ и выйти, активация и эмбеддинги "
+        "не считаются (обычный запуск потом возьмёт эту раскладку из кеша и продолжит с активации)",
+    )
     predict_parser = subparsers.add_parser("predict", help="декодирование картинки или батча")
     predict_parser.add_argument("--layout-path", type=str, default=None)
     predict_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
@@ -2413,6 +2525,7 @@ def main() -> None:
             label=args.label,
             activation_samples=args.activation_samples,
             reuse_cache=not args.rebuild,
+            layout_only=args.layout_only,
         )
         runner.run()
         return
