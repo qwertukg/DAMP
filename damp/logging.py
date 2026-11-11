@@ -196,6 +196,12 @@ class DampLogger:
         self._event_sequence = 0
         self._interval_policy: LogIntervalPolicy | None = None
         self._blueprint_builder: Callable[[], Any] = RerunViewerBlueprint.build
+        # True — журнал выключен целиком (рабочие процессы: записи ведёт основной процесс).
+        self._muted = False
+
+    def mute(self) -> None:
+        """Выключает журнал этого процесса: ни консоли, ни rerun (для рабочих процессов)."""
+        self._muted = True
 
     def use_blueprint(self, builder: Callable[[], Any]) -> None:
         """Своя раскладка панелей окна для отдельного скрипта; по умолчанию — ход раскладки DAMP.
@@ -306,6 +312,8 @@ class DampLogger:
         self._interval_policy = LogIntervalPolicy(intervals, default_interval=default_interval)
 
     def should_log(self, event: str) -> bool:
+        if self._muted:
+            return False
         if self._interval_policy is None:
             return True
         return self._interval_policy.should_log(event)
@@ -322,6 +330,8 @@ class DampLogger:
     ) -> None:
         if not section:
             raise ValueError("section must be provided")
+        if self._muted:
+            return
         if force is None:
             if not self.should_log(event):
                 return

@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Iterable
 
 
+# Байт буфера битов → символ строки: 0 → «0», всё остальное → «1».
+_TO01_TABLE = bytes([ord("0")] + [ord("1")] * 255)
+
+
 class BitArray:
     """Разреженный битовый вектор фиксированной длины (§2)."""
 
@@ -60,7 +64,8 @@ class BitArray:
         return sum(1 for index in smaller if index in larger)
 
     def to01(self) -> str:
-        return "".join("1" if bit else "0" for bit in self._bits)
+        # Та же строка, что "".join("1" if bit else "0" ...), одной операцией над буфером.
+        return self._bits.translate(_TO01_TABLE).decode("ascii")
 
     def __len__(self) -> int:
         return len(self._bits)

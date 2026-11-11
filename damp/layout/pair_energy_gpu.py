@@ -17,6 +17,12 @@
 дают одно и то же число, поэтому энергии побитово те же. Слагаемые окна считаются одним блоком по многим
 парам, а суммируются порциями прежней формы: сумма float32 зависит от порядка сложения, порядок — от формы
 тензора редукции.
+
+Слитый расчёт (FusedPairEnergy): те же φ_c, φ_s считает одно ядро на элемент (пара, точка) по таблице
+сходства; суммы — та же редукция. pair_energies отдаёт его результат, сверяя с исходным проходом при первом
+вызове каждого вида расчёта и затем раз в заданное число вызовов; при расхождении слитый расчёт отключается.
+Расстановка на устройстве (позиции N×2, сетка ячеек) нужна только исходному проходу: слитому расчёту нужная
+часть расстановки уходит с хоста вместе с парами шага, поэтому после обменов её можно не обновлять.
 """
 from __future__ import annotations
 
@@ -25,6 +31,7 @@ from typing import Any, Sequence
 
 from damp.article_refs import GPU_IMPLEMENTATION, OPTIM_SIM_MATRIX, OPTIM_SUBSET
 from damp.layout.device_kernel import DeviceKernel
+from damp.layout.fused_pair_energy import FusedPairEnergy
 from damp.logging import LOGGER
 
 
@@ -44,28 +51,58 @@ class TorchPairEnergyEngine:
     # побитового подсчёта по окну (измерено: N = 8 693, окно 441 ячейка — 1.9 мс против 2.5 мс;
     # N = 88 317 — 139 мс против 25 мс). Оба способа дают одно и то же целое число общих бит.
     WINDOW_FULL_PRODUCT_RATIO = 32
+    # Коды float32 N × L держатся на устройстве, пока занимают не больше стольких байт: они нужны только
+    # произведениям «код × коды всех точек» (проход по всему V, таблицы сходства). При большем числе точек
+    # на устройстве остаются коды 64-битными словами (N × ⌈L/64⌉), общие биты считаются по ним (§2.2.4).
+    FLOAT_CODES_MAX_BYTES = 1 << 30
+    # Наименьшая порция редукции пути по окну ячеек: при N > LOCAL_CHUNK_ELEMENTS / 64 порция из
+    # LOCAL_CHUNK_ELEMENTS // N пар вырождается (единицы строк), и редукции нельзя объединять.
+    LOCAL_CHUNK_ROWS_MIN = 64
+    # Сверка слитого ядра с исходным проходом — не больше чем на стольких первых парах шага (целое число
+    # порций редукции): исходный проход на сотнях тысяч пар занял бы минуты.
+    VERIFY_MAX_PAIRS = 32768
 
     def __init__(
         self,
         *,
         torch_mod: Any,
         device: Any,
-        code_matrix: Any,
+        code_matrix: Any = None,
         ones: Any,
         similarity: str,
         grid_shape: tuple[int, int],
+        code_table: Any = None,
     ) -> None:
         self._torch = torch_mod
         self._device = device
         self._similarity = similarity
-        self._codes = torch_mod.as_tensor(code_matrix, dtype=torch_mod.float32, device=device)
+        # Коды точек: таблица массивов (LayoutCodeTable) или матрица бит N × L.
+        self._code_table = code_table
+        self._codes_float: Any = None
+        if code_table is not None:
+            self._point_count = int(code_table.count)
+            self._code_length = int(code_table.code_length)
+            if self._point_count * self._code_length * 4 <= self.FLOAT_CODES_MAX_BYTES:
+                codes = torch_mod.empty((self._point_count, self._code_length), dtype=torch_mod.float32, device=device)
+                for start, bits in code_table.bit_chunks():
+                    codes[start : start + bits.shape[0]] = torch_mod.as_tensor(bits, device=device)
+                self._codes_float = codes
+        else:
+            self._codes_float = torch_mod.as_tensor(code_matrix, dtype=torch_mod.float32, device=device)
+            self._point_count = int(code_matrix.shape[0])
+            self._code_length = int(code_matrix.shape[1])
         self._ones = torch_mod.as_tensor(ones, dtype=torch_mod.float32, device=device)
-        self._point_count = int(code_matrix.shape[0])
-        self._code_length = int(code_matrix.shape[1])
         self._codes_packed: Any = None
+        # Место бита кода в 64-битных словах (номер слова и сдвиг) — для распаковки строк кодов из слов.
+        self._bit_places: tuple[Any, Any] | None = None
         self._height, self._width = int(grid_shape[0]), int(grid_shape[1])
         self._pos = torch_mod.zeros((self._point_count, 2), dtype=torch_mod.float32, device=device)
         self._grid = torch_mod.full((self._height, self._width), -1, dtype=torch_mod.long, device=device)
+        # Слитый расчёт: параметры (None — выключен), объект, период и счётчики сверки с исходным проходом.
+        self._fused_options: dict[str, Any] | None = None
+        self._fused: FusedPairEnergy | None = None
+        self._fused_verify_every = 0
+        self._fused_calls: dict[tuple, int] = {}
         self._all_indices = torch_mod.arange(self._point_count, device=device)
         self._cell_index: Any = None
         LOGGER.event(
@@ -75,16 +112,23 @@ class TorchPairEnergyEngine:
                 "device": str(device),
                 "points": self._point_count,
                 "grid": (self._height, self._width),
-                "code_length": int(code_matrix.shape[1]),
+                "code_length": self._code_length,
                 "similarity": similarity,
                 "chunk_elements": self.CHUNK_ELEMENTS,
+                "float_codes": self._codes_float is not None,
                 "note": "сходство из кодов на лету, матрица N×N не строится (§5.9.5, §5.12)",
             },
         )
 
     @classmethod
     def create(
-        cls, *, code_matrix: Any, ones: Any, similarity: str, grid_shape: tuple[int, int]
+        cls,
+        *,
+        code_matrix: Any = None,
+        ones: Any,
+        similarity: str,
+        grid_shape: tuple[int, int],
+        code_table: Any = None,
     ) -> "TorchPairEnergyEngine | None":
         try:
             import torch
@@ -95,7 +139,7 @@ class TorchPairEnergyEngine:
                 data={"error": str(exc)},
             )
             return None
-        if code_matrix is None or ones is None:
+        if (code_matrix is None and code_table is None) or ones is None:
             LOGGER.event(
                 "layout.gpu.pair_energy.unavailable",
                 section=GPU_IMPLEMENTATION,
@@ -122,6 +166,7 @@ class TorchPairEnergyEngine:
                 ones=ones,
                 similarity=similarity,
                 grid_shape=grid_shape,
+                code_table=code_table,
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.event(
@@ -140,6 +185,11 @@ class TorchPairEnergyEngine:
         return self._point_count
 
     @property
+    def code_length(self) -> int:
+        """Длина кода L в битах."""
+        return self._code_length
+
+    @property
     def torch_mod(self) -> Any:
         return self._torch
 
@@ -153,18 +203,179 @@ class TorchPairEnergyEngine:
         return self._pos
 
     @property
-    def ones(self) -> Any:
-        """Число единиц кода каждой точки на устройстве (N, float32)."""
-        return self._ones
-
-    @property
     def grid(self) -> Any:
         """Сетка ячеек на устройстве: номер точки в ячейке или −1 (высота × ширина, int64)."""
         return self._grid
 
+    @property
+    def codes(self) -> Any:
+        """Коды точек на устройстве (N × L float32, биты 0/1)."""
+        return self._codes
+
+    @property
+    def _codes(self) -> Any:
+        if self._codes_float is None:
+            raise RuntimeError(
+                "codes N × L float32 are not kept on the device for this many points: "
+                "a pass over all points of V is unavailable (use the subset B or the cell window)"
+            )
+        return self._codes_float
+
+    @property
+    def has_float_codes(self) -> bool:
+        """Коды float32 N × L есть на устройстве (иначе — только 64-битными словами)."""
+        return self._codes_float is not None
+
+    def _code_rows(self, indices: Any) -> Any:
+        """Коды точек indices строками float32 (k × L): из матрицы кодов или распаковкой 64-битных слов."""
+        if self._codes_float is not None:
+            return self._codes_float[indices]
+        torch = self._torch
+        if self._bit_places is None:
+            import numpy as np
+
+            bit = np.arange(self._code_length, dtype=np.int64)
+            # Бит i лежит в байте i // 8 (старший бит байта — меньший номер), байты слова — от младшего.
+            shift = 8 * ((bit // 8) % 8) + (7 - bit % 8)
+            self._bit_places = (
+                torch.as_tensor(bit // 64, device=self._device),
+                torch.as_tensor(shift, device=self._device),
+            )
+        word, shift = self._bit_places
+        words = self._packed_codes()[indices]
+        return ((words[:, word] >> shift[None, :]) & 1).to(torch.float32)
+
+    @property
+    def ones(self) -> Any:
+        """Число единиц кода каждой точки (N float32)."""
+        return self._ones
+
+    @property
+    def similarity(self) -> str:
+        return self._similarity
+
+    @property
+    def grid_shape(self) -> tuple[int, int]:
+        return self._height, self._width
+
+    @property
+    def fused_active(self) -> bool:
+        """Слитый расчёт включён и не отключён сверкой."""
+        return self._fused_options is not None
+
+    def configure_fused(
+        self,
+        *,
+        enabled: bool,
+        block_elements: int,
+        table_max_bytes: int,
+        table_memory_fraction: float,
+        verify_every: int,
+        similarity_table: bool = True,
+    ) -> None:
+        """Слитый расчёт энергий (FusedPairEnergy): включить с параметрами или выключить."""
+        if verify_every < 0:
+            raise ValueError("verify_every must be >= 0")
+        self._fused = None
+        self._fused_calls.clear()
+        self._fused_verify_every = int(verify_every)
+        if not enabled or not FusedPairEnergy.supported(self):
+            self._fused_options = None
+            LOGGER.event(
+                "layout.fused.energy.disabled",
+                section=GPU_IMPLEMENTATION,
+                data={
+                    "stage": "configure",
+                    "requested": bool(enabled),
+                    "device": str(self._device),
+                    "note": "энергии считает исходный проход по операциям torch (§5.12)",
+                },
+            )
+            return
+        self._fused_options = {
+            "block_elements": int(block_elements),
+            "table_max_bytes": int(table_max_bytes),
+            "table_memory_fraction": float(table_memory_fraction),
+            "similarity_table": bool(similarity_table),
+        }
+
+    def _fused_engine(self) -> "FusedPairEnergy | None":
+        """Слитый расчёт; None — выключен или отключён сверкой."""
+        if self._fused_options is None:
+            return None
+        if self._fused is None:
+            try:
+                self._fused = FusedPairEnergy(self, **self._fused_options)
+            except Exception as exc:  # noqa: BLE001
+                self._disable_fused(str(exc), stage="init")
+                return None
+        return self._fused
+
+    def fused_on_the_fly(self) -> "FusedPairEnergy | None":
+        """Слитый расчёт, если он включён и считает общие биты на лету (без таблиц сходства); иначе None."""
+        fused = self._fused_engine()
+        return fused if fused is not None and fused.on_the_fly else None
+
+    def _disable_fused(self, error: str, *, stage: str) -> None:
+        self._fused_options = None
+        self._fused = None
+        LOGGER.event(
+            "layout.fused.energy.disabled",
+            section=GPU_IMPLEMENTATION,
+            data={
+                "stage": stage,
+                "error": error,
+                "note": "энергии дальше считает исходный проход по операциям torch (§5.5, §5.12)",
+            },
+            force=True,
+        )
+
+    def release(self) -> None:
+        """Отдать память устройства: таблицы слитого расчёта, коды, расстановку. Движок после этого не годен."""
+        self._fused = None
+        self._fused_options = None
+        self._codes_float = None
+        self._codes_packed = None
+        self._pos = None
+        self._grid = None
+        self._ones = None
+        self._all_indices = None
+        if self._device.type == "cuda":
+            import gc
+
+            gc.collect()
+            self._torch.cuda.empty_cache()
+
+    def host_arrays(self) -> tuple[Any, Any]:
+        """Расстановка с устройства массивами хоста: ячейки точек N×2 (y, x) и сетка с номером точки или −1."""
+        import numpy as np
+
+        return self._pos.cpu().numpy().astype(np.int64), self._grid.cpu().numpy()
+
+    def window_common_bits(self, points: Any, window: Any) -> Any:
+        """Число общих бит кода точки points[i] с кодами точек window[i, k] (§2.2.4)."""
+        return self._window_common_bits(points, window)
+
+    def packed_codes(self) -> Any:
+        """Коды точек 64-битными словами на устройстве (N × ⌈L/64⌉, int64)."""
+        return self._packed_codes()
+
     def local_chunk_rows(self) -> int:
         """Число пар в одной порции редукции пути по окну ячеек (форма порции [пары, ячейки окна])."""
-        return max(1, self.LOCAL_CHUNK_ELEMENTS // max(1, self._point_count))
+        return max(self.LOCAL_CHUNK_ROWS_MIN, self.LOCAL_CHUNK_ELEMENTS // max(1, self._point_count))
+
+    @staticmethod
+    def window_reach(pos_a: Any, pos_b: Any, local_radius: float | None) -> int:
+        """Полуширина окна ячеек, покрывающего окрестности всех пар (§5.5.2) — то же число, что у
+        neighbourhood_geometry, по массивам хоста."""
+        import numpy as np
+
+        delta = (np.asarray(pos_a) - np.asarray(pos_b)).astype(np.float32)
+        distance = np.sqrt(delta[:, 0] * delta[:, 0] + delta[:, 1] * delta[:, 1])
+        radius_max = float(np.ceil(distance.max())) + 1.0
+        if local_radius is not None:
+            radius_max = max(radius_max, float(np.float32(local_radius)))
+        return int(math.ceil(radius_max)) + 1
 
     def neighbourhood_geometry(self, pa: Any, pb: Any, local_radius: float | None) -> tuple[Any, Any, int]:
         """Окрестность пар (§5.5.2): центры c, квадраты радиусов r² и полуширина окна ячеек, покрывающего их все.
@@ -209,7 +420,7 @@ class TorchPairEnergyEngine:
         torch = self._torch
         pair_count, cells = int(window.shape[0]), int(window.shape[1])
         common = torch.empty((pair_count, cells), dtype=torch.float32, device=self._device)
-        if self._point_count <= self.WINDOW_FULL_PRODUCT_RATIO * cells:
+        if self._codes_float is not None and self._point_count <= self.WINDOW_FULL_PRODUCT_RATIO * cells:
             # Точек мало: строка произведения на коды всех точек дешевле побитового счёта по окну.
             step = max(1, self.LOCAL_CHUNK_ELEMENTS // max(1, self._point_count))
             for start in range(0, pair_count, step):
@@ -234,6 +445,11 @@ class TorchPairEnergyEngine:
 
     def _packed_codes(self) -> Any:
         """Коды точек 64-битными словами на устройстве (N × ⌈L/64⌉, int64) для подсчёта общих бит (§2.2.4)."""
+        if self._codes_packed is None and self._code_table is not None:
+            import numpy as np
+
+            words = np.ascontiguousarray(self._code_table.words64()).view(np.int64)
+            self._codes_packed = self._torch.as_tensor(words, device=self._device)
         if self._codes_packed is None:
             import numpy as np
 
@@ -300,7 +516,7 @@ class TorchPairEnergyEngine:
         eta: float | None,
     ) -> Any:
         """sim_λ(a, v) для кодов a (по индексам) и столбцов v: общие биты через матричное произведение (§2.2.4, §5.4)."""
-        common = self._codes[row_indices] @ col_codes.T
+        common = self._code_rows(row_indices) @ col_codes.T
         return self._sim_lambda_from_common(
             common, self._ones[row_indices][:, None], col_ones[None, :], lambda_threshold=lambda_threshold, eta=eta
         )
@@ -314,27 +530,52 @@ class TorchPairEnergyEngine:
     ) -> None:
         """Позиции только сдвинутых точек и изменившиеся ячейки сетки (после обменов шага).
 
-        Точки (индекс, y, x) и ячейки (y, x, точка или −1) уходят на устройство одним массивом.
+        cells — тройки (y, x, точка или −1).
+        """
+        import numpy as np
+
+        cell_table = np.asarray(cells, dtype=np.int64).reshape(-1, 3)
+        self.apply_moves(
+            np.asarray(indices, dtype=np.int64),
+            np.asarray(pos_y, dtype=np.int64),
+            np.asarray(pos_x, dtype=np.int64),
+            cell_table[:, 0],
+            cell_table[:, 1],
+            cell_table[:, 2],
+        )
+
+    def apply_moves(
+        self,
+        moved: Any,
+        moved_y: Any,
+        moved_x: Any,
+        cell_y: Any,
+        cell_x: Any,
+        cell_point: Any,
+    ) -> None:
+        """Обмены шага массивами: новые ячейки сдвинутых точек и новые точки ячеек (−1 — пусто).
+
+        Точки (индекс, y, x) и ячейки (y, x, точка) уходят на устройство одним массивом.
         """
         torch = self._torch
         import numpy as np
 
-        moved = len(indices)
-        changed = len(cells)
-        if moved + changed == 0:
+        moved_count = int(len(moved))
+        changed = int(len(cell_y))
+        if moved_count + changed == 0:
             return
-        table = np.empty((moved + changed, 3), dtype=np.int64)
-        if moved:
-            table[:moved, 0] = indices
-            table[:moved, 1] = pos_y
-            table[:moved, 2] = pos_x
-        if changed:
-            table[moved:] = np.asarray(cells, dtype=np.int64).reshape(-1, 3)
+        table = np.empty((moved_count + changed, 3), dtype=np.int64)
+        table[:moved_count, 0] = moved
+        table[:moved_count, 1] = moved_y
+        table[:moved_count, 2] = moved_x
+        table[moved_count:, 0] = cell_y
+        table[moved_count:, 1] = cell_x
+        table[moved_count:, 2] = cell_point
         device_table = torch.as_tensor(table, device=self._device)
-        if moved:
-            self._pos[device_table[:moved, 0]] = device_table[:moved, 1:3].to(torch.float32)
+        if moved_count:
+            self._pos[device_table[:moved_count, 0]] = device_table[:moved_count, 1:3].to(torch.float32)
         if changed:
-            self._grid[device_table[moved:, 0], device_table[moved:, 1]] = device_table[moved:, 2]
+            self._grid[device_table[moved_count:, 0], device_table[moved_count:, 1]] = device_table[moved_count:, 2]
 
     # Ядро обновления ячеек (CUDA): компилируется при первом обновлении, общее для всех движков процесса.
     _CELL_KERNEL: Any = None
@@ -416,12 +657,149 @@ class TorchPairEnergyEngine:
         eta: float | None,
         eval_indices: Sequence[int] | None = None,
         need_swapped: bool = True,
+        positions: Any = None,
+        grid: Any = None,
+        sample_offsets: tuple[Any, Any] | None = None,
     ) -> tuple[Any, Any]:
-        """(φ_c, φ_s) для всех пар одним проходом по V или B (§5.5, §5.9.4, §5.12); numpy float32.
+        """(φ_c, φ_s) для всех пар шага по V или B (§5.5, §5.9.4, §5.12); numpy float32.
+
+        eval_indices — подмножество B точек (§5.9.4): суммы берутся только по нему. sample_offsets — выборка
+        ячеек окна окрестности (смещения dy, dx от ячейки центра пары, по числу на ячейку выборки): суммы
+        берутся только по точкам этих ячеек — та же оценка энергии по случайному подмножеству (§5.9.4),
+        но подмножество своё у каждой пары: ячейки её окрестности.
 
         idx_b = −1 — вторая ячейка пуста (точка переносится в пустую ячейку, §5.9.1).
         need_swapped = False — φ_s вызывающему не нужна (энергии точек §5.7): в пути по окну ячеек
         её суммы не считаются и возвращаются нули.
+
+        Считает слитое ядро (FusedPairEnergy), если оно включено и расчёт идёт по всему V; его числа — те же,
+        что у исходного прохода. Сверка с исходным проходом — при первом вызове каждого вида расчёта и затем
+        раз в verify_every вызовов (в раскладку тогда идёт результат исходного прохода); при расхождении или
+        ошибке слитый расчёт отключается.
+
+        positions, grid — расстановка массивами хоста (ячейки точек N×2 и сетка с номером точки или −1).
+        Если они заданы, расстановка на устройстве считается устаревшей: слитому расчёту она не нужна,
+        а перед исходным проходом загружается из этих массивов заново.
+        """
+        import numpy as np
+
+        arguments = dict(
+            neighbourhood=neighbourhood,
+            local_radius=local_radius,
+            kernel=kernel,
+            euclidean=euclidean,
+            distance_eps=distance_eps,
+            kernel_width=kernel_width,
+            lambda_threshold=lambda_threshold,
+            eta=eta,
+        )
+        host_state = positions is not None and grid is not None
+        fused = self._fused_engine() if len(idx_a) else None
+        if fused is not None:
+            try:
+                host_positions, host_grid = (positions, grid) if host_state else self.host_arrays()
+                result = fused.pair_energies(
+                    idx_a, idx_b, pos_a, pos_b,
+                    positions=host_positions, grid=host_grid, need_swapped=need_swapped,
+                    eval_indices=eval_indices, sample_offsets=sample_offsets, **arguments,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._disable_fused(str(exc), stage="pair_energies")
+                result = None
+            if result is not None:
+                energy_c, energy_s, kind = result
+                key = (kind, kernel if neighbourhood else "distance", bool(euclidean), eta is None, bool(need_swapped))
+                calls = self._fused_calls.get(key, 0)
+                self._fused_calls[key] = calls + 1
+                verify = calls == 0 or (self._fused_verify_every > 0 and calls % self._fused_verify_every == 0)
+                if not verify:
+                    return energy_c, energy_s
+                if host_state:
+                    self.update_positions(positions[:, 0], positions[:, 1])
+                # Исходный проход — на первых парах шага, целым числом его порций редукции: суммы этих пар
+                # от остальных пар шага не зависят, если окно ячеек взято то же, что у всего шага.
+                pairs = int(len(idx_a))
+                if kind == "window":
+                    rows = self.local_chunk_rows()
+                elif eval_indices is None:
+                    rows = self.dense_chunk_rows()
+                else:
+                    rows = max(1, self.CHUNK_ELEMENTS // max(1, len(eval_indices)))
+                checked = pairs if pairs <= self.VERIFY_MAX_PAIRS else max(rows, self.VERIFY_MAX_PAIRS // rows * rows)
+                checked = min(pairs, checked)
+                reach = self.window_reach(pos_a, pos_b, local_radius) if neighbourhood else None
+                reference = self._pair_energies_reference(
+                    idx_a[:checked], idx_b[:checked], pos_a[:checked], pos_b[:checked],
+                    eval_indices=eval_indices, need_swapped=need_swapped, sample_offsets=sample_offsets,
+                    window_reach=reach, **arguments,
+                )
+                # Побитовое сравнение: суммы float32 должны быть теми же числами.
+                matched = bool(
+                    np.array_equal(np.asarray(reference[0]).view(np.int32), energy_c[:checked].view(np.int32))
+                    and np.array_equal(np.asarray(reference[1]).view(np.int32), energy_s[:checked].view(np.int32))
+                )
+                LOGGER.event(
+                    "layout.fused.energy.verify",
+                    section=GPU_IMPLEMENTATION,
+                    data={
+                        "kind": kind,
+                        "kernel": key[1],
+                        "pairs": pairs,
+                        "checked_pairs": checked,
+                        "subset": 0 if eval_indices is None else len(eval_indices),
+                        "sampled_cells": 0 if sample_offsets is None else len(sample_offsets[0]),
+                        "calls": calls,
+                        "matched": matched,
+                        "note": "φ_c, φ_s слитого ядра побитово равны исходному проходу (§5.5, §5.12)",
+                    },
+                    force=True,
+                )
+                if not matched:
+                    self._disable_fused("fused energies differ from the reference pass", stage="verify")
+                if self._device.type == "cuda":
+                    # Память под промежуточные тензоры исходного прохода возвращается устройству: рядом
+                    # с таблицей сходства её кеш в распределителе torch вытеснял бы блоки слитого ядра.
+                    self._torch.cuda.empty_cache()
+                if matched:
+                    # Числа слитого ядра равны исходным на проверенных парах — результат шага один и тот же.
+                    return energy_c, energy_s
+                if checked == pairs:
+                    return reference
+                return self._pair_energies_reference(
+                    idx_a, idx_b, pos_a, pos_b, eval_indices=eval_indices, need_swapped=need_swapped,
+                    sample_offsets=sample_offsets, **arguments,
+                )
+        if host_state:
+            self.update_positions(positions[:, 0], positions[:, 1])
+        return self._pair_energies_reference(
+            idx_a, idx_b, pos_a, pos_b, eval_indices=eval_indices, need_swapped=need_swapped,
+            sample_offsets=sample_offsets, **arguments,
+        )
+
+    def _pair_energies_reference(
+        self,
+        idx_a: Sequence[int],
+        idx_b: Sequence[int],
+        pos_a: Sequence[Sequence[float]],
+        pos_b: Sequence[Sequence[float]],
+        *,
+        neighbourhood: bool,
+        local_radius: float | None,
+        kernel: str,
+        euclidean: bool,
+        distance_eps: float,
+        kernel_width: float,
+        lambda_threshold: float,
+        eta: float | None,
+        eval_indices: Sequence[int] | None = None,
+        need_swapped: bool = True,
+        sample_offsets: tuple[Any, Any] | None = None,
+        window_reach: int | None = None,
+    ) -> tuple[Any, Any]:
+        """Исходный проход: (φ_c, φ_s) для всех пар по V или B операциями torch (§5.5, §5.9.4, §5.12).
+
+        sample_offsets — выборка ячеек окна окрестности (см. pair_energies); window_reach — полуширина окна
+        ячеек, заданная вызывающим (сверка на части пар шага: окно — как у всего шага).
         """
         torch = self._torch
         import numpy as np
@@ -439,15 +817,24 @@ class TorchPairEnergyEngine:
                 eval_idx = self._all_indices
             else:
                 eval_idx = torch.as_tensor(np.asarray(eval_indices, dtype=np.int64), device=device)
+            if neighbourhood and sample_offsets is not None:
+                centre, radius_sq, _ = self.neighbourhood_geometry(pa, pb, local_radius)
+                return self._pair_energies_local(
+                    ia, ib, pa, pb, centre, radius_sq, 0,
+                    kernel=kernel, euclidean=euclidean, distance_eps=distance_eps, kernel_width=kernel_width,
+                    lambda_threshold=lambda_threshold, eta=eta, need_swapped=need_swapped,
+                    offsets=sample_offsets,
+                )
             eval_pos = self._pos[eval_idx]
-            eval_codes = self._codes[eval_idx]
             eval_ones = self._ones[eval_idx]
             eval_count = int(eval_idx.shape[0])
             chunk = max(1, self.CHUNK_ELEMENTS // max(1, eval_count))
             energy_c = torch.zeros(pair_count, dtype=torch.float32, device=device)
             energy_s = torch.zeros(pair_count, dtype=torch.float32, device=device)
             if neighbourhood:
-                centre, radius_sq, window_reach = self.neighbourhood_geometry(pa, pb, local_radius)
+                centre, radius_sq, pairs_reach = self.neighbourhood_geometry(pa, pb, local_radius)
+                if window_reach is None:
+                    window_reach = pairs_reach
                 # Окно (2R+1)² ячеек вокруг центра покрывает окрестность; если оно меньше всего V, сходства,
                 # расстояния и веса считаются только по окну.
                 window_cells = (2 * window_reach + 1) ** 2
@@ -457,6 +844,7 @@ class TorchPairEnergyEngine:
                         kernel=kernel, euclidean=euclidean, distance_eps=distance_eps, kernel_width=kernel_width,
                         lambda_threshold=lambda_threshold, eta=eta, need_swapped=need_swapped,
                     )
+            eval_codes = self._code_rows(eval_idx)
             for start in range(0, pair_count, chunk):
                 stop = min(pair_count, start + chunk)
                 a = ia[start:stop]
@@ -518,8 +906,11 @@ class TorchPairEnergyEngine:
         lambda_threshold: float,
         eta: float | None,
         need_swapped: bool = True,
+        offsets: tuple[Any, Any] | None = None,
     ) -> tuple[Any, Any]:
         """Энергии окрестности (§5.5.2) по окну ячеек сетки вокруг центра пары.
+
+        offsets — выборка ячеек окна (смещения dy, dx от ячейки центра): сумма берётся только по ним (§5.9.4).
 
         Та же сумма, что и в полном проходе: точки v с ‖v − c‖ ≤ r (все они лежат в окне), без самой пары;
         сходство, расстояния и веса считаются только для K = (2R+1)² ячеек окна вместо N точек (§5.12).
@@ -532,10 +923,16 @@ class TorchPairEnergyEngine:
         torch = self._torch
         device = self._device
         pair_count = int(ia.shape[0])
-        offsets = torch.arange(-window_reach, window_reach + 1, device=device)
-        dy_off, dx_off = torch.meshgrid(offsets, offsets, indexing="ij")
-        dy_off = dy_off.reshape(-1)
-        dx_off = dx_off.reshape(-1)
+        if offsets is None:
+            span = torch.arange(-window_reach, window_reach + 1, device=device)
+            dy_off, dx_off = torch.meshgrid(span, span, indexing="ij")
+            dy_off = dy_off.reshape(-1)
+            dx_off = dx_off.reshape(-1)
+        else:
+            import numpy as np
+
+            dy_off = torch.as_tensor(np.asarray(offsets[0], dtype=np.int64), device=device)
+            dx_off = torch.as_tensor(np.asarray(offsets[1], dtype=np.int64), device=device)
         # Порция редукции (пар на одну сумму по окну) и блок арифметики из целого числа порций.
         chunk = self.local_chunk_rows()
         cells = int(dy_off.numel())
@@ -636,11 +1033,16 @@ class TorchPairEnergyEngine:
         lambda_threshold: float,
         eta: float | None,
         distance_eps: float,
+        positions: Any = None,
+        grid: Any = None,
     ) -> Any:
-        """E(c, r) = Σ_{v ≠ c, ‖v − c‖ ≤ r} sim_λ(c, v) / (d + ε) для всех точек (§5.7)."""
+        """E(c, r) = Σ_{v ≠ c, ‖v − c‖ ≤ r} sim_λ(c, v) / (d + ε) для всех точек (§5.7).
+
+        positions, grid — расстановка массивами хоста (см. pair_energies); без них берётся с устройства.
+        """
         import numpy as np
 
-        pos = self._pos.cpu().numpy()
+        pos = positions if positions is not None else self._pos.cpu().numpy()
         indices = np.arange(self._point_count, dtype=np.int64)
         energy_c, _ = self.pair_energies(
             indices,
@@ -656,6 +1058,8 @@ class TorchPairEnergyEngine:
             lambda_threshold=lambda_threshold,
             eta=eta,
             need_swapped=False,
+            positions=positions,
+            grid=grid,
         )
         return energy_c
 

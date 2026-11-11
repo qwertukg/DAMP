@@ -45,7 +45,9 @@ from damp.layout.pair_sampler import CompiledPairSampler
 from damp.layout.pair_sign_kernel import PairSignKernel
 from damp.layout.potential_bounds import PotentialBounds
 from damp.layout.reduction_replica import ReductionReplica
-from damp.layout.payload import LayoutEncodedCode
+from damp.layout.code_table import LayoutCodeTable
+from damp.layout.device_step import DeviceLongStep
+from damp.layout.payload import LayoutEncodedCode, LayoutJsonWriter
 from damp.layout.sparse_long_energy import SimilarityRows, SparseLongEnergy
 from damp.logging import LOGGER
 
@@ -59,6 +61,10 @@ class LayoutPoint:
 
 
 _RADIUS_SCHEDULES = ("swaps", "linear", "geometric")
+# Выше этого числа точек отказ расчёта энергий на torch — ошибка раскладки: запасные пути не справятся.
+_TORCH_FALLBACK_POINT_LIMIT = 200_000
+# Шаг на устройстве сверяет энергии первых пар с исходным проходом движка на первом шаге и раз в столько шагов.
+_DEVICE_STEP_VERIFY_EVERY = 1000
 
 
 @dataclass(frozen=True)
@@ -1245,6 +1251,67 @@ class _TensorLayoutEngine:
             )
 
 
+class _UniformDraws:
+    """Числа random.Random.random() пачкой (отбор обменов при отжиге берёт по числу на невыгодную пару).
+
+    random.Random и numpy.random.RandomState — один и тот же генератор MT19937 с одной формулой числа:
+    два 32-битных слова a, b дают (⌊a/2⁵⌋·2²⁶ + ⌊b/2⁶⌋)/2⁵³. Состояние генератора Python передаётся
+    генератору numpy, тот выдаёт count чисел массивом, и состояние возвращается обратно: числа и состояние
+    те же, что после count вызовов random(). Свойство проверяется один раз; если в установленных версиях
+    оно не выполняется, числа берутся по одному.
+    """
+
+    # С этого числа запросов пачка дешевле вызовов по одному (передача состояния стоит ≈ 80 мкс).
+    MIN_COUNT = 512
+    _VERIFIED: bool | None = None
+    _LEGACY: "np.random.RandomState | None" = None
+
+    @classmethod
+    def _bulk(cls, rng: random.Random, count: int) -> "np.ndarray":
+        if cls._LEGACY is None:
+            cls._LEGACY = np.random.RandomState(0)
+        legacy = cls._LEGACY
+        version, state, gauss = rng.getstate()
+        legacy.set_state(("MT19937", np.array(state[:-1], dtype=np.uint32), state[-1]))
+        values = legacy.random_sample(count)
+        key, position = legacy.get_state()[1:3]
+        rng.setstate((version, tuple(key.tolist()) + (int(position),), gauss))
+        return values
+
+    @classmethod
+    def _verified(cls) -> bool:
+        if cls._VERIFIED is None:
+            matched = True
+            try:
+                one_by_one = random.Random(20240229)
+                in_bulk = random.Random(20240229)
+                for count in (1, 7, 623, 624, 625, 1000, 4096):
+                    expected = np.array([one_by_one.random() for _ in range(count)])
+                    matched = matched and np.array_equal(expected, cls._bulk(in_bulk, count))
+                matched = matched and one_by_one.getstate() == in_bulk.getstate()
+            except Exception:  # noqa: BLE001
+                matched = False
+            cls._VERIFIED = bool(matched)
+            LOGGER.event(
+                "layout.swap.bulk_draws",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "bulk": cls._VERIFIED,
+                    "note": "числа генератора для отбора обменов берутся пачкой: те же числа и то же состояние "
+                    "генератора, что при вызовах по одному",
+                },
+            )
+        return cls._VERIFIED
+
+    @classmethod
+    def take(cls, rng: random.Random, count: int) -> "np.ndarray":
+        """count чисел rng.random() массивом float64; состояние rng — как после count вызовов."""
+        if count >= cls.MIN_COUNT and type(rng) is random.Random and cls._verified():
+            return cls._bulk(rng, count)
+        draw = rng.random
+        return np.array([draw() for _ in range(count)])
+
+
 @dataclass(frozen=True)
 class _AdaptiveUpdate:
     """Итог шага расписания §7.1.7: доля обменов этапа и смена параметров по триггеру."""
@@ -1434,7 +1501,7 @@ class Layout:
 
     def __init__(
         self,
-        codes: Mapping[float, Sequence[BitArray]],
+        codes: "Mapping[float, Sequence[BitArray]] | LayoutCodeTable",
         *,
         grid_size: int | None = None,
         empty_ratio: float = 0.15,
@@ -1472,9 +1539,25 @@ class Layout:
         potential_bounds_grid: int = 8,
         reduction_replica: bool = True,
         replica_max_bytes: int = 1 << 30,
+        fused_energy: bool = True,
+        fused_table_max_bytes: int = 6 * 1024 * 1024 * 1024,
+        fused_table_memory_fraction: float = 0.7,
+        fused_block_elements: int = 40_000_000,
+        fused_verify_every: int = 2000,
+        fused_similarity_table: bool = True,
+        neighbourhood_sample_side: int | None = None,
+        enforce_pair_radius: bool = False,
+        initial_cells: "np.ndarray | None" = None,
+        device_step: bool = False,
     ) -> None:
-        if not codes:
+        if codes is None or len(codes) == 0:
             raise ValueError("codes must be non-empty")
+        if neighbourhood_sample_side is not None and neighbourhood_sample_side <= 0:
+            raise ValueError("neighbourhood_sample_side must be positive when set")
+        if fused_table_max_bytes < 0 or not 0.0 < fused_table_memory_fraction <= 1.0:
+            raise ValueError("fused_table_max_bytes must be >= 0 and fused_table_memory_fraction in (0, 1]")
+        if fused_block_elements <= 0 or fused_verify_every < 0:
+            raise ValueError("fused_block_elements must be positive and fused_verify_every >= 0")
         if sparse_max_edges < 0 or not 0.0 < sparse_memory_fraction <= 1.0:
             raise ValueError("sparse_max_edges must be >= 0 and sparse_memory_fraction in (0, 1]")
         if sparse_buffer_bytes <= 0 or sparse_entry_budget <= 0:
@@ -1509,28 +1592,39 @@ class Layout:
         if parallel_workers is not None and parallel_workers < 0:
             raise ValueError("parallel_workers must be >= 0")
 
-        self._points = []
-        self._codes: dict[float, list[BitArray]] = {}
-        for hue, label_codes in codes.items():
-            hue_value = float(hue)
-            bucket = self._codes.setdefault(hue_value, [])
-            for code_entry in label_codes:
-                layout_code, ones, label_text = self._coerce_code_entry(
-                    code_entry,
-                    default_label=hue_value,
-                )
-                bucket.append(layout_code)
-                self._points.append(
-                    LayoutPoint(
-                        code=layout_code,
-                        label=label_text,
-                        hue=hue_value,
-                        ones=ones,
+        # Коды точек хранятся таблицей массивов (упакованные биты, hue, подписи): на ней работают расчёт энергий,
+        # цвета и запись раскладки. Точки объектами (_points), подписи (_labels) и строки кодов (_values)
+        # строятся из таблицы при первом обращении — большим раскладкам они не нужны и в память не помещаются.
+        self._points_cache: list[LayoutPoint] | None = None
+        self._labels_cache: list[str] | None = None
+        self._values_cache: list[str] | None = None
+        self._code_matrix_cache: "np.ndarray | None" = None
+        if isinstance(codes, LayoutCodeTable):
+            self._table = codes
+        else:
+            points: list[LayoutPoint] = []
+            for hue, label_codes in codes.items():
+                hue_value = float(hue)
+                for code_entry in label_codes:
+                    layout_code, ones, label_text = self._coerce_code_entry(
+                        code_entry,
+                        default_label=hue_value,
                     )
-                )
-        self._labels = [self._format_label(point.label) for point in self._points]
-        self._values = [point.code.to01() for point in self._points]
-        self._point_count = len(self._points)
+                    points.append(
+                        LayoutPoint(
+                            code=layout_code,
+                            label=label_text,
+                            hue=hue_value,
+                            ones=ones,
+                        )
+                    )
+            self._points_cache = points
+            self._table = LayoutCodeTable.from_codes(
+                [point.code for point in points],
+                hues=[point.hue for point in points],
+                labels=[point.label for point in points],
+            )
+        self._point_count = self._table.count
         self._similarity = similarity
         self._long_distance = long_distance
         self._short_distance = short_distance
@@ -1547,8 +1641,6 @@ class Layout:
             max_hue=_DEFAULT_PSEUDO_COLOR_MAX_HUE,
         )
         self._colors_rgb_cache: tuple[tuple[int, int, int], ...] | None = None
-        self._colors_rgb_array_cache: "np.ndarray | None" = None
-        self._component_colors_cache: dict[float | None, "np.ndarray"] = {}
         self._rng = random.Random(seed)
         # Векторная выборка пар (§5.3, §5.9.1, §5.9.3) — отдельный генератор numpy с тем же seed.
         self._np_rng = np.random.default_rng(seed)
@@ -1563,15 +1655,50 @@ class Layout:
         if long_subset_min_neighbours <= 0:
             raise ValueError("long_subset_min_neighbours must be positive")
         self._long_subset_min_neighbours = int(long_subset_min_neighbours)
+        # Выборка ячеек окрестности гауссова ядра дальней фазы (§5.9.4): число слоёв выборки по стороне окна;
+        # None — окрестность считается целиком. Свой генератор: остальные потоки случайных чисел не меняются.
+        self._neighbourhood_sample_side = (
+            None if neighbourhood_sample_side is None else int(neighbourhood_sample_side)
+        )
+        self._sample_rng = np.random.default_rng([int(seed), 1])
+        self._disc_offsets_cache: dict[int, tuple["np.ndarray", "np.ndarray"]] = {}
+        # Шаг дальней фазы целиком на устройстве (большие раскладки): расстановка живёт на устройстве,
+        # массивы хоста догоняют её при первом обращении (_pull_device).
+        self._device_step_enabled = bool(device_step)
+        self._device_seed = int(seed)
+        self._device_state: DeviceLongStep | None = None
+        self._device_ahead = False
+        self._device_steps = 0
+        # True — пары, вторая ячейка которых оказалась дальше радиуса выбора r (§5.3), в шаг не входят.
+        self._enforce_pair_radius = bool(enforce_pair_radius)
+        LOGGER.event(
+            "layout.energy.neighbourhood_sample.config",
+            section=OPTIM_SUBSET,
+            data={
+                "sample_side": -1 if self._neighbourhood_sample_side is None else self._neighbourhood_sample_side,
+                "mode": "full_window" if self._neighbourhood_sample_side is None else "stratified_cells",
+                "note": "энергия окрестности гауссова ядра по случайной выборке её ячеек: окно делится на слои "
+                "side × side, из слоя берётся одна случайная ячейка (§5.9.4); None — по всем ячейкам",
+            },
+        )
         self._long_subset_indices: list[int] = []
         self._long_subset_last_step: int = 0
         self._long_step_counter: int = 0
         self._subset_similarity_cache: dict[int, "numpy.ndarray"] = {}
         self._short_subset_indices: tuple[int, ...] | None = None
         self._short_similarity_cache: dict[int, "numpy.ndarray"] = {}
-        self._code_matrix, self._ones_array = self._build_code_matrix()
-        # Коды, упакованные в 64-битные слова: число общих бит пары — popcount(a & b) (§2.2.4).
-        self._packed_codes = self._pack_codes(self._code_matrix)
+        # Число единиц кодов и коды 64-битными словами: число общих бит пары — popcount(a & b) (§2.2.4).
+        # Матрица бит N × L (_code_matrix) распаковывается из таблицы при первом обращении.
+        self._ones_array = self._table.ones.astype(np.float32)
+        self._packed_codes = self._table.words64() if hasattr(np, "bitwise_count") else None
+        LOGGER.event(
+            "layout.sim_matrix.ready",
+            section=OPTIM_SIM_MATRIX,
+            data={
+                "points": self._point_count,
+                "code_len": self._table.code_length,
+            },
+        )
         # Дальняя энергия по ненулевым sim_λ при жёстком пороге (§5.5.1, §5.9.5): строки сходства строятся
         # при первом шаге дальней фазы и прореживаются при росте λ (§7.1.7).
         self._sparse_long_enabled = bool(sparse_long)
@@ -1623,17 +1750,20 @@ class Layout:
         # Списки расстановки — источник истины (§5.1.2); массивы _pos_np, _grid_np повторяют их для векторных
         # выборки пар и расчёта энергий. True — списки могли измениться в обход обменов, массивы пересобираются.
         self._arrays_stale = True
+        # True — обмены шага применены только к массивам (_apply_swaps_arrays): списки пересобираются из массивов
+        # при первом обращении к ним (_sync_lists). Устаревшими бывают либо списки, либо массивы, но не оба.
+        self._lists_stale = False
         self._pos_np: "np.ndarray | None" = None
         self._grid_np: "np.ndarray | None" = None
         self._short_weights_np: "np.ndarray | None" = None
         self._short_weights_source: list[float] | None = None
 
         if grid_size is None:
-            target = len(self._points) * (1.0 + empty_ratio)
+            target = self._point_count * (1.0 + empty_ratio)
             grid_size = math.ceil(math.sqrt(target))
         if grid_size <= 0:
             raise ValueError("grid_size must be positive")
-        if grid_size * grid_size < len(self._points):
+        if grid_size * grid_size < self._point_count:
             raise ValueError("grid_size too small for number of points")
 
         self.height = grid_size
@@ -1643,7 +1773,7 @@ class Layout:
             section=LAYOUT_ALGORITHM,
             data={
                 "points": self._point_count,
-                "labels": len(self._codes),
+                "labels": self._table.hue_count(),
                 "seed": seed,
             },
         )
@@ -1725,36 +1855,14 @@ class Layout:
             section=GPU_IMPLEMENTATION,
             data={"use_gpu": use_gpu},
         )
-        if self._points:
-            ones_values = [point.ones for point in self._points]
-            LOGGER.event(
-                "layout.codes",
-                section=SPARSE_BIT_VECTORS,
-                data={
-                    "code_length": len(self._points[0].code),
-                    "ones_min": min(ones_values),
-                    "ones_max": max(ones_values),
-                    "ones_avg": sum(ones_values) / len(ones_values),
-                },
-            )
-        else:
-            LOGGER.event(
-                "layout.codes",
-                section=SPARSE_BIT_VECTORS,
-                data={
-                    "code_length": 0,
-                    "ones_min": 0,
-                    "ones_max": 0,
-                    "ones_avg": 0,
-                },
-            )
-        self.grid: list[list[int | None]] = [
-            [None for _ in range(self.width)] for _ in range(self.height)
-        ]
-        self._positions: list[tuple[int, int]] = [(-1, -1)] * len(self._points)
-        self._pos_y = [0] * len(self._points)
-        self._pos_x = [0] * len(self._points)
-        self._row_occupied: list[set[int]] = [set() for _ in range(self.height)]
+        self._table.log_summary()
+        # Списки расстановки заполняются из массивов при первом обращении (_sync_lists): начальная расстановка
+        # (_place_points) пишется сразу в массивы.
+        self._grid_cells: list[list[int | None]] = [[] for _ in range(self.height)]
+        self._positions_list: list[tuple[int, int]] = []
+        self._pos_y_list: list[int] = []
+        self._pos_x_list: list[int] = []
+        self._row_occupied_sets: list[set[int]] = [set() for _ in range(self.height)]
         self._radius_offsets_cache: dict[int, list[tuple[int, int]]] = {}
         self._short_energy_weights: list[float] | None = None
         self._short_energy_last_step: int = -1
@@ -1764,7 +1872,11 @@ class Layout:
         # чтобы раскладка, активация и экспорт не считали одно и то же (§5.7).
         self._positions_version: int = 0
         self._point_energy_cache: dict[int, tuple[int, list[float]]] = {}
-        self._place_points()
+        if initial_cells is None:
+            self._place_points()
+        else:
+            # Начальная расстановка задана (раскладка от затравки, вне статьи) вместо случайной (§5.2).
+            self.place_cells(initial_cells, log=False)
 
         self._long_swap_radius_sum = 0.0
         self._long_swap_count = 0
@@ -1789,20 +1901,38 @@ class Layout:
         self._torch_engine: TorchPairEnergyEngine | None = None
         self._torch_positions_version = -1
         # Точки и ячейки, изменившиеся с последней загрузки на устройство: после шага загружаются только они.
-        # Ячейки (y·ширина + x), содержимое которых обмены изменили с последней загрузки на устройство.
-        self._torch_dirty_cells: list[int] = []
-        # Сдвинутые теми же обменами точки тройками (точка, старая ячейка, новая ячейка) — для сумм PotentialBounds.
-        self._torch_moves: list[int] = []
+        self._torch_dirty_points: set[int] = set()
+        self._torch_dirty_cells: dict[tuple[int, int], int] = {}
+        # Обмены, применённые по массивам и ещё не загруженные на устройство: по набору массивов на шаг
+        # (сдвинутые точки и их ячейки, изменившиеся ячейки и их точки). _torch_tracked_changes — сколько
+        # изменений версии расстановки описано этими наборами или списками _torch_dirty_*.
+        self._torch_pending_moves: list[tuple["np.ndarray", ...]] = []
+        self._swap_radius_cache: "np.ndarray | None" = None
+        self._torch_tracked_changes = 0
+        # Цвета точек массивами uint8 для карт хода раскладки (§5.14, рис. 16): от расстановки не зависят.
+        self._colors_rgb_array: "np.ndarray | None" = None
+        self._component_colors_cache: dict[float | None, list[tuple[int, int, int]]] = {}
+        self._component_colors_arrays: dict[float | None, "np.ndarray"] = {}
         self._gpu_positions_dirty = True
         if self._use_gpu:
             # Основной путь: энергии пар и точек на torch со сходством из кодов (§5.9.5, §5.12);
             # OpenGL-движок с матрицей N×N и прежний тензорный путь — только если torch недоступен.
             self._torch_engine = TorchPairEnergyEngine.create(
-                code_matrix=self._code_matrix,
+                code_table=self._table,
                 ones=self._ones_array,
                 similarity=self._similarity,
                 grid_shape=(self.height, self.width),
             )
+            if self._torch_engine is not None:
+                # Слитый расчёт энергий: те же φ_c, φ_s одним ядром на слагаемое (§5.5, §5.9.5, §5.12).
+                self._torch_engine.configure_fused(
+                    enabled=bool(fused_energy),
+                    block_elements=int(fused_block_elements),
+                    table_max_bytes=int(fused_table_max_bytes),
+                    table_memory_fraction=float(fused_table_memory_fraction),
+                    verify_every=int(fused_verify_every),
+                    similarity_table=bool(fused_similarity_table),
+                )
             if self._torch_engine is None:
                 self._gpu_engine = _GpuLayoutEngine.create(self._points, self._similarity)
                 self._tensor_engine = _TensorLayoutEngine.create(
@@ -1838,60 +1968,146 @@ class Layout:
             self._compiled_sampler = CompiledPairSampler.create(height=self.height, width=self.width)
 
     # ------------------------------------------------------------------ списки расстановки
-    # grid, _positions, _pos_y, _pos_x, _row_occupied — источник истины раскладки (§5.1.2). Обмены меняют
-    # списки и массивы _pos_np, _grid_np вместе (_apply_swaps), поэтому шагу не нужно пересобирать массивы
-    # из списков. Обращение к спискам по этим именам (чтение ради правки на месте или замена списка)
-    # помечает массивы устаревшими: следующий шаг пересоберёт их (_sync_arrays). Код шага раскладки
-    # читает списки по внутренним именам (_grid_cells, …) и массивы не сбрасывает.
+    # grid, _positions, _pos_y, _pos_x, _row_occupied — расстановка раскладки (§5.1.2) списками; массивы
+    # _pos_np, _grid_np — она же для векторных выборки пар и расчёта энергий. Шаг на torch применяет обмены
+    # только к массивам (_apply_swaps_arrays) и помечает списки устаревшими; обращение к спискам по этим
+    # именам сначала пересобирает их из массивов (_sync_lists, на месте: ссылки на списки остаются верными),
+    # а затем помечает устаревшими массивы — список могут править на месте или заменить, и следующий шаг
+    # пересоберёт массивы (_sync_arrays). _apply_swaps меняет списки и массивы вместе.
+    @property
+    def _points(self) -> list[LayoutPoint]:
+        """Точки объектами (код BitArray, подпись, hue, число единиц): строятся из таблицы кодов по требованию."""
+        if self._points_cache is None:
+            table = self._table
+            labels = table.labels()
+            hues = table.hues.tolist()
+            ones = table.ones.tolist()
+            self._points_cache = [
+                LayoutPoint(code=code, label=labels[index], hue=hues[index], ones=ones[index])
+                for index, code in enumerate(table.codes())
+            ]
+        return self._points_cache
+
+    @property
+    def _labels(self) -> list[str]:
+        if self._labels_cache is None:
+            self._labels_cache = [self._format_label(label) for label in self._table.labels()]
+        return self._labels_cache
+
+    @property
+    def _values(self) -> list[str]:
+        """Коды точек строками «0101…» (как BitArray.to01())."""
+        if self._values_cache is None:
+            self._values_cache = self._table.values()
+        return self._values_cache
+
+    @property
+    def _code_matrix(self) -> "np.ndarray":
+        """Биты кодов матрицей uint8 N × L (§2.2): распаковывается из таблицы при первом обращении."""
+        if self._code_matrix_cache is None:
+            self._code_matrix_cache = self._table.bits()
+        return self._code_matrix_cache
+
+    @property
+    def point_count(self) -> int:
+        """Число точек раскладки N (§5.1.1)."""
+        return self._point_count
+
+    @property
+    def code_table(self) -> LayoutCodeTable:
+        """Коды точек раскладки таблицей массивов (в порядке точек)."""
+        return self._table
+
     @property
     def grid(self) -> list[list[int | None]]:
+        self._sync_lists()
         self._arrays_stale = True
         return self._grid_cells
 
     @grid.setter
     def grid(self, value: list[list[int | None]]) -> None:
+        self._sync_lists()
         self._arrays_stale = True
         self._grid_cells = value
 
     @property
     def _positions(self) -> list[tuple[int, int]]:
+        self._sync_lists()
         self._arrays_stale = True
         return self._positions_list
 
     @_positions.setter
     def _positions(self, value: list[tuple[int, int]]) -> None:
+        self._sync_lists()
         self._arrays_stale = True
         self._positions_list = value
 
     @property
     def _pos_y(self) -> list[int]:
+        self._sync_lists()
         self._arrays_stale = True
         return self._pos_y_list
 
     @_pos_y.setter
     def _pos_y(self, value: list[int]) -> None:
+        self._sync_lists()
         self._arrays_stale = True
         self._pos_y_list = value
 
     @property
     def _pos_x(self) -> list[int]:
+        self._sync_lists()
         self._arrays_stale = True
         return self._pos_x_list
 
     @_pos_x.setter
     def _pos_x(self, value: list[int]) -> None:
+        self._sync_lists()
         self._arrays_stale = True
         self._pos_x_list = value
 
     @property
     def _row_occupied(self) -> list[set[int]]:
+        self._sync_lists()
         self._arrays_stale = True
         return self._row_occupied_sets
 
     @_row_occupied.setter
     def _row_occupied(self, value: list[set[int]]) -> None:
+        self._sync_lists()
         self._arrays_stale = True
         self._row_occupied_sets = value
+
+    def _sync_lists(self) -> None:
+        """Списки расстановки догоняют массивы после обменов, применённых по массивам (_apply_swaps_arrays).
+
+        Списки пересобираются на месте: объекты grid, _positions, … остаются теми же.
+        """
+        self._pull_device()
+        if not self._lists_stale:
+            return
+        self._lists_stale = False
+        grid_np = self._grid_np
+        for cells, row in zip(self._grid_cells, grid_np.tolist()):
+            cells[:] = [None if point < 0 else point for point in row]
+        pos_y = self._pos_np[:, 0].tolist()
+        pos_x = self._pos_np[:, 1].tolist()
+        self._positions_list[:] = list(zip(pos_y, pos_x))
+        self._pos_y_list[:] = pos_y
+        self._pos_x_list[:] = pos_x
+        occupied_y, occupied_x = np.nonzero(grid_np >= 0)
+        starts = np.searchsorted(occupied_y, np.arange(self.height + 1))
+        columns = occupied_x.tolist()
+        for row, occupied in enumerate(self._row_occupied_sets):
+            occupied.clear()
+            occupied.update(columns[starts[row] : starts[row + 1]])
+
+    def _positions_array(self) -> "np.ndarray":
+        """Ячейки (y, x) всех точек массивом N×2 — без пересборки списков и без сброса массивов."""
+        self._pull_device()
+        if self._lists_stale or (not self._arrays_stale and self._pos_np is not None):
+            return self._pos_np
+        return np.asarray(self._positions_list, dtype=np.int64).reshape(-1, 2)
 
     def _long_average_swap_radius(self) -> float | None:
         if self._long_swap_count == 0:
@@ -2419,9 +2635,10 @@ class Layout:
         visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT or not log_visuals
         visuals: list = []
         if log_visuals and not visuals_skipped:
-            # Центры ячеек и цвета точек — массивами: те же числа, что давал обход точек по одной.
-            positions = self._cell_centres()
-            colors = self._colors_rgb_array()
+            # Позиции и цвета массивами: те же значения, что у списков, без обхода точек в Python.
+            cells = self._positions_array()
+            positions = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1)
+            colors = self._colors_array()
             image = self._build_image(colors)
             visuals = [
                 LOGGER.visual_image(
@@ -2534,6 +2751,47 @@ class Layout:
                 "turn sim_lambda into a constant 0.5*sim and disable the threshold (§5.4)"
             )
 
+    def cells_array(self) -> "np.ndarray":
+        """Ячейки (y, x) всех точек массивом N × 2 (копия)."""
+        return np.array(self._positions_array(), dtype=np.int64)
+
+    def place_cells(self, cells: "np.ndarray", *, log: bool = True) -> None:
+        """Расставить точки по ячейкам массива N × 2 (y, x): одна точка в ячейке дискретной матрицы (§5.1.2).
+
+        То же, что restore_positions, но массивами — без списков на каждую точку.
+        """
+        cells = np.asarray(cells, dtype=np.int64)
+        if cells.shape != (self._point_count, 2):
+            raise ValueError("cells must contain one (y, x) cell per point")
+        pos_y = cells[:, 0]
+        pos_x = cells[:, 1]
+        if bool(((pos_y < 0) | (pos_y >= self.height) | (pos_x < 0) | (pos_x >= self.width)).any()):
+            raise ValueError(f"cells are outside the {self.height}x{self.width} grid")
+        grid = np.full((self.height, self.width), -1, dtype=np.int64)
+        grid[pos_y, pos_x] = np.arange(self._point_count, dtype=np.int64)
+        if int((grid >= 0).sum()) != self._point_count:
+            raise ValueError("a cell holds two points; the layout matrix is discrete (§5.1.2)")
+        self._pos_np = np.stack([pos_y, pos_x], axis=1)
+        self._grid_np = grid
+        self._arrays_stale = False
+        self._lists_stale = True
+        self._gpu_positions_dirty = True
+        self._positions_version += 1
+        if log:
+            LOGGER.event(
+                "layout.place_cells",
+                section=LAYOUT_DISCRETE,
+                data={"points": self._point_count, "width": self.width, "height": self.height},
+            )
+
+    def release_device(self) -> None:
+        """Освободить память устройства, занятую расчётом энергий этой раскладки (таблицы сходства, коды)."""
+        engine = self._torch_engine
+        self._torch_engine = None
+        self._sparse_long = None
+        if engine is not None:
+            engine.release()
+
     def restore_positions(self, positions: Sequence[tuple[int, int]]) -> None:
         """Восстановить уже разложенное пространство: одна точка в ячейке дискретной матрицы (§5.1.2)."""
         if len(positions) != self._point_count:
@@ -2586,6 +2844,10 @@ class Layout:
         short_config: ShortLayoutOptimConfig | None = None,
     ) -> int:
         swaps_with_delta: list[tuple[tuple[int, int, int, int], float]] = []
+        if mode == "long" and self._device_step_enabled and pair_radius is not None:
+            device_swaps = self._device_long_step(pairs_per_step, int(pair_radius), step_index)
+            if device_swaps is not None:
+                return device_swaps
         self._sync_arrays()
         if mode == "short":
             similarity_cutoff = (
@@ -2609,6 +2871,8 @@ class Layout:
             )
         else:
             pairs_np = self._sample_pairs_long_np(pairs_per_step, pair_radius)
+        if self._enforce_pair_radius and pair_radius is not None and pairs_np.shape[0]:
+            pairs_np = self._pairs_within_radius(pairs_np, pair_radius, mode=mode, step_index=step_index)
 
         # Дальняя фаза с гауссовым ядром считается машинерией окрестности §5.5.2
         # (радиус r(t) = радиус пар, ядро gauss, обмен при φ_s > φ_c); выбор пар остаётся дальним (§5.3).
@@ -2627,7 +2891,7 @@ class Layout:
                 step_index=step_index,
             )
             if torch_swaps is not None:
-                return self._apply_tracked_swaps(torch_swaps, mode=mode)
+                return self._apply_swaps_arrays(torch_swaps, mode=mode)
         pairs = [(int(row[0]), int(row[1]), int(row[2]), int(row[3])) for row in pairs_np]
 
         # Для дальней фазы с гауссовым ядром OpenGL-движок (все пары одним вызовом) быстрее
@@ -2751,6 +3015,7 @@ class Layout:
         Обмены меняют списки и массивы вместе (_apply_swaps), поэтому пересборка O(N) нужна только после
         обращения к спискам в обход обменов: расстановка точек, восстановление раскладки, правка снаружи.
         """
+        self._pull_device()
         if not self._arrays_stale and self._pos_np is not None and self._grid_np is not None:
             return
         pos_y = np.asarray(self._pos_y_list, dtype=np.int64)
@@ -2767,39 +3032,95 @@ class Layout:
             return
         if self._torch_positions_version == self._positions_version:
             return
-        dirty = self._torch_dirty_cells
-        moves = self._torch_moves
-        incremental = (
+        # Все изменения расстановки с последней загрузки описаны обменами — загружаются только они.
+        tracked = (
             self._torch_positions_version >= 0
-            and self._torch_positions_version + 1 == self._positions_version
-            and 0 < len(dirty) <= max(2, self._point_count // 2)
+            and self._torch_positions_version + self._torch_tracked_changes == self._positions_version
         )
+        pending = self._torch_pending_moves
+        limit = max(1, self._point_count // 4)
         bounds = self._bounds
-        moved = len(moves) // 3
-        if incremental:
-            # Изменились только ячейки обменов шага: на устройство уходят они и их нынешние жильцы.
-            self._sync_arrays()
-            # Обмены одного шага не делят ячеек (§5.10: ячейка участвует не больше чем в одном обмене шага),
-            # поэтому изменившиеся ячейки в списке не повторяются.
-            cells = np.asarray(dirty, dtype=np.int64)
-            occupants = self._grid_np.reshape(-1)[cells]
-            if bounds is not None and self._bounds_on and bounds.valid and moved <= self._bounds_move_limit:
-                # Суммы границы потенциала обновляются вместе с позициями: проход по строкам сдвинутых точек.
-                bounds.apply_moves(cells, occupants, np.asarray(moves, dtype=np.int64).reshape(-1, 3))
-            else:
-                if bounds is not None:
-                    # Обменов слишком много (их учёт дороже расчёта строк) либо суммы не ведутся.
-                    self._bounds_on = False
-                    bounds.invalidate()
-                self._torch_engine.update_cells(cells, occupants)
+        moved_points = sum(len(moves[0]) for moves in pending)
+        if tracked and pending and not self._torch_dirty_points and moved_points <= limit:
+            # Обмены, применённые по массивам: наборы уходят на устройство в порядке шагов. Изменились только
+            # ячейки обменов: на устройство уходят они и их нынешние жильцы (обмены шага не делят ячеек, §5.10).
+            width = self.width
+            keep_bounds = (
+                bounds is not None
+                and self._bounds_on
+                and bounds.valid
+                and len(pending) == 1
+                and moved_points <= self._bounds_move_limit
+            )
+            if bounds is not None and not keep_bounds:
+                # Обменов слишком много (их учёт дороже расчёта строк) либо суммы не ведутся.
+                self._bounds_on = False
+                bounds.invalidate()
+            for moved, moved_y, moved_x, y1, x1, y2, x2, idx_a, idx_b in pending:
+                cell_1 = y1 * width + x1
+                cell_2 = y2 * width + x2
+                cells = np.concatenate([cell_1, cell_2])
+                occupants = np.concatenate([idx_b, idx_a])
+                if keep_bounds:
+                    # Суммы границы потенциала обновляются вместе с позициями: проход по строкам сдвинутых
+                    # точек — тройки (точка, старая ячейка, новая ячейка).
+                    has_a = idx_a >= 0
+                    has_b = idx_b >= 0
+                    triples = np.concatenate(
+                        [
+                            np.stack([idx_a[has_a], cell_1[has_a], cell_2[has_a]], axis=1),
+                            np.stack([idx_b[has_b], cell_2[has_b], cell_1[has_b]], axis=1),
+                        ]
+                    )
+                    bounds.apply_moves(cells, occupants, triples)
+                else:
+                    self._torch_engine.update_cells(cells, occupants)
+        elif tracked and not pending and 0 < len(self._torch_dirty_points) <= limit:
+            if bounds is not None:
+                bounds.invalidate()
+            self._sync_lists()
+            pos_y = self._pos_y_list
+            pos_x = self._pos_x_list
+            indices = sorted(self._torch_dirty_points)
+            self._torch_engine.update_points(
+                indices,
+                [pos_y[idx] for idx in indices],
+                [pos_x[idx] for idx in indices],
+                [(y, x, occupant) for (y, x), occupant in self._torch_dirty_cells.items()],
+            )
         else:
             if bounds is not None:
                 bounds.invalidate()
-            self._torch_engine.update_positions(self._pos_y_list, self._pos_x_list)
-        self._last_moved_points = moved
-        dirty.clear()
-        moves.clear()
+            cells = self._positions_array()
+            self._torch_engine.update_positions(cells[:, 0], cells[:, 1])
+        self._last_moved_points = moved_points
+        pending.clear()
+        self._torch_tracked_changes = 0
+        self._torch_dirty_points.clear()
+        self._torch_dirty_cells.clear()
         self._torch_positions_version = self._positions_version
+
+    def _host_layout_state(self, *, device_needed: bool) -> dict[str, "np.ndarray"]:
+        """Расстановка для расчёта энергий движком torch: массивы хоста для слитого ядра (или пусто).
+
+        Слитое ядро берёт нужную часть расстановки с хоста вместе с парами шага. Если расстановка на устройстве
+        шагу не нужна (device_needed = False: энергии считает только слитое ядро), обмены прошлых шагов на
+        устройство не загружаются: она остаётся устаревшей, и следующее обращение к ней
+        (_ensure_torch_positions) загрузит её целиком. Иначе она обновляется как обычно.
+        """
+        engine = self._torch_engine
+        if engine is None or not engine.fused_active:
+            self._ensure_torch_positions()
+            return {}
+        self._sync_arrays()
+        if device_needed:
+            self._ensure_torch_positions()
+        else:
+            self._torch_pending_moves.clear()
+            self._torch_dirty_points.clear()
+            self._torch_dirty_cells.clear()
+            self._torch_tracked_changes = 0
+        return {"positions": self._pos_np, "grid": self._grid_np}
 
     def _sample_nearby_np(
         self,
@@ -2858,6 +3179,10 @@ class Layout:
             first_y = y1
             first_x = x1
             attempts = 0
+            # Общие границы: 0 ≤ c − lo ≤ hi − lo проверяется одним сравнением без знака.
+            span_y = np.uint64(hi_y - lo_y) if hi_y >= lo_y else None
+            span_x = np.uint64(hi_x - lo_x) if hi_x >= lo_x else None
+            unsigned_bounds = uniform and span_y is not None and span_x is not None
             while attempts < 50 and idx.size > self._SAMPLE_SCALAR_LIMIT:
                 remaining = int(idx.size)
                 if merged:
@@ -2870,16 +3195,25 @@ class Layout:
                 attempts += 1
                 cy = first_y + dy
                 cx = first_x + dx
-                ok = (dy * dy + dx * dx <= radius_sq) & ((dy != 0) | (dx != 0))
-                if uniform:
+                # Смещение в круге радиуса r и не нулевое: 0 < dy² + dx² ≤ r².
+                distance_sq = dy * dy
+                distance_sq += dx * dx
+                ok = distance_sq <= radius_sq
+                ok &= distance_sq != 0
+                if unsigned_bounds:
+                    ok &= (cy - lo_y if lo_y else cy).view(np.uint64) <= span_y
+                    ok &= (cx - lo_x if lo_x else cx).view(np.uint64) <= span_x
+                elif uniform:
                     ok &= (cy >= lo_y) & (cy <= hi_y) & (cx >= lo_x) & (cx <= hi_x)
                 else:
                     y_lo, y_hi, x_lo, x_hi = limits_of(idx)
                     ok &= (cy >= y_lo) & (cy <= y_hi) & (cx >= x_lo) & (cx <= x_hi)
-                hit = idx[ok]
-                y2[hit] = cy[ok]
-                x2[hit] = cx[ok]
-                rest = ~ok
+                chosen = np.flatnonzero(ok)
+                hit = idx[chosen]
+                y2[hit] = cy[chosen]
+                x2[hit] = cx[chosen]
+                np.logical_not(ok, out=ok)
+                rest = np.flatnonzero(ok)
                 idx = idx[rest]
                 first_y = first_y[rest]
                 first_x = first_x[rest]
@@ -2985,10 +3319,6 @@ class Layout:
 
     def _pair_similarity_np(self, idx_a: "np.ndarray", idx_b: "np.ndarray") -> "np.ndarray":
         """sim(a, b) для массива пар индексов без порога (§2.2.4) — для ранней отсечки пар (§5.9.1)."""
-        if self._code_matrix is None or self._ones_array is None:
-            return np.asarray(
-                [self._similarity_value(int(a), int(b)) for a, b in zip(idx_a, idx_b)], dtype=np.float64
-            )
         if self._packed_codes is not None:
             # Число общих бит — popcount(a & b) по 64-битным словам: то же целое, что сумма произведений бит.
             common = np.bitwise_count(self._packed_codes[idx_a] & self._packed_codes[idx_b]).sum(axis=1, dtype=np.int64)
@@ -3248,11 +3578,14 @@ class Layout:
         kernel: str,
         local_radius: int | None,
         step_index: int | None,
-    ) -> list[tuple[tuple[int, int, int, int], float]] | None:
-        """Энергии всех пар шага на torch (§5.10, §5.12): по всему V или по подмножеству B (§5.9.4)."""
+    ) -> "np.ndarray | None":
+        """Энергии всех пар шага на torch (§5.10, §5.12): по всему V или по подмножеству B (§5.9.4).
+
+        Возвращает принятые обмены массивом m × 4 (y1, x1, y2, x2) в порядке пар шага (§5.6); None — движка нет.
+        """
         engine = self._torch_engine
         if engine is None or pairs_np.shape[0] == 0:
-            return [] if engine is not None else None
+            return np.zeros((0, 4), dtype=np.int64) if engine is not None else None
         sampler = self._compiled_sampler
         occupied: "np.ndarray | None" = None
         if sampler is not None:
@@ -3289,6 +3622,17 @@ class Layout:
             pos_a = np.stack([y1, x1], axis=1)
             pos_b = np.stack([y2, x2], axis=1)
         euclidean = self._distance_mode("short" if eval_short else "long") == "euclidean"
+        host_state: dict[str, "np.ndarray"] = {}
+        sample_offsets: tuple["np.ndarray", "np.ndarray"] | None = None
+        if mode == "long" and eval_short and eval_indices is None and idx_a.size:
+            # Подмножество B уже не годится (в окрестность попадает слишком мало его точек): энергия
+            # окрестности оценивается по выборке её ячеек — у каждой пары свои ячейки (§5.9.4).
+            sample_offsets = self._neighbourhood_sample(pos_a, pos_b, local_radius, step_index)
+        elif mode == "short" and self._neighbourhood_sample_side is not None and idx_a.size:
+            # Ближняя фаза большой раскладки: окрестность целиком, но только по ячейкам круга.
+            reach = TorchPairEnergyEngine.window_reach(pos_a, pos_b, local_radius)
+            if (2 * reach + 1) ** 2 < self._point_count:
+                sample_offsets = self._disc_offsets(reach)
 
         def dense_energies(limit: int | None = None) -> tuple["np.ndarray", "np.ndarray"]:
             """Исходный проход движка; limit — только первые пары шага (сверка на первых порциях)."""
@@ -3307,6 +3651,8 @@ class Layout:
                 lambda_threshold=self._lambda,
                 eta=self._eta,
                 eval_indices=eval_indices,
+                sample_offsets=sample_offsets,
+                **host_state,
             )
 
         def sparse_energies(signs_only: bool, limit: int | None = None) -> tuple["np.ndarray", "np.ndarray"] | None:
@@ -3327,10 +3673,12 @@ class Layout:
             )
 
         try:
-            self._ensure_torch_positions()
             # При жёстком пороге суммы по всему V (§5.5.1) и по окрестности (§5.5.2) сводятся к ненулевым sim_λ:
             # те же φ_c, φ_s считаются по строкам сходства.
             sparse = self._sparse_long_engine() if eval_indices is None and idx_a.size else None
+            # Расстановка на устройстве нужна расчёту по строкам сходства; слитому ядру — массивы хоста
+            # (и по всему V, и по подмножеству B).
+            host_state = self._host_layout_state(device_needed=sparse is not None)
             if sparse is None:
                 energy_c, energy_s = dense_energies()
             else:
@@ -3348,20 +3696,23 @@ class Layout:
                 section=GPU_IMPLEMENTATION,
                 data={"error": str(exc), "pairs": int(idx_a.size), "mode": mode},
             )
+            if self._point_count > _TORCH_FALLBACK_POINT_LIMIT:
+                # Запасные пути (OpenGL с матрицей N×N, процессор) на таком числе точек не работают.
+                raise
             self._torch_engine = None
             return None
         # Окрестность (§5.5.2, и gauss-дальняя): обмен выгоден при φ_s > φ_c; дальняя §5.5.1: при φ_s < φ_c.
         deltas = (energy_s - energy_c) if eval_short else (energy_c - energy_s)
-        event = "layout.energy.pairs.gpu"
-        if LOGGER.should_log(event):
+        if LOGGER.should_log("layout.energy.pairs.gpu"):
             LOGGER.event(
-                event,
+                "layout.energy.pairs.gpu",
                 section=GPU_IMPLEMENTATION,
                 data={
                     "step": 0 if step_index is None else step_index,
                     "mode": mode,
                     "pairs": int(idx_a.size),
                     "eval_points": self._point_count if eval_indices is None else len(eval_indices),
+                    "sampled_cells": 0 if sample_offsets is None else int(sample_offsets[0].size),
                     "kernel": kernel if eval_short else "distance",
                     "local_radius": local_radius if eval_short else None,
                     "favourable": int((deltas > 0.0).sum()),
@@ -3370,14 +3721,211 @@ class Layout:
                 force=True,
             )
         deltas = deltas.astype(np.float64)
-        if self._swap_temperature <= 0.0:
-            # Жадное правило §5.6: в список обменов идут только пары с выгодной энергией — тот же список,
-            # что даёт _select_swaps, но без обхода всех пар шага в Python.
-            favourable = np.flatnonzero(deltas > 0.0)
-            coords = zip(y1[favourable].tolist(), x1[favourable].tolist(), y2[favourable].tolist(), x2[favourable].tolist())
-            return list(zip(coords, deltas[favourable].tolist()))
-        coords = list(zip(y1.tolist(), x1.tolist(), y2.tolist(), x2.tolist()))
-        return self._select_swaps(coords, deltas.tolist())
+        # Жадное правило §5.6 — пары с выгодной энергией; с температурой — отбор Metropolis: те же пары
+        # в том же порядке, что даёт _select_swaps, но без обхода всех пар шага в Python.
+        accepted = np.flatnonzero(self._accepted_swaps(deltas))
+        return np.stack([y1[accepted], x1[accepted], y2[accepted], x2[accepted]], axis=1)
+
+    def _pull_device(self) -> None:
+        """Массивы расстановки хоста догоняют расстановку на устройстве после шагов на нём."""
+        if not self._device_ahead:
+            return
+        self._device_ahead = False
+        cells = self._device_state.download()
+        grid = np.full((self.height, self.width), -1, dtype=np.int64)
+        grid[cells[:, 0], cells[:, 1]] = np.arange(self._point_count, dtype=np.int64)
+        self._pos_np = cells
+        self._grid_np = grid
+        self._arrays_stale = False
+        self._lists_stale = True
+
+    def _device_long_step(self, pairs_per_step: int, pair_radius: int, step_index: int | None) -> int | None:
+        """Шаг дальней фазы с гауссовым ядром целиком на устройстве (§5.3, §5.5, §5.6, §5.10, §5.12).
+
+        None — шаг на устройстве неприменим (нет слитого расчёта с общими битами на лету, нет выборки
+        окрестности, энергии считаются по подмножеству B) или отказал: шаг выполняется на хосте.
+        """
+        engine = self._torch_engine
+        if (
+            engine is None
+            or self._long_kernel != "gauss"
+            or self._neighbourhood_sample_side is None
+            or self._long_subset_size is not None
+        ):
+            return None
+        local_radius = self._long_kernel_radius(pair_radius)
+        energy_arguments = dict(
+            kernel="gauss",
+            euclidean=self._distance_mode("short") == "euclidean",
+            distance_eps=self._distance_eps,
+            kernel_width=self._long_kernel_width,
+            lambda_threshold=self._lambda,
+            eta=self._eta,
+        )
+        try:
+            state = self._device_state
+            if state is None:
+                fused = engine.fused_on_the_fly()
+                if fused is None:
+                    self._device_step_enabled = False
+                    return None
+                state = self._device_state = DeviceLongStep(engine, fused, seed=self._device_seed)
+            if state.version != self._positions_version:
+                state.upload(self._positions_array(), self._positions_version)
+            reference = None
+            if self._device_steps % _DEVICE_STEP_VERIFY_EVERY == 0:
+                def reference(idx_a, idx_b, pos_a, pos_b, window, reach):  # noqa: ANN001, ANN202
+                    cells = state.download()
+                    engine.update_positions(cells[:, 0], cells[:, 1])
+                    return engine._pair_energies_reference(
+                        idx_a, idx_b, pos_a, pos_b, neighbourhood=True, local_radius=local_radius,
+                        sample_offsets=window, window_reach=reach, **energy_arguments,
+                    )
+            applied, length = state.step(
+                pairs=pairs_per_step,
+                radius=pair_radius,
+                local_radius=local_radius,
+                offsets=lambda reach: self._neighbourhood_offsets(reach, step_index),
+                temperature=self._swap_temperature,
+                energy_arguments=energy_arguments,
+                step_index=step_index,
+                reference=reference,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "layout.device_step.failed",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc), "step": 0 if step_index is None else step_index,
+                      "note": "шаг на устройстве отключён: раскладка продолжается шагами на хосте"},
+                force=True,
+            )
+            self._pull_device()
+            self._device_step_enabled = False
+            self._device_state = None
+            return None
+        self._device_steps += 1
+        if applied:
+            self._positions_version += 1
+            state.version = self._positions_version
+            self._device_ahead = True
+            self._long_swap_radius_sum += length
+            self._long_swap_count += applied
+            self._gpu_positions_dirty = True
+            # Расстановка движка (исходный проход, строки сходства) устарела целиком.
+            self._torch_pending_moves.clear()
+            self._torch_dirty_points.clear()
+            self._torch_dirty_cells.clear()
+            self._torch_tracked_changes = 0
+        return applied
+
+    def _pairs_within_radius(
+        self, pairs_np: "np.ndarray", pair_radius: int, *, mode: str, step_index: int | None
+    ) -> "np.ndarray":
+        """Пары шага, вторая ячейка которых лежит в радиусе выбора r от первой (§5.3).
+
+        Вторая ячейка выбирается попытками в круге радиуса r; если попытки исчерпаны (ячейка у границы сетки
+        или плитки), берётся любая ячейка сетки или плитки — возможно, дальше r. Окрестность такой пары
+        (её радиус не меньше ‖p1 − p2‖, §5.5.2) растягивает окно ячеек всех пар шага: одна дальняя пара на
+        сотни тысяч пар делает шаг на порядки дороже. В больших раскладках такие пары в шаг не входят.
+        """
+        dy = pairs_np[:, 0] - pairs_np[:, 2]
+        dx = pairs_np[:, 1] - pairs_np[:, 3]
+        near = dy * dy + dx * dx <= int(pair_radius) * int(pair_radius)
+        if bool(near.all()):
+            return pairs_np
+        if LOGGER.should_log("layout.pairs.beyond_radius"):
+            LOGGER.event(
+                "layout.pairs.beyond_radius",
+                section=PAIR_SELECTION,
+                data={
+                    "step": 0 if step_index is None else step_index,
+                    "mode": mode,
+                    "pair_radius": int(pair_radius),
+                    "pairs": int(pairs_np.shape[0]),
+                    "dropped": int(pairs_np.shape[0] - int(near.sum())),
+                    "note": "пары, вторая ячейка которых дальше радиуса выбора r, в шаг не входят (§5.3)",
+                },
+                force=True,
+            )
+        return pairs_np[near]
+
+    def _neighbourhood_sample(
+        self,
+        pos_a: "np.ndarray",
+        pos_b: "np.ndarray",
+        local_radius: int | None,
+        step_index: int | None,
+    ) -> tuple["np.ndarray", "np.ndarray"] | None:
+        """Выборка ячеек окна окрестности пар шага (§5.9.4): смещения dy, dx от ячейки центра пары.
+
+        Окно (2R+1)² ячеек, покрывающее окрестности всех пар шага (§5.5.2), делится на квадратные слои t × t,
+        t = ⌊(2R+1) / side⌋; сетка слоёв сдвинута на случайное начало, из каждого слоя берётся одна случайная
+        ячейка. Каждая ячейка окна попадает в выборку с одной и той же вероятностью 1/t², поэтому сумма по
+        выборке — несмещённая оценка энергии окрестности с общим для всех пар множителем 1/t² (на знак
+        Δ = φ_s − φ_c и на отбор обменов множитель не влияет). Слои дают меньший разброс оценки, чем
+        независимые случайные ячейки: веса гауссова ядра меняются плавно. Выборка обновляется каждый шаг.
+
+        Если окно мало (t < 2), окрестность считается целиком, но только по ячейкам круга: окрестность пары —
+        круг радиуса не больше R − 1 вокруг её центра, угловые ячейки квадратного окна в сумму не входят
+        никогда (около трети окна). Сумма та же, слагаемых меньше.
+        None — выборка выключена: окрестность считается по всему квадратному окну.
+        """
+        if self._neighbourhood_sample_side is None:
+            return None
+        return self._neighbourhood_offsets(
+            TorchPairEnergyEngine.window_reach(pos_a, pos_b, local_radius), step_index
+        )
+
+    def _neighbourhood_offsets(self, reach: int, step_index: int | None) -> tuple["np.ndarray", "np.ndarray"]:
+        """Смещения ячеек окна окрестности полуширины reach: выборка слоями или все ячейки круга (§5.9.4)."""
+        side_cells = int(self._neighbourhood_sample_side)
+        side = 2 * reach + 1
+        stride = side // side_cells
+        if stride < 2:
+            return self._disc_offsets(reach)
+        strata = -(-(side + stride - 1) // stride)
+        rng = self._sample_rng
+        origin = rng.integers(0, stride, size=2)
+        jitter = rng.integers(0, stride, size=(2, strata, strata))
+        base = stride * np.arange(strata, dtype=np.int64) - reach
+        dy = (base[:, None] - int(origin[0]) + jitter[0]).reshape(-1)
+        dx = (base[None, :] - int(origin[1]) + jitter[1]).reshape(-1)
+        if LOGGER.should_log("layout.energy.neighbourhood_sample"):
+            LOGGER.event(
+                "layout.energy.neighbourhood_sample",
+                section=OPTIM_SUBSET,
+                data={
+                    "step": 0 if step_index is None else step_index,
+                    "window_reach": reach,
+                    "window_cells": side * side,
+                    "stratum_side": stride,
+                    "sampled_cells": int(dy.size),
+                    "note": "энергия окрестности пар оценивается по выборке ячеек окна: одна случайная ячейка "
+                    "из каждого слоя t × t (§5.9.4)",
+                },
+                force=True,
+            )
+        return dy, dx
+
+    def _disc_offsets(self, reach: int) -> tuple["np.ndarray", "np.ndarray"]:
+        """Смещения ячеек окна полуширины reach, которые могут попасть в окрестность пары (§5.5.2).
+
+        Окрестность — круг радиуса не больше reach − 1 вокруг центра пары; центр отстоит от своей ячейки
+        не больше чем на полячейки по каждой оси. Ячейка со смещением (dy, dx) лежит от центра не ближе
+        √((|dy| − ½)₊² + (|dx| − ½)₊²): смещения, где это больше reach − 1, в окрестность не попадают.
+        """
+        cached = self._disc_offsets_cache.get(reach)
+        if cached is None:
+            span = np.arange(-reach, reach + 1, dtype=np.int64)
+            dy, dx = np.meshgrid(span, span, indexing="ij")
+            near_y = np.maximum(np.abs(dy) - 0.5, 0.0)
+            near_x = np.maximum(np.abs(dx) - 0.5, 0.0)
+            inside = near_y * near_y + near_x * near_x <= float(reach - 1) ** 2
+            cached = (dy[inside].copy(), dx[inside].copy())
+            if len(self._disc_offsets_cache) > 64:
+                self._disc_offsets_cache.clear()
+            self._disc_offsets_cache[reach] = cached
+        return cached
 
     def _sparse_long_engine(self, *, build: bool = True) -> SparseLongEnergy | None:
         """Расчёт энергий по ненулевым sim_λ (§5.5.1, §5.5.2, §5.9.5) — применим при жёстком пороге η = ∞ (§5.4).
@@ -3752,7 +4300,11 @@ class Layout:
         return list(self._values)
 
     def hues(self) -> list[float]:
-        return [point.hue for point in self._points]
+        return self._table.hues.tolist()
+
+    def hue_count(self) -> int:
+        """Число различных значений известной компоненты стимула (hue) среди точек."""
+        return self._table.hue_count()
 
     def save_json(self, path: str) -> None:
         if not path:
@@ -3762,8 +4314,7 @@ class Layout:
         base_payload: dict[str, Any] | None = None
         if os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8") as fp:
-                    base_payload = json.load(fp)
+                base_payload = LayoutJsonWriter.read_header(path)
             except Exception as exc:
                 LOGGER.event(
                     "layout.export.json.error",
@@ -3771,22 +4322,10 @@ class Layout:
                     data={"path": path, "error": str(exc), "stage": "read"},
                 )
                 base_payload = None
-        points_payload: list[dict[str, Any]] = []
-        for idx, (y, x) in enumerate(self._positions):
-            point = self._points[idx]
-            # Код, подпись и позиция берутся у одной и той же точки раскладки: порядок точек Layout
-            # (сгруппированный по hue) может не совпадать с порядком записей базового файла.
-            points_payload.append(
-                {
-                    "index": idx,
-                    "y": y,
-                    "x": x,
-                    "label": point.label,
-                    "value": self._values[idx],
-                    "hue": point.hue,
-                    "ones": point.ones,
-                }
-            )
+        # Код, подпись и позиция берутся у одной и той же точки раскладки: порядок точек Layout
+        # (сгруппированный по hue) может не совпадать с порядком записей базового файла. Точки пишутся
+        # потоком из таблицы кодов и массива ячеек — тот же текст, что давал json.dump словаря точек.
+        cells = self._positions_array()
         payload = dict(base_payload) if isinstance(base_payload, dict) else {}
         payload.update(
             {
@@ -3797,15 +4336,14 @@ class Layout:
                 "lambda_threshold": self._lambda,
                 "eta": self._eta,
                 "pair_radius": self._pair_radius,
-                "layout": points_payload,
+                LayoutJsonWriter.POINTS_KEY: None,
             }
         )
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
         try:
-            with open(path, "w", encoding="utf-8") as fp:
-                json.dump(payload, fp, ensure_ascii=True, indent=2)
+            LayoutJsonWriter.write(path, payload, self._table, y=cells[:, 0], x=cells[:, 1])
         except Exception as exc:
             LOGGER.event(
                 "layout.export.json.error",
@@ -3832,31 +4370,45 @@ class Layout:
         """Псевдоцвет каждой точки как сумма цветов её единичных битов (§5.14)."""
         if self._colors_rgb_cache is None:
             self._colors_rgb_cache = tuple(
-                self._colorizer.color(point.code) for point in self._points
+                (int(r), int(g), int(b)) for r, g, b in self._colors_array().tolist()
             )
         return list(self._colors_rgb_cache)
 
-    def _colors_rgb_array(self) -> "np.ndarray":
-        """Псевдоцвета точек (§5.14) массивом N × 3 uint8 — те же значения, что у colors_rgb()."""
-        if self._colors_rgb_array_cache is None:
-            self._colors_rgb_array_cache = np.asarray(self.colors_rgb(), dtype=np.uint8).reshape(-1, 3)
-        return self._colors_rgb_array_cache
+    def _colors_array(self) -> "np.ndarray":
+        """Псевдоцвета кодов всех точек массивом uint8 N × 3 (§5.14): от расстановки не зависят."""
+        if self._colors_rgb_array is None:
+            colors = np.zeros((self._point_count, 3), dtype=np.uint8)
+            for start, bits in self._table.bit_chunks():
+                colors[start : start + bits.shape[0]] = self._colorizer.colors(bits)
+            self._colors_rgb_array = colors
+        return self._colors_rgb_array
 
     def _component_colors_array(self, period: float | None) -> "np.ndarray":
-        """Цвета точек по известной компоненте стимула (рис. 16) массивом N × 3 uint8; от расстановки не зависят."""
-        cached = self._component_colors_cache.get(period)
+        """Цвета известной компоненты стимула массивом uint8 N × 3 (рис. 13–16): по цвету на значение hue."""
+        cached = self._component_colors_arrays.get(period)
         if cached is None:
-            cached = np.asarray(self.component_colors_rgb(period=period), dtype=np.uint8).reshape(-1, 3)
-            self._component_colors_cache[period] = cached
-        return cached
+            import colorsys
 
-    def _cell_centres(self) -> "np.ndarray":
-        """Центры ячеек точек (x + 0.5, y + 0.5) массивом N × 2 — координаты точек на картинке раскладки."""
-        self._sync_arrays()
-        centres = np.empty((self._point_count, 2), dtype=np.float64)
-        centres[:, 0] = self._pos_np[:, 1] + 0.5
-        centres[:, 1] = self._pos_np[:, 0] + 0.5
-        return centres
+            hues = self._table.hues
+            values, inverse = np.unique(hues, return_inverse=True)
+            if period is None:
+                # Те же действия, что в component_colors_rgb: (hue − min) / span · (1 − 1e-9).
+                span = float(values.max() - values.min()) if values.size else 0.0
+                normalized = [
+                    0.0 if span <= 0.0 else (float(value) - float(values.min())) / span * (1.0 - 1e-9)
+                    for value in values.tolist()
+                ]
+            else:
+                if period <= 0.0:
+                    raise ValueError("period must be positive")
+                normalized = [(float(value) % period) / period for value in values.tolist()]
+            palette = np.zeros((len(normalized), 3), dtype=np.uint8)
+            for slot, value in enumerate(normalized):
+                r, g, b = colorsys.hsv_to_rgb(value, 1.0, 1.0)
+                palette[slot] = (int(r * 255), int(g * 255), int(b * 255))
+            cached = palette[inverse.reshape(-1)] if hues.size else np.zeros((0, 3), dtype=np.uint8)
+            self._component_colors_arrays[period] = cached
+        return cached
 
     def component_colors_rgb(self, *, period: float | None = None) -> list[tuple[int, int, int]]:
         """Диагностическая раскраска по известной компоненте стимула (рис. 13–16).
@@ -3865,35 +4417,22 @@ class Layout:
         точки — это исходная величина (например, угол), а не код. В самом
         алгоритме раскладки она не участвует.
         """
-        import colorsys
-
-        hues = [point.hue for point in self._points]
-        if not hues:
+        cached = self._component_colors_cache.get(period)
+        if cached is not None:
+            # Цвет точки зависит только от её hue и периода: считается один раз.
+            return list(cached)
+        if self._point_count == 0:
             return []
-        if period is None:
-            min_hue = min(hues)
-            max_hue = max(hues)
-            span = max_hue - min_hue
-            normalized = [
-                0.0 if span <= 0.0 else (hue - min_hue) / span * (1.0 - 1e-9)
-                for hue in hues
-            ]
-        else:
-            if period <= 0.0:
-                raise ValueError("period must be positive")
-            normalized = [(hue % period) / period for hue in hues]
-        colors: list[tuple[int, int, int]] = []
-        for value in normalized:
-            r, g, b = colorsys.hsv_to_rgb(value, 1.0, 1.0)
-            colors.append((int(r * 255), int(g * 255), int(b * 255)))
+        colors = [(int(r), int(g), int(b)) for r, g, b in self._component_colors_array(period).tolist()]
+        self._component_colors_cache[period] = list(colors)
         return colors
 
     def render_image(self, *, log: bool = True) -> "numpy.ndarray":
         """Карта раскладки в псевдоцветах кодов (§5.14)."""
-        colors = self._colors_rgb_array()
+        colors = self._colors_array()
         image = self._build_image(colors)
         if log:
-            positions = self._cell_centres()
+            positions = self._point_centres()
             LOGGER.event(
                 "layout.render_image",
                 section=LAID_OUT_STRUCTURE,
@@ -3921,12 +4460,12 @@ class Layout:
         """Композиция V и Ê: цвет точки по коду, яркость по энергии (рис. 18, §5.14)."""
         if len(energies) != self._point_count:
             raise ValueError("energies must match the number of layout points")
-        # Яркость точки — её энергия Ê в [0, 1]; округление до ближайшего целого с половиной к чётному, как round().
+        # Канал · яркость с округлением до ближайшего чётного — как int(round(channel * brightness)).
         brightness = np.clip(np.asarray(energies, dtype=np.float64), 0.0, 1.0)
-        shaded = np.rint(self._colors_rgb_array().astype(np.float64) * brightness[:, None]).astype(np.uint8)
+        shaded = np.rint(self._colors_array().astype(np.float64) * brightness[:, None]).astype(np.uint8)
         image = self._build_image(shaded)
         if log:
-            positions = self._cell_centres()
+            positions = self._point_centres()
             LOGGER.event(
                 "layout.render_energy_image",
                 section=LAID_OUT_STRUCTURE,
@@ -3960,7 +4499,7 @@ class Layout:
         colors = self._component_colors_array(period)
         image = self._build_image(colors)
         if log:
-            positions = self._cell_centres()
+            positions = self._point_centres()
             LOGGER.event(
                 "layout.render_component_image",
                 section=MAPPING_CONTINUITY,
@@ -3987,6 +4526,11 @@ class Layout:
             )
         return image
 
+    def _point_centres(self) -> "np.ndarray":
+        """Центры ячеек точек (x + 0.5, y + 0.5) массивом N × 2 — координаты точек на картах раскладки."""
+        cells = self._positions_array()
+        return np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1)
+
     def _build_image(
         self,
         colors: Sequence[tuple[int, int, int]] | None = None,
@@ -4001,17 +4545,16 @@ class Layout:
             )
             return []
 
-        colour_array = self._colors_rgb_array() if colors is None else np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
         image = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-        # Одна точка в ячейке (§5.1.2): цвет точки записывается в её ячейку — то же, что обход точек по одной.
-        self._sync_arrays()
-        rows = self._pos_np[:, 0]
-        columns = self._pos_np[:, 1]
-        inside = (rows >= 0) & (rows < self.height) & (columns >= 0) & (columns < self.width)
+        if self._point_count == 0:
+            return image
+        cells = self._positions_array()
+        point_colors = self._colors_array() if colors is None else np.asarray(colors, dtype=np.uint8).reshape(-1, 3)
+        inside = (cells[:, 0] >= 0) & (cells[:, 0] < self.height) & (cells[:, 1] >= 0) & (cells[:, 1] < self.width)
         if bool(inside.all()):
-            image[rows, columns] = colour_array
+            image[cells[:, 0], cells[:, 1]] = point_colors
         else:
-            image[rows[inside], columns[inside]] = colour_array[inside]
+            image[cells[inside, 0], cells[inside, 1]] = point_colors[inside]
         return image
 
     def average_local_energy(self, radius: int) -> float:
@@ -4043,14 +4586,23 @@ class Layout:
         return avg_energy
 
     def _place_points(self) -> None:
-        cells = [(y, x) for y in range(self.height) for x in range(self.width)]
+        """Начальная расстановка: точки в случайных ячейках сетки, по одной в ячейке (§5.1.2).
+
+        Перемешиваются номера ячеек y·width + x — та же перестановка и тот же расход генератора, что при
+        перемешивании списка ячеек (y, x): перестановка зависит только от длины списка. Расстановка пишется
+        в массивы; списки (grid, _positions, …) заполняются из них при первом обращении.
+        """
+        cells = list(range(self.height * self.width))
         self._rng.shuffle(cells)
-        for idx, (y, x) in enumerate(cells[: len(self._points)]):
-            self.grid[y][x] = idx
-            self._positions[idx] = (y, x)
-            self._pos_y[idx] = y
-            self._pos_x[idx] = x
-            self._row_occupied[y].add(x)
+        chosen = np.asarray(cells[: self._point_count], dtype=np.int64)
+        pos_y = chosen // self.width
+        pos_x = chosen % self.width
+        self._pos_np = np.stack([pos_y, pos_x], axis=1)
+        grid = np.full((self.height, self.width), -1, dtype=np.int64)
+        grid[pos_y, pos_x] = np.arange(self._point_count, dtype=np.int64)
+        self._grid_np = grid
+        self._arrays_stale = False
+        self._lists_stale = True
 
     def _sample_pair(self, radius: int | None) -> tuple[int, int, int, int]:
         idx_a = self._rng.randrange(self._point_count)
@@ -4149,17 +4701,20 @@ class Layout:
             return [], "empty"
         if self._torch_engine is not None:
             try:
-                self._ensure_torch_positions()
                 engine = self._torch_engine
+                host_state: dict[str, "np.ndarray"] = {}
 
                 def window_energies() -> tuple["np.ndarray", "np.ndarray"]:
                     energies = engine.point_energies(
-                        radius, lambda_threshold=self._lambda, eta=self._eta, distance_eps=self._distance_eps
+                        radius, lambda_threshold=self._lambda, eta=self._eta, distance_eps=self._distance_eps,
+                        **host_state,
                     )
                     return energies, np.zeros(len(energies), dtype=np.float32)
 
                 # Строки сходства ради одного расчёта энергий точек не строятся: берутся, если уже есть.
                 sparse = self._sparse_long_engine(build=False)
+                # Расстановка на устройстве нужна расчёту по строкам сходства; слитому ядру — массивы хоста.
+                host_state = self._host_layout_state(device_needed=sparse is not None)
                 if sparse is None:
                     torch_energies = window_energies()[0]
                 else:
@@ -4864,26 +5419,38 @@ class Layout:
         """Отбор обменов по Δ (положительная Δ = выгодно): жадно (§5.6) или с температурой."""
         if self._swap_temperature <= 0.0:
             return [(c, float(d)) for c, d in zip(coords, deltas) if d > 0.0]
-        import numpy as np
-
-        arr = np.asarray(deltas, dtype=np.float64)
-        if arr.size == 0:
-            return []
-        rms = float(np.sqrt(np.mean(arr * arr))) or 1.0
-        scale = self._swap_temperature * rms
-        accept = arr > 0.0
-        losing = ~accept & (arr < 0.0)
-        if losing.any():
-            draws = np.array([self._rng.random() for _ in range(int(losing.sum()))])
-            accept[losing] = draws < np.exp(arr[losing] / scale)
-        LOGGER.event(
-            "layout.swap.annealed",
-            section=POINT_EXCHANGE,
-            data={"pairs": int(arr.size), "favourable": int((arr > 0.0).sum()),
-                  "accepted_unfavourable": int((accept & (arr <= 0.0)).sum()),
-                  "temperature": self._swap_temperature, "rms_delta": rms},
-        )
+        accept = self._accepted_swaps(np.asarray(deltas, dtype=np.float64))
         return [(c, float(d)) for c, d, ok in zip(coords, deltas, accept) if ok]
+
+    def _accepted_swaps(self, deltas: "np.ndarray") -> "np.ndarray":
+        """Маска принятых обменов по Δ пар шага (float64, положительная Δ = выгодно).
+
+        Температура 0 — жадное правило §5.6. Иначе выгодные обмены принимаются всегда, невыгодные —
+        с вероятностью exp(Δ / (T · rms|Δ|)) (отжиг, расширение статьи): по одному числу генератора
+        на невыгодную пару в порядке пар шага.
+        """
+        if self._swap_temperature <= 0.0:
+            return deltas > 0.0
+        if deltas.size == 0:
+            return np.zeros(0, dtype=bool)
+        rms = float(np.sqrt(np.mean(deltas * deltas))) or 1.0
+        scale = self._swap_temperature * rms
+        accept = deltas > 0.0
+        losing = ~accept & (deltas < 0.0)
+        losing_count = int(np.count_nonzero(losing))
+        if losing_count:
+            draws = _UniformDraws.take(self._rng, losing_count)
+            accept[losing] = draws < np.exp(deltas[losing] / scale)
+        if LOGGER.should_log("layout.swap.annealed"):
+            LOGGER.event(
+                "layout.swap.annealed",
+                section=POINT_EXCHANGE,
+                data={"pairs": int(deltas.size), "favourable": int((deltas > 0.0).sum()),
+                      "accepted_unfavourable": int((accept & (deltas <= 0.0)).sum()),
+                      "temperature": self._swap_temperature, "rms_delta": rms},
+                force=True,
+            )
+        return accept
 
     def _long_kernel_radius(self, pair_radius: int | None) -> int:
         """Радиус окрестности гауссова ядра дальней фазы: следует за радиусом выбора пар, не ниже минимума."""
@@ -5332,7 +5899,96 @@ class Layout:
         applied = self._apply_swaps(swaps, mode=mode)
         return applied
 
+    @staticmethod
+    def _first_come_swaps(cell_1: "np.ndarray", cell_2: "np.ndarray") -> "np.ndarray":
+        """Номера обменов, которые применяются при обходе по порядку (§5.10): обмен пропускается, если одну
+        из его ячеек уже занял ранее применённый обмен.
+
+        Обмен, обе ячейки которого больше ни у кого не встречаются, применяется всегда; по порядку
+        обходятся только обмены с общими ячейками — их единицы на шаг.
+        """
+        count = int(cell_1.size)
+        cells = np.concatenate([cell_1, cell_2])
+        order = np.argsort(cells, kind="stable")
+        ordered = cells[order]
+        same = ordered[1:] == ordered[:-1]
+        if not same.any():
+            return np.arange(count)
+        repeated = np.zeros(2 * count, dtype=bool)
+        repeated[1:] |= same
+        repeated[:-1] |= same
+        contested = np.zeros(count, dtype=bool)
+        contested[order[repeated] % count] = True
+        keep = ~contested
+        used: set[int] = set()
+        indices = np.flatnonzero(contested)
+        for index, first, second in zip(indices.tolist(), cell_1[indices].tolist(), cell_2[indices].tolist()):
+            if first in used or second in used:
+                continue
+            used.add(first)
+            used.add(second)
+            keep[index] = True
+        return np.flatnonzero(keep)
+
+    def _swap_radius_table(self) -> "np.ndarray":
+        """math.hypot(dy, dx) для всех смещений сетки: таблица [|dy|, |dx|] (строится при первом обмене)."""
+        table = self._swap_radius_cache
+        if table is None:
+            table = np.array(
+                [[math.hypot(dy, dx) for dx in range(self.width)] for dy in range(self.height)], dtype=np.float64
+            )
+            self._swap_radius_cache = table
+        return table
+
+    def _apply_swaps_arrays(self, swaps: "np.ndarray", *, mode: str) -> int:
+        """Обмены шага массивом m × 4 (y1, x1, y2, x2): то же, что _apply_tracked_swaps, без обхода в Python.
+
+        Обмены применяются в порядке пар шага; обмен пропускается, если его ячейку уже занял применённый
+        обмен (§5.10). Применённые обмены не делят ячеек, поэтому расстановка меняется одним присваиванием.
+        Меняются массивы _pos_np, _grid_np; списки расстановки помечаются устаревшими (_sync_lists).
+        """
+        if swaps.shape[0] == 0:
+            return 0
+        self._sync_arrays()
+        grid_np = self._grid_np
+        pos_np = self._pos_np
+        width = self.width
+        kept = self._first_come_swaps(swaps[:, 0] * width + swaps[:, 1], swaps[:, 2] * width + swaps[:, 3])
+        if kept.size != swaps.shape[0]:
+            swaps = swaps[kept]
+        y1, x1, y2, x2 = swaps[:, 0], swaps[:, 1], swaps[:, 2], swaps[:, 3]
+        idx_a = grid_np[y1, x1]
+        idx_b = grid_np[y2, x2]
+        grid_np[y1, x1] = idx_b
+        grid_np[y2, x2] = idx_a
+        has_a = idx_a >= 0
+        has_b = idx_b >= 0
+        moved = np.concatenate([idx_a[has_a], idx_b[has_b]])
+        moved_y = np.concatenate([y2[has_a], y1[has_b]])
+        moved_x = np.concatenate([x2[has_a], x1[has_b]])
+        pos_np[moved, 0] = moved_y
+        pos_np[moved, 1] = moved_x
+        applied = int(swaps.shape[0])
+        self._lists_stale = True
+        if mode == "long":
+            # Радиусы обменов дальней фазы: те же значения math.hypot и то же сложение по порядку, что
+            # в _apply_swaps (накопление слева направо, без попарного суммирования).
+            radii = self._swap_radius_table()[np.abs(y1 - y2), np.abs(x1 - x2)]
+            running = np.empty(applied + 1, dtype=np.float64)
+            running[0] = self._long_swap_radius_sum
+            running[1:] = radii
+            self._long_swap_radius_sum = float(np.cumsum(running)[-1])
+            self._long_swap_count += applied
+        # Обмены шага для расстановки на устройстве: загружаются, только если ею пользуются (_ensure_torch_positions).
+        self._torch_pending_moves.append((moved, moved_y, moved_x, y1, x1, y2, x2, idx_a, idx_b))
+        self._torch_tracked_changes += 1
+        # §5.9.3: веса первой точки пересчитываются периодически (energy_recalc_every), а не после обмена.
+        self._gpu_positions_dirty = True
+        self._positions_version += 1
+        return applied
+
     def _apply_swaps(self, swaps: Iterable[tuple[int, int, int, int]], *, mode: str) -> int:
+        self._sync_lists()
         used: set[tuple[int, int]] = set()
         applied = 0
         grid = self._grid_cells
@@ -5344,9 +6000,6 @@ class Layout:
         grid_np = self._grid_np
         pos_np = self._pos_np
         arrays_live = not self._arrays_stale and grid_np is not None and pos_np is not None
-        dirty_cells = self._torch_dirty_cells
-        moves = self._torch_moves
-        width = self.width
         for y1, x1, y2, x2 in swaps:
             if (y1, x1) in used or (y2, x2) in used:
                 continue
@@ -5379,20 +6032,19 @@ class Layout:
             used.add((y1, x1))
             used.add((y2, x2))
             applied += 1
-            cell_1 = y1 * width + x1
-            cell_2 = y2 * width + x2
-            dirty_cells.append(cell_1)
-            dirty_cells.append(cell_2)
             if idx_a is not None:
-                moves.extend((idx_a, cell_1, cell_2))
+                self._torch_dirty_points.add(idx_a)
             if idx_b is not None:
-                moves.extend((idx_b, cell_2, cell_1))
+                self._torch_dirty_points.add(idx_b)
+            self._torch_dirty_cells[(y1, x1)] = -1 if idx_b is None else idx_b
+            self._torch_dirty_cells[(y2, x2)] = -1 if idx_a is None else idx_a
             if mode == "long":
                 self._register_long_swap_radius(y1, x1, y2, x2)
         if applied:
             # §5.9.3: веса первой точки пересчитываются периодически (energy_recalc_every), а не после обмена.
             self._gpu_positions_dirty = True
             self._positions_version += 1
+            self._torch_tracked_changes += 1
         return applied
 
     def _register_long_swap_radius(self, y1: int, x1: int, y2: int, x2: int) -> None:
@@ -5640,34 +6292,6 @@ class Layout:
             return False
         self._gpu_positions_dirty = False
         return True
-
-    def _build_code_matrix(self) -> tuple["numpy.ndarray | None", "numpy.ndarray | None"]:
-        try:
-            import numpy as np
-        except Exception as exc:
-            LOGGER.event(
-                "layout.sim_matrix.numpy_unavailable",
-                section=OPTIM_SIM_MATRIX,
-                data={"error": str(exc)},
-            )
-            return None, None
-        if self._point_count == 0:
-            return None, None
-        code_len = len(self._points[0].code)
-        matrix = np.zeros((self._point_count, code_len), dtype=np.uint8)
-        ones = np.zeros(self._point_count, dtype=np.float32)
-        for idx, point in enumerate(self._points):
-            matrix[idx] = np.frombuffer(point.code._bits, dtype=np.uint8, count=code_len)
-            ones[idx] = float(point.ones)
-        LOGGER.event(
-            "layout.sim_matrix.ready",
-            section=OPTIM_SIM_MATRIX,
-            data={
-                "points": self._point_count,
-                "code_len": code_len,
-            },
-        )
-        return matrix, ones
 
     def _code_classes(self) -> "np.ndarray":
         """Номер класса одинаковых кодов каждой точки (§2.2.4: сходство — функция кодов); int32, длина N."""
