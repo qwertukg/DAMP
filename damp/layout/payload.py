@@ -289,19 +289,34 @@ class LayoutPayloadBuilder:
         payload[LayoutJsonWriter.POINTS_KEY] = [record.as_payload(y=None, x=None) for record in self.records]
         return payload
 
-    def save_base(self, path: str) -> None:
+    # Оценка размера записи точки в файле раскладки сверх строки кода: ключи, подпись, hue, ячейка.
+    POINT_OVERHEAD_BYTES = 170
+
+    def save_base(self, path: str, *, max_points_bytes: int | None = None) -> None:
+        """Записать файл раскладки до самой раскладки: заголовок (подпись кодера, параметры) и коды точек.
+
+        max_points_bytes — предел размера списка точек: если он больше (такой файл как кеш раскладки всё равно
+        не читается), пишется только заголовок, а точки с ячейками запишет раскладка (Layout.save_json):
+        список на гигабайты не пишется дважды.
+        """
         if not path:
             raise ValueError("path must be provided for layout payload export")
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        LayoutJsonWriter.write(path, self._header(), self.table())
+        table = self.table()
+        estimated = table.count * (table.code_length + self.POINT_OVERHEAD_BYTES)
+        points_written = max_points_bytes is None or estimated <= max_points_bytes
+        if not points_written:
+            table = table.take(np.zeros(0, dtype=np.int64))
+        LayoutJsonWriter.write(path, self._header(), table)
         LOGGER.event(
             "layout.payload.base",
             section=OUTSIDE_ARTICLE,
             data={
                 "path": path,
                 "points": self._count,
+                "points_written": points_written,
                 "similarity": self._similarity,
                 "lambda_threshold": self._lambda_threshold,
                 "eta": self._eta,

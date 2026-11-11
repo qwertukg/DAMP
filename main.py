@@ -1,5 +1,6 @@
 import concurrent.futures
 import glob
+import hashlib
 import math
 import time
 from dataclasses import dataclass
@@ -138,6 +139,15 @@ ENCODING_WORKERS = None
 ENCODING_WORKERS_MAX = 12
 # Цифр в одном задании рабочего процесса.
 ENCODING_CHUNK_DIGITS = 200
+# Коды цифр большого набора сохраняются на диск (вне статьи): повторный запуск с тем же кодером берёт их
+# из файла data/codes-<набор>-<отпечаток>.npz и не кодирует набор заново (60 000 цифр — 2 минуты). Отпечаток —
+# всё, от чего зависят углопозиции и коды: подпись кодера, константы MNIST_* и ENCODER_* этого файла, тексты
+# модулей кодирования и извлечения стимулов; при любом их изменении файл не подходит и набор кодируется
+# заново. Файл пишется и читается для наборов от ENCODING_CODES_CACHE_MIN_DIGITS цифр; ключ --rebuild
+# относится к раскладке и на него не влияет. False — набор кодируется при каждом запуске.
+ENCODING_CODES_CACHE = True
+ENCODING_CODES_CACHE_MIN_DIGITS = 2000
+ENCODING_CODES_CACHE_DIR = "data"
 MNIST_ANGLE_MIN = 0.0
 MNIST_ANGLE_MAX = 360.0
 MNIST_ANGLE_CODE_LENGTH = 256
@@ -440,6 +450,17 @@ LAYOUT_TUNE_LONG_SUBSET_REFRESH_MAX = 80
 #    ячеек), но не меньше LAYOUT_SEED_REFINE_RADIUS_MIN. None — без затравки: со случайной расстановки,
 #    с подмножеством B и выборкой окрестности на всех радиусах (шум оценок на больших радиусах даёт разрывы).
 LAYOUT_SEED_POINTS = 30000
+# Режим статьи: затравка многоуровневая. На точку затравки очередного уровня приходится не больше
+# LAYOUT_SEED_LEVEL_RATIO_MAX точек следующего: 30 тыс. → 400 тыс. → 5.3 млн вместо 30 тыс. → 5.3 млн.
+# Ближняя фаза уровня начинается с радиуса в LAYOUT_SEED_SHORT_RADIUS_FACTOR блоков родителя (блок —
+# √отношения ячеек, не меньше LAYOUT_SEED_REFINE_RADIUS_MIN): стоимость её первых этапов растёт как квадрат
+# радиуса, поэтому два уровня по 13 точек на родителя на порядок дешевле одного уровня в 177 точек,
+# а промежуточный уровень в 13 раз меньше полного. Измерено на 10 000 цифр с теми же отношениями уровней,
+# что у 60 000 (Ē(3) при λ = 0.8 / сходство соседей / угол соседей): один уровень, радиус 27 — 0.857 / 0.928 /
+# 4.23°; два уровня, радиус 2 блока — 0.868 / 0.940 / 3.73°; 3 блока — 0.871 / 0.941 / 3.61°; 4 блока —
+# 0.875 / 0.943 / 3.48°; 6 блоков — 0.875 / 0.942 / 3.45° (дальше качество не растёт, время растёт).
+LAYOUT_SEED_LEVEL_RATIO_MAX = 16
+LAYOUT_SEED_SHORT_RADIUS_FACTOR = 4.0
 # Файл раскладки больше этого размера как кеш не читается (вне статьи): чтение строит по объекту на точку,
 # и на миллионах точек они не помещаются в память — раскладка считается заново. 256 МБ — около 380 тыс. точек.
 LAYOUT_CACHE_MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -456,6 +477,9 @@ LAYOUT_TUNE_LARGE_LONG_SUBSET_REFRESH = 1
 LAYOUT_NEIGHBOURHOOD_SAMPLE_SIDE = 12
 LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX = 31
 LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX = 23
+# Режим статьи, большие раскладки: радиус окрестности пары в ближней фазе — наименьший допустимый статьёй
+# (§5.5.2: r ≥ ‖p1 − p2‖): r = max(⌈‖p1 − p2‖⌉ + 1, это значение); None — постоянный радиус фазы.
+LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN = 5
 LAYOUT_TUNE_SHORT_PAIR_FACTOR = 0.2
 LAYOUT_TUNE_SHORT_PAIRS_MIN = 1800
 LAYOUT_TUNE_SHORT_PAIRS_MAX = 12000
@@ -771,10 +795,14 @@ class TunedLayoutParams:
     neighbourhood_sample_side: int | None = None
     # True — пары, вторая ячейка которых дальше радиуса выбора r (§5.3), в шаг не входят.
     enforce_pair_radius: bool = False
+    # Наименьший радиус окрестности ближней фазы, следующий за радиусом выбора пар (§5.5.2); None — постоянный.
+    neighbourhood_radius_min: int | None = None
     # Число точек затравки большой раскладки (случайное подмножество, раскладываемое целиком); None — без неё.
     seed_points: int | None = None
     # True — шаг дальней фазы большой раскладки выполняется целиком на устройстве.
     device_step: bool = False
+    # True — шаг ближней фазы большой раскладки режима статьи выполняется целиком на устройстве.
+    device_short_step: bool = False
 
 
 @dataclass(frozen=True)
@@ -1094,8 +1122,39 @@ class LayoutParameterTuner:
         )
         short_energy_recalc_every = max(LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR, short_steps // 6)
         neighbourhood_sample_side: int | None = None
-        large_layout = LAYOUT_SMOOTH_PINWHEELS and total_points > LAYOUT_LONG_FULL_SPACE_MAX_POINTS
-        if large_layout:
+        large_layout = total_points > LAYOUT_LONG_FULL_SPACE_MAX_POINTS
+        article_large = large_layout and not LAYOUT_SMOOTH_PINWHEELS
+        if article_large:
+            # Большая раскладка в режиме статьи: глобальный порядок — из раскладки затравки (дальняя фаза §5.5.1
+            # по всему V на миллионах точек неосуществима), ближний порядок — ближней фазой §5.5.2.
+            long_subset_size = None
+            short_pairs = max(short_pairs, int(total_points * LAYOUT_TUNE_LARGE_SHORT_PAIR_FACTOR))
+            if LAYOUT_PAIRS_POINT_FRACTION is not None:
+                short_pairs = min(short_pairs, max(1, int(total_points * LAYOUT_PAIRS_POINT_FRACTION)))
+            short_local_radius = min(short_local_radius, LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
+            short_energy_radius = min(short_energy_radius, LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX)
+            # Ближняя фаза заканчивается по числу обменов (§5.6); бюджет шагов — только верхняя граница
+            # (период пересчёта весов первой точки §5.9.3 остаётся прежним).
+            short_steps = LAYOUT_TUNE_SHORT_STEPS_MAX
+            LOGGER.event(
+                "layout.tune.large.article",
+                section=OPTIM_SUBSET,
+                data={
+                    "points": total_points,
+                    "seed_points": -1 if LAYOUT_SEED_POINTS is None else LAYOUT_SEED_POINTS,
+                    "seed_level_ratio_max": LAYOUT_SEED_LEVEL_RATIO_MAX,
+                    "short_radius_factor": LAYOUT_SEED_SHORT_RADIUS_FACTOR,
+                    "short_pairs_per_step": short_pairs,
+                    "short_steps": short_steps,
+                    "short_local_radius": short_local_radius,
+                    "short_energy_radius": short_energy_radius,
+                    "neighbourhood_radius_min": LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN,
+                    "note": "большая раскладка режима статьи: дальний порядок — из точной раскладки затравки "
+                    "(подмножество, §5.9.4), уровни затравки, на каждом — ближняя фаза §5.5.2 на устройстве; "
+                    "пар за шаг — доля точек (§5.10)",
+                },
+            )
+        elif large_layout:
             # Большая раскладка: пар за шаг — доля точек (§5.10), энергии — по подмножеству B и по выборке
             # ячеек окрестности (§5.9.4), радиусы ближней фазы — не выше значений на границе режима.
             long_pairs = max(long_pairs, int(total_points * LAYOUT_TUNE_LARGE_LONG_PAIR_FACTOR))
@@ -1161,8 +1220,10 @@ class LayoutParameterTuner:
             short_energy_recalc_every=short_energy_recalc_every,
             neighbourhood_sample_side=neighbourhood_sample_side,
             enforce_pair_radius=large_layout,
+            neighbourhood_radius_min=LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN if article_large else None,
             seed_points=LAYOUT_SEED_POINTS if large_layout else None,
-            device_step=bool(LAYOUT_DEVICE_STEP) and large_layout,
+            device_step=bool(LAYOUT_DEVICE_STEP) and large_layout and not article_large,
+            device_short_step=bool(LAYOUT_DEVICE_STEP) and article_large,
         )
 
 
@@ -1735,6 +1796,148 @@ class DigitEncodingWorker:
         return result
 
 
+class EncodedCodesFile:
+    """Коды цифр набора на диске (вне статьи): повторный запуск с тем же кодером не кодирует набор заново.
+
+    Файл хранит первые D цифр набора в его порядке: метки, число углопозиций каждой цифры, углы и упакованные
+    коды — те же байты, что дало кодирование. Имя файла содержит отпечаток всего, от чего зависят углопозиции
+    (§4.4) и коды (§4.6): подпись кодера, значения констант MNIST_* и ENCODER_* main.py, тексты модулей
+    кодирования и извлечения стимулов, часть набора и отбор по метке. Изменилось что-то из этого — имя другое,
+    файл не находится, набор кодируется заново.
+    """
+
+    # Модули, от текста которых зависят углопозиции и коды.
+    SOURCES = (
+        os.path.join("damp", "MnistSobelAngleMap.py"),
+        os.path.join("damp", "encoding", "bitarray.py"),
+        os.path.join("damp", "encoding", "damp_encoder.py"),
+        os.path.join("damp", "layout", "code_table.py"),
+    )
+    CONSTANT_PREFIXES = ("MNIST_", "ENCODER_")
+
+    def __init__(self, directory: str, *, encoder: Encoder, split: str, label: int | None) -> None:
+        self._code_length = int(encoder.code_length)
+        self._fingerprint = self._compute_fingerprint(encoder, split, label)
+        suffix = "" if label is None else f"-label{int(label)}"
+        self._path = os.path.join(directory, f"codes-{split}{suffix}-{self._fingerprint[:16]}.npz")
+
+    @classmethod
+    def _compute_fingerprint(cls, encoder: Encoder, split: str, label: int | None) -> str:
+        digest = hashlib.sha256()
+        digest.update(f"{encoder.signature}|{encoder.code_length}|{split}|{label}".encode("utf-8"))
+        constants = globals()
+        for name in sorted(constants):
+            if name.startswith(cls.CONSTANT_PREFIXES):
+                digest.update(f"{name}={constants[name]!r};".encode("utf-8"))
+        root = os.path.dirname(os.path.abspath(__file__))
+        for source in cls.SOURCES:
+            with open(os.path.join(root, source), "rb") as fp:
+                digest.update(fp.read())
+        return digest.hexdigest()
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def load(self, digits: int) -> "list[DigitCodes] | None":
+        """Первые digits цифр набора из файла; None — файла нет, он от другого кодера или цифр в нём меньше."""
+        if not os.path.exists(self._path):
+            return None
+        started = time.perf_counter()
+        try:
+            with np.load(self._path, allow_pickle=False) as data:
+                if str(data["fingerprint"]) != self._fingerprint or int(data["code_length"]) != self._code_length:
+                    return None
+                counts = data["counts"]
+                if counts.size < digits:
+                    return None
+                counts = counts[:digits].astype(np.int64)
+                total = int(counts.sum())
+                labels = data["labels"][:digits].tolist()
+                angles = data["angles"][:total]
+                packed = data["packed"][:total]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "mnist.encoding.cache.error",
+                section=OUTSIDE_ARTICLE,
+                data={"path": self._path, "error": str(exc), "stage": "read"},
+            )
+            return None
+        stops = np.cumsum(counts).tolist()
+        items: list[DigitCodes] = []
+        start = 0
+        for label, stop in zip(labels, stops):
+            items.append(
+                DigitCodes(
+                    label=int(label),
+                    angles=tuple(angles[start:stop].tolist()),
+                    packed=packed[start:stop],
+                    code_length=self._code_length,
+                )
+            )
+            start = stop
+        LOGGER.event(
+            "mnist.encoding.cache.load",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "path": self._path,
+                "digits": digits,
+                "codes": total,
+                "seconds": time.perf_counter() - started,
+                "note": "углопозиции (§4.4) и коды (§4.6) цифр взяты из файла: кодер, константы MNIST_* и ENCODER_* "
+                "и тексты модулей кодирования — те же, что при записи файла",
+            },
+        )
+        return items
+
+    def save(self, items: "Sequence[DigitCodes]") -> None:
+        """Записать цифры набора (в его порядке), если в файле их меньше."""
+        digits = len(items)
+        try:
+            if os.path.exists(self._path):
+                with np.load(self._path, allow_pickle=False) as data:
+                    if str(data["fingerprint"]) == self._fingerprint and int(data["counts"].size) >= digits:
+                        return
+            started = time.perf_counter()
+            counts = np.asarray([item.count for item in items], dtype=np.int32)
+            total = int(counts.sum())
+            packed = np.zeros((total, -(-self._code_length // 8)), dtype=np.uint8)
+            angles = np.zeros(total, dtype=np.float64)
+            start = 0
+            for item in items:
+                stop = start + item.count
+                if item.count:
+                    packed[start:stop] = item.packed
+                    angles[start:stop] = item.angles
+                start = stop
+            directory = os.path.dirname(self._path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            temporary = self._path + ".tmp.npz"
+            np.savez(
+                temporary,
+                fingerprint=np.asarray(self._fingerprint),
+                code_length=np.asarray(self._code_length),
+                labels=np.asarray([item.label for item in items], dtype=np.int16),
+                counts=counts,
+                angles=angles,
+                packed=packed,
+            )
+            os.replace(temporary, self._path)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "mnist.encoding.cache.error",
+                section=OUTSIDE_ARTICLE,
+                data={"path": self._path, "error": str(exc), "stage": "write"},
+            )
+            return
+        LOGGER.event(
+            "mnist.encoding.cache.save",
+            section=OUTSIDE_ARTICLE,
+            data={"path": self._path, "digits": digits, "codes": total, "seconds": time.perf_counter() - started},
+        )
+
+
 class StimulusCodeCache:
     """Углопозиции и коды цифр считаются один раз: раскладка, калибровка и база эмбеддингов берут их отсюда.
 
@@ -1744,13 +1947,25 @@ class StimulusCodeCache:
     Большой набор (от ENCODING_PARALLEL_MIN_DIGITS недостающих цифр) кодируется рабочими процессами.
     """
 
-    def __init__(self, dataset, encoder: Encoder, extractor: MnistSobelAngleMap, *, label: int | None) -> None:
+    def __init__(
+        self,
+        dataset,
+        encoder: Encoder,
+        extractor: MnistSobelAngleMap,
+        *,
+        label: int | None,
+        store: "EncodedCodesFile | None" = None,
+    ) -> None:
         self._iterator = iter(dataset)
         self._encoder = encoder
         self._extractor = extractor
         self._label = label
         self._items: list[DigitCodes] = []
         self._exhausted = False
+        # Файл кодов набора на диске (большие наборы); _skip — сколько цифр набора взято из файла и ещё
+        # не пропущено в самом наборе (набор читается дальше, только если понадобятся следующие цифры).
+        self._store = store
+        self._skip = 0
 
     @staticmethod
     def encode_digit(
@@ -1778,6 +1993,10 @@ class StimulusCodeCache:
         """Следующая цифра набора с нужной меткой: изображение и метка; None — набор кончился."""
         for img_tensor, digit in self._iterator:
             if self._label is not None and int(digit) != self._label:
+                continue
+            if self._skip:
+                # Эта цифра уже взята из файла кодов.
+                self._skip -= 1
                 continue
             return img_tensor.squeeze(0).numpy(), int(digit)
         self._exhausted = True
@@ -1846,11 +2065,22 @@ class StimulusCodeCache:
 
     def take(self, count: int) -> list[DigitCodes]:
         """Первые count цифр набора (включая цифры без углопозиций)."""
+        store = self._store if count >= ENCODING_CODES_CACHE_MIN_DIGITS else None
+        if store is not None and not self._items and not self._exhausted:
+            cached = store.load(count)
+            if cached is not None:
+                self._items = cached
+                self._skip = len(cached)
         missing = count - len(self._items)
+        encoded = False
         if missing >= ENCODING_PARALLEL_MIN_DIGITS and not self._exhausted:
             self._load_parallel(missing)
+            encoded = True
         while len(self._items) < count and not self._exhausted:
             self._load_next()
+            encoded = True
+        if store is not None and encoded:
+            store.save(self._items[:count])
         return self._items[:count]
 
     def take_nonempty(self, count: int) -> list[DigitCodes]:
@@ -1907,6 +2137,33 @@ def _run_layout(
         )
         if cached_layout is not None:
             return cached_layout
+    return _layout_from_codes(codes, run_params, colorizer, layout_path=layout_path)
+
+
+def _seed_level_points(points: int, seed_points: int) -> int:
+    """Число точек затравки очередного уровня большой раскладки из points точек.
+
+    Режим сглаживания — один уровень: seed_points. Режим статьи — уровней столько, чтобы на точку затравки
+    приходилось не больше LAYOUT_SEED_LEVEL_RATIO_MAX точек следующего уровня; отношение N / seed_points
+    делится между уровнями поровну. Нижний уровень — seed_points точек, он раскладывается целиком.
+    """
+    if LAYOUT_SMOOTH_PINWHEELS or points <= seed_points:
+        return seed_points
+    ratio = points / float(seed_points)
+    levels = max(1, math.ceil(math.log(ratio) / math.log(LAYOUT_SEED_LEVEL_RATIO_MAX) - 1e-9))
+    if levels == 1:
+        return seed_points
+    return max(seed_points, int(math.ceil(points / ratio ** (1.0 / levels))))
+
+
+def _layout_from_codes(
+    codes: "dict[float, list] | LayoutCodeTable",
+    run_params: TunedLayoutParams,
+    colorizer: EncoderCodeColorizer | None,
+    *,
+    layout_path: str | None = None,
+) -> Layout:
+    """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка."""
     seeded = (
         run_params.seed_points is not None
         and isinstance(codes, LayoutCodeTable)
@@ -1917,6 +2174,11 @@ def _run_layout(
     else:
         layout = _new_layout(codes, run_params, colorizer)
         refine_radius = refine_steps = None
+    if refine_steps == 0:
+        # Режим статьи: дальний порядок большой раскладки взят у затравки, дальней фазы нет; ближняя фаза
+        # начинается с радиуса в несколько блоков затравки.
+        _run_short_phase(layout, run_params, step_offset=1, start_radius=refine_radius)
+        return layout
     _run_long_phase(
         layout, run_params, step_offset=1, layout_path=layout_path, start_radius=refine_radius, steps=refine_steps
     )
@@ -1952,8 +2214,10 @@ def _new_layout(
         long_subset_min_neighbours=LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS,
         neighbourhood_sample_side=run_params.neighbourhood_sample_side,
         enforce_pair_radius=run_params.enforce_pair_radius,
+        neighbourhood_radius_min=run_params.neighbourhood_radius_min,
         initial_cells=initial_cells,
         device_step=run_params.device_step,
+        device_short_step=run_params.device_short_step,
         **_sparse_layout_options(),
     )
 
@@ -1971,33 +2235,49 @@ def _seeded_layout(
     по тому же геометрическому расписанию, что полная фаза (те же шаги на октаву радиуса, §7.1.7).
     """
     placement = SeededPlacement(
-        codes, seed_count=int(run_params.seed_points), seed=LAYOUT_RANDOM_SEED, similarity=LAYOUT_SIMILARITY
+        codes,
+        seed_count=_seed_level_points(codes.count, int(run_params.seed_points)),
+        seed=LAYOUT_RANDOM_SEED,
+        similarity=LAYOUT_SIMILARITY,
     )
     seed_params = LayoutParameterTuner(
         empty_ratio=LAYOUT_EMPTY_RATIO, start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR
     ).tune(placement.seed_count)
     started = time.perf_counter()
-    seed_layout = _new_layout(placement.seed_table(), seed_params, colorizer)
-    _run_long_phase(seed_layout, seed_params, step_offset=1, layout_path=None)
-    _run_short_phase(seed_layout, seed_params, step_offset=1 + seed_layout.last_steps)
+    # Затравка раскладывается тем же путём: целиком либо, если она сама велика, от своей затравки (уровни).
+    seed_layout = _layout_from_codes(placement.seed_table(), seed_params, colorizer)
     seed_cells = seed_layout.cells_array()
     seed_shape = (seed_layout.height, seed_layout.width)
+    seed_lambda = seed_layout.lambda_threshold
     seed_seconds = time.perf_counter() - started
     # Таблицы сходства затравки занимают память устройства, нужную большой раскладке.
     seed_layout.release_device()
     del seed_layout
     grid_size = int(math.ceil(math.sqrt(codes.count * (1.0 + LAYOUT_EMPTY_RATIO))))
     started = time.perf_counter()
-    cells = placement.cells(seed_cells, seed_shape, (grid_size, grid_size))
+    cells = placement.cells(
+        seed_cells,
+        seed_shape,
+        (grid_size, grid_size),
+        # Режим статьи: место точки в блоке родителя — по похожим на неё точкам затравки (sim ≥ λ затравки).
+        neighbour_threshold=None if LAYOUT_SMOOTH_PINWHEELS else seed_lambda,
+    )
     layout = _new_layout(codes, run_params, colorizer, initial_cells=cells)
+    if not LAYOUT_SMOOTH_PINWHEELS:
+        # Порог λ большой раскладки продолжает расписание затравки (§7.1.7): её дальний порядок уже установлен.
+        layout.set_similarity_params(lambda_threshold=seed_lambda)
     full_radius = max(LAYOUT_ADAPTIVE_RADIUS_MIN, int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR))
+    # Начальный радиус доводки — в блоках родителя: дальней фазы сглаживания либо ближней фазы режима статьи.
+    radius_factor = LAYOUT_SEED_REFINE_RADIUS_FACTOR if LAYOUT_SMOOTH_PINWHEELS else LAYOUT_SEED_SHORT_RADIUS_FACTOR
     refine_radius = min(
         full_radius,
-        max(LAYOUT_SEED_REFINE_RADIUS_MIN, int(math.ceil(LAYOUT_SEED_REFINE_RADIUS_FACTOR * placement.block_side()))),
+        max(LAYOUT_SEED_REFINE_RADIUS_MIN, int(math.ceil(radius_factor * placement.block_side()))),
     )
     refine_steps = run_params.long_steps
     if full_radius > 1 and refine_radius < full_radius:
         refine_steps = max(1, int(round(run_params.long_steps * math.log(refine_radius) / math.log(full_radius))))
+    if not LAYOUT_SMOOTH_PINWHEELS:
+        refine_steps = 0
     LOGGER.event(
         "layout.seed.refine",
         section=LAYOUT_PARAMETERS,
@@ -2011,8 +2291,14 @@ def _seeded_layout(
             "full_radius": full_radius,
             "refine_steps": refine_steps,
             "full_steps": run_params.long_steps,
-            "note": "порядок крупнее блока затравки взят из её раскладки: дальняя фаза идёт с радиуса "
-            "refine_radius по тому же геометрическому расписанию (§7.1.7)",
+            "lambda_threshold": layout.lambda_threshold,
+            "note": (
+                "порядок крупнее блока затравки взят из её раскладки: дальняя фаза идёт с радиуса "
+                "refine_radius по тому же геометрическому расписанию (§7.1.7)"
+                if LAYOUT_SMOOTH_PINWHEELS
+                else "дальний порядок взят из раскладки затравки, порог λ продолжает её расписание (§7.1.7): "
+                "идёт ближняя фаза (§5.5.2) с радиуса выбора пар refine_radius"
+            ),
         },
     )
     return layout, refine_radius, refine_steps
@@ -2065,8 +2351,10 @@ def _run_long_phase(
     )
 
 
-def _run_short_phase(layout: Layout, run_params: TunedLayoutParams, *, step_offset: int) -> None:
-    """Ближняя фаза раскладки (§5.5.2, §7.1.7)."""
+def _run_short_phase(
+    layout: Layout, run_params: TunedLayoutParams, *, step_offset: int, start_radius: int | None = None
+) -> None:
+    """Ближняя фаза раскладки (§5.5.2, §7.1.7); start_radius — начальный радиус выбора пар доводки от затравки."""
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
         max(
@@ -2078,6 +2366,8 @@ def _run_short_phase(layout: Layout, run_params: TunedLayoutParams, *, step_offs
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         min(short_radius_base, short_radius_max),
     )
+    if start_radius is not None:
+        short_radius_start = max(LAYOUT_ADAPTIVE_RADIUS_MIN, min(short_radius_start, int(start_radius)))
     adaptive_short = AdaptiveLayoutConfig(
         start_radius=short_radius_start,
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
@@ -2258,7 +2548,10 @@ class MnistLayoutRunner:
     def _code_cache(self, dataset) -> StimulusCodeCache:
         """Коды цифр набора — один общий кеш для раскладки и активации."""
         if self._codes is None:
-            self._codes = StimulusCodeCache(dataset, self.encoder, self.extractor, label=self.label)
+            store = None
+            if ENCODING_CODES_CACHE:
+                store = EncodedCodesFile(ENCODING_CODES_CACHE_DIR, encoder=self.encoder, split="train", label=self.label)
+            self._codes = StimulusCodeCache(dataset, self.encoder, self.extractor, label=self.label, store=store)
         return self._codes
 
     def _tune_layout(self, total_codes: int) -> TunedLayoutParams:
@@ -2451,7 +2744,8 @@ class MnistLayoutRunner:
             tuned_params = self._tune_layout(total_codes)
             expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
             layout_path = _layout_json_path(self.count, expected_pair_radius)
-            payload.save_base(layout_path)
+            # Файл больше LAYOUT_CACHE_MAX_FILE_BYTES как кеш не читается: до раскладки пишется только заголовок.
+            payload.save_base(layout_path, max_points_bytes=LAYOUT_CACHE_MAX_FILE_BYTES)
             if not self._reuse_cache:
                 self._checkpoint_store.reset(layout_path, target_samples=self._activation_samples)
             encoding_checkpoint = self._checkpoint_store.load(layout_path)

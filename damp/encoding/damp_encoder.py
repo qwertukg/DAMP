@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import colorsys
 import functools
 import hashlib
 import math
+import os
 import random
 from typing import List, Optional, Sequence, Tuple
 
@@ -909,6 +911,10 @@ class Encoder:
     # ------------------------------------------------------------- pseudo colour
     # Кодов за один проход векторного расчёта цветов (k × L чисел float64 на канал).
     COLOR_CHUNK_ROWS = 4096
+    # С этого числа порций строк цвета считаются потоками (каждая порция — те же действия numpy, что и по одной;
+    # numpy на время расчёта отпускает блокировку интерпретатора): 5.3 млн кодов — 9 с вместо 57 с.
+    COLOR_PARALLEL_MIN_CHUNKS = 8
+    COLOR_WORKERS_MAX = 8
 
     @classmethod
     def colors_from_bits(cls, bits: "np.ndarray", *, min_hue: float, max_hue: float) -> "np.ndarray":
@@ -931,16 +937,31 @@ class Encoder:
         palette = np.array(
             [_bit_pseudo_color(index, denominator, min_hue, max_hue) for index in range(length)], dtype=np.float64
         )
-        for start in range(0, count, cls.COLOR_CHUNK_ROWS):
+
+        compiled = _CompiledColorSums.instance()
+
+        def chunk_colors(start: int) -> None:
+            """Цвета порции строк: суммы каналов по единичным битам в порядке номеров, масштаб, округление."""
             active = bits[start : start + cls.COLOR_CHUNK_ROWS] != 0
             sums = np.empty((active.shape[0], 3), dtype=np.float64)
-            for channel in range(3):
-                sums[:, channel] = np.cumsum(np.where(active, palette[:, channel], 0.0), axis=1)[:, -1]
+            if compiled is None or not compiled.sums(active, palette, sums):
+                for channel in range(3):
+                    sums[:, channel] = np.cumsum(np.where(active, palette[:, channel], 0.0), axis=1)[:, -1]
             lit = active.any(axis=1)
             scale = 255.0 / np.where(lit, sums.max(axis=1), 1.0)
             colors = np.rint(sums * scale[:, None])
             colors[~lit] = 0.0
             result[start : start + active.shape[0]] = colors.astype(np.uint8)
+
+        starts = range(0, count, cls.COLOR_CHUNK_ROWS)
+        workers = min(len(starts), cls.COLOR_WORKERS_MAX, os.cpu_count() or 1)
+        if len(starts) >= cls.COLOR_PARALLEL_MIN_CHUNKS and workers > 1:
+            # Порции независимы и пишут в разные строки результата: порядок их расчёта чисел не меняет.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(chunk_colors, starts))
+        else:
+            for start in starts:
+                chunk_colors(start)
         LOGGER.event(
             "encoder.code.colors",
             section=LAID_OUT_STRUCTURE,
@@ -1090,6 +1111,83 @@ class Encoder:
         if grid_x <= 0 or grid_y <= 0:
             return None
         return grid_x, grid_y
+
+
+try:  # numba — необязательная зависимость: без неё суммы цветов считает numpy.
+    import numba
+except Exception:  # noqa: BLE001
+    numba = None
+
+
+def _channel_sums_py(active, palette, sums):  # noqa: ANN001, ANN201
+    """Суммы цветов единичных битов каждой строки: сложение float64 по порядку номеров битов."""
+    for row in range(active.shape[0]):
+        red = 0.0
+        green = 0.0
+        blue = 0.0
+        for index in range(active.shape[1]):
+            if active[row, index]:
+                red += palette[index, 0]
+                green += palette[index, 1]
+                blue += palette[index, 2]
+        sums[row, 0] = red
+        sums[row, 1] = green
+        sums[row, 2] = blue
+
+
+class _CompiledColorSums:
+    """Суммы цветов единичных битов кода (§5.14) скомпилированным циклом numba — те же числа, что у numpy.
+
+    Сумма канала — сложение цветов единичных битов по порядку номеров. numpy считает её накопленной суммой
+    по строке, где на месте нулевого бита стоит 0.0 (прибавление 0.0 значения не меняет); цикл складывает
+    только единичные биты в том же порядке — те же сложения float64 в том же порядке. Первая порция сверяется
+    с numpy; при расхождении и без numba суммы считает numpy.
+    """
+
+    _INSTANCE: "_CompiledColorSums | None" = None
+    _UNAVAILABLE = False
+
+    def __init__(self, function) -> None:  # noqa: ANN001
+        self._function = function
+        self._verified = False
+        self._enabled = True
+
+    @classmethod
+    def instance(cls) -> "_CompiledColorSums | None":
+        if cls._INSTANCE is None and not cls._UNAVAILABLE:
+            try:
+                if numba is None:
+                    raise ImportError("numba is not installed")
+                # nogil: порции строк считаются потоками Python одновременно.
+                cls._INSTANCE = cls(numba.njit(cache=True, nogil=True)(_channel_sums_py))
+            except Exception:  # noqa: BLE001
+                cls._UNAVAILABLE = True
+        return cls._INSTANCE
+
+    def sums(self, active: "np.ndarray", palette: "np.ndarray", sums: "np.ndarray") -> bool:
+        """Суммы каналов строк active (k × L, bool) в sums (k × 3); False — считать numpy."""
+        if not self._enabled:
+            return False
+        self._function(active, palette, sums)
+        if not self._verified:
+            expected = np.empty_like(sums)
+            for channel in range(3):
+                expected[:, channel] = np.cumsum(np.where(active, palette[:, channel], 0.0), axis=1)[:, -1]
+            matched = bool(np.array_equal(expected, sums))
+            self._verified = True
+            self._enabled = matched
+            LOGGER.event(
+                "encoder.code.colors.compiled",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "codes": int(active.shape[0]),
+                    "identical": matched,
+                    "note": "суммы цветов единичных битов скомпилированным циклом сверены с numpy: те же числа",
+                },
+            )
+            if not matched:
+                sums[:] = expected
+        return True
 
 
 @dataclass(frozen=True)

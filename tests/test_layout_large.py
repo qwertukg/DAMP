@@ -486,7 +486,7 @@ class SeededPlacementTests(unittest.TestCase):
         self.assertTrue(bool(((cells >= 0) & (cells < 37)).all()))
         # Родитель — самая похожая точка затравки: проверка на процессоре даёт тех же родителей.
         parent_seeds, parent = placement.parents(seed_cells, seed_shape)
-        host = placement._match_host(placement.seed_indices[parent_seeds])
+        host = placement._match_host(placement.seed_indices[parent_seeds])[0][:, 0]
         host[placement.seed_indices[parent_seeds]] = np.arange(parent_seeds.size)
         words = table.words64()
         ones = table.ones.astype(np.float64)

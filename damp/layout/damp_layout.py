@@ -46,9 +46,10 @@ from damp.layout.pair_sign_kernel import PairSignKernel
 from damp.layout.potential_bounds import PotentialBounds
 from damp.layout.reduction_replica import ReductionReplica
 from damp.layout.code_table import LayoutCodeTable
-from damp.layout.device_step import DeviceLongStep
+from damp.layout.device_step import DeviceLongStep, DeviceShortStep
 from damp.layout.payload import LayoutEncodedCode, LayoutJsonWriter
 from damp.layout.sparse_long_energy import SimilarityRows, SparseLongEnergy
+from damp.layout.window_energy_kernel import WindowEnergyKernel
 from damp.logging import LOGGER
 
 
@@ -65,6 +66,8 @@ _RADIUS_SCHEDULES = ("swaps", "linear", "geometric")
 _TORCH_FALLBACK_POINT_LIMIT = 200_000
 # Шаг на устройстве сверяет энергии первых пар с исходным проходом движка на первом шаге и раз в столько шагов.
 _DEVICE_STEP_VERIFY_EVERY = 1000
+# Строк таблицы кодов на один блок расчёта псевдоцветов (§5.14): биты блока — 512 байт на код.
+_COLOR_BLOCK_ROWS = 262_144
 
 
 @dataclass(frozen=True)
@@ -1547,13 +1550,17 @@ class Layout:
         fused_similarity_table: bool = True,
         neighbourhood_sample_side: int | None = None,
         enforce_pair_radius: bool = False,
+        neighbourhood_radius_min: int | None = None,
         initial_cells: "np.ndarray | None" = None,
         device_step: bool = False,
+        device_short_step: bool = False,
     ) -> None:
         if codes is None or len(codes) == 0:
             raise ValueError("codes must be non-empty")
         if neighbourhood_sample_side is not None and neighbourhood_sample_side <= 0:
             raise ValueError("neighbourhood_sample_side must be positive when set")
+        if neighbourhood_radius_min is not None and neighbourhood_radius_min <= 0:
+            raise ValueError("neighbourhood_radius_min must be positive when set")
         if fused_table_max_bytes < 0 or not 0.0 < fused_table_memory_fraction <= 1.0:
             raise ValueError("fused_table_max_bytes must be >= 0 and fused_table_memory_fraction in (0, 1]")
         if fused_block_elements <= 0 or fused_verify_every < 0:
@@ -1669,8 +1676,19 @@ class Layout:
         self._device_state: DeviceLongStep | None = None
         self._device_ahead = False
         self._device_steps = 0
+        # Шаг ближней фазы режима статьи на устройстве (большие раскладки): расстановка и ядро окна
+        # WindowEnergyKernel; им же считаются энергии точек (§5.7). _device_owner — чья расстановка новее хоста.
+        self._device_short_enabled = bool(device_short_step)
+        self._device_short: DeviceShortStep | None = None
+        self._device_owner: DeviceLongStep | None = None
+        self._device_weights_step: int | None = None
+        self._device_weights_key: tuple[float, float] | None = None
+        self._device_energies_verified = False
         # True — пары, вторая ячейка которых оказалась дальше радиуса выбора r (§5.3), в шаг не входят.
         self._enforce_pair_radius = bool(enforce_pair_radius)
+        # Радиус окрестности ближней фазы (§5.5.2: r ≥ ‖p1 − p2‖) следует за радиусом выбора пар, но не ниже
+        # этого значения; None — постоянный local_radius фазы.
+        self._neighbourhood_radius_min = None if neighbourhood_radius_min is None else int(neighbourhood_radius_min)
         LOGGER.event(
             "layout.energy.neighbourhood_sample.config",
             section=OPTIM_SUBSET,
@@ -1746,7 +1764,8 @@ class Layout:
         self._sampler_calls = {"long": 0, "short": 0}
         self._ones_float64 = None if self._ones_array is None else self._ones_array.astype(np.float64)
         # Класс одинаковых кодов каждой точки: у пары точек одного класса φ_c = φ_s точно (PairSignKernel).
-        self._code_class = self._code_classes()
+        # Считается при первом расчёте по строкам сходства: большим раскладкам (без строк) он не нужен.
+        self._code_class_cache: "np.ndarray | None" = None
         # Списки расстановки — источник истины (§5.1.2); массивы _pos_np, _grid_np повторяют их для векторных
         # выборки пар и расчёта энергий. True — списки могли измениться в обход обменов, массивы пересобираются.
         self._arrays_stale = True
@@ -2786,9 +2805,13 @@ class Layout:
 
     def release_device(self) -> None:
         """Освободить память устройства, занятую расчётом энергий этой раскладки (таблицы сходства, коды)."""
+        self._pull_device()
         engine = self._torch_engine
         self._torch_engine = None
         self._sparse_long = None
+        self._device_short = None
+        self._device_state = None
+        self._device_owner = None
         if engine is not None:
             engine.release()
 
@@ -2819,6 +2842,11 @@ class Layout:
         )
 
     @property
+    def lambda_threshold(self) -> float:
+        """Текущий порог сходства λ (§5.4); растёт ступенями по ходу раскладки (§7.1.7)."""
+        return float(self._lambda)
+
+    @property
     def pair_radius(self) -> int | None:
         return self._pair_radius
 
@@ -2846,6 +2874,12 @@ class Layout:
         swaps_with_delta: list[tuple[tuple[int, int, int, int], float]] = []
         if mode == "long" and self._device_step_enabled and pair_radius is not None:
             device_swaps = self._device_long_step(pairs_per_step, int(pair_radius), step_index)
+            if device_swaps is not None:
+                return device_swaps
+        if mode == "short" and self._device_short_enabled and pair_radius is not None and local_radius is not None:
+            device_swaps = self._device_short_step(
+                pairs_per_step, int(pair_radius), int(local_radius), step_index, short_config
+            )
             if device_swaps is not None:
                 return device_swaps
         self._sync_arrays()
@@ -2879,7 +2913,10 @@ class Layout:
         gauss_long = mode == "long" and self._long_kernel == "gauss"
         eval_short = mode == "short" or gauss_long
         eval_kernel = "gauss" if gauss_long else "inverse"
-        eval_local_radius = local_radius if mode == "short" else self._long_kernel_radius(pair_radius)
+        if mode == "short":
+            eval_local_radius = self._short_neighbourhood_radius(local_radius, pair_radius)
+        else:
+            eval_local_radius = self._long_kernel_radius(pair_radius)
 
         if self._torch_engine is not None:
             torch_swaps = self._evaluate_pairs_torch(
@@ -3007,6 +3044,18 @@ class Layout:
                 deltas.append(delta)
             swaps_with_delta = self._select_swaps(coords, deltas)
         return self._apply_tracked_swaps(swaps_with_delta, mode=mode)
+
+    def _short_neighbourhood_radius(self, local_radius: int | None, pair_radius: int | None) -> int | None:
+        """Радиус окрестности пар ближней фазы (§5.5.2): r ≥ ‖p1 − p2‖, «чем больше r, тем точнее раскладка».
+
+        Обычно это постоянный local_radius фазы. В больших раскладках (neighbourhood_radius_min задан) у каждой
+        пары свой радиус — наименьший допустимый: r = max(⌈‖p1 − p2‖⌉ + 1, neighbourhood_radius_min), но не больше
+        local_radius. Расчёт энергий берёт наибольшее из возвращённого значения и ⌈‖p1 − p2‖⌉ + 1, поэтому
+        условие r ≥ ‖p1 − p2‖ выполнено всегда, а число слагаемых суммы следует за расстоянием между точками пары.
+        """
+        if self._neighbourhood_radius_min is None or local_radius is None or pair_radius is None:
+            return local_radius
+        return min(int(local_radius), self._neighbourhood_radius_min)
 
     # ----------------------------------------------------------------- массивы и векторная выборка пар
     def _sync_arrays(self) -> None:
@@ -3731,7 +3780,7 @@ class Layout:
         if not self._device_ahead:
             return
         self._device_ahead = False
-        cells = self._device_state.download()
+        cells = (self._device_owner or self._device_state).download()
         grid = np.full((self.height, self.width), -1, dtype=np.int64)
         grid[cells[:, 0], cells[:, 1]] = np.arange(self._point_count, dtype=np.int64)
         self._pos_np = cells
@@ -3808,6 +3857,7 @@ class Layout:
             self._positions_version += 1
             state.version = self._positions_version
             self._device_ahead = True
+            self._device_owner = state
             self._long_swap_radius_sum += length
             self._long_swap_count += applied
             self._gpu_positions_dirty = True
@@ -3817,6 +3867,165 @@ class Layout:
             self._torch_dirty_cells.clear()
             self._torch_tracked_changes = 0
         return applied
+
+    def _device_short_state(self) -> DeviceShortStep | None:
+        """Расстановка и ядро окна на устройстве для ближней фазы большой раскладки (§5.5.2, §5.7).
+
+        None — недоступно: нет движка torch с CUDA, порог сходства — сигмоида (ядро считает жёсткий порог
+        §7.1.7) либо шаг на устройстве отключён.
+        """
+        engine = self._torch_engine
+        if engine is None or not self._device_short_enabled or self._eta is not None:
+            return None
+        state = self._device_short
+        if state is None:
+            if not WindowEnergyKernel.supported(engine):
+                self._device_short_enabled = False
+                return None
+            state = self._device_short = DeviceShortStep(engine, WindowEnergyKernel(engine), seed=self._device_seed)
+        if state.version != self._positions_version:
+            state.upload(self._positions_array(), self._positions_version)
+        return state
+
+    def _device_reference_energies(
+        self,
+        state: DeviceShortStep,
+        idx_a: "np.ndarray",
+        idx_b: "np.ndarray",
+        pos_a: "np.ndarray",
+        pos_b: "np.ndarray",
+        reach: int,
+        *,
+        local_radius: float,
+        euclidean: bool,
+        need_swapped: bool = True,
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """φ_c, φ_s пар исходным проходом движка по расстановке устройства — для сверки ядра окна."""
+        engine = self._torch_engine
+        cells = state.download()
+        engine.update_positions(cells[:, 0], cells[:, 1])
+        # Расстановка движка заменена целиком: учёт обменов для неё начинается заново.
+        self._torch_pending_moves.clear()
+        self._torch_dirty_points.clear()
+        self._torch_dirty_cells.clear()
+        self._torch_tracked_changes = 0
+        self._torch_positions_version = -1
+        return engine._pair_energies_reference(
+            idx_a, idx_b, pos_a, pos_b,
+            neighbourhood=True, local_radius=float(local_radius), kernel="inverse", euclidean=euclidean,
+            distance_eps=self._distance_eps, kernel_width=self._long_kernel_width,
+            lambda_threshold=self._lambda, eta=self._eta, need_swapped=need_swapped, window_reach=reach,
+        )
+
+    def _device_short_step(
+        self,
+        pairs_per_step: int,
+        pair_radius: int,
+        local_radius: int,
+        step_index: int | None,
+        short_config: ShortLayoutOptimConfig | None,
+    ) -> int | None:
+        """Шаг ближней фазы режима статьи целиком на устройстве (§5.3, §5.5.2, §5.6, §5.9.1, §5.9.3, §5.10, §5.12).
+
+        None — шаг на устройстве неприменим или отказал: шаг выполняется на хосте.
+        """
+        try:
+            state = self._device_short_state()
+            if state is None:
+                return None
+            euclidean = self._distance_mode("short") == "euclidean"
+            similarity_cutoff = (
+                self._lambda
+                if short_config is None or short_config.similarity_cutoff is None
+                else short_config.similarity_cutoff
+            )
+            if short_config is not None and short_config.use_weighted_first_point:
+                # §5.9.3: энергии всех точек пересчитываются периодически, P(p) ∝ −ln Ê(p, r).
+                key = (float(short_config.energy_radius), float(short_config.energy_eps))
+                due = (
+                    self._device_weights_step is None
+                    or step_index is None
+                    or key != self._device_weights_key
+                    or step_index - self._device_weights_step >= short_config.energy_recalc_every
+                )
+                if due:
+                    state.refresh_weights(
+                        short_config.energy_radius,
+                        energy_eps=short_config.energy_eps,
+                        distance_eps=self._distance_eps,
+                        lambda_threshold=self._lambda,
+                        step_index=step_index,
+                    )
+                    self._device_weights_step = 0 if step_index is None else step_index
+                    self._device_weights_key = key
+            radius = self._short_neighbourhood_radius(local_radius, pair_radius)
+            reference = None
+            if self._device_steps % _DEVICE_STEP_VERIFY_EVERY == 0:
+                def reference(idx_a, idx_b, pos_a, pos_b, reach):  # noqa: ANN001, ANN202
+                    return self._device_reference_energies(
+                        state, idx_a, idx_b, pos_a, pos_b, reach, local_radius=radius, euclidean=euclidean
+                    )
+            applied, _ = state.short_step(
+                pairs=pairs_per_step,
+                radius=pair_radius,
+                local_radius=radius,
+                similarity_cutoff=similarity_cutoff,
+                euclidean=euclidean,
+                distance_eps=self._distance_eps,
+                lambda_threshold=self._lambda,
+                step_index=step_index,
+                reference=reference,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "layout.device_step.failed",
+                section=GPU_IMPLEMENTATION,
+                data={"error": str(exc), "step": 0 if step_index is None else step_index, "mode": "short",
+                      "note": "шаг на устройстве отключён: раскладка продолжается шагами на хосте"},
+                force=True,
+            )
+            self._pull_device()
+            self._device_short_enabled = False
+            self._device_short = None
+            return None
+        self._device_steps += 1
+        if applied:
+            self._positions_version += 1
+            state.version = self._positions_version
+            self._device_ahead = True
+            self._device_owner = state
+            self._gpu_positions_dirty = True
+            # Расстановка движка (исходный проход, строки сходства) устарела целиком.
+            self._torch_pending_moves.clear()
+            self._torch_dirty_points.clear()
+            self._torch_dirty_cells.clear()
+            self._torch_tracked_changes = 0
+        return applied
+
+    def _device_point_energies(self, radius: int) -> "np.ndarray | None":
+        """E(c, r) всех точек (§5.7) ядром окна на устройстве; None — ядро недоступно.
+
+        Первый расчёт сверяется с исходным проходом движка на части точек.
+        """
+        state = self._device_short_state()
+        if state is None:
+            return None
+        energies = state.point_energies(
+            float(radius), distance_eps=self._distance_eps, lambda_threshold=self._lambda
+        ).cpu().numpy()
+        if not self._device_energies_verified:
+            self._device_energies_verified = True
+            sample = np.linspace(0, self._point_count - 1, num=min(self._point_count, 2048)).astype(np.int64)
+            cells = state.download()[sample]
+            reach = WindowEnergyKernel.reach(0.0, float(radius))
+            expected, _ = self._device_reference_energies(
+                state, sample, np.full(sample.size, -1, dtype=np.int64), cells, cells, reach,
+                local_radius=float(radius), euclidean=True, need_swapped=False,
+            )
+            zeros = np.zeros(sample.size, dtype=np.float32)
+            if not state.kernel.verify(energies[sample], zeros, expected, zeros, kind="points"):
+                raise RuntimeError("device point energies differ from the reference pass")
+        return energies
 
     def _pairs_within_radius(
         self, pairs_np: "np.ndarray", pair_radius: int, *, mode: str, step_index: int | None
@@ -4378,8 +4587,11 @@ class Layout:
         """Псевдоцвета кодов всех точек массивом uint8 N × 3 (§5.14): от расстановки не зависят."""
         if self._colors_rgb_array is None:
             colors = np.zeros((self._point_count, 3), dtype=np.uint8)
-            for start, bits in self._table.bit_chunks():
-                colors[start : start + bits.shape[0]] = self._colorizer.colors(bits)
+            # Биты кодов распаковываются блоками строк (матрица N × L целиком не создаётся); цвет кода от других
+            # кодов не зависит, поэтому от размера блока числа не зависят.
+            for start in range(0, self._point_count, _COLOR_BLOCK_ROWS):
+                stop = min(self._point_count, start + _COLOR_BLOCK_ROWS)
+                colors[start:stop] = self._colorizer.colors(self._table.bits(start, stop))
             self._colors_rgb_array = colors
         return self._colors_rgb_array
 
@@ -4699,6 +4911,22 @@ class Layout:
             raise ValueError("radius must be positive")
         if self._point_count == 0:
             return [], "empty"
+        if self._torch_engine is not None and self._device_short_enabled:
+            # Большая раскладка режима статьи: энергии точек считает ядро окна на устройстве.
+            try:
+                device_energies = self._device_point_energies(radius)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.event(
+                    "layout.point_energy.gpu_failed",
+                    section=GPU_IMPLEMENTATION,
+                    data={"error": str(exc), "engine": "window_kernel"},
+                    force=True,
+                )
+                self._device_short_enabled = False
+                self._device_short = None
+                device_energies = None
+            if device_energies is not None:
+                return device_energies.tolist(), "gpu"
         if self._torch_engine is not None:
             try:
                 engine = self._torch_engine
@@ -6292,6 +6520,13 @@ class Layout:
             return False
         self._gpu_positions_dirty = False
         return True
+
+    @property
+    def _code_class(self) -> "np.ndarray":
+        """Класс одинаковых кодов каждой точки (int32, длина N): строится при первом обращении."""
+        if self._code_class_cache is None:
+            self._code_class_cache = self._code_classes()
+        return self._code_class_cache
 
     def _code_classes(self) -> "np.ndarray":
         """Номер класса одинаковых кодов каждой точки (§2.2.4: сходство — функция кодов); int32, длина N."""

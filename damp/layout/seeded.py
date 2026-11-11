@@ -23,6 +23,7 @@ import numpy as np
 
 from damp.article_refs import OPTIM_SUBSET, OUTSIDE_ARTICLE, SIMILARITY_MEASURES
 from damp.layout.code_table import LayoutCodeTable
+from damp.layout.device_kernel import DeviceKernel
 from damp.logging import LOGGER
 
 
@@ -35,6 +36,28 @@ class SeededPlacement:
     KEY_LEVELS = 1 << 20
     # То же для расчёта на процессоре (numpy): в памяти держится порция × родители × слова кода.
     MATCH_ELEMENTS_CPU = 2_000_000
+    # Поиск родителя в два приёма, когда родителей больше стольких (многоуровневая затравка): перебор
+    # «каждая точка × каждый родитель» на сотнях тысяч родителей занял бы десятки минут. Родители делятся
+    # на списки по самой похожей из PIVOTS опорных точек (случайные родители); точке подбираются PROBES самых
+    # похожих опорных точек, и родитель ищется в их списках (до LIST_MAX случайных родителей в списке).
+    # 882 тыс. точек, 163 тыс. родителей: у 99.9 % точек найден родитель с тем же сходством, что у перебора
+    # (среднее сходство с родителем 0.9943 в обоих случаях).
+    PIVOT_MIN_PARENTS = 65536
+    PIVOTS = 8192
+    PROBES = 8
+    LIST_MAX = 128
+    # Предел элементов (точки × кандидаты в родители) на один проход второго приёма: операциями torch
+    # (на элемент — слова кода кандидата) и ядром устройства (на элемент — номер кандидата и число общих бит).
+    CANDIDATE_ELEMENTS = 2_000_000
+    CANDIDATE_ELEMENTS_KERNEL = 16_000_000
+    _CANDIDATE_KERNELS: dict[int, Any] = {}
+    # Место точки внутри блока родителя (режим статьи): точка сдвигается от середины блока к другим похожим
+    # на неё родителям — взвешенное по сходству среднее смещение до NEIGHBOUR_PARENTS самых похожих родителей,
+    # лежащих не дальше NEIGHBOUR_RADIUS ячеек затравки от самого похожего, — и получает случайную добавку
+    # в пределах NEIGHBOUR_JITTER блока. Порядок внутри блока тем самым продолжает порядок раскладки затравки.
+    NEIGHBOUR_PARENTS = 8
+    NEIGHBOUR_RADIUS = 3.0
+    NEIGHBOUR_JITTER = 0.75
     # Точка затравки годится в родители, если её связная область раскладки затравки (связность по 8 соседним
     # ячейкам) содержит не меньше этой доли точек затравки: одиночные точки и мелкие островки вне общего
     # массива утянули бы за собой по блоку точек каждая.
@@ -85,6 +108,19 @@ class SeededPlacement:
         области; у пустых ячеек — height·width."""
         height, width = occupied.shape
         empty = height * width
+        try:
+            # scipy размечает области за один проход; метка области приводится к тому же виду —
+            # наименьшему линейному номеру её ячейки (сетка 774²: 0.05 с вместо 15 с распространения меток).
+            from scipy import ndimage
+
+            marked, regions = ndimage.label(occupied, structure=np.ones((3, 3), dtype=bool))
+            if regions == 0:
+                return np.full((height, width), empty, dtype=np.int64)
+            linear = np.arange(empty, dtype=np.int64).reshape(height, width)
+            lowest = np.asarray(ndimage.minimum(linear, marked, index=np.arange(1, regions + 1)), dtype=np.int64)
+            return np.where(occupied, np.concatenate(([empty], lowest))[marked], empty)
+        except ImportError:
+            pass
         labels = np.where(occupied, np.arange(empty, dtype=np.int64).reshape(height, width), empty)
         while True:
             padded = np.pad(labels, 1, constant_values=empty)
@@ -116,8 +152,38 @@ class SeededPlacement:
             denominator = ones_rows + ones_cols - common
         return xp.where(denominator > 0, common / xp.where(denominator > 0, denominator, 1.0), 0.0)
 
-    def _match_device(self, parents: "np.ndarray") -> "np.ndarray | None":
-        """Самый похожий родитель каждой точки на CUDA; None — устройство недоступно.
+    def _distinct_codes(self) -> tuple["np.ndarray", "np.ndarray"]:
+        """Различные коды таблицы: номер точки-представителя каждого кода и номер кода каждой точки.
+
+        Коды сравниваются по 64-битной свёртке слов, затем проверяется, что код каждой точки побитово равен
+        коду её представителя; если свёртки разных кодов совпали, различные коды находит сортировка самих
+        кодов (на 5.3 млн точек — 13 с вместо 2.5 с). Каждое слово сначала перемешивается (умножения
+        и сдвиги по модулю 2⁶⁴), и только потом слова складываются с нечётными множителями: сумма самих слов
+        с множителями совпадает у кодов, которые отличаются только старшими битами слов.
+        """
+        words = self._table.words64()
+        multipliers = np.random.default_rng(0x5EED).integers(0, 2**63, size=words.shape[1], dtype=np.uint64) * np.uint64(2)
+        multipliers += np.uint64(1)
+        mixed = words ^ (words >> np.uint64(33))
+        mixed *= np.uint64(0xFF51AFD7ED558CCD)
+        mixed ^= mixed >> np.uint64(33)
+        mixed *= np.uint64(0xC4CEB9FE1A85EC53)
+        mixed ^= mixed >> np.uint64(33)
+        mixed *= multipliers[None, :]
+        keys = mixed.sum(axis=1, dtype=np.uint64)
+        del mixed
+        _, representatives, code_of_point = np.unique(keys, return_index=True, return_inverse=True)
+        code_of_point = code_of_point.reshape(-1)
+        if not bool((words == words[representatives[code_of_point]]).all()):
+            _, representatives, code_of_point = np.unique(words, axis=0, return_index=True, return_inverse=True)
+            code_of_point = code_of_point.reshape(-1)
+        return representatives.astype(np.int64), code_of_point.astype(np.int64)
+
+    def _match_device(
+        self, parents: "np.ndarray", top: int = 1, queries: "np.ndarray | None" = None
+    ) -> "tuple[np.ndarray, np.ndarray] | None":
+        """Самые похожие родители точек queries (None — всех точек) на CUDA: номера (строки × top, по убыванию
+        сходства) и сходства; None — устройство недоступно.
 
         Число общих бит (§2.2.4) — произведение кодов порции точек на коды родителей (целые до длины кода,
         в float32 точны); биты порции распаковываются из упакованных кодов таблицы.
@@ -144,36 +210,207 @@ class SeededPlacement:
 
             ones = torch.as_tensor(table.ones.astype(np.float32), device=device)
             parent_device = torch.as_tensor(parents, device=device)
-            parent_codes = codes(words[parent_device]).T.contiguous()
-            parent_ones = ones[parent_device].unsqueeze(0)
-            best = torch.empty(table.count, dtype=torch.int64, device=device)
-            chunk = max(1, self.MATCH_ELEMENTS // max(1, parents.size))
-            for start in range(0, table.count, chunk):
-                stop = min(table.count, start + chunk)
-                similarity = self._similarity(
-                    codes(words[start:stop]) @ parent_codes, ones[start:stop].unsqueeze(1), parent_ones, torch
-                )
-                best[start:stop] = similarity.argmax(dim=1)
-            result = best.cpu().numpy()
-        del parent_codes, best, words
+            rows = (
+                torch.arange(table.count, device=device)
+                if queries is None
+                else torch.as_tensor(np.asarray(queries, dtype=np.int64), device=device)
+            )
+            row_count = int(rows.numel())
+            top = max(1, min(int(top), int(parents.size)))
+            best = torch.empty((row_count, top), dtype=torch.int64, device=device)
+            best_similarity = torch.empty((row_count, top), dtype=torch.float32, device=device)
+            if parents.size > self.PIVOT_MIN_PARENTS:
+                self._match_pivots(torch, words, codes, ones, parent_device, rows, best, best_similarity)
+            else:
+                parent_codes = codes(words[parent_device]).T.contiguous()
+                parent_ones = ones[parent_device].unsqueeze(0)
+                chunk = max(1, self.MATCH_ELEMENTS // max(1, parents.size))
+                for start in range(0, row_count, chunk):
+                    stop = min(row_count, start + chunk)
+                    part = rows[start:stop]
+                    similarity = self._similarity(
+                        codes(words[part]) @ parent_codes, ones[part].unsqueeze(1), parent_ones, torch
+                    )
+                    if top == 1:
+                        best[start:stop, 0] = similarity.argmax(dim=1)
+                        best_similarity[start:stop] = torch.gather(similarity, 1, best[start:stop])
+                    else:
+                        best_similarity[start:stop], best[start:stop] = torch.topk(similarity, top, dim=1)
+                del parent_codes
+            result = best.cpu().numpy(), best_similarity.cpu().numpy()
+        del best, best_similarity, words
         torch.cuda.empty_cache()
         return result
 
-    def _match_host(self, parents: "np.ndarray") -> "np.ndarray":
-        """Самый похожий родитель каждой точки на процессоре (numpy)."""
+    def _match_pivots(
+        self, torch: Any, words: Any, codes: Any, ones: Any, parents: Any, rows: Any, best: Any, best_similarity: Any
+    ) -> None:
+        """Самые похожие родители точек rows в два приёма (вне статьи; ср. подмножество §5.9.4): пишет
+        номера и сходства в best, best_similarity (строки × top).
+
+        1. PIVOTS случайных родителей — опорные точки; каждый родитель попадает в список самой похожей на него
+           опорной точки (в списке — до LIST_MAX случайных родителей).
+        2. Для точки находятся PROBES самых похожих опорных точек (произведение кодов, как в полном переборе),
+           а родитель выбирается из их списков по числу общих бит кодов (§2.2.4).
+        Мера сходства та же; родитель — самый похожий среди кандидатов, а не среди всех родителей.
+        """
+        device = words.device
+        count = int(rows.numel())
+        parent_count = int(parents.numel())
+        pivots = min(self.PIVOTS, parent_count)
+        rng = self._rng
+        pivot_slots = torch.as_tensor(np.sort(rng.choice(parent_count, size=pivots, replace=False)), device=device)
+        pivot_points = parents[pivot_slots]
+        pivot_codes = codes(words[pivot_points]).T.contiguous()
+        pivot_ones = ones[pivot_points].unsqueeze(0)
+        # Приём 1: список каждого родителя — по самой похожей опорной точке.
+        assign = torch.empty(parent_count, dtype=torch.int64, device=device)
+        chunk = max(1, self.MATCH_ELEMENTS // pivots)
+        for start in range(0, parent_count, chunk):
+            listed = parents[start : start + chunk]
+            similarity = self._similarity(
+                codes(words[listed]) @ pivot_codes, ones[listed].unsqueeze(1), pivot_ones, torch
+            )
+            assign[start : start + chunk] = similarity.argmax(dim=1)
+        # Родители в случайном порядке, затем устойчиво по спискам: первые LIST_MAX списка — случайная выборка.
+        shuffled = torch.as_tensor(rng.permutation(parent_count), device=device)
+        sorted_assign, order = torch.sort(assign[shuffled], stable=True)
+        members = shuffled[order]
+        sizes = torch.bincount(assign, minlength=pivots)
+        starts = torch.cumsum(sizes, dim=0) - sizes
+        rank = torch.arange(parent_count, device=device) - starts[sorted_assign]
+        list_max = int(min(self.LIST_MAX, int(sizes.max().item())))
+        kept = rank < list_max
+        lists = torch.full((pivots, list_max), -1, dtype=torch.int64, device=device)
+        lists[sorted_assign[kept], rank[kept]] = members[kept]
+        dropped = int(parent_count - int(kept.sum().item()))
+        # Приём 2: PROBES самых похожих опорных точек и лучший родитель из их списков.
+        parent_words = words[parents]
+        parent_ones = ones[parents]
+        probes = min(self.PROBES, pivots)
+        candidates_per_point = probes * list_max
+        kernel = self._candidate_kernel(int(words.shape[1]))
+        candidate_elements = self.CANDIDATE_ELEMENTS if kernel is None else self.CANDIDATE_ELEMENTS_KERNEL
+        chunk = max(1, min(self.MATCH_ELEMENTS // pivots, candidate_elements // candidates_per_point))
+        top = int(best.shape[1])
+        for start in range(0, count, chunk):
+            stop = min(count, start + chunk)
+            part = rows[start:stop]
+            point_words = words[part]
+            point_ones = ones[part].unsqueeze(1)
+            similarity = self._similarity(codes(point_words) @ pivot_codes, point_ones, pivot_ones, torch)
+            nearest = torch.topk(similarity, probes, dim=1).indices
+            candidates = lists[nearest].reshape(stop - start, candidates_per_point)
+            safe = torch.clamp(candidates, min=0)
+            # Общие биты с кандидатами — popcount(код точки & код родителя) по 64-битным словам (§2.2.4).
+            if kernel is not None:
+                table = candidates.to(torch.int32).contiguous()
+                rows_index = torch.arange(stop - start, dtype=torch.int32, device=device).unsqueeze(1)
+                slot_index = torch.arange(candidates_per_point, dtype=torch.int32, device=device).unsqueeze(0)
+                common = kernel(
+                    rows_index, slot_index,
+                    cand_ptr=table.data_ptr(), qwords_ptr=point_words.data_ptr(), pwords_ptr=parent_words.data_ptr(),
+                    slots=candidates_per_point,
+                ).clamp(min=0).to(torch.float32)
+            else:
+                bits = parent_words[safe] & point_words.unsqueeze(1)
+                bits = bits - ((bits >> 1) & 0x5555555555555555)
+                bits = (bits & 0x3333333333333333) + ((bits >> 2) & 0x3333333333333333)
+                bits = (bits + (bits >> 4)) & 0x0F0F0F0F0F0F0F0F
+                common = (((bits * 0x0101010101010101) >> 56) & 0xFF).sum(dim=2).to(torch.float32)
+            candidate_similarity = self._similarity(common, point_ones, parent_ones[safe], torch)
+            candidate_similarity = torch.where(
+                candidates >= 0, candidate_similarity, torch.full_like(candidate_similarity, -1.0)
+            )
+            if top == 1:
+                choice = candidate_similarity.argmax(dim=1, keepdim=True)
+                chosen_similarity = torch.gather(candidate_similarity, 1, choice)
+            else:
+                # Кандидатов может быть меньше top: недостающие места занимает лучший родитель.
+                chosen_similarity, choice = torch.topk(candidate_similarity, min(top, candidates_per_point), dim=1)
+                if int(choice.shape[1]) < top:
+                    pad = top - int(choice.shape[1])
+                    choice = torch.cat([choice, choice[:, :1].expand(-1, pad)], dim=1)
+                    chosen_similarity = torch.cat([chosen_similarity, chosen_similarity[:, :1].expand(-1, pad)], dim=1)
+            chosen = torch.gather(candidates, 1, choice)
+            missing = chosen < 0
+            chosen = torch.where(missing, chosen[:, :1].expand_as(chosen), chosen)
+            chosen_similarity = torch.where(missing, chosen_similarity[:, :1].expand_as(chosen_similarity), chosen_similarity)
+            best[start:stop] = chosen
+            best_similarity[start:stop] = chosen_similarity
+        LOGGER.event(
+            "layout.seed.parents.pivots",
+            section=OPTIM_SUBSET,
+            data={
+                "points": count,
+                "parents": parent_count,
+                "pivots": pivots,
+                "probes": probes,
+                "list_mean": float(sizes.to(torch.float64).mean().item()),
+                "list_max": int(sizes.max().item()),
+                "list_kept": list_max,
+                "parents_outside_lists": dropped,
+                "note": "родитель ищется среди родителей из списков самых похожих опорных точек, а не перебором "
+                "всех родителей (ср. подмножество §5.9.4); мера сходства та же (§2.2.4)",
+            },
+        )
+
+    @classmethod
+    def _candidate_kernel(cls, words: int) -> Any:
+        """Ядро устройства «число общих бит точки и кандидата в родители» (§2.2.4); None — jiterator недоступен.
+
+        Поток читает номер кандидата точки (−1 — места в списке нет) и считает popcount(код точки & код
+        кандидата) по словам кода: слова кодов кандидатов не собираются в промежуточный тензор.
+        """
+        if words not in cls._CANDIDATE_KERNELS:
+            kernel = None
+            try:
+                from torch.cuda.jiterator import _create_jit_fn
+
+                popcount = "".join(f"  common += __popcll(a[{index}] & b[{index}]);\n" for index in range(words))
+                source = (
+                    f"template <typename T> T damp_candidate_common_{words}(T row, T slot, long long cand_ptr,\n"
+                    "    long long qwords_ptr, long long pwords_ptr, long long slots) {\n"
+                    "  int candidate = ((const int*)cand_ptr)[(long long)row * slots + (long long)slot];\n"
+                    "  if (candidate < 0) return (T)(-1);\n"
+                    f"  const long long* a = (const long long*)qwords_ptr + {words} * (long long)row;\n"
+                    f"  const long long* b = (const long long*)pwords_ptr + {words} * (long long)candidate;\n"
+                    "  int common = 0;\n" + popcount + "  return (T)common;\n"
+                    "}\n"
+                )
+                kernel = DeviceKernel(_create_jit_fn(source, cand_ptr=0, qwords_ptr=0, pwords_ptr=0, slots=1))
+            except Exception:  # noqa: BLE001
+                kernel = None
+            cls._CANDIDATE_KERNELS[words] = kernel
+        return cls._CANDIDATE_KERNELS[words]
+
+    def _match_host(
+        self, parents: "np.ndarray", top: int = 1, queries: "np.ndarray | None" = None
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Самые похожие родители точек queries (None — всех точек) на процессоре (numpy): номера и сходства."""
         table = self._table
         words = table.words64()
         ones = table.ones.astype(np.float64)
         parent_words = words[parents]
         parent_ones = ones[parents][None, :]
-        best = np.empty(table.count, dtype=np.int64)
+        points = np.arange(table.count, dtype=np.int64) if queries is None else np.asarray(queries, dtype=np.int64)
+        top = max(1, min(int(top), int(parents.size)))
+        best = np.empty((points.size, top), dtype=np.int64)
+        best_similarity = np.empty((points.size, top), dtype=np.float32)
         chunk = max(1, self.MATCH_ELEMENTS_CPU // max(1, parents.size))
-        for start in range(0, table.count, chunk):
-            rows = words[start : start + chunk]
+        for start in range(0, points.size, chunk):
+            part = points[start : start + chunk]
+            rows = words[part]
             common = np.bitwise_count(rows[:, None, :] & parent_words[None, :, :]).sum(axis=2, dtype=np.int64)
-            similarity = self._similarity(common.astype(np.float64), ones[start : start + chunk, None], parent_ones, np)
-            best[start : start + chunk] = similarity.argmax(axis=1)
-        return best
+            similarity = self._similarity(common.astype(np.float64), ones[part, None], parent_ones, np)
+            if top == 1:
+                order = similarity.argmax(axis=1)[:, None]
+            else:
+                # По убыванию сходства; при равенстве — меньший номер родителя (устойчивая сортировка).
+                order = np.argsort(-similarity, axis=1, kind="stable")[:, :top]
+            best[start : start + chunk] = order
+            best_similarity[start : start + chunk] = np.take_along_axis(similarity, order, axis=1)
+        return best, best_similarity
 
     def parents(self, seed_cells: "np.ndarray", seed_shape: tuple[int, int]) -> tuple["np.ndarray", "np.ndarray"]:
         """Родитель каждой точки: номера точек затравки, годных в родители, и номер родителя (в этом списке).
@@ -181,14 +418,33 @@ class SeededPlacement:
         Родитель — самая похожая точка затравки (§2.2.4); точка затравки, годная в родители, — родитель самой
         себе (её место в раскладке затравки сохраняется).
         """
+        parent_seeds, nearest, _ = self.similar_parents(seed_cells, seed_shape, top=1)
+        return parent_seeds, nearest[:, 0].copy()
+
+    def similar_parents(
+        self, seed_cells: "np.ndarray", seed_shape: tuple[int, int], *, top: int
+    ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+        """Самые похожие родители каждой точки: номера точек затравки, годных в родители, номера top самых
+        похожих родителей точки в этом списке (N × top, по убыванию сходства) и их сходства (§2.2.4).
+
+        Первый столбец — родитель точки; точка затравки, годная в родители, — родитель самой себе.
+        """
         mask = self._parent_mask(seed_cells, seed_shape)
         parent_seeds = np.flatnonzero(mask)
         parent_points = self._indices[parent_seeds]
-        best = self._match_device(parent_points)
-        device = best is not None
-        if best is None:
-            best = self._match_host(parent_points)
-        best[parent_points] = np.arange(parent_points.size, dtype=np.int64)
+        # Сходство — функция кодов (§2.2.4): у точек с одинаковым кодом родители одни и те же. Родители ищутся
+        # для одной точки каждого различного кода и переносятся на остальные точки этого кода.
+        representatives, code_of_point = self._distinct_codes()
+        matched = self._match_device(parent_points, top, representatives)
+        device = matched is not None
+        if matched is None:
+            matched = self._match_host(parent_points, top, representatives)
+        nearest = matched[0][code_of_point]
+        similarity = matched[1][code_of_point]
+        del matched
+        nearest[parent_points, 0] = np.arange(parent_points.size, dtype=np.int64)
+        similarity[parent_points, 0] = 1.0
+        best = nearest[:, 0]
         children = np.bincount(best, minlength=parent_points.size)
         LOGGER.event(
             "layout.seed.parents",
@@ -197,6 +453,7 @@ class SeededPlacement:
                 "points": self._table.count,
                 "seed_points": self.seed_count,
                 "parents": int(parent_points.size),
+                "distinct_codes": int(representatives.size),
                 "children_mean": float(children.mean()),
                 "children_max": int(children.max()),
                 "device": "cuda" if device else "cpu",
@@ -205,7 +462,7 @@ class SeededPlacement:
                 "островки затравки в родители не идут",
             },
         )
-        return parent_seeds, best
+        return parent_seeds, nearest, similarity
 
     # ------------------------------------------------------------------ расстановка
     @staticmethod
@@ -257,6 +514,61 @@ class SeededPlacement:
             cells -= int(border.size)
         return region
 
+    def _neighbour_targets(
+        self,
+        parent_cells: "np.ndarray",
+        nearest: "np.ndarray",
+        similarity: "np.ndarray",
+        threshold: float,
+        seed_shape: tuple[int, int],
+    ) -> "np.ndarray":
+        """Цели точек в ячейках затравки (N × 2, дробные): середина блока родителя со сдвигом к похожим родителям.
+
+        В дальней энергии статьи (§5.5.1) точку тянут все похожие на неё точки: φ = Σ sim_λ·d. Здесь это
+        притяжение считается по подмножеству (§5.9.4) — по самым похожим родителям точки: сдвиг от середины
+        блока родителя — взвешенное по сходству среднее смещение до родителей с sim ≥ threshold (§5.4), лежащих
+        не дальше NEIGHBOUR_RADIUS ячеек затравки от самого похожего (дальние похожие родители — это другое место
+        карты, их середина лежала бы в чужой области). Сам родитель входит в среднее с нулевым смещением.
+        Добавка в пределах NEIGHBOUR_JITTER блока разводит точки с одинаковыми кодами.
+        """
+        rng = self._rng
+        count = int(nearest.shape[0])
+        base = parent_cells[nearest[:, 0]].astype(np.float32)
+        shift = np.zeros((count, 2), dtype=np.float32)
+        total = np.maximum(similarity[:, 0], np.float32(1e-6)).astype(np.float32)
+        radius_sq = np.float32(self.NEIGHBOUR_RADIUS * self.NEIGHBOUR_RADIUS)
+        moved = np.zeros(count, dtype=bool)
+        for column in range(1, int(nearest.shape[1])):
+            offset = parent_cells[nearest[:, column]].astype(np.float32) - base
+            weight = similarity[:, column].astype(np.float32)
+            near = (weight >= np.float32(threshold)) & ((offset * offset).sum(axis=1) <= radius_sq)
+            weight = np.where(near, weight, np.float32(0.0))
+            shift += offset * weight[:, None]
+            total += weight
+            moved |= near & (offset != 0).any(axis=1)
+        shift /= total[:, None]
+        jitter = (rng.random((count, 2)).astype(np.float32) - np.float32(0.5)) * np.float32(self.NEIGHBOUR_JITTER)
+        target = base + np.float32(0.5) + shift + jitter
+        target[:, 0] = np.clip(target[:, 0], 0.0, np.nextafter(np.float32(seed_shape[0]), np.float32(0.0)))
+        target[:, 1] = np.clip(target[:, 1], 0.0, np.nextafter(np.float32(seed_shape[1]), np.float32(0.0)))
+        length = np.sqrt((shift * shift).sum(axis=1))
+        LOGGER.event(
+            "layout.seed.neighbours",
+            section=OPTIM_SUBSET,
+            data={
+                "points": count,
+                "neighbour_parents": int(nearest.shape[1]),
+                "threshold": threshold,
+                "radius": self.NEIGHBOUR_RADIUS,
+                "shifted_share": float(moved.mean()),
+                "shift_mean": float(length.mean()),
+                "shift_p99": float(np.quantile(length, 0.99)),
+                "note": "место точки в блоке родителя сдвинуто к другим похожим на неё родителям (sim ≥ λ, §5.4): "
+                "притяжение дальней энергии §5.5.1 по подмножеству — самым похожим точкам затравки (§5.9.4)",
+            },
+        )
+        return target.astype(np.float64)
+
     @staticmethod
     def _halved(group: "np.ndarray", first: "np.ndarray", second: "np.ndarray") -> "np.ndarray":
         """Каждая группа делится пополам по координате first (при равенстве — по second): номера новых групп.
@@ -275,6 +587,22 @@ class SeededPlacement:
         result[order] = ordered * 2 + upper
         return result
 
+    @staticmethod
+    def _halved_device(torch: Any, group: Any, first: Any, second: Any) -> Any:
+        """_halved на устройстве: те же группы; при равных ключах раньше идёт элемент с меньшим номером."""
+        count = int(group.numel())
+        order = torch.argsort((group << 40) | (first << 20) | second, stable=True)
+        ordered = group[order]
+        boundary = torch.ones(count, dtype=torch.bool, device=group.device)
+        boundary[1:] = ordered[1:] != ordered[:-1]
+        starts = torch.nonzero(boundary).view(-1)
+        sizes = torch.diff(torch.cat([starts, torch.tensor([count], device=group.device)]))
+        rank = torch.arange(count, device=group.device) - torch.repeat_interleave(starts, sizes)
+        upper = rank >= torch.repeat_interleave(torch.div(sizes, 2, rounding_mode="floor"), sizes)
+        result = torch.empty(count, dtype=torch.int64, device=group.device)
+        result[order] = ordered * 2 + upper.to(torch.int64)
+        return result
+
     @classmethod
     def match_cells(
         cls,
@@ -282,12 +610,17 @@ class SeededPlacement:
         target_x: "np.ndarray",
         cell_y: "np.ndarray",
         cell_x: "np.ndarray",
+        *,
+        on_device: bool = False,
     ) -> "np.ndarray":
         """Взаимно-однозначное соответствие точек (с целями target) ячейкам: номер ячейки каждой точки.
 
         Точки и ячейки делятся пополам по медиане одной и той же координаты, поочерёдно по y и x, пока
         в группе не останется один элемент: точка получает ячейку своей группы. Порядок по обеим осям
         сохраняется, избыток точек в одном месте раздвигает соседей на доли блока, а не уносится на край.
+
+        on_device — сортировки на CUDA (5.3 млн точек: 3 с вместо 30 с); при равных ключах порядок элементов
+        может отличаться от сортировки numpy, соответствие остаётся взаимно-однозначным и сохраняет порядок.
         """
         count = int(target_y.size)
         if int(cell_y.size) != count:
@@ -304,6 +637,34 @@ class SeededPlacement:
 
         target_y, target_x = quantised(target_y), quantised(target_x)
         cell_y, cell_x = quantised(cell_y), quantised(cell_x)
+        if on_device:
+            try:
+                import torch
+
+                available = torch.cuda.is_available()
+            except Exception:  # noqa: BLE001
+                available = False
+            if available:
+                device = torch.device("cuda")
+                with torch.no_grad():
+                    point_y, point_x, grid_y, grid_x = (
+                        torch.as_tensor(values, device=device) for values in (target_y, target_x, cell_y, cell_x)
+                    )
+                    point_group = torch.zeros(count, dtype=torch.int64, device=device)
+                    cell_group = torch.zeros(count, dtype=torch.int64, device=device)
+                    for level in range(levels):
+                        if level % 2 == 0:
+                            point_group = cls._halved_device(torch, point_group, point_y, point_x)
+                            cell_group = cls._halved_device(torch, cell_group, grid_y, grid_x)
+                        else:
+                            point_group = cls._halved_device(torch, point_group, point_x, point_y)
+                            cell_group = cls._halved_device(torch, cell_group, grid_x, grid_y)
+                    match = torch.empty(count, dtype=torch.int64, device=device)
+                    match[torch.argsort(point_group, stable=True)] = torch.argsort(cell_group, stable=True)
+                    result = match.cpu().numpy()
+                del point_y, point_x, grid_y, grid_x, point_group, cell_group, match
+                torch.cuda.empty_cache()
+                return result
         point_group = np.zeros(count, dtype=np.int64)
         cell_group = np.zeros(count, dtype=np.int64)
         for level in range(levels):
@@ -322,12 +683,18 @@ class SeededPlacement:
         seed_cells: "np.ndarray",
         seed_shape: tuple[int, int],
         shape: tuple[int, int],
+        *,
+        neighbour_threshold: float | None = None,
     ) -> "np.ndarray":
         """Ячейки (y, x) всех точек на сетке shape по раскладке затравки seed_cells на сетке seed_shape.
 
         seed_cells — ячейки точек затравки в порядке seed_indices. Каждой ячейке затравки отвечает блок
         ячеек большой сетки; цель точки — случайное место блока её родителя. Точки расставляются по ячейкам
         области блоков родителей взаимно-однозначно (match_cells): одна точка в ячейке (§5.1.2).
+
+        neighbour_threshold — порог сходства λ раскладки затравки (§5.4). Если он задан, цель точки —
+        не случайное место блока, а середина блока родителя, сдвинутая к другим родителям, похожим на точку
+        не меньше порога (_neighbour_targets): порядок внутри блока продолжает порядок затравки.
         """
         seed_cells = np.asarray(seed_cells, dtype=np.int64)
         if seed_cells.shape != (self.seed_count, 2):
@@ -339,15 +706,24 @@ class SeededPlacement:
             raise ValueError("grid is too small for the number of points")
         scale_y = height / float(seed_shape[0])
         scale_x = width / float(seed_shape[1])
-        parent_seeds, parent = self.parents(seed_cells, seed_shape)
-        parent_cells = seed_cells[parent_seeds]
         rng = self._rng
-        # Цель точки — случайное место блока родителя.
-        target_y = (parent_cells[parent, 0] + rng.random(count)) * scale_y
-        target_x = (parent_cells[parent, 1] + rng.random(count)) * scale_x
+        if neighbour_threshold is None:
+            parent_seeds, parent = self.parents(seed_cells, seed_shape)
+            parent_cells = seed_cells[parent_seeds]
+            # Цель точки — случайное место блока родителя.
+            target_y = (parent_cells[parent, 0] + rng.random(count)) * scale_y
+            target_x = (parent_cells[parent, 1] + rng.random(count)) * scale_x
+        else:
+            parent_seeds, nearest, similarity = self.similar_parents(
+                seed_cells, seed_shape, top=self.NEIGHBOUR_PARENTS
+            )
+            parent_cells = seed_cells[parent_seeds]
+            target = self._neighbour_targets(parent_cells, nearest, similarity, float(neighbour_threshold), seed_shape)
+            target_y = target[:, 0] * scale_y
+            target_x = target[:, 1] * scale_x
         region = self._region(parent_cells, seed_shape, (height, width))
         cell_y, cell_x = np.nonzero(region)
-        match = self.match_cells(target_y, target_x, cell_y, cell_x)
+        match = self.match_cells(target_y, target_x, cell_y, cell_x, on_device=neighbour_threshold is not None)
         cells = np.stack([cell_y[match], cell_x[match]], axis=1).astype(np.int64)
         shift = np.hypot(cells[:, 0] + 0.5 - target_y, cells[:, 1] + 0.5 - target_x)
         LOGGER.event(
