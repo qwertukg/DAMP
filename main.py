@@ -461,6 +461,14 @@ LAYOUT_SEED_POINTS = 30000
 # 0.875 / 0.943 / 3.48°; 6 блоков — 0.875 / 0.942 / 3.45° (дальше качество не растёт, время растёт).
 LAYOUT_SEED_LEVEL_RATIO_MAX = 16
 LAYOUT_SEED_SHORT_RADIUS_FACTOR = 4.0
+# Порог ранней отсечки пар (§5.9.1) в ближней фазе уровня большой раскладки режима статьи; 0 — без отсечки.
+# Отсечка sim(a, b) ≥ t оставляет в шаге только пары похожих точек: статья советует её «на поздних стадиях,
+# когда двигать надо похожие точки». У точной раскладки непохожие точки разводит дальняя фаза; на уровнях
+# выше затравки её нет, а точки соседних родителей после расстановки перемешаны на ширине блока — развести
+# их и провести границы областей должна ближняя фаза, и с отсечкой она этого не может (пара точек из разных
+# областей в шаг не попадает). Измерено на 10 000 цифр (уровни 5000 → 66 тыс. → 883 тыс.), Ē(3) при λ = 0.8:
+# с отсечкой 0.65 — 0.853, без отсечки — 0.887 (при прежней расстановке ровно в блок родителя: 0.875 и 0.888).
+LAYOUT_SEED_SHORT_SIMILARITY_CUTOFF = 0.0
 # Файл раскладки больше этого размера как кеш не читается (вне статьи): чтение строит по объекту на точку,
 # и на миллионах точек они не помещаются в память — раскладка считается заново. 256 МБ — около 380 тыс. точек.
 LAYOUT_CACHE_MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -2176,8 +2184,14 @@ def _layout_from_codes(
         refine_radius = refine_steps = None
     if refine_steps == 0:
         # Режим статьи: дальний порядок большой раскладки взят у затравки, дальней фазы нет; ближняя фаза
-        # начинается с радиуса в несколько блоков затравки.
-        _run_short_phase(layout, run_params, step_offset=1, start_radius=refine_radius)
+        # начинается с радиуса в несколько блоков затравки и идёт без ранней отсечки пар (§5.9.1).
+        _run_short_phase(
+            layout,
+            run_params,
+            step_offset=1,
+            start_radius=refine_radius,
+            similarity_cutoff=LAYOUT_SEED_SHORT_SIMILARITY_CUTOFF,
+        )
         return layout
     _run_long_phase(
         layout, run_params, step_offset=1, layout_path=layout_path, start_radius=refine_radius, steps=refine_steps
@@ -2352,9 +2366,15 @@ def _run_long_phase(
 
 
 def _run_short_phase(
-    layout: Layout, run_params: TunedLayoutParams, *, step_offset: int, start_radius: int | None = None
+    layout: Layout,
+    run_params: TunedLayoutParams,
+    *,
+    step_offset: int,
+    start_radius: int | None = None,
+    similarity_cutoff: float | None = None,
 ) -> None:
-    """Ближняя фаза раскладки (§5.5.2, §7.1.7); start_radius — начальный радиус выбора пар доводки от затравки."""
+    """Ближняя фаза раскладки (§5.5.2, §7.1.7); start_radius — начальный радиус выбора пар доводки от затравки,
+    similarity_cutoff — порог ранней отсечки пар (§5.9.1) вместо LAYOUT_SHORT_SIMILARITY_CUTOFF."""
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
         max(
@@ -2383,7 +2403,7 @@ def _run_short_phase(
         energy_recalc_every=run_params.short_energy_recalc_every,
         energy_eps=LAYOUT_SHORT_ENERGY_EPS,
         use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
-        similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF,
+        similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF if similarity_cutoff is None else similarity_cutoff,
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
     layout.run(

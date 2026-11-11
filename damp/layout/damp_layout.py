@@ -2651,33 +2651,21 @@ class Layout:
     ) -> None:
         if not force and not LOGGER.should_log("layout.visual"):
             return
-        visuals_skipped = self._point_count > _VISUAL_POINT_LIMIT or not log_visuals
+        # Карта большой раскладки — картинка в десятки мегабайт: без Rerun она не строится.
+        visuals_skipped = not log_visuals or (
+            self._point_count > _VISUAL_POINT_LIMIT and not LOGGER.visuals_enabled()
+        )
         visuals: list = []
         if log_visuals and not visuals_skipped:
             # Позиции и цвета массивами: те же значения, что у списков, без обхода точек в Python.
-            cells = self._positions_array()
-            positions = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1)
             colors = self._colors_array()
-            image = self._build_image(colors)
-            visuals = [
-                LOGGER.visual_image(
-                    f"{path}/image",
-                    image,
-                ),
-                LOGGER.visual_points2d(
-                    f"{path}/image",
-                    positions,
-                    colors=colors,
-                    radii=0.5,
-                ),
-            ]
+            visuals = self._map_visuals(f"{path}/image", f"{path}/image", self._build_image(colors), colors)
             if self._component_period is not None:
                 # Та же карта, раскрашенная по углу стимула, как в pinwheel-тесте (рис. 16, §5.13.2).
                 component_colors = self._component_colors_array(self._component_period)
-                visuals += [
-                    LOGGER.visual_image(f"{path}/angle", self._build_image(component_colors)),
-                    LOGGER.visual_points2d(f"{path}/angle", positions, colors=component_colors, radii=0.5),
-                ]
+                visuals += self._map_visuals(
+                    f"{path}/angle", f"{path}/angle", self._build_image(component_colors), component_colors
+                )
         energy_radius: int | None = None
         energy_value: float | None = None
         energy_source: str | None = None
@@ -3969,7 +3957,8 @@ class Layout:
                 pairs=pairs_per_step,
                 radius=pair_radius,
                 local_radius=radius,
-                similarity_cutoff=similarity_cutoff,
+                # Порог 0 — без ранней отсечки (§5.9.1): сходство пар не считается, пары не добираются.
+                similarity_cutoff=similarity_cutoff if similarity_cutoff > 0.0 else None,
                 euclidean=euclidean,
                 distance_eps=self._distance_eps,
                 lambda_threshold=self._lambda,
@@ -4644,25 +4633,11 @@ class Layout:
         colors = self._colors_array()
         image = self._build_image(colors)
         if log:
-            positions = self._point_centres()
             LOGGER.event(
                 "layout.render_image",
                 section=LAID_OUT_STRUCTURE,
                 data={"height": self.height, "width": self.width, "coloring": "code_bits"},
-                visuals=[
-                    LOGGER.visual_image(
-                        "layout/final/image",
-                        image,
-                        static=True,
-                    ),
-                    LOGGER.visual_points2d(
-                        "layout/final/points",
-                        positions,
-                        colors=colors,
-                        radii=0.5,
-                        static=True,
-                    ),
-                ],
+                visuals=self._map_visuals("layout/final/image", "layout/final/points", image, colors, static=True),
             )
         return image
 
@@ -4677,7 +4652,6 @@ class Layout:
         shaded = np.rint(self._colors_array().astype(np.float64) * brightness[:, None]).astype(np.uint8)
         image = self._build_image(shaded)
         if log:
-            positions = self._point_centres()
             LOGGER.event(
                 "layout.render_energy_image",
                 section=LAID_OUT_STRUCTURE,
@@ -4687,20 +4661,9 @@ class Layout:
                     "coloring": "code_bits_times_energy",
                     "energy_mean": sum(float(e) for e in energies) / max(1, len(energies)),
                 },
-                visuals=[
-                    LOGGER.visual_image(
-                        "layout/final/energy_image",
-                        image,
-                        static=True,
-                    ),
-                    LOGGER.visual_points2d(
-                        "layout/final/energy_points",
-                        positions,
-                        colors=shaded,
-                        radii=0.5,
-                        static=True,
-                    ),
-                ],
+                visuals=self._map_visuals(
+                    "layout/final/energy_image", "layout/final/energy_points", image, shaded, static=True
+                ),
             )
         return image
 
@@ -4711,7 +4674,6 @@ class Layout:
         colors = self._component_colors_array(period)
         image = self._build_image(colors)
         if log:
-            positions = self._point_centres()
             LOGGER.event(
                 "layout.render_component_image",
                 section=MAPPING_CONTINUITY,
@@ -4721,20 +4683,9 @@ class Layout:
                     "coloring": "stimulus_component",
                     "period": period,
                 },
-                visuals=[
-                    LOGGER.visual_image(
-                        "layout/final/component_image",
-                        image,
-                        static=True,
-                    ),
-                    LOGGER.visual_points2d(
-                        "layout/final/component_points",
-                        positions,
-                        colors=colors,
-                        radii=0.5,
-                        static=True,
-                    ),
-                ],
+                visuals=self._map_visuals(
+                    "layout/final/component_image", "layout/final/component_points", image, colors, static=True
+                ),
             )
         return image
 
@@ -4742,6 +4693,26 @@ class Layout:
         """Центры ячеек точек (x + 0.5, y + 0.5) массивом N × 2 — координаты точек на картах раскладки."""
         cells = self._positions_array()
         return np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1)
+
+    def _map_visuals(
+        self, image_path: str, points_path: str, image: "np.ndarray", colors: "np.ndarray", *, static: bool = False
+    ) -> list:
+        """Карта раскладки для Rerun (§5.14): картинка «ячейка сетки — пиксель» и точки кружками поверх неё.
+
+        У большой раскладки (N > _VISUAL_POINT_LIMIT) кружков нет: все её точки уже на картинке, а миллионы
+        кружков окно не тянет. Пустой набор точек убирает с карты кружки меньшей раскладки (затравки большого
+        набора), записанные раньше по тому же пути, — иначе они остались бы поверх новой картинки.
+        """
+        if self._point_count > _VISUAL_POINT_LIMIT:
+            positions = np.zeros((0, 2), dtype=np.float32)
+            point_colors = np.zeros((0, 3), dtype=np.uint8)
+        else:
+            positions = self._point_centres()
+            point_colors = colors
+        return [
+            LOGGER.visual_image(image_path, image, static=static),
+            LOGGER.visual_points2d(points_path, positions, colors=point_colors, radii=0.5, static=static),
+        ]
 
     def _build_image(
         self,

@@ -53,11 +53,18 @@ class SeededPlacement:
     _CANDIDATE_KERNELS: dict[int, Any] = {}
     # Место точки внутри блока родителя (режим статьи): точка сдвигается от середины блока к другим похожим
     # на неё родителям — взвешенное по сходству среднее смещение до NEIGHBOUR_PARENTS самых похожих родителей,
-    # лежащих не дальше NEIGHBOUR_RADIUS ячеек затравки от самого похожего, — и получает случайную добавку
-    # в пределах NEIGHBOUR_JITTER блока. Порядок внутри блока тем самым продолжает порядок раскладки затравки.
+    # лежащих не дальше NEIGHBOUR_RADIUS ячеек затравки от самого похожего, — и получает случайную добавку:
+    # нормальную, со стандартным отклонением NEIGHBOUR_SPREAD блока по каждой оси. Порядок внутри блока тем
+    # самым продолжает порядок раскладки затравки. Добавка изотропна и шире блока: если точки родителя
+    # занимают ровно его блок, карта уровня — это карта затравки, увеличенная квадратами, и «лесенка» её
+    # границ превращается в прямые отрезки вдоль осей сетки длиной в блок и больше. Измерено на 10 000 цифр
+    # (уровни 5000 → 66 тыс. → 883 тыс., ближняя фаза уровня без ранней отсечки; доля длины границ областей
+    # на прямых отрезках ≥ 8 / ≥ 16 ячеек и Ē(3)): равномерно в 0.75 блока — 9.4 % / 1.2 % и 0.888;
+    # σ = 0.5 — 5.5 % / 0.22 % и 0.889; σ = 0.7 — 5.1 % / 0.04 % и 0.887; σ = 1.0 — 4.5 % / 0.13 % и 0.881
+    # (у точных раскладок 100–1000 цифр — 1.5–2 % / 0).
     NEIGHBOUR_PARENTS = 8
     NEIGHBOUR_RADIUS = 3.0
-    NEIGHBOUR_JITTER = 0.75
+    NEIGHBOUR_SPREAD = 0.7
     # Точка затравки годится в родители, если её связная область раскладки затравки (связность по 8 соседним
     # ячейкам) содержит не меньше этой доли точек затравки: одиночные точки и мелкие островки вне общего
     # массива утянули бы за собой по блоку точек каждая.
@@ -80,7 +87,8 @@ class SeededPlacement:
                 "points": table.count,
                 "seed_points": int(seed_count),
                 "note": "случайное подмножество B точек раскладывается целиком; остальные точки ставятся возле "
-                "самых похожих точек B (расширение §5.9.4: подмножество задаёт глобальный порядок)",
+                "самых похожих точек B (расширение §5.9.4: подмножество задаёт глобальный порядок); пока "
+                "раскладывается B, на карте хода раскладки только его точки — остальные появляются после расстановки",
             },
         )
 
@@ -422,12 +430,13 @@ class SeededPlacement:
         return parent_seeds, nearest[:, 0].copy()
 
     def similar_parents(
-        self, seed_cells: "np.ndarray", seed_shape: tuple[int, int], *, top: int
+        self, seed_cells: "np.ndarray", seed_shape: tuple[int, int], *, top: int, balanced: bool = False
     ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
         """Самые похожие родители каждой точки: номера точек затравки, годных в родители, номера top самых
         похожих родителей точки в этом списке (N × top, по убыванию сходства) и их сходства (§2.2.4).
 
         Первый столбец — родитель точки; точка затравки, годная в родители, — родитель самой себе.
+        balanced — точки делятся поровну между родителями с одним и тем же кодом (_balanced_parents).
         """
         mask = self._parent_mask(seed_cells, seed_shape)
         parent_seeds = np.flatnonzero(mask)
@@ -444,6 +453,11 @@ class SeededPlacement:
         del matched
         nearest[parent_points, 0] = np.arange(parent_points.size, dtype=np.int64)
         similarity[parent_points, 0] = 1.0
+        children_single = np.bincount(nearest[:, 0], minlength=parent_points.size)
+        if balanced:
+            nearest[:, 0] = self._balanced_parents(
+                nearest[:, 0], code_of_point, parent_points, seed_cells[parent_seeds]
+            )
         best = nearest[:, 0]
         children = np.bincount(best, minlength=parent_points.size)
         LOGGER.event(
@@ -454,15 +468,76 @@ class SeededPlacement:
                 "seed_points": self.seed_count,
                 "parents": int(parent_points.size),
                 "distinct_codes": int(representatives.size),
+                "parent_codes": int(np.unique(code_of_point[parent_points]).size),
                 "children_mean": float(children.mean()),
+                "children_p99": float(np.quantile(children, 0.99)),
                 "children_max": int(children.max()),
+                "children_max_single": int(children_single.max()),
+                "balanced": bool(balanced),
                 "device": "cuda" if device else "cpu",
                 "similarity": self._measure,
                 "note": "родитель точки — самая похожая на неё точка затравки (§2.2.4); одиночные точки и мелкие "
-                "островки затравки в родители не идут",
+                "островки затравки в родители не идут; children_max_single — детей у родителя, если бы все точки "
+                "одного кода шли к одному из равных родителей",
             },
         )
         return parent_seeds, nearest, similarity
+
+    @staticmethod
+    def _morton(cell_y: "np.ndarray", cell_x: "np.ndarray") -> "np.ndarray":
+        """Номер ячейки вдоль Z-кривой (биты y и x вперемежку): близкие номера — близкие ячейки."""
+
+        def spread(values: "np.ndarray") -> "np.ndarray":
+            bits = values.astype(np.uint64) & np.uint64(0xFFFFFFFF)
+            bits = (bits | (bits << np.uint64(16))) & np.uint64(0x0000FFFF0000FFFF)
+            bits = (bits | (bits << np.uint64(8))) & np.uint64(0x00FF00FF00FF00FF)
+            bits = (bits | (bits << np.uint64(4))) & np.uint64(0x0F0F0F0F0F0F0F0F)
+            bits = (bits | (bits << np.uint64(2))) & np.uint64(0x3333333333333333)
+            return (bits | (bits << np.uint64(1))) & np.uint64(0x5555555555555555)
+
+        return (spread(cell_y) << np.uint64(1)) | spread(cell_x)
+
+    def _balanced_parents(
+        self,
+        best: "np.ndarray",
+        code_of_point: "np.ndarray",
+        parent_points: "np.ndarray",
+        parent_cells: "np.ndarray",
+    ) -> "np.ndarray":
+        """Родитель каждой точки среди родителей с тем же кодом, что у самого похожего на неё: всем поровну.
+
+        Сходство — функция кодов (§2.2.4): родители с одинаковым кодом похожи на точку одинаково, а в раскладке
+        затравки они занимают целую область. Если отдать все точки одному из равных родителей, на его блок
+        придётся в десятки раз больше точек, чем в нём ячеек (в наборе MNIST на код приходится 12 точек,
+        у частых кодов — тысячи), и расстановка раздвинет их в прямоугольник с прямыми границами. Поэтому
+        точки, выбравшие родителей одного кода, делятся между всеми родителями этого кода поровну: область
+        кода на большой сетке повторяет его область в раскладке затравки.
+
+        Родители одного кода идут вдоль Z-кривой по ячейкам затравки, точки — по своим кодам: точки одного
+        кода попадают к одному родителю или к соседним. Точка затравки остаётся родителем самой себе.
+        """
+        parent_count = int(parent_points.size)
+        parent_code = code_of_point[parent_points]
+        order = np.lexsort((self._morton(parent_cells[:, 0], parent_cells[:, 1]), parent_code))
+        ordered_code = parent_code[order]
+        first = np.flatnonzero(np.concatenate(([True], ordered_code[1:] != ordered_code[:-1])))
+        sizes = np.diff(np.concatenate((first, [parent_count])))
+        group_of_parent = np.empty(parent_count, dtype=np.int64)
+        group_of_parent[order] = np.repeat(np.arange(first.size, dtype=np.int64), sizes)
+        is_parent = np.zeros(best.size, dtype=bool)
+        is_parent[parent_points] = True
+        points = np.flatnonzero(~is_parent)
+        group = group_of_parent[best[points]]
+        point_order = np.lexsort((code_of_point[points], group))
+        points = points[point_order]
+        group = group[point_order]
+        group_first = np.searchsorted(group, np.arange(first.size, dtype=np.int64))
+        group_size = np.diff(np.concatenate((group_first, [points.size])))
+        rank = np.arange(points.size, dtype=np.int64) - group_first[group]
+        slot = (rank * sizes[group]) // np.maximum(group_size[group], 1)
+        result = best.copy()
+        result[points] = order[first[group] + slot]
+        return result
 
     # ------------------------------------------------------------------ расстановка
     @staticmethod
@@ -529,7 +604,9 @@ class SeededPlacement:
         блока родителя — взвешенное по сходству среднее смещение до родителей с sim ≥ threshold (§5.4), лежащих
         не дальше NEIGHBOUR_RADIUS ячеек затравки от самого похожего (дальние похожие родители — это другое место
         карты, их середина лежала бы в чужой области). Сам родитель входит в среднее с нулевым смещением.
-        Добавка в пределах NEIGHBOUR_JITTER блока разводит точки с одинаковыми кодами.
+        Нормальная добавка (σ = NEIGHBOUR_SPREAD блока) разводит точки с одинаковыми кодами и размывает
+        границы блоков: точки соседних родителей перемешиваются на ширине блока, и границу областей
+        проводит ближняя фаза уровня, а не сетка блоков.
         """
         rng = self._rng
         count = int(nearest.shape[0])
@@ -547,7 +624,7 @@ class SeededPlacement:
             total += weight
             moved |= near & (offset != 0).any(axis=1)
         shift /= total[:, None]
-        jitter = (rng.random((count, 2)).astype(np.float32) - np.float32(0.5)) * np.float32(self.NEIGHBOUR_JITTER)
+        jitter = rng.standard_normal((count, 2)).astype(np.float32) * np.float32(self.NEIGHBOUR_SPREAD)
         target = base + np.float32(0.5) + shift + jitter
         target[:, 0] = np.clip(target[:, 0], 0.0, np.nextafter(np.float32(seed_shape[0]), np.float32(0.0)))
         target[:, 1] = np.clip(target[:, 1], 0.0, np.nextafter(np.float32(seed_shape[1]), np.float32(0.0)))
@@ -715,7 +792,7 @@ class SeededPlacement:
             target_x = (parent_cells[parent, 1] + rng.random(count)) * scale_x
         else:
             parent_seeds, nearest, similarity = self.similar_parents(
-                seed_cells, seed_shape, top=self.NEIGHBOUR_PARENTS
+                seed_cells, seed_shape, top=self.NEIGHBOUR_PARENTS, balanced=True
             )
             parent_cells = seed_cells[parent_seeds]
             target = self._neighbour_targets(parent_cells, nearest, similarity, float(neighbour_threshold), seed_shape)

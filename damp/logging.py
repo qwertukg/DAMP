@@ -318,6 +318,16 @@ class DampLogger:
             return True
         return self._interval_policy.should_log(event)
 
+    def visuals_enabled(self) -> bool:
+        """True — картинки записей доходят до Rerun: журнал не выключен и Rerun включён (RERUN=on).
+
+        Нужен там, где сама картинка стоит дорого (карта раскладки из миллионов точек): без Rerun её не строят.
+        """
+        if self._muted:
+            return False
+        self._ensure_rerun()
+        return bool(rr.is_enabled())
+
     def event(
         self,
         event: str,

@@ -219,6 +219,33 @@ class DeviceShortStepTests(unittest.TestCase):
         self._run_short(second, steps=60)
         self.assertEqual(first.positions(), second.positions())
 
+    def test_zero_cutoff_takes_pairs_without_early_cutoff(self) -> None:
+        """§5.9.1: порог 0 — без ранней отсечки: сходство пар не считается, в шаг идут и непохожие точки."""
+        layout = self._layout()
+        state = layout._device_short_state()
+        cutoffs: list = []
+        original = state.short_step
+
+        def recorded(**arguments):  # noqa: ANN003, ANN202
+            cutoffs.append(arguments["similarity_cutoff"])
+            return original(**arguments)
+
+        config = ShortLayoutOptimConfig(
+            energy_radius=4, energy_recalc_every=25, energy_eps=1e-6, use_weighted_first_point=True,
+            similarity_cutoff=0.0, partitions=4,
+        )
+        failure = AssertionError("сходство пар считалось при пороге 0")
+        with mock.patch.object(state, "short_step", side_effect=recorded):
+            with mock.patch.object(state.kernel, "pair_similarity", side_effect=failure):
+                layout.run(
+                    steps=5, pairs_per_step=250, pair_radius=6, mode="short", local_radius=8,
+                    min_swap_ratio=0.0, short_optim=config,
+                )
+        self.assertEqual(cutoffs, [None] * 5)
+        self.assertTrue(layout._device_short_enabled)
+        cells = layout.cells_array()
+        self.assertEqual(len({(int(y), int(x)) for y, x in cells}), layout.point_count)
+
     def test_neighbourhood_radius_follows_pair(self) -> None:
         """§5.5.2: r ≥ ‖p1 − p2‖ — в больших раскладках берётся наименьший радиус, не ниже заданного."""
         layout = self._layout()
@@ -317,6 +344,57 @@ class ArticlePlacementTests(unittest.TestCase):
         )
         self.assertLess(parent_distance(cells), 2.0 * parent_distance(plain) + scale)
 
+    def test_equal_parents_share_points(self) -> None:
+        """Точки одного кода делятся поровну между родителями с этим кодом, а не достаются одному из них."""
+        records = _records(40, 68)
+        # 40 различных кодов по 30 точек: в затравке из 240 точек у кода в среднем 6 родителей.
+        table = _builder([record for record in records for _ in range(30)]).code_table()
+        placement = SeededPlacement(table, seed_count=240, seed=9, similarity="cosine")
+        seed_layout = Layout(placement.seed_table(), empty_ratio=0.4, **_ARTICLE_PARAMS)
+        seed_cells, seed_shape = seed_layout.cells_array(), (seed_layout.height, seed_layout.width)
+        parent_seeds, single, single_similarity = placement.similar_parents(seed_cells, seed_shape, top=2)
+        _, shared, shared_similarity = placement.similar_parents(seed_cells, seed_shape, top=2, balanced=True)
+        parent_points = placement.seed_indices[parent_seeds]
+        words = table.words64()
+        # Родитель — с тем же кодом, что у самого похожего: сходство с ним то же.
+        self.assertTrue(bool((words[parent_points[shared[:, 0]]] == words[parent_points[single[:, 0]]]).all()))
+        self.assertTrue(np.array_equal(shared_similarity, single_similarity))
+        self.assertTrue(np.array_equal(shared[parent_points, 0], np.arange(parent_points.size)))
+        # Остальные столбцы (другие похожие родители) не меняются.
+        self.assertTrue(np.array_equal(shared[:, 1], single[:, 1]))
+        children_single = np.bincount(single[:, 0], minlength=parent_points.size)
+        children_shared = np.bincount(shared[:, 0], minlength=parent_points.size)
+        # Без деления почти все точки кода достаются одному родителю, остальным — только они сами.
+        self.assertGreater(float((children_single == 1).mean()), 0.5)
+        self.assertLess(float((children_shared == 1).mean()), 0.1)
+        self.assertLess(int(children_shared.max()), int(children_single.max()))
+        # У родителей одного кода детей поровну (с точностью до одной точки).
+        _, code_of_point = placement._distinct_codes()
+        parent_code = code_of_point[parent_points]
+        for code in np.unique(parent_code):
+            counts = children_shared[parent_code == code]
+            self.assertLessEqual(int(counts.max()) - int(counts.min()), 1)
+
+    def test_place_in_block_is_spread_isotropically(self) -> None:
+        """Место точки в блоке родителя размыто нормальной добавкой σ = NEIGHBOUR_SPREAD блока по каждой оси:
+        точки родителя не заполняют ровно его квадратный блок (иначе границы областей шли бы по сетке блоков)."""
+        table, placement, _, _ = self._placement()
+        rng = np.random.default_rng(10)
+        seed_shape = (400, 400)
+        parent_cells = rng.integers(50, 350, size=(placement.seed_count, 2))
+        nearest = rng.integers(0, placement.seed_count, size=(table.count, 1))
+        similarity = np.ones((table.count, 1), dtype=np.float32)
+        target = placement._neighbour_targets(parent_cells, nearest, similarity, 0.6, seed_shape)
+        offset = target - (parent_cells[nearest[:, 0]] + 0.5)
+        spread = SeededPlacement.NEIGHBOUR_SPREAD
+        self.assertAlmostEqual(float(offset[:, 0].std()), spread, delta=0.08 * spread)
+        self.assertAlmostEqual(float(offset[:, 1].std()), spread, delta=0.08 * spread)
+        self.assertLess(abs(float(np.corrcoef(offset[:, 0], offset[:, 1])[0, 1])), 0.1)
+        self.assertLess(abs(float(offset.mean())), 0.05)
+        # Заметная доля точек лежит за пределами блока родителя.
+        outside = (np.abs(offset) > 0.5).any(axis=1)
+        self.assertGreater(float(outside.mean()), 0.5)
+
     def test_match_cells_on_device_is_bijection_and_keeps_order(self) -> None:
         rng = np.random.default_rng(8)
         count = 5000
@@ -331,6 +409,72 @@ class ArticlePlacementTests(unittest.TestCase):
         self.assertGreater(float(np.corrcoef(target_x, cell_x[match])[0, 1]), 0.95)
         host = SeededPlacement.match_cells(target_y, target_x, cell_y, cell_x)
         self.assertEqual(sorted(host.tolist()), list(range(count)))
+
+
+class LargeLayoutMapTests(unittest.TestCase):
+    """Карта большой раскладки в Rerun (§5.14): все точки картинкой «ячейка — пиксель», без кружков."""
+
+    @staticmethod
+    def _layout() -> Layout:
+        return Layout(
+            _builder(_records(300, 71)).code_table(), empty_ratio=0.4, component_period=180.0, **_ARTICLE_PARAMS
+        )
+
+    @staticmethod
+    def _logged_visuals(layout: Layout, *, rerun: bool) -> list:
+        """Картинки записи layout.visual: (вид, путь, данные) по порядку."""
+        visuals: list = []
+
+        def image(path, data, *, static=False):  # noqa: ANN001, ANN202
+            visuals.append(("image", path, np.asarray(data)))
+            return ("image", path)
+
+        def points(path, positions, *, colors=None, radii=None, static=False):  # noqa: ANN001, ANN202
+            visuals.append(("points", path, np.asarray(positions)))
+            return ("points", path)
+
+        with mock.patch.object(LOGGER, "visual_image", side_effect=image), \
+                mock.patch.object(LOGGER, "visual_points2d", side_effect=points), \
+                mock.patch.object(LOGGER, "visuals_enabled", return_value=rerun), \
+                mock.patch.object(LOGGER, "event"):
+            layout._log_layout_state("layout", 0, log_visuals=True, force=True)
+        return visuals
+
+    def test_large_layout_map_shows_every_point_without_circles(self) -> None:
+        layout = self._layout()
+        cells = layout.cells_array()
+        with mock.patch("damp.layout.damp_layout._VISUAL_POINT_LIMIT", layout.point_count - 1):
+            visuals = self._logged_visuals(layout, rerun=True)
+        self.assertEqual([(kind, path) for kind, path, _ in visuals], [
+            ("image", "layout/image"), ("points", "layout/image"),
+            ("image", "layout/angle"), ("points", "layout/angle"),
+        ])
+        for kind, _, data in visuals:
+            if kind == "points":
+                # Пустой набор: кружки меньшей раскладки (затравки) по тому же пути с карты убираются.
+                self.assertEqual(data.shape, (0, 2))
+            else:
+                # Каждая точка раскладки — пиксель картинки в своей ячейке.
+                self.assertEqual(data.shape, (layout.height, layout.width, 3))
+                occupied = np.zeros((layout.height, layout.width), dtype=bool)
+                occupied[cells[:, 0], cells[:, 1]] = True
+                self.assertFalse(data[~occupied].any())
+        angle_image = visuals[2][2]
+        self.assertEqual(int(np.count_nonzero(angle_image.any(axis=2))), layout.point_count)
+
+    def test_large_layout_map_is_not_built_without_rerun(self) -> None:
+        layout = self._layout()
+        with mock.patch("damp.layout.damp_layout._VISUAL_POINT_LIMIT", layout.point_count - 1):
+            self.assertEqual(self._logged_visuals(layout, rerun=False), [])
+
+    def test_small_layout_map_keeps_circles(self) -> None:
+        layout = self._layout()
+        cells = layout.cells_array()
+        visuals = self._logged_visuals(layout, rerun=False)
+        self.assertEqual([kind for kind, _, _ in visuals], ["image", "points", "image", "points"])
+        centres = np.stack([cells[:, 1] + 0.5, cells[:, 0] + 0.5], axis=1)
+        np.testing.assert_array_equal(visuals[1][2], centres)
+        np.testing.assert_array_equal(visuals[3][2], centres)
 
 
 class BaseFileTests(unittest.TestCase):
@@ -493,12 +637,25 @@ class ArticleLargeTunerTests(unittest.TestCase):
                 params = original_tune(self, total_points)
                 return dataclasses.replace(params, long_steps=400, short_steps=150)
 
+            cutoffs: list[tuple[int, float | None]] = []
+            original_short = main._run_short_phase
+
+            def recorded_short(layout, run_params, **options):  # noqa: ANN001, ANN003, ANN202
+                cutoffs.append((layout.point_count, options.get("similarity_cutoff")))
+                return original_short(layout, run_params, **options)
+
             with mock.patch.object(main.LayoutParameterTuner, "tune", short_tune):
-                params = main.LayoutParameterTuner().tune(table.count)
-                self.assertEqual(params.seed_points, 600)
-                # 9000 / 600 = 15 при пределе 4 точки на родителя: уровни 600 → 2324 → 9000.
-                self.assertGreater(main._seed_level_points(table.count, 600), 600)
-                layout = main._run_layout(table, params, count=0, total_codes=table.count, use_cache=False)
+                with mock.patch.object(main, "_run_short_phase", recorded_short):
+                    params = main.LayoutParameterTuner().tune(table.count)
+                    self.assertEqual(params.seed_points, 600)
+                    # 9000 / 600 = 15 при пределе 4 точки на родителя: уровни 600 → 2324 → 9000.
+                    self.assertGreater(main._seed_level_points(table.count, 600), 600)
+                    layout = main._run_layout(table, params, count=0, total_codes=table.count, use_cache=False)
+        # §5.9.1: затравка раскладывается с ранней отсечкой пар, уровни выше неё — без отсечки (дальней фазы
+        # на них нет, и разводить непохожие точки должна ближняя фаза).
+        self.assertEqual([cutoff for _, cutoff in cutoffs], [None, 0.0, 0.0])
+        self.assertEqual(cutoffs[0][0], 600)
+        self.assertEqual(cutoffs[-1][0], table.count)
         cells = layout.cells_array()
         self.assertEqual(len({(int(y), int(x)) for y, x in cells}), table.count)
         grid = np.full((layout.height, layout.width), -1, dtype=np.int64)
