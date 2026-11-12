@@ -27,13 +27,22 @@ from damp.activation import (
     OutputCodeSize,
     reassign_output_bits,
 )
+from damp.activation.plane_detection import (
+    BestMatchActivation,
+    PlaneDetection,
+    PlaneDetectorSpace,
+    StimulusSetCodes,
+)
 from damp.MnistSobelAngleMap import MnistSobelAngleMap, UpscaledSobel
+from damp.encoding.colour_merge import ColourMerge
 from damp.encoding.damp_encoder import (
     ClosedDimension,
     Encoder,
     EncoderCodeColorizer,
     OpenedDimension,
+    PlaneDimension,
     geometric_detector_layers,
+    plane_detector_layers,
 )
 import numpy as np
 
@@ -73,6 +82,8 @@ LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER = 1
 LOG_INTERVAL_ACTIVATION_SAMPLE = 100
 LOG_INTERVAL_ACTIVATION_VISUAL = 100
 LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
+LOG_INTERVAL_SECOND_LEVEL_IMAGE = 100
+LOG_INTERVAL_SECOND_LEVEL_VISUAL = 25
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
@@ -425,6 +436,34 @@ DECODER_DATASET_LIMIT = 64
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
 
+# --- Второй уровень: детекторы-круги над первой раскладкой (§4.3, §6.2, §6.5, §6.6; расширение статьи).
+# Раскладка заполняется кругами всех слоёв равномерно, как детекторы двумерной позиции (§4.3), а не по
+# кластерам раскладки (§6.4). Слои, перекрытие, цветовые полосы и случайные биты — по тем же правилам,
+# что у X и Y стимула (MNIST_POSITION_*); радиус круга задаётся долей стороны карты: от самого широкого
+# слоя к самому узкому, между ними число кругов по стороне растёт геометрически (§4.2, §4.5).
+# Стимулы набора (все углопозиции одной картинки) зажигают самые похожие точки первой раскладки, зажжённые
+# точки активируют круги, биты активных кругов объединяются в код набора (§2.2.1); коды наборов
+# раскладываются тем же Layout (§6.2, §6.6).
+SECOND_LEVEL_CODE_LENGTH = 16384
+SECOND_LEVEL_LAYERS = MNIST_POSITION_LAYERS
+SECOND_LEVEL_OVERLAP = MNIST_POSITION_OVERLAP
+# 0.85 стороны — два круга по стороне, как MNIST_POSITION_WIDEST_DETECTORS = 2: самый широкий слой
+# накрывает всю карту и даёт сходство кодам любых двух позиций (дальний порядок, §4.5).
+SECOND_LEVEL_RADIUS_MAX = 0.85
+SECOND_LEVEL_RADIUS_MIN = 0.012
+SECOND_LEVEL_RANDOM_SEED = ENCODER_RANDOM_SEED
+# Стимул зажигает точки с наибольшим сходством, если оно не ниже λ_a (§6.1); порог тот же, что у активации §6.5.
+SECOND_LEVEL_ACTIVATION_LAMBDA = ACTIVATION_LAMBDA_THRESHOLD
+# §2: плотность кода не выше 25 %. Если единиц в объединении больше, биты отбираются colour merge (§3.3):
+# "short" сохраняет коротковолновые (старшие) биты узких слоёв, "long" — длинноволновые (§3.3.2).
+SECOND_LEVEL_MAX_DENSITY = 0.25
+SECOND_LEVEL_MERGE_KEEP = "short"
+# Подпись и цвет точки второй раскладки — класс цифры: hue = класс · шаг (10 классов на круге 360°).
+SECOND_LEVEL_CLASS_HUE_STEP = 36.0
+# Число тестовых картинок проверки нечётким поиском по кодам второго уровня (§2.2.5).
+SECOND_LEVEL_EVALUATE_LIMIT = 200
+SECOND_LEVEL_FILE_PREFIX = "data/second"
+
 # §5.10: пары шага считаются спекулятивно по старым позициям; это не влияет на результат, пока обменов
 # за шаг много меньше числа точек. В режиме статьи число пар за шаг (а значит, и обменов) ограничено
 # долей LAYOUT_PAIRS_POINT_FRACTION от числа точек в обеих фазах; None — без ограничения (режим сглаживания,
@@ -741,6 +780,13 @@ LOG_INTERVALS = {
     "activation.map.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.energy.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
+    # Второй уровень: события на каждую картинку — раз в столько картинок.
+    "encoder.encode.set": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "colour_merge.merge": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.activation": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.detect": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.code": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.visual": LOG_INTERVAL_SECOND_LEVEL_VISUAL,
 }
 
 LAYOUT_CACHE_PATTERNS = (
@@ -1728,6 +1774,49 @@ def _build_colorizer() -> EncoderCodeColorizer:
         min_hue=LAYOUT_PSEUDO_COLOR_MIN_HUE,
         max_hue=LAYOUT_PSEUDO_COLOR_MAX_HUE,
     )
+
+
+def _build_plane_encoder(layout: Layout) -> Encoder:
+    """Кодер двумерной позиции на карте раскладки (§4.3): круги всех слоёв заполняют её сетку ячеек."""
+    layers = plane_detector_layers(
+        layers_count=SECOND_LEVEL_LAYERS,
+        widest_radius=SECOND_LEVEL_RADIUS_MAX,
+        narrowest_radius=SECOND_LEVEL_RADIUS_MIN,
+        overlap=SECOND_LEVEL_OVERLAP,
+    )
+    encoder = Encoder(
+        PlaneDimension(
+            "Map",
+            PlaneDetectorSpace.plane_size(layout),
+            layers,
+            code_length=SECOND_LEVEL_CODE_LENGTH,
+        ),
+        random_seed=SECOND_LEVEL_RANDOM_SEED,
+        layer_phase=ENCODER_LAYER_PHASE,
+    )
+    # §4.5, §5.13.1: сходство кодов позиций должно убывать с расстоянием на карте на всём её протяжении;
+    # Encoder.long_range_order сам логирует профиль и предупреждение.
+    encoder.long_range_order("Map")
+    return encoder
+
+
+def _build_plane_detection(layout: Layout) -> PlaneDetection:
+    """Детекторы-круги над раскладкой и зажигание её точек стимулами: код набора стимулов (§4.3, §6.2, §6.5)."""
+    space = PlaneDetectorSpace(
+        layout,
+        _build_plane_encoder(layout),
+        merge=ColourMerge(
+            max(1, int(SECOND_LEVEL_CODE_LENGTH * SECOND_LEVEL_MAX_DENSITY)),
+            keep=SECOND_LEVEL_MERGE_KEEP,
+        ),
+    )
+    activation = BestMatchActivation(
+        layout.code_table,
+        similarity=LAYOUT_SIMILARITY,
+        lambda_threshold=SECOND_LEVEL_ACTIVATION_LAMBDA,
+        use_gpu=ACTIVATION_USE_GPU,
+    )
+    return PlaneDetection(activation, space)
 
 
 def _build_extractor(
@@ -2733,7 +2822,12 @@ class MnistLayoutRunner:
             embeddings=embeddings,
         )
 
-    def run(self) -> None:
+    def digit_codes(self, count: int) -> list[DigitCodes]:
+        """Первые count цифр обучающего набора с их углопозициями и кодами — из общего кеша кодов."""
+        return self._code_cache(self._build_dataset()).take_nonempty(count)
+
+    def run(self) -> Layout:
+        """Конвейер MNIST: раскладка, затем (без --layout-only) активация и эмбеддинги; возвращает раскладку."""
         if self._reuse_cache:
             cached_layout = self._try_load_cached_layout()
         else:
@@ -2829,7 +2923,7 @@ class MnistLayoutRunner:
                 stages=stages,
                 embeddings=checkpoint_embeddings,
             )
-            return
+            return layout
         try:
             cached_embeddings = self._embedding_store.load(layout_path)
         except FileNotFoundError:
@@ -2874,6 +2968,7 @@ class MnistLayoutRunner:
             stages=stages,
             embeddings=embeddings,
         )
+        return layout
 
 
 
@@ -3172,6 +3267,108 @@ class MnistDecodeRunner:
         return best_temp, best_acc
 
 
+class MnistSecondLevelRunner:
+    """Второй уровень на MNIST (§6.2, §6.6; расширение статьи): код картинки и раскладка кодов картинок.
+
+    1. Первая раскладка углопозиций — обычным конвейером (MnistLayoutRunner, только раскладка).
+    2. Над ней строятся детекторы-круги (§4.3); все углопозиции картинки зажигают самые похожие точки
+       раскладки, зажжённые точки активируют круги, биты кругов дают код картинки (PlaneDetection).
+    3. Коды картинок раскладываются тем же Layout: точка второй раскладки — картинка, цвет — класс цифры.
+    4. Проверка: нечёткий поиск тестовых картинок по базе кодов обучающих (§2.2.5), тем же декодером.
+    """
+
+    def __init__(
+        self,
+        *,
+        count: int,
+        reuse_cache: bool = True,
+        evaluate_limit: int = SECOND_LEVEL_EVALUATE_LIMIT,
+        split: str = "test",
+    ) -> None:
+        if evaluate_limit < 0:
+            raise ValueError("evaluate_limit must be non-negative")
+        self.count = int(count)
+        self._evaluate_limit = int(evaluate_limit)
+        self._split = split
+        self._primary = MnistLayoutRunner(count=count, reuse_cache=reuse_cache, layout_only=True)
+
+    def run(self) -> float | None:
+        """Весь путь второго уровня; возвращает точность нечёткого поиска (None — проверка отключена)."""
+        primary_layout = self._primary.run()
+        detection = _build_plane_detection(primary_layout)
+        codes = self._encode_digits(detection)
+        codes.log_summary(detection.space, similarity=LAYOUT_SIMILARITY, seed=SECOND_LEVEL_RANDOM_SEED)
+        second_layout = self._layout_codes(codes)
+        self._export(second_layout)
+        if self._evaluate_limit == 0:
+            return None
+        return self._evaluate(detection, codes)
+
+    def _encode_digits(self, detection: PlaneDetection) -> StimulusSetCodes:
+        """Коды второго уровня обучающих картинок: набор стимулов — все углопозиции одной цифры."""
+        codes = StimulusSetCodes(detection.code_length)
+        for item in self._primary.digit_codes(self.count):
+            codes.add(item.label, detection.encode_packed(item.packed, label=item.label))
+        return codes
+
+    def _layout_codes(self, codes: StimulusSetCodes) -> Layout:
+        """Раскладка кодов картинок тем же алгоритмом и с той же настройкой, что первая (§6.2, §6.6)."""
+        table = codes.table(hue_step=SECOND_LEVEL_CLASS_HUE_STEP).grouped_by_hue()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        return _layout_from_codes(table, tuner.tune(table.count), self._primary.colorizer)
+
+    def _export(self, layout: Layout) -> None:
+        """JSON и карты второй раскладки: псевдоцвета кода, раскраска по классу цифры, яркость по энергии."""
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        stem = f"{SECOND_LEVEL_FILE_PREFIX}-{self.count}-{suffix}"
+        layout.save_json(f"{stem}-{LAYOUT_CACHE_TAG}.json")
+        MnistLayoutRunner._save_layout_images(
+            layout,
+            image_path=f"{stem}.png",
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
+        )
+
+    def _evaluate(self, detection: PlaneDetection, codes: StimulusSetCodes) -> float:
+        """Нечёткий поиск (§2.2.5): класс тестовой картинки — по самым похожим кодам обучающих картинок."""
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        database = EmbeddingDatabase(
+            [
+                LabeledEmbedding(label=label, embedding=embedding)
+                for label, embedding in zip(codes.labels, codes.embeddings())
+            ],
+            DecoderConfig(
+                similarity=DECODER_SIMILARITY,
+                temperature=DECODER_SOFTMAX_TEMPERATURE,
+                min_confidence=DECODER_MIN_CONFIDENCE,
+                expected_classes=DECODER_EXPECTED_CLASSES,
+                knn_top_k=DECODER_KNN_TOP_K,
+                top_k_per_class=DECODER_TOP_K_PER_CLASS,
+                min_similarity=DECODER_MIN_SIMILARITY,
+            ),
+        )
+        decoder = MnistDecoder(
+            encoder=self._primary.encoder,
+            extractor=self._primary.extractor,
+            activation_engine=detection,
+            embedding_db=database,
+        )
+        dataset = MNIST(root="./data", train=self._split == "train", download=True, transform=transforms.ToTensor())
+        images: list["np.ndarray"] = []
+        labels: list[int] = []
+        for index, (image, label) in enumerate(dataset):
+            if index >= self._evaluate_limit:
+                break
+            images.append(image.squeeze(0).numpy())
+            labels.append(int(label))
+        _, accuracy = decoder.predict_batch(images, labels=labels)
+        return 0.0 if accuracy is None else float(accuracy)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DAMP MNIST demo")
     subparsers = parser.add_subparsers(dest="command")
@@ -3210,6 +3407,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--limit", type=int, default=DECODER_DATASET_LIMIT)
     evaluate_parser.add_argument("--split", choices=["train", "test"], default="test")
     evaluate_parser.add_argument("--temperature", type=float, default=None)
+    second_parser = subparsers.add_parser(
+        "second",
+        help="второй уровень: коды картинок из детекторов-кругов над первой раскладкой, их раскладка и проверка",
+    )
+    second_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
+    second_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="игнорировать готовую первую раскладку в data/ и посчитать её заново",
+    )
+    second_parser.add_argument(
+        "--limit",
+        type=int,
+        default=SECOND_LEVEL_EVALUATE_LIMIT,
+        help="число картинок проверки нечётким поиском; 0 — без проверки",
+    )
+    second_parser.add_argument("--split", choices=["train", "test"], default="test")
     return parser
 
 
@@ -3266,6 +3480,17 @@ def main() -> None:
             log_first=False,
         )
         print(f"dataset={args.split} samples={args.limit} accuracy={accuracy:.4f}")
+        return
+    if command == "second":
+        second_runner = MnistSecondLevelRunner(
+            count=args.count,
+            reuse_cache=not args.rebuild,
+            evaluate_limit=args.limit,
+            split=args.split,
+        )
+        second_accuracy = second_runner.run()
+        if second_accuracy is not None:
+            print(f"second level: dataset={args.split} samples={args.limit} accuracy={second_accuracy:.4f}")
         return
     parser.error(f"unknown command {command}")
 
