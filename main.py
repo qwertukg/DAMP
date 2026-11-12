@@ -151,10 +151,18 @@ ENCODING_CODES_CACHE_DIR = "data"
 MNIST_ANGLE_MIN = 0.0
 MNIST_ANGLE_MAX = 360.0
 MNIST_ANGLE_CODE_LENGTH = 256
-MNIST_ANGLE_LAYERS = 22
+# Слоёв и перекрытия у угла и позиции поровну (10 слоёв, перекрытие 0.7): в режиме статьи
+# (LAYOUT_SMOOTH_PINWHEELS = False) соседних ячеек, разнящихся по углу больше чем на 30° или по позиции больше
+# чем на 3 окна, втрое меньше, чем при прежних 22 слоях и перекрытии 0.4 (300 цифр: 19.1 % → 5.5 %,
+# 60 000 цифр: 1.21 % → 0.37 %). Перекрытие убирает стенки между областями, отношение слоёв угла и позиции
+# решает, какая координата выходит непрерывной (§4.2.1, §4.5, §5.13.2.2). Цена: различных кодов на
+# 60 000 цифр 256 тыс. вместо 456 тыс. Прежние значения оставлены в закомментированных строках.
+# MNIST_ANGLE_LAYERS = 22
+MNIST_ANGLE_LAYERS = 10
 MNIST_ANGLE_WIDEST_DETECTORS = 2
 MNIST_ANGLE_NARROWEST_DETECTORS = 180
-MNIST_ANGLE_OVERLAP = 0.4
+# MNIST_ANGLE_OVERLAP = 0.4
+MNIST_ANGLE_OVERLAP = 0.7
 # Позиции MNIST — индексы участков 0…6. Нижняя граница вынесена на шаг за край данных: детекторов за краями
 # отрезка нет (MNIST_POSITION_EDGE_DETECTORS = False), и при MIN = 0 участок 0 лежал на самой границе —
 # 22 бита вместо ~34 и J(0, 1) = 0,81 при ~0,57 у остальных соседей. С MIN = -1 перекрытие соседних
@@ -165,13 +173,15 @@ MNIST_POSITION_CODE_LENGTH = 128
 # 15 слоёв — минимальное уменьшение с 22, при котором в pinwheel-тесте (позиции 2×2, режим сглаживания)
 # пропадает дыра на стыке четырёх позиций: соседние позиции достаточно похожи, чтобы точки на стыке
 # получали энергию от чужих кластеров (22 слоя: 3–10 пустых ячеек в центре, 16: 0–5, 15: 1–2).
-MNIST_POSITION_LAYERS = 22
+# MNIST_POSITION_LAYERS = 22
+MNIST_POSITION_LAYERS = 10
 MNIST_POSITION_WIDEST_DETECTORS = 2
 # Самый узкий слой позиции — 28 детекторов (самый широкий — MNIST_POSITION_WIDEST_DETECTORS = 2);
 # между ними слои растут геометрически, у каждого слоя своё число детекторов.
 MNIST_POSITION_NARROWEST_DETECTORS = 28
 # Перекрытие соседних позиционных детекторов слоя (§4.2.1: «detectors must overlap at each level»).
-MNIST_POSITION_OVERLAP = 0.4
+# MNIST_POSITION_OVERLAP = 0.4
+MNIST_POSITION_OVERLAP = 0.7
 # False — в слое ровно MNIST_POSITION_WIDEST…NARROWEST детекторов внутри отрезка (2 … 14), без детекторов
 # за краями; True — детекторы заходят за концы отрезка, как в Angle-Encoder.
 MNIST_POSITION_EDGE_DETECTORS = False
