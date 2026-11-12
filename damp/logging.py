@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import sys
 from typing import Any, Callable, Mapping, Sequence
@@ -207,6 +208,16 @@ class DampLogger:
     def mute(self) -> None:
         """Выключает журнал этого процесса: ни консоли, ни rerun (для рабочих процессов)."""
         self._muted = True
+
+    @contextmanager
+    def quiet(self):
+        """Временно выключает журнал: для пробных построений, записи которых повторяли бы записи итогового."""
+        previous = self._muted
+        self._muted = True
+        try:
+            yield
+        finally:
+            self._muted = previous
 
     def use_blueprint(self, builder: Callable[[], Any]) -> None:
         """Своя раскладка панелей окна для отдельного скрипта; по умолчанию — ход раскладки DAMP.

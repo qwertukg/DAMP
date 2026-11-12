@@ -309,9 +309,13 @@ class PlaneDimension(Dimension):
         detector_layers: Sequence[Detectors],
         *,
         code_length: int,
+        layer_bands: bool = True,
     ) -> None:
         if len(size) != 2 or len(size[0]) != 2 or len(size[1]) != 2:
             raise ValueError("size must be ((y_min, y_max), (x_min, x_max))")
+        # True — у каждого слоя своя цветовая полоса кода, как у одномерных координат (§3.2); False — бит круга
+        # случаен во всём коде: слои делят код поровну по числу активных кругов, а не по числу слоёв.
+        self.layer_bands = bool(layer_bands)
         self.y_min, self.y_max = float(size[0][0]), float(size[0][1])
         self.x_min, self.x_max = float(size[1][0]), float(size[1][1])
         if self.y_max <= self.y_min or self.x_max <= self.x_min:
@@ -335,6 +339,7 @@ class PlaneDimension(Dimension):
                 "x_range": (self.x_min, self.x_max),
                 "side": self.side,
                 "code_length": self.code_length,
+                "layer_bands": self.layer_bands,
                 "layers": len(self.detector_layers),
                 "radii": [radius for _, radius, _, _ in geometry],
                 "radii_of_side": [radius / self.side for _, radius, _, _ in geometry],
@@ -363,6 +368,14 @@ class PlaneDimension(Dimension):
         """Большая сторона плоскости: к ней отнесены шаг решётки и радиусы кругов."""
         return self.period
 
+    def layer_band(self, layer_index: int) -> tuple[int, int]:
+        """Биты кода, из которых берётся случайный бит круга слоя: полоса слоя (§3.2) либо весь код."""
+        if self.layer_bands:
+            return super().layer_band(layer_index)
+        if not 0 <= layer_index < len(self.detector_layers):
+            raise ValueError("layer_index out of range")
+        return 0, self.code_length
+
     def layer_geometry(self, layer: Detectors) -> tuple[float, float, int, int]:
         """Шаг решётки, радиус круга и число кругов по вертикали и по горизонтали для слоя."""
         step = self.side / layer.count
@@ -378,6 +391,7 @@ class PlaneDimension(Dimension):
     def signature_token(self) -> str:
         return (
             f"{self.title}|plane|{self.y_min}|{self.y_max}|{self.x_min}|{self.x_max}|{self.code_length}|"
+            f"{self.layer_bands}|"
         )
 
 
@@ -699,10 +713,15 @@ class Encoder:
         )
         # Слой каждого детектора (номер слоя — цвет его бита, §3.2): для разбора кода набора по слоям.
         self._detector_layers = np.asarray([w.layer_index for w in self.detectors], dtype=np.int64)
+        self._detector_bits = np.asarray([w.bit for w in self.detectors], dtype=np.int64)
 
     def detector_layer_indices(self) -> "np.ndarray":
         """Номер слоя каждого детектора (по self.detectors): 0 — самый широкий слой (§4.2, §4.5)."""
         return self._detector_layers
+
+    def detector_bits(self) -> "np.ndarray":
+        """Бит кода каждого детектора (по self.detectors): один случайный бит полосы его слоя (§4.2.1)."""
+        return self._detector_bits
 
     # ------------------------------------------------------------------ geometry
     def _build_layer_detectors(

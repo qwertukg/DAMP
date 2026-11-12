@@ -73,6 +73,11 @@ class EmbeddingDatabase:
             ones = item.embedding.count()
             self._items.append((item.label, item.embedding, ones))
             self._by_class[item.label].append((item.embedding, ones))
+        # Биты базы упакованы по 8 в байт: число общих бит запроса со всеми эмбеддингами считается одной
+        # векторной операцией вместо обхода множеств единичных битов; значения сходства те же.
+        self._code_length = len(self._items[0][1]) if self._items else 0
+        self._packed = self._pack_items()
+        self._ones = np.asarray([ones for _, _, ones in self._items], dtype=np.int64)
 
         LOGGER.event(
             "decoder.base.init",
@@ -87,6 +92,49 @@ class EmbeddingDatabase:
                 "min_similarity": self._config.min_similarity,
             },
         )
+
+    # Эмбеддингов за одну упаковку (матрица «эмбеддинги × биты» не строится целиком).
+    _PACK_CHUNK = 2048
+    _BYTE_ONES = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1).astype(np.int64)
+
+    def _pack_items(self) -> "np.ndarray":
+        """Биты эмбеддингов базы, упакованные по 8 в байт (эмбеддинги × ⌈L/8⌉)."""
+        width = -(-self._code_length // 8)
+        packed = np.zeros((len(self._items), width), dtype=np.uint8)
+        for start in range(0, len(self._items), self._PACK_CHUNK):
+            chunk = self._items[start : start + self._PACK_CHUNK]
+            for _, embedding, _ in chunk:
+                if len(embedding) != self._code_length:
+                    raise ValueError("embedding sizes must match for similarity")
+            bits = np.stack(
+                [np.frombuffer(embedding._bits, dtype=np.uint8, count=self._code_length) for _, embedding, _ in chunk]
+            )
+            packed[start : start + len(chunk)] = np.packbits(bits != 0, axis=1)
+        return packed
+
+    def _similarities(self, query: BitArray, query_ones: int) -> "np.ndarray":
+        """Сходство запроса с каждым эмбеддингом базы (§2.2.4) — те же значения, что у _similarity_value."""
+        if len(query) != self._code_length:
+            raise ValueError("embedding sizes must match for similarity")
+        packed_query = np.packbits(np.frombuffer(query._bits, dtype=np.uint8, count=self._code_length) != 0)
+        shared = self._packed & packed_query[None, :]
+        if hasattr(np, "bitwise_count"):
+            common = np.bitwise_count(shared).sum(axis=1, dtype=np.int64)
+        else:
+            common = self._BYTE_ONES[shared].sum(axis=1)
+        sim_name = (self._config.similarity or "").lower()
+        if sim_name in ("cosine", "cos", "cosine2", "cos2"):
+            denominator = np.sqrt((int(query_ones) * self._ones).astype(np.float64))
+        else:
+            # §2.2.4.2: для битовых векторов J2 = |a∧b| / |a∨b|.
+            denominator = (int(query_ones) + self._ones - common).astype(np.float64)
+        values = np.divide(
+            common.astype(np.float64), denominator, out=np.zeros(common.shape[0], dtype=np.float64), where=denominator > 0
+        )
+        values[self._ones <= 0] = 0.0
+        if sim_name in ("cosine2", "cos2"):
+            values = values * values
+        return values
 
     @property
     def expected_classes(self) -> Sequence[int]:
@@ -141,11 +189,11 @@ class EmbeddingDatabase:
         import heapq
 
         neighbors: list[tuple[float, int]] = []
+        similarities = self._similarities(embedding, query_ones).tolist()
 
         if k_per_class > 0:
             heaps_by_class: dict[int, list[tuple[float, int]]] = {lbl: [] for lbl in self._expected_classes}
-            for label, stored, stored_ones in self._items:
-                sim = self._similarity_value(embedding, query_ones, stored, stored_ones)
+            for (label, _, _), sim in zip(self._items, similarities):
                 if sim <= min_sim:
                     continue
                 h = heaps_by_class[label]
@@ -163,8 +211,7 @@ class EmbeddingDatabase:
             strategy = "per_class_topk"
         else:
             heap: list[tuple[float, int]] = []
-            for label, stored, stored_ones in self._items:
-                sim = self._similarity_value(embedding, query_ones, stored, stored_ones)
+            for (label, _, _), sim in zip(self._items, similarities):
                 if sim <= min_sim:
                     continue
                 if len(heap) < k_total:

@@ -10,7 +10,8 @@
 
 1. каждый стимул зажигает точки раскладки с самым похожим кодом (BestMatchActivation; §6.1, §6.5);
 2. зажжённые точки активируют круги, в поле которых лежат (PlaneDetectorSpace; §4.3);
-3. биты активных кругов объединяются: OR, при пересыщении — colour merge (§2.2.1, §3.3, §6.5).
+3. код набора — вектор фиксированной длины: каждому кругу назначен один случайный бит цветовой полосы его
+   слоя, активный круг зажигает свой бит (§4.2.1); длина кода подбирается по плотности (PlaneCodeSizer; §6.6).
 
 Полученные коды наследуют топологию стимулов и раскладываются на следующем уровне (§6.2, §6.6).
 """
@@ -19,7 +20,7 @@ from __future__ import annotations
 import colorsys
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from damp.article_refs import (
     CODE_SPACE_ACTIVATION,
     DETECTOR_HIERARCHY,
     MAPPING_CONTINUITY,
+    NEURAL_ANALOGY,
     OUTSIDE_ARTICLE,
     SIMILARITY_MEASURES,
     SPARSE_BIT_VECTORS,
@@ -34,7 +36,6 @@ from damp.article_refs import (
     TWO_DIM_CODES,
 )
 from damp.encoding.bitarray import BitArray
-from damp.encoding.colour_merge import ColourMerge
 from damp.encoding.damp_encoder import DetectorCircle, Encoder, PlaneDimension
 from damp.layout.code_table import LayoutCodeTable
 from damp.layout.damp_layout import Layout
@@ -322,7 +323,6 @@ class PlaneCode:
     bits: "np.ndarray"  # биты кода, uint8, длина кода
     active_detectors: "np.ndarray"  # номера активных кругов (по детекторам кодера)
     positions: int  # различных зажжённых ячеек
-    dropped_bits: int  # отброшено colour merge (§3.3)
 
 
 class PlaneDetectorSpace:
@@ -337,7 +337,7 @@ class PlaneDetectorSpace:
     VISUAL_CIRCLES_MAX = 400
     VISUAL_CIRCLE_SEGMENTS = 24
 
-    def __init__(self, layout: Layout, encoder: Encoder, *, merge: ColourMerge | None = None) -> None:
+    def __init__(self, layout: Layout, encoder: Encoder) -> None:
         if len(encoder.dimensions) != 1 or not isinstance(encoder.dimensions[0], PlaneDimension):
             raise ValueError("plane detector space needs an Encoder with a single PlaneDimension (§4.3)")
         plane = encoder.dimensions[0]
@@ -347,7 +347,6 @@ class PlaneDetectorSpace:
             raise ValueError("the plane of the encoder must cover the layout grid")
         self._encoder = encoder
         self._plane = plane
-        self._merge = merge
         self._cells = layout.cells_array()
         self._layers = encoder.detector_layer_indices()
         self._layer_count = len(plane.detector_layers)
@@ -363,9 +362,9 @@ class PlaneDetectorSpace:
                 "layers": self._layer_count,
                 "layer_detectors": self._per_layer(self._layer_sizes),
                 "code_length": encoder.code_length,
-                "saturation_limit": None if merge is None else merge.saturation_limit,
                 "note": "расширение статьи: круги расставлены равномерно, как детекторы двумерной позиции (§4.3), "
-                "а не по кластерам раскладки (§6.4); круг активен, если в его поле есть зажжённая точка",
+                "а не по кластерам раскладки (§6.4); круг активен, если в его поле есть зажжённая точка, "
+                "и зажигает свой бит кода",
             },
         )
 
@@ -395,16 +394,17 @@ class PlaneDetectorSpace:
         """Цветовая полоса слоя в коде: начало и длина (§3.2)."""
         return self._plane.layer_band(layer_index)
 
-    def detect(self, points: "np.ndarray") -> PlaneCode:
-        """Код набора зажжённых точек: OR битов кругов, накрывающих хотя бы одну из них (§4.3, §2.2.1, §3.3)."""
+    def positions(self, points: "np.ndarray") -> "np.ndarray":
+        """Позиции зажжённых точек на плоскости: центры их ячеек (y + 0.5, x + 0.5), без повторов."""
         points = np.asarray(points, dtype=np.int64)
         cells = np.unique(self._cells[points], axis=0) if points.size else np.zeros((0, 2), dtype=np.int64)
-        positions = cells.astype(np.float64) + 0.5
+        return cells.astype(np.float64) + 0.5
+
+    def detect(self, points: "np.ndarray") -> PlaneCode:
+        """Код набора зажжённых точек: свой бит зажигает каждый круг, накрывающий хотя бы одну из них (§4.3)."""
+        points = np.asarray(points, dtype=np.int64)
+        positions = self.positions(points)
         bits, active = self._encoder.encode_set(positions)
-        united = int(np.count_nonzero(bits))
-        dropped = 0
-        if self._merge is not None:
-            bits, dropped = self._merge.merge(bits)
         active_bits = int(np.count_nonzero(bits))
         layer_active = np.bincount(self._layers[active], minlength=self._layer_count)
         LOGGER.event(
@@ -412,17 +412,17 @@ class PlaneDetectorSpace:
             section=TWO_DIM_CODES,
             data={
                 "lit_points": int(points.size),
-                "lit_cells": int(cells.shape[0]),
+                "lit_cells": int(positions.shape[0]),
                 "active_detectors": int(active.size),
                 "layer_active": self._per_layer(layer_active),
                 "layer_detectors": self._per_layer(self._layer_sizes),
-                "united_bits": united,
-                "dropped_bits": dropped,
                 "active_bits": active_bits,
+                # Активных кругов больше, чем единиц: несколько кругов могут делить бит (коллизии §4.2.1).
+                "shared": int(active.size) - active_bits,
                 "density": active_bits / self.code_length,
             },
         )
-        return PlaneCode(bits=bits, active_detectors=active, positions=int(cells.shape[0]), dropped_bits=dropped)
+        return PlaneCode(bits=bits, active_detectors=active, positions=int(positions.shape[0]))
 
     def log_visual(self, points: "np.ndarray", code: PlaneCode, *, label: object | None = None) -> None:
         """Зажжённые точки раскладки и активные круги в Rerun (ср. рис. 19, 20)."""
@@ -470,6 +470,94 @@ class PlaneDetectorSpace:
             ],
             force=True,
         )
+
+
+class PlaneCodeSizer:
+    """Длина кода набора стимулов по заданной плотности (§2, §6.6).
+
+    §6.6, шаг 3: размер выходного слоя вычисляется по среднему числу детекторов, активируемых стимулами.
+    Код имеет фиксированную длину, каждому кругу назначен один случайный бит цветовой полосы его слоя
+    (§4.2.1), активный круг зажигает свой бит. Длина — наименьшая, при которой средняя плотность кодов
+    калибровочных наборов не выше заданной (§2: не выше 25 %). Какие круги активны, от длины кода не
+    зависит — от неё зависят только биты кругов, поэтому наборы активируются один раз, а пробные кодеры
+    разной длины строятся без записи в журнал.
+    """
+
+    # Длины перебираются кратными этому числу: код хранится упакованным по 8 бит в байт.
+    LENGTH_STEP = 8
+
+    def __init__(self, *, target_density: float, min_length: int, max_length: int) -> None:
+        if not 0.0 < target_density < 1.0:
+            raise ValueError("target_density must be in (0, 1)")
+        if min_length <= 0 or max_length < min_length:
+            raise ValueError("code length bounds must satisfy 0 < min_length <= max_length")
+        self._target = float(target_density)
+        self._min_steps = -(-int(min_length) // self.LENGTH_STEP)
+        self._max_steps = int(max_length) // self.LENGTH_STEP
+        if self._max_steps < self._min_steps:
+            raise ValueError("code length bounds leave no length that is a multiple of LENGTH_STEP")
+
+    def fit(
+        self,
+        layout: Layout,
+        activation: BestMatchActivation,
+        stimulus_sets: Sequence["np.ndarray"],
+        build_encoder: Callable[[int], Encoder],
+    ) -> int:
+        """Длина кода для раскладки: stimulus_sets — упакованные коды стимулов калибровочных наборов,
+        build_encoder(length) — кодер двумерной позиции с кодом длины length."""
+        if not stimulus_sets:
+            raise ValueError("at least one calibration stimulus set is required")
+        with LOGGER.quiet():
+            probe = PlaneDetectorSpace(layout, build_encoder(self._max_steps * self.LENGTH_STEP))
+            active_sets = [
+                probe.encoder.encode_set(probe.positions(activation.lit_points(packed).points))[1]
+                for packed in stimulus_sets
+            ]
+        trials: dict[int, float] = {}
+
+        def density(steps: int) -> float:
+            if steps not in trials:
+                length = steps * self.LENGTH_STEP
+                with LOGGER.quiet():
+                    bits = build_encoder(length).detector_bits()
+                trials[steps] = float(np.mean([np.unique(bits[active]).size for active in active_sets])) / length
+            return trials[steps]
+
+        low, high = self._min_steps, self._max_steps
+        if density(low) <= self._target:
+            high = low
+        elif density(high) > self._target:
+            low = high
+        else:
+            # Плотность убывает с длиной кода: ищется наименьшая длина с плотностью не выше заданной.
+            while high - low > 1:
+                middle = (low + high) // 2
+                if density(middle) > self._target:
+                    low = middle
+                else:
+                    high = middle
+        length = high * self.LENGTH_STEP
+        LOGGER.event(
+            "plane_detection.code_size",
+            section=NEURAL_ANALOGY,
+            data={
+                "samples": len(active_sets),
+                "mean_active_detectors": float(np.mean([active.size for active in active_sets])),
+                "min_active_detectors": int(min(active.size for active in active_sets)),
+                "max_active_detectors": int(max(active.size for active in active_sets)),
+                "target_density": self._target,
+                "code_length": length,
+                "density": density(high),
+                "reached": density(high) <= self._target,
+                "trials": len(trials),
+                "min_length": self._min_steps * self.LENGTH_STEP,
+                "max_length": self._max_steps * self.LENGTH_STEP,
+                "note": "§6.6, шаг 3: размер выходного слоя — по среднему числу активных детекторов; длина кода "
+                "наименьшая, при которой средняя плотность кодов калибровочных наборов не выше заданной (§2)",
+            },
+        )
+        return length
 
 
 @dataclass(frozen=True)
@@ -648,8 +736,9 @@ class StimulusSetCodes:
         bits = self.bits(rows)
         band_fill: list[str] = []
         band_constant: list[str] = []
-        for layer in range(space.layer_count):
-            start, length = space.layer_band(layer)
+        # Полосы слоёв; если бит круга берётся из всего кода, полоса одна — весь код.
+        bands = list(dict.fromkeys(space.layer_band(layer) for layer in range(space.layer_count)))
+        for start, length in bands:
             band = bits[:, start : start + length]
             band_fill.append(f"{band.mean():.2f}")
             # Биты полосы, одинаковые у всех кодов набора, не различают картинки.
@@ -671,10 +760,11 @@ class StimulusSetCodes:
                 "silent_stimuli": self._silent,
                 "stimuli": self._stimuli,
                 "sample": int(rows.shape[0]),
+                "bands": len(bands),
                 "band_fill": " ".join(band_fill),
                 "band_constant": " ".join(band_constant),
-                "note": "band_fill — доля единиц в цветовой полосе слоя (от широкого слоя к узкому); "
-                "band_constant — доля битов полосы, одинаковых у всех кодов (§2: плотность не выше 25 %)",
+                "note": "band_fill — доля единиц в цветовой полосе слоя (от широкого слоя к узкому; одна полоса — "
+                "бит круга берётся из всего кода); band_constant — доля битов полосы, одинаковых у всех кодов",
             },
         )
         stats = self._similarity_stats(similarity, rows, bits, quantiles)

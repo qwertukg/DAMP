@@ -30,12 +30,12 @@ from damp.activation import (
 from damp.activation.plane_detection import (
     BestMatchActivation,
     LabelMapQuality,
+    PlaneCodeSizer,
     PlaneDetection,
     PlaneDetectorSpace,
     StimulusSetCodes,
 )
 from damp.MnistSobelAngleMap import MnistSobelAngleMap, UpscaledSobel
-from damp.encoding.colour_merge import ColourMerge
 from damp.encoding.damp_encoder import (
     ClosedDimension,
     Encoder,
@@ -442,26 +442,37 @@ DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
 # кластерам раскладки (§6.4). Слои, перекрытие, цветовые полосы и случайные биты — по тем же правилам,
 # что у X и Y стимула (MNIST_POSITION_*); радиус круга задаётся долей стороны карты: от самого широкого
 # слоя к самому узкому, между ними число кругов по стороне растёт геометрически (§4.2, §4.5).
-# Стимулы набора (все углопозиции одной картинки) зажигают самые похожие точки первой раскладки, зажжённые
-# точки активируют круги, биты активных кругов объединяются в код набора (§2.2.1); коды наборов
-# раскладываются тем же Layout (§6.2, §6.6).
-SECOND_LEVEL_CODE_LENGTH = 16384
+# Стимулы набора (все углопозиции одной картинки) зажигают самые похожие точки первой раскладки, зажжённая
+# точка активирует круги, в поле которых лежит. Код набора — вектор фиксированной длины: каждому кругу
+# назначен один случайный бит цветовой полосы его слоя, активный круг зажигает свой бит (§4.2.1). Коды
+# наборов раскладываются тем же Layout (§6.2, §6.6).
+# Длина кода не задаётся, а подбирается (§6.6, шаг 3: размер выходного слоя — по среднему числу активных
+# детекторов): наименьшая, при которой средняя плотность кодов первых SECOND_LEVEL_CALIBRATION_SAMPLES
+# картинок не выше SECOND_LEVEL_TARGET_DENSITY (§2: 25 %). Поиск идёт между SECOND_LEVEL_CODE_LENGTH_MIN
+# и SECOND_LEVEL_CODE_LENGTH_MAX.
+SECOND_LEVEL_TARGET_DENSITY = 0.25
+SECOND_LEVEL_CALIBRATION_SAMPLES = 100
+SECOND_LEVEL_CODE_LENGTH_MIN = 256
+SECOND_LEVEL_CODE_LENGTH_MAX = 262144
 SECOND_LEVEL_LAYERS = MNIST_POSITION_LAYERS
 SECOND_LEVEL_OVERLAP = MNIST_POSITION_OVERLAP
+# False — случайный бит круга берётся из всего кода; True — из цветовой полосы его слоя, как у одномерных
+# координат (§3.2). Картинка активирует в узких слоях сотни кругов, в широких — единицы, а полосы слоёв равны:
+# при плотности кода 25 % полосы пяти широких слоёв заполнены на 1–11 %, полосы трёх узких — на 48–63 %,
+# и круги узких слоёв, которые и различают картинки, сливаются. 2000 обучающих цифр, 1000 тестовых,
+# ближайший сосед, плотность 25 %: с полосами — 89.6 % (код 7 648 бит), без полос — 93.7 % (8 392 бита).
+SECOND_LEVEL_LAYER_BANDS = False
 # 0.85 стороны — два круга по стороне, как MNIST_POSITION_WIDEST_DETECTORS = 2: самый широкий слой
 # накрывает всю карту и даёт сходство кодам любых двух позиций (дальний порядок, §4.5).
 SECOND_LEVEL_RADIUS_MAX = 0.85
 # Самый узкий слой. 2000 обучающих цифр, 1000 тестовых, ближайший сосед по косинусу кодов картинок
-# (по сырым пикселям на тех же данных — 88.4 %): радиус 0.006 — 89.9 %, 0.012 — 92.6 %, 0.02 — 93.6 %;
-# 5 слоёв 0.25…0.03 — 92.8 %. Слишком узкие круги различают отдельные углопозиции и не обобщают.
+# (по сырым пикселям на тех же данных — 88.4 %), код 16 384 бита с полосами слоёв: радиус 0.006 — 89.9 %,
+# 0.012 — 92.6 %, 0.02 — 93.6 %; 5 слоёв 0.25…0.03 — 92.8 %. Слишком узкие круги различают отдельные
+# углопозиции и не обобщают.
 SECOND_LEVEL_RADIUS_MIN = 0.02
 SECOND_LEVEL_RANDOM_SEED = ENCODER_RANDOM_SEED
 # Стимул зажигает точки с наибольшим сходством, если оно не ниже λ_a (§6.1); порог тот же, что у активации §6.5.
 SECOND_LEVEL_ACTIVATION_LAMBDA = ACTIVATION_LAMBDA_THRESHOLD
-# §2: плотность кода не выше 25 %. Если единиц в объединении больше, биты отбираются colour merge (§3.3):
-# "short" сохраняет коротковолновые (старшие) биты узких слоёв, "long" — длинноволновые (§3.3.2).
-SECOND_LEVEL_MAX_DENSITY = 0.25
-SECOND_LEVEL_MERGE_KEEP = "short"
 # Подпись и цвет точки второй раскладки — класс цифры: hue = класс · шаг (10 классов на круге 360°).
 SECOND_LEVEL_CLASS_HUE_STEP = 36.0
 # Порог сходства второй раскладки (§5.4, §7.1.7). Сходства кодов картинок лежат в другом диапазоне, чем
@@ -796,7 +807,6 @@ LOG_INTERVALS = {
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
     # Второй уровень: события на каждую картинку — раз в столько картинок.
     "encoder.encode.set": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
-    "colour_merge.merge": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
     "plane_detection.activation": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
     "plane_detection.detect": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
     "plane_detection.code": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
@@ -1841,8 +1851,11 @@ def _build_colorizer() -> EncoderCodeColorizer:
     )
 
 
-def _build_plane_encoder(layout: Layout) -> Encoder:
-    """Кодер двумерной позиции на карте раскладки (§4.3): круги всех слоёв заполняют её сетку ячеек."""
+def _build_plane_encoder(layout: Layout, code_length: int, *, check_order: bool = True) -> Encoder:
+    """Кодер двумерной позиции на карте раскладки (§4.3): круги всех слоёв заполняют её сетку ячеек.
+
+    code_length — длина кода; check_order — проверить дальний порядок кодов позиций (§4.5).
+    """
     layers = plane_detector_layers(
         layers_count=SECOND_LEVEL_LAYERS,
         widest_radius=SECOND_LEVEL_RADIUS_MAX,
@@ -1854,34 +1867,42 @@ def _build_plane_encoder(layout: Layout) -> Encoder:
             "Map",
             PlaneDetectorSpace.plane_size(layout),
             layers,
-            code_length=SECOND_LEVEL_CODE_LENGTH,
+            code_length=int(code_length),
+            layer_bands=SECOND_LEVEL_LAYER_BANDS,
         ),
         random_seed=SECOND_LEVEL_RANDOM_SEED,
         layer_phase=ENCODER_LAYER_PHASE,
     )
-    # §4.5, §5.13.1: сходство кодов позиций должно убывать с расстоянием на карте на всём её протяжении;
-    # Encoder.long_range_order сам логирует профиль и предупреждение.
-    encoder.long_range_order("Map")
+    if check_order:
+        # §4.5, §5.13.1: сходство кодов позиций должно убывать с расстоянием на карте на всём её протяжении;
+        # Encoder.long_range_order сам логирует профиль и предупреждение.
+        encoder.long_range_order("Map")
     return encoder
 
 
-def _build_plane_detection(layout: Layout) -> PlaneDetection:
-    """Детекторы-круги над раскладкой и зажигание её точек стимулами: код набора стимулов (§4.3, §6.2, §6.5)."""
-    space = PlaneDetectorSpace(
-        layout,
-        _build_plane_encoder(layout),
-        merge=ColourMerge(
-            max(1, int(SECOND_LEVEL_CODE_LENGTH * SECOND_LEVEL_MAX_DENSITY)),
-            keep=SECOND_LEVEL_MERGE_KEEP,
-        ),
-    )
+def _build_plane_detection(layout: Layout, calibration: Sequence["np.ndarray"]) -> PlaneDetection:
+    """Детекторы-круги над раскладкой и зажигание её точек стимулами: код набора стимулов (§4.3, §6.2, §6.5).
+
+    calibration — упакованные коды стимулов калибровочных наборов (картинок): по ним подбирается длина кода
+    с заданной средней плотностью (§6.6, шаг 3).
+    """
     activation = BestMatchActivation(
         layout.code_table,
         similarity=LAYOUT_SIMILARITY,
         lambda_threshold=SECOND_LEVEL_ACTIVATION_LAMBDA,
         use_gpu=ACTIVATION_USE_GPU,
     )
-    return PlaneDetection(activation, space)
+    code_length = PlaneCodeSizer(
+        target_density=SECOND_LEVEL_TARGET_DENSITY,
+        min_length=SECOND_LEVEL_CODE_LENGTH_MIN,
+        max_length=SECOND_LEVEL_CODE_LENGTH_MAX,
+    ).fit(
+        layout,
+        activation,
+        calibration,
+        lambda length: _build_plane_encoder(layout, length, check_order=False),
+    )
+    return PlaneDetection(activation, PlaneDetectorSpace(layout, _build_plane_encoder(layout, code_length)))
 
 
 def _build_extractor(
@@ -3363,7 +3384,8 @@ class MnistSecondLevelRunner:
 
     1. Первая раскладка углопозиций — обычным конвейером (MnistLayoutRunner, только раскладка).
     2. Над ней строятся детекторы-круги (§4.3); все углопозиции картинки зажигают самые похожие точки
-       раскладки, зажжённые точки активируют круги, биты кругов дают код картинки (PlaneDetection).
+       раскладки, зажжённая точка активирует круги, в поле которых лежит, активный круг зажигает свой бит
+       кода картинки (PlaneDetection). Длина кода подобрана под плотность 25 % (PlaneCodeSizer, §6.6).
     3. Коды картинок раскладываются тем же Layout: точка второй раскладки — картинка, цвет — класс цифры.
     4. Проверка: нечёткий поиск тестовых картинок по базе кодов обучающих (§2.2.5), тем же декодером.
     """
@@ -3386,8 +3408,11 @@ class MnistSecondLevelRunner:
     def run(self) -> float | None:
         """Весь путь второго уровня; возвращает точность нечёткого поиска (None — проверка отключена)."""
         primary_layout = self._primary.run()
-        detection = _build_plane_detection(primary_layout)
-        codes = self._encode_digits(detection)
+        digits = self._primary.digit_codes(self.count)
+        detection = _build_plane_detection(
+            primary_layout, [item.packed for item in digits[:SECOND_LEVEL_CALIBRATION_SAMPLES]]
+        )
+        codes = self._encode_digits(detection, digits)
         summary = codes.log_summary(
             detection.space,
             similarity=LAYOUT_SIMILARITY,
@@ -3406,10 +3431,11 @@ class MnistSecondLevelRunner:
             return None
         return self._evaluate(detection, codes)
 
-    def _encode_digits(self, detection: PlaneDetection) -> StimulusSetCodes:
+    @staticmethod
+    def _encode_digits(detection: PlaneDetection, digits: Sequence[DigitCodes]) -> StimulusSetCodes:
         """Коды второго уровня обучающих картинок: набор стимулов — все углопозиции одной цифры."""
         codes = StimulusSetCodes(detection.code_length)
-        for item in self._primary.digit_codes(self.count):
+        for item in digits:
             codes.add(item.label, detection.encode_packed(item.packed, label=item.label))
         return codes
 

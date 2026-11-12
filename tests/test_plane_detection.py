@@ -11,12 +11,12 @@ import numpy as np  # noqa: E402
 from damp.activation.plane_detection import (  # noqa: E402
     BestMatchActivation,
     LabelMapQuality,
+    PlaneCodeSizer,
     PlaneDetection,
     PlaneDetectorSpace,
     StimulusSetCodes,
 )
 from damp.encoding.bitarray import BitArray  # noqa: E402
-from damp.encoding.colour_merge import ColourMerge  # noqa: E402
 from damp.encoding.damp_encoder import (  # noqa: E402
     DetectorCircle,
     Detectors,
@@ -67,6 +67,23 @@ class PlaneDimensionTests(unittest.TestCase):
             # Бит детектора лежит в цветовой полосе своего слоя (§3.2).
             start, length = plane.layer_band(layer_index)
             self.assertTrue(all(start <= circle.bit < start + length for circle in circles))
+
+    def test_without_layer_bands_the_random_bit_comes_from_the_whole_code(self) -> None:
+        layers = plane_detector_layers(layers_count=5, widest_radius=0.85, narrowest_radius=0.05, overlap=0.7)
+        size = ((0.0, 40.0), (0.0, 40.0))
+        banded = Encoder(PlaneDimension("Map", size, layers, code_length=600), random_seed=0)
+        whole = Encoder(PlaneDimension("Map", size, layers, code_length=600, layer_bands=False), random_seed=0)
+        plane = whole.dimensions[0]
+        self.assertEqual([plane.layer_band(layer) for layer in range(5)], [(0, 600)] * 5)
+        # Геометрия кругов та же, отличается только назначение битов.
+        self.assertEqual(
+            [(c.center_y, c.center_x, c.radius) for c in whole.detectors],
+            [(c.center_y, c.center_x, c.radius) for c in banded.detectors],
+        )
+        narrowest = [c.bit for c in whole.detectors if c.layer_index == 4]
+        self.assertLess(min(narrowest), 120)  # с полосами узкий слой занимал бы только биты 480…599
+        self.assertEqual(len(set(narrowest[:600])), 600)  # в слое биты не повторяются, пока хватает кода
+        self.assertNotEqual(whole.signature, banded.signature)
 
     def test_active_circles_match_exhaustive_check(self) -> None:
         encoder = _plane_encoder(40.0, 28.0)
@@ -144,24 +161,6 @@ class PlaneDimensionTests(unittest.TestCase):
             main._build_encoder().signature,
             "b8a53e99d91a8fb5bd56ba817513fd8b544bd2d5ef17b0d701815d9fe3832d44",
         )
-
-
-class ColourMergeTests(unittest.TestCase):
-    def test_merge_is_plain_or_within_budget(self) -> None:
-        bits = np.zeros(32, dtype=np.uint8)
-        bits[[1, 5, 30]] = 1
-        merged, dropped = ColourMerge(3).merge(bits)
-        np.testing.assert_array_equal(merged, bits)
-        self.assertEqual(dropped, 0)
-
-    def test_merge_keeps_one_end_of_the_spectrum(self) -> None:
-        bits = np.zeros(32, dtype=np.uint8)
-        bits[[1, 5, 9, 20, 30]] = 1
-        short, dropped = ColourMerge(2, keep="short").merge(bits)
-        self.assertEqual(np.flatnonzero(short).tolist(), [20, 30])
-        self.assertEqual(dropped, 3)
-        long, _ = ColourMerge(2, keep="long").merge(bits)
-        self.assertEqual(np.flatnonzero(long).tolist(), [1, 5])
 
 
 def _random_codes(count: int, length: int, ones: int, seed: int) -> np.ndarray:
@@ -265,11 +264,54 @@ class PlaneDetectionTests(unittest.TestCase):
         far_common = int((base & self.space.detect(np.array([far])).bits).sum())
         self.assertGreater(near_common, far_common)
 
-    def test_colour_merge_limits_saturation(self) -> None:
-        space = PlaneDetectorSpace(self.layout, self.encoder, merge=ColourMerge(20, keep="short"))
-        code = space.detect(np.arange(60))
-        self.assertEqual(int(code.bits.sum()), 20)
-        self.assertGreater(code.dropped_bits, 0)
+    def test_every_active_circle_lights_its_own_bit(self) -> None:
+        code = self.space.detect(np.arange(60))
+        bits_of_active = np.unique(self.encoder.detector_bits()[code.active_detectors])
+        np.testing.assert_array_equal(np.flatnonzero(code.bits), bits_of_active)
+        self.assertEqual(code.bits.shape[0], self.encoder.code_length)
+
+    def _plane_encoder_of_length(self, length: int) -> Encoder:
+        return Encoder(
+            PlaneDimension(
+                "Map",
+                PlaneDetectorSpace.plane_size(self.layout),
+                plane_detector_layers(layers_count=4, widest_radius=0.85, narrowest_radius=0.08, overlap=0.7),
+                code_length=length,
+            ),
+            random_seed=0,
+        )
+
+    def test_code_length_is_the_smallest_with_target_density(self) -> None:
+        table = self.layout.code_table
+        sets = [table.packed[start : start + 6] for start in range(0, 60, 6)]
+        activation = BestMatchActivation(table, similarity="cosine", lambda_threshold=0.5, use_gpu=False)
+        target = 0.25
+        length = PlaneCodeSizer(target_density=target, min_length=16, max_length=4096).fit(
+            self.layout, activation, sets, self._plane_encoder_of_length
+        )
+        self.assertEqual(length % PlaneCodeSizer.LENGTH_STEP, 0)
+
+        def mean_density(code_length: int) -> float:
+            detection = PlaneDetection(
+                activation, PlaneDetectorSpace(self.layout, self._plane_encoder_of_length(code_length))
+            )
+            return float(np.mean([detection.encode_packed(packed).bits.mean() for packed in sets]))
+
+        self.assertLessEqual(mean_density(length), target)
+        self.assertGreater(mean_density(length - PlaneCodeSizer.LENGTH_STEP), target)
+
+    def test_code_length_stays_within_bounds(self) -> None:
+        table = self.layout.code_table
+        sets = [table.packed[:30]]
+        activation = BestMatchActivation(table, similarity="cosine", lambda_threshold=0.5, use_gpu=False)
+        short = PlaneCodeSizer(target_density=0.01, min_length=16, max_length=64).fit(
+            self.layout, activation, sets, self._plane_encoder_of_length
+        )
+        self.assertEqual(short, 64)
+        long = PlaneCodeSizer(target_density=0.99, min_length=512, max_length=4096).fit(
+            self.layout, activation, sets, self._plane_encoder_of_length
+        )
+        self.assertEqual(long, 512)
 
     def test_stimulus_set_codes_become_a_layout_table(self) -> None:
         table = self.layout.code_table
