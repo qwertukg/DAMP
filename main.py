@@ -1,5 +1,8 @@
+import concurrent.futures
 import glob
+import hashlib
 import math
+import time
 from dataclasses import dataclass
 import json
 import os
@@ -32,8 +35,12 @@ from damp.encoding.damp_encoder import (
     OpenedDimension,
     geometric_detector_layers,
 )
+import numpy as np
+
+from damp.layout.code_table import LayoutCodeTable
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
 from damp.layout.payload import LayoutEncodedCode, LayoutPayloadBuilder
+from damp.layout.seeded import SeededPlacement
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding, MnistDecoder, PredictionResult
@@ -50,6 +57,9 @@ LOG_INTERVAL_LAYOUT_AVG_ENERGY = 200
 LOG_INTERVAL_LAYOUT_VISUAL = 1
 LOG_INTERVAL_LAYOUT_ADAPTIVE = 200
 LOG_INTERVAL_LAYOUT_SWAP_RATIO = 50
+# Выборка пар ближней фазы по плиткам (§5.10): событие на каждую плитку каждого шага — раз в столько вызовов.
+LOG_INTERVAL_LAYOUT_SHORT_SAMPLING = 500
+LOG_INTERVAL_LAYOUT_SHORT_TILES = 50
 LOG_INTERVAL_LAYOUT_EXPORT = 1
 LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS = 1
 LOG_INTERVAL_ACTIVATION_INIT = 1
@@ -121,13 +131,38 @@ MNIST_SOBEL_UPSCALE_ENABLED = True
 MNIST_SOBEL_UPSCALE = 8
 MNIST_SOBEL_CONTRAST = 100.0
 MNIST_SOBEL_ENTITY_PATH = "/sobel"
+# Кодирование цифр рабочими процессами (вне статьи: подготовка кодов большого набора). Набор, в котором
+# не хватает от стольких цифр, кодируется процессами; меньший — в основном процессе, с записями журнала кодера.
+ENCODING_PARALLEL_MIN_DIGITS = 2000
+# Число рабочих процессов; None — по числу ядер без одного, не больше ENCODING_WORKERS_MAX.
+ENCODING_WORKERS = None
+ENCODING_WORKERS_MAX = 12
+# Цифр в одном задании рабочего процесса.
+ENCODING_CHUNK_DIGITS = 200
+# Коды цифр большого набора сохраняются на диск (вне статьи): повторный запуск с тем же кодером берёт их
+# из файла data/codes-<набор>-<отпечаток>.npz и не кодирует набор заново (60 000 цифр — 2 минуты). Отпечаток —
+# всё, от чего зависят углопозиции и коды: подпись кодера, константы MNIST_* и ENCODER_* этого файла, тексты
+# модулей кодирования и извлечения стимулов; при любом их изменении файл не подходит и набор кодируется
+# заново. Файл пишется и читается для наборов от ENCODING_CODES_CACHE_MIN_DIGITS цифр; ключ --rebuild
+# относится к раскладке и на него не влияет. False — набор кодируется при каждом запуске.
+ENCODING_CODES_CACHE = True
+ENCODING_CODES_CACHE_MIN_DIGITS = 2000
+ENCODING_CODES_CACHE_DIR = "data"
 MNIST_ANGLE_MIN = 0.0
 MNIST_ANGLE_MAX = 360.0
 MNIST_ANGLE_CODE_LENGTH = 256
-MNIST_ANGLE_LAYERS = 22
+# Слоёв и перекрытия у угла и позиции поровну (10 слоёв, перекрытие 0.7): в режиме статьи
+# (LAYOUT_SMOOTH_PINWHEELS = False) соседних ячеек, разнящихся по углу больше чем на 30° или по позиции больше
+# чем на 3 окна, втрое меньше, чем при прежних 22 слоях и перекрытии 0.4 (300 цифр: 19.1 % → 5.5 %,
+# 60 000 цифр: 1.21 % → 0.37 %). Перекрытие убирает стенки между областями, отношение слоёв угла и позиции
+# решает, какая координата выходит непрерывной (§4.2.1, §4.5, §5.13.2.2). Цена: различных кодов на
+# 60 000 цифр 256 тыс. вместо 456 тыс. Прежние значения оставлены в закомментированных строках.
+# MNIST_ANGLE_LAYERS = 22
+MNIST_ANGLE_LAYERS = 10
 MNIST_ANGLE_WIDEST_DETECTORS = 2
 MNIST_ANGLE_NARROWEST_DETECTORS = 180
-MNIST_ANGLE_OVERLAP = 0.4
+# MNIST_ANGLE_OVERLAP = 0.4
+MNIST_ANGLE_OVERLAP = 0.7
 # Позиции MNIST — индексы участков 0…6. Нижняя граница вынесена на шаг за край данных: детекторов за краями
 # отрезка нет (MNIST_POSITION_EDGE_DETECTORS = False), и при MIN = 0 участок 0 лежал на самой границе —
 # 22 бита вместо ~34 и J(0, 1) = 0,81 при ~0,57 у остальных соседей. С MIN = -1 перекрытие соседних
@@ -138,13 +173,15 @@ MNIST_POSITION_CODE_LENGTH = 128
 # 15 слоёв — минимальное уменьшение с 22, при котором в pinwheel-тесте (позиции 2×2, режим сглаживания)
 # пропадает дыра на стыке четырёх позиций: соседние позиции достаточно похожи, чтобы точки на стыке
 # получали энергию от чужих кластеров (22 слоя: 3–10 пустых ячеек в центре, 16: 0–5, 15: 1–2).
-MNIST_POSITION_LAYERS = 22
+# MNIST_POSITION_LAYERS = 22
+MNIST_POSITION_LAYERS = 10
 MNIST_POSITION_WIDEST_DETECTORS = 2
 # Самый узкий слой позиции — 28 детекторов (самый широкий — MNIST_POSITION_WIDEST_DETECTORS = 2);
 # между ними слои растут геометрически, у каждого слоя своё число детекторов.
 MNIST_POSITION_NARROWEST_DETECTORS = 28
 # Перекрытие соседних позиционных детекторов слоя (§4.2.1: «detectors must overlap at each level»).
-MNIST_POSITION_OVERLAP = 0.4
+# MNIST_POSITION_OVERLAP = 0.4
+MNIST_POSITION_OVERLAP = 0.7
 # False — в слое ровно MNIST_POSITION_WIDEST…NARROWEST детекторов внутри отрезка (2 … 14), без детекторов
 # за краями; True — детекторы заходят за концы отрезка, как в Angle-Encoder.
 MNIST_POSITION_EDGE_DETECTORS = False
@@ -183,7 +220,7 @@ LAYOUT_LONG_KERNEL_WIDTH = 1.0   # σ гауссова ядра = width · r(t);
 LAYOUT_LAMBDA_THRESHOLD = 0.65
 # Крутизна сигмоиды порога (§5.4); None — жёсткий порог η = ∞, как в параметрах раскладки §7.1.7.
 LAYOUT_ETA = 10.0 if LAYOUT_SMOOTH_PINWHEELS else None
-LAYOUT_EMPTY_RATIO = 0.15
+LAYOUT_EMPTY_RATIO = 0.50
 LAYOUT_USE_GPU = True
 LAYOUT_RANDOM_SEED = 0
 # Дальняя энергия по всему V (§5.5.1), пока точек не больше этого числа; выше — подмножество B (§5.9.4).
@@ -191,12 +228,90 @@ LAYOUT_RANDOM_SEED = 0
 # ~1 % случайных пар всегда «выгодны», обмены не падают до 1 % от стартовых, триггер не срабатывает,
 # λ = 0.65 и r = d/2 все 50 000 шагов — расписание доделывала ближняя фаза. С полным V на 100 цифрах
 # расписание завершается к шагу ~18 000, ближняя фаза только полирует (подбор 2026-11-10).
-# Цена: шаг стоит p·N·512 произведений; на 88k точек ≈ 1 с/шаг — там нужна ветка layout-speedup (моменты).
+# Цена плотного прохода: шаг стоит p·N·512 произведений (на 88k точек ≈ 1.1 с/шаг); при жёстком пороге шаг
+# считается по ненулевым sim_λ (LAYOUT_SPARSE_LONG) с тем же результатом.
 LAYOUT_LONG_FULL_SPACE_MAX_POINTS = 100000
 # Подмножество B в гауссовой дальней фазе допустимо, пока в окрестность радиуса r(t) ожидаемо попадает
 # не меньше стольких точек B (иначе оценка локальной энергии шумная и обмены случайны); ниже — всё V.
 # На 100 цифрах (8 693 точки, |B| = 745) подмножество на всём протяжении фазы давало Ē 0.26 вместо 0.70.
 LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS = 50
+# Энергии по ненулевым sim_λ (§5.5.1, §5.5.2, §5.7, §5.9.5). При жёстком пороге (η = ∞, §7.1.7) sim_λ(a, v) = 0
+# для всех v с sim < λ, поэтому суммы по всему V, по окрестности пары и энергии точек сводятся к точкам,
+# похожим на a или b: строки сходства строятся один раз, прореживаются при росте λ, шаг стоит O(p·k)
+# вместо O(p·N) (k — число похожих точек). Суммы φ_c, φ_s побитово те же, что у исходных проходов (та же
+# редукция float32 той же формы), поэтому раскладка совпадает шаг в шаг (docs/ARTICLE_COMPLIANCE.md,
+# «Ускорение без изменения результата»). False — всегда исходные проходы по всему V и по окну ячеек.
+LAYOUT_SPARSE_LONG = True
+# Наибольшее число ненулевых элементов строк сходства (8 байт на элемент); больше — плотный проход.
+LAYOUT_SPARSE_MAX_EDGES = 400_000_000
+# Доля свободной памяти устройства, которую могут занять строки сходства.
+LAYOUT_SPARSE_MEMORY_FRACTION = 0.5
+# Память под буферы плотной редукции (участки [порция пар, N] для φ_c и φ_s).
+LAYOUT_SPARSE_BUFFER_BYTES = 256 * 1024 * 1024
+# Предел элементов (строки точек × наибольшая степень) на один блок расчёта слагаемых.
+LAYOUT_SPARSE_ENTRY_BUDGET = 4_000_000
+# С этого числа порций плотного прохода на шаг пары сначала отсеиваются по оценке ошибки суммирования
+# float32: знак φ_c − φ_s известен без плотной редукции, она остаётся только парам с разностью у нуля.
+LAYOUT_SPARSE_SCREEN_MIN_CHUNKS = 1
+# Сверка с плотным проходом: после построения и каждого прореживания строк и затем раз в столько шагов
+# шаг считается обоими способами (в раскладку идёт результат исходного прохода); при расхождении расчёт
+# по строкам отключается. 0 — сверка только после построения и прореживания.
+LAYOUT_SPARSE_VERIFY_EVERY = 2000
+# Сверка пар шага идёт на стольких первых порциях исходного прохода (порция плотного прохода — 4 млн элементов
+# «пары × точки»): форма порции та же, что в проходе по всем парам, а цена сверки не растёт с числом пар
+# (на 59 тыс. точек проход по всем парам шага — 0.5 с). 0 — сверка на всех парах шага.
+LAYOUT_SPARSE_VERIFY_CHUNKS = 1
+# Знак φ_c − φ_s пар шага (§5.6) одним проходом ядра устройства по строкам сходства (§5.12): поток на отрезок
+# строки из LAYOUT_PAIR_KERNEL_SEGMENT слагаемых, частичные суммы float32, решение — по оценке ошибки
+# суммирования. Пары, у которых разность сумм лежит в пределах этой ошибки (единицы на шаг), считаются
+# редукцией исходного прохода, поэтому обмены те же шаг в шаг. False — знак по суммам блоков строк torch.
+LAYOUT_PAIR_KERNEL = True
+LAYOUT_PAIR_KERNEL_SEGMENT = 16
+# Выборка пар шага (§5.3, §5.9.1, §5.9.3) скомпилированными циклами numba на том же генераторе numpy: те же
+# запросы в том же порядке — те же пары и то же состояние генератора. Сверка с выборкой numpy — на первых
+# вызовах и затем раз в LAYOUT_SAMPLER_VERIFY_EVERY вызовов (0 — только на первых); при расхождении и без
+# numba пары выбирает numpy.
+LAYOUT_COMPILED_SAMPLER = True
+LAYOUT_SAMPLER_VERIFY_EVERY = 1000
+# Отсев пар дальней фазы по нижней границе потенциала точки (§5.5.1, §5.9.4 — по духу: агрегаты вместо всех точек,
+# но без приближения): похожие точки каждой точки сведены в группы по ячейкам грубой сетки
+# LAYOUT_POTENTIAL_BOUNDS_GRID × LAYOUT_POTENTIAL_BOUNDS_GRID (масса и центр масс группы). По неравенству Йенсена
+# U_a(p) ≥ Σ_групп M·‖p − центр‖; если из этого следует φ_c < φ_s с запасом на ошибку суммирования float32,
+# обмена нет (§5.6) и строки сходства пары не считаются. В разложенном пространстве так снимается 94–98 % пар
+# шага; остальные считаются как раньше, поэтому обмены те же шаг в шаг. False — все пары считаются по строкам.
+LAYOUT_POTENTIAL_BOUNDS = True
+LAYOUT_POTENTIAL_BOUNDS_GRID = 8
+# Пары, у которых φ_c − φ_s лежит в пределах ошибки суммирования float32 (единицы на шаг), решает само число
+# редукции исходного прохода. True — оно считается на хосте в том же порядке сложения, что у редукции устройства
+# (порядок сверяется с устройством для каждой формы порции и затем периодически): без загрузки, запуска ядер
+# и выгрузки на каждом таком шаге. Для этого строки сходства копируются на хост, пока занимают не больше
+# LAYOUT_REPLICA_MAX_BYTES (8 байт на элемент; 59 тыс. точек при λ = 0.65 — 0.73 ГБ). False или больший объём —
+# такие пары считает устройство.
+LAYOUT_REDUCTION_REPLICA = True
+LAYOUT_REPLICA_MAX_BYTES = 1 << 30
+# Слитый расчёт энергий (§5.5, §5.7, §5.9.5, §5.12; нужен torch с CUDA). Исходный проход строит слагаемые
+# φ_c, φ_s полусотней операций torch на порцию пар — время шага определяет число проходов по памяти
+# устройства. Слитый расчёт берёт сходство кодов из таблицы, предвычисленной один раз (§5.9.5: сходство
+# от расстановки не зависит), а всё слагаемое считает одним ядром на элемент (пара, точка) теми же
+# операциями float32 в том же порядке; суммирует та же редукция той же формы. φ_c, φ_s побитово те же,
+# раскладка совпадает шаг в шаг в обоих режимах (сигмоида и жёсткий порог) — docs/ARTICLE_COMPLIANCE.md,
+# «Слитое ядро энергий». Заодно шаг раскладки идёт по массивам (отбор и применение обменов без обхода
+# пар в Python). False — всегда исходный проход.
+LAYOUT_FUSED_ENERGY = True
+# Таблицы сходства слитого расчёта (§5.9.5), по убыванию скорости: значения sim_λ всех пар точек (float32,
+# 4 байта на пару; строится заново при смене λ, §7.1.7) → число общих бит кодов (uint8, байт на пару точек или
+# на пару различных кодов; от λ и η не зависит) → общие биты на лету. Берётся первая, которая помещается
+# в LAYOUT_FUSED_TABLE_MAX_BYTES и в долю LAYOUT_FUSED_TABLE_MEMORY_FRACTION свободной памяти устройства.
+# 100 цифр (8 693 точки): sim_λ — 302 МБ; 1000 цифр (88 317 точек, 67 378 различных кодов): общие биты — 4.5 ГБ.
+LAYOUT_FUSED_SIMILARITY_TABLE = True
+LAYOUT_FUSED_TABLE_MAX_BYTES = 6 * 1024 * 1024 * 1024
+LAYOUT_FUSED_TABLE_MEMORY_FRACTION = 0.7
+# Предел элементов (пары × точки) на один блок слитого ядра: ограничивает память под слагаемые.
+LAYOUT_FUSED_BLOCK_ELEMENTS = 40_000_000
+# Сверка с исходным проходом: при первом расчёте каждого вида (по всему V, по окну ячеек; ядро гаусса,
+# 1/d, d) и затем раз в столько расчётов шаг считается обоими способами (в раскладку идёт результат
+# исходного прохода); при расхождении слитый расчёт отключается. 0 — сверка только при первом расчёте.
+LAYOUT_FUSED_VERIFY_EVERY = 2000
 
 LAYOUT_LONG_PAIRS_PER_STEP = 24000
 LAYOUT_LONG_STEPS = 14000
@@ -330,6 +445,59 @@ LAYOUT_TUNE_LONG_SUBSET_MAX = 2048
 LAYOUT_TUNE_LONG_SUBSET_REFRESH_DIVISOR = 18
 LAYOUT_TUNE_LONG_SUBSET_REFRESH_MIN = 20
 LAYOUT_TUNE_LONG_SUBSET_REFRESH_MAX = 80
+# Большие раскладки (N > LAYOUT_LONG_FULL_SPACE_MAX_POINTS, режим сглаживания). Пределы числа пар шага,
+# подобранные до 100 тыс. точек, на миллионах точек дают единицы оценок обмена на точку вместо сотен;
+# точные суммы по окрестности стоят N·r². Поэтому (§5.9.4, §5.10):
+#  - пар за шаг — доля точек (та же, что у настройки на границе 100 тыс.: 20000/100000 и 12000/100000);
+#  - на больших радиусах энергия пары считается по подмножеству B из LAYOUT_TUNE_LARGE_LONG_SUBSET точек,
+#    обновляемому каждый шаг, пока в окрестность ожидаемо попадает ≥ LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS точек B;
+#  - дальше — по выборке ячеек окрестности: окно делится на LAYOUT_NEIGHBOURHOOD_SAMPLE_SIDE² слоёв,
+#    из слоя берётся одна случайная ячейка (≈ 0.52·side² точек окрестности: при 12 — около 75);
+#  - радиусы ближней фазы не растут с сеткой выше значений на 100 тыс. точек (0.08·G и 0.06·G при G = 388).
+#  - глобальный порядок берётся из раскладки затравки — случайного подмножества из LAYOUT_SEED_POINTS точек,
+#    разложенного целиком обычным алгоритмом; остальные точки ставятся возле самых похожих точек затравки,
+#    и дальняя фаза идёт с радиуса LAYOUT_SEED_REFINE_RADIUS_FACTOR блоков затравки (блок — √(N / затравка)
+#    ячеек), но не меньше LAYOUT_SEED_REFINE_RADIUS_MIN. None — без затравки: со случайной расстановки,
+#    с подмножеством B и выборкой окрестности на всех радиусах (шум оценок на больших радиусах даёт разрывы).
+LAYOUT_SEED_POINTS = 30000
+# Режим статьи: затравка многоуровневая. На точку затравки очередного уровня приходится не больше
+# LAYOUT_SEED_LEVEL_RATIO_MAX точек следующего: 30 тыс. → 400 тыс. → 5.3 млн вместо 30 тыс. → 5.3 млн.
+# Ближняя фаза уровня начинается с радиуса в LAYOUT_SEED_SHORT_RADIUS_FACTOR блоков родителя (блок —
+# √отношения ячеек, не меньше LAYOUT_SEED_REFINE_RADIUS_MIN): стоимость её первых этапов растёт как квадрат
+# радиуса, поэтому два уровня по 13 точек на родителя на порядок дешевле одного уровня в 177 точек,
+# а промежуточный уровень в 13 раз меньше полного. Измерено на 10 000 цифр с теми же отношениями уровней,
+# что у 60 000 (Ē(3) при λ = 0.8 / сходство соседей / угол соседей): один уровень, радиус 27 — 0.857 / 0.928 /
+# 4.23°; два уровня, радиус 2 блока — 0.868 / 0.940 / 3.73°; 3 блока — 0.871 / 0.941 / 3.61°; 4 блока —
+# 0.875 / 0.943 / 3.48°; 6 блоков — 0.875 / 0.942 / 3.45° (дальше качество не растёт, время растёт).
+LAYOUT_SEED_LEVEL_RATIO_MAX = 16
+LAYOUT_SEED_SHORT_RADIUS_FACTOR = 4.0
+# Порог ранней отсечки пар (§5.9.1) в ближней фазе уровня большой раскладки режима статьи; 0 — без отсечки.
+# Отсечка sim(a, b) ≥ t оставляет в шаге только пары похожих точек: статья советует её «на поздних стадиях,
+# когда двигать надо похожие точки». У точной раскладки непохожие точки разводит дальняя фаза; на уровнях
+# выше затравки её нет, а точки соседних родителей после расстановки перемешаны на ширине блока — развести
+# их и провести границы областей должна ближняя фаза, и с отсечкой она этого не может (пара точек из разных
+# областей в шаг не попадает). Измерено на 10 000 цифр (уровни 5000 → 66 тыс. → 883 тыс.), Ē(3) при λ = 0.8:
+# с отсечкой 0.65 — 0.853, без отсечки — 0.887 (при прежней расстановке ровно в блок родителя: 0.875 и 0.888).
+LAYOUT_SEED_SHORT_SIMILARITY_CUTOFF = 0.0
+# Файл раскладки больше этого размера как кеш не читается (вне статьи): чтение строит по объекту на точку,
+# и на миллионах точек они не помещаются в память — раскладка считается заново. 256 МБ — около 380 тыс. точек.
+LAYOUT_CACHE_MAX_FILE_BYTES = 256 * 1024 * 1024
+#  - шаг дальней фазы идёт целиком на устройстве (LAYOUT_DEVICE_STEP): выбор пар, энергии, отбор и применение
+#    обменов — те же действия, что на хосте, но случайные числа берёт генератор устройства. На миллионе пар
+#    за шаг массивы numpy на хосте занимали половину времени шага.
+LAYOUT_DEVICE_STEP = True
+LAYOUT_SEED_REFINE_RADIUS_FACTOR = 2.0
+LAYOUT_SEED_REFINE_RADIUS_MIN = 8
+LAYOUT_TUNE_LARGE_LONG_PAIR_FACTOR = 0.2
+LAYOUT_TUNE_LARGE_SHORT_PAIR_FACTOR = 0.12
+LAYOUT_TUNE_LARGE_LONG_SUBSET = 256
+LAYOUT_TUNE_LARGE_LONG_SUBSET_REFRESH = 1
+LAYOUT_NEIGHBOURHOOD_SAMPLE_SIDE = 12
+LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX = 31
+LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX = 23
+# Режим статьи, большие раскладки: радиус окрестности пары в ближней фазе — наименьший допустимый статьёй
+# (§5.5.2: r ≥ ‖p1 − p2‖): r = max(⌈‖p1 − p2‖⌉ + 1, это значение); None — постоянный радиус фазы.
+LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN = 5
 LAYOUT_TUNE_SHORT_PAIR_FACTOR = 0.2
 LAYOUT_TUNE_SHORT_PAIRS_MIN = 1800
 LAYOUT_TUNE_SHORT_PAIRS_MAX = 12000
@@ -446,6 +614,47 @@ LOG_INTERVALS = {
     "layout.energy.pair.ignore_self": LOG_INTERVAL_LAYOUT_ENERGY,
     "layout.energy.long.progress": LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS,
     "layout.energy.pairs.gpu": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.sparse.energy.pairs": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.sparse.energy.neighbourhood": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.short.pair_sampling": LOG_INTERVAL_LAYOUT_SHORT_SAMPLING,
+    "layout.short.tiles": LOG_INTERVAL_LAYOUT_SHORT_TILES,
+    "layout.short.partition_pairs": LOG_INTERVAL_LAYOUT_SHORT_TILES,
+    "layout.pair_sampling.merged_draws": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled.unavailable": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled.verify": LOG_INTERVAL_INIT,
+    "layout.pair_sampling.compiled.mismatch": LOG_INTERVAL_INIT,
+    "layout.pair_kernel.init": LOG_INTERVAL_INIT,
+    "layout.pair_kernel.status": LOG_INTERVAL_LAYOUT_ENERGY,
+    "layout.pair_kernel.calibration": LOG_INTERVAL_INIT,
+    "layout.pair_kernel.reference.verify": LOG_INTERVAL_INIT,
+    "layout.replica.init": LOG_INTERVAL_INIT,
+    "layout.replica.calibration": LOG_INTERVAL_INIT,
+    "layout.replica.rows": LOG_INTERVAL_INIT,
+    "layout.replica.rows.skipped": LOG_INTERVAL_INIT,
+    "layout.replica.verify": LOG_INTERVAL_INIT,
+    "layout.bounds.init": LOG_INTERVAL_INIT,
+    "layout.bounds.rebuild": LOG_INTERVAL_INIT,
+    "layout.bounds.disabled": LOG_INTERVAL_INIT,
+    "layout.bounds.share": LOG_INTERVAL_LAYOUT_ADAPTIVE,
+    "layout.codes.classes": LOG_INTERVAL_INIT,
+    "layout.kernel.cache": LOG_INTERVAL_INIT,
+    "layout.sparse.energy.init": LOG_INTERVAL_INIT,
+    "layout.sparse.energy.verify": LOG_INTERVAL_INIT,
+    "layout.sparse.energy.disabled": LOG_INTERVAL_INIT,
+    "layout.sparse.rows.build": LOG_INTERVAL_INIT,
+    "layout.sparse.rows.prune": LOG_INTERVAL_INIT,
+    "layout.sparse.rows.skipped": LOG_INTERVAL_INIT,
+    "layout.fused.table.build": LOG_INTERVAL_INIT,
+    "layout.fused.table.skipped": LOG_INTERVAL_INIT,
+    "layout.fused.similarity_table.build": LOG_INTERVAL_INIT,
+    "layout.fused.packed_codes": LOG_INTERVAL_INIT,
+    "layout.fused.energy.init": LOG_INTERVAL_INIT,
+    "layout.fused.energy.verify": LOG_INTERVAL_INIT,
+    "layout.fused.energy.disabled": LOG_INTERVAL_INIT,
+    "layout.fused.energy.merge_disabled": LOG_INTERVAL_INIT,
+    "layout.fused.kernel_cache": LOG_INTERVAL_INIT,
+    "layout.swap.bulk_draws": LOG_INTERVAL_INIT,
     "layout.gpu.config": LOG_INTERVAL_INIT,
     "layout.gpu.context_failed": LOG_INTERVAL_INIT,
     "layout.gpu.disabled": LOG_INTERVAL_INIT,
@@ -483,6 +692,11 @@ LOG_INTERVALS = {
     "layout.run.settings": LOG_INTERVAL_INIT,
     "layout.run.swap_monitor": LOG_INTERVAL_INIT,
     "layout.run.swap_ratio": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
+    # Отбор обменов при отжиге идёт на каждом шаге дальней фазы: событие раз в столько шагов.
+    "layout.swap.annealed": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
+    "layout.device_step": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
+    "layout.energy.neighbourhood_sample": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
+    "layout.pairs.beyond_radius": LOG_INTERVAL_LAYOUT_SWAP_RATIO,
     "layout.run.swap_stability.stop": LOG_INTERVAL_INIT,
     "layout.run.save_on_stop": LOG_INTERVAL_LAYOUT_EXPORT,
     "layout.run.save_on_stop.error": LOG_INTERVAL_LAYOUT_EXPORT,
@@ -595,6 +809,18 @@ class TunedLayoutParams:
     short_local_radius: int
     short_energy_radius: int
     short_energy_recalc_every: int
+    # Число слоёв выборки ячеек окрестности по стороне окна (§5.9.4); None — окрестность считается целиком.
+    neighbourhood_sample_side: int | None = None
+    # True — пары, вторая ячейка которых дальше радиуса выбора r (§5.3), в шаг не входят.
+    enforce_pair_radius: bool = False
+    # Наименьший радиус окрестности ближней фазы, следующий за радиусом выбора пар (§5.5.2); None — постоянный.
+    neighbourhood_radius_min: int | None = None
+    # Число точек затравки большой раскладки (случайное подмножество, раскладываемое целиком); None — без неё.
+    seed_points: int | None = None
+    # True — шаг дальней фазы большой раскладки выполняется целиком на устройстве.
+    device_step: bool = False
+    # True — шаг ближней фазы большой раскладки режима статьи выполняется целиком на устройстве.
+    device_short_step: bool = False
 
 
 @dataclass(frozen=True)
@@ -913,6 +1139,70 @@ class LayoutParameterTuner:
             LAYOUT_SHORT_LOCAL_RADIUS_MIN, int(grid_size * LAYOUT_TUNE_SHORT_ENERGY_RADIUS_FACTOR)
         )
         short_energy_recalc_every = max(LAYOUT_TUNE_SHORT_ENERGY_RECALC_FLOOR, short_steps // 6)
+        neighbourhood_sample_side: int | None = None
+        large_layout = total_points > LAYOUT_LONG_FULL_SPACE_MAX_POINTS
+        article_large = large_layout and not LAYOUT_SMOOTH_PINWHEELS
+        if article_large:
+            # Большая раскладка в режиме статьи: глобальный порядок — из раскладки затравки (дальняя фаза §5.5.1
+            # по всему V на миллионах точек неосуществима), ближний порядок — ближней фазой §5.5.2.
+            long_subset_size = None
+            short_pairs = max(short_pairs, int(total_points * LAYOUT_TUNE_LARGE_SHORT_PAIR_FACTOR))
+            if LAYOUT_PAIRS_POINT_FRACTION is not None:
+                short_pairs = min(short_pairs, max(1, int(total_points * LAYOUT_PAIRS_POINT_FRACTION)))
+            short_local_radius = min(short_local_radius, LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
+            short_energy_radius = min(short_energy_radius, LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX)
+            # Ближняя фаза заканчивается по числу обменов (§5.6); бюджет шагов — только верхняя граница
+            # (период пересчёта весов первой точки §5.9.3 остаётся прежним).
+            short_steps = LAYOUT_TUNE_SHORT_STEPS_MAX
+            LOGGER.event(
+                "layout.tune.large.article",
+                section=OPTIM_SUBSET,
+                data={
+                    "points": total_points,
+                    "seed_points": -1 if LAYOUT_SEED_POINTS is None else LAYOUT_SEED_POINTS,
+                    "seed_level_ratio_max": LAYOUT_SEED_LEVEL_RATIO_MAX,
+                    "short_radius_factor": LAYOUT_SEED_SHORT_RADIUS_FACTOR,
+                    "short_pairs_per_step": short_pairs,
+                    "short_steps": short_steps,
+                    "short_local_radius": short_local_radius,
+                    "short_energy_radius": short_energy_radius,
+                    "neighbourhood_radius_min": LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN,
+                    "note": "большая раскладка режима статьи: дальний порядок — из точной раскладки затравки "
+                    "(подмножество, §5.9.4), уровни затравки, на каждом — ближняя фаза §5.5.2 на устройстве; "
+                    "пар за шаг — доля точек (§5.10)",
+                },
+            )
+        elif large_layout:
+            # Большая раскладка: пар за шаг — доля точек (§5.10), энергии — по подмножеству B и по выборке
+            # ячеек окрестности (§5.9.4), радиусы ближней фазы — не выше значений на границе режима.
+            long_pairs = max(long_pairs, int(total_points * LAYOUT_TUNE_LARGE_LONG_PAIR_FACTOR))
+            short_pairs = max(short_pairs, int(total_points * LAYOUT_TUNE_LARGE_SHORT_PAIR_FACTOR))
+            if LAYOUT_SEED_POINTS is not None:
+                # Глобальный порядок — из раскладки затравки: больших радиусов и подмножества B нет.
+                long_subset_size = None
+            else:
+                long_subset_size = LAYOUT_TUNE_LARGE_LONG_SUBSET
+                long_subset_refresh = LAYOUT_TUNE_LARGE_LONG_SUBSET_REFRESH
+            neighbourhood_sample_side = LAYOUT_NEIGHBOURHOOD_SAMPLE_SIDE
+            short_local_radius = min(short_local_radius, LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
+            short_energy_radius = min(short_energy_radius, LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX)
+            LOGGER.event(
+                "layout.tune.large",
+                section=OPTIM_SUBSET,
+                data={
+                    "points": total_points,
+                    "long_pairs_per_step": long_pairs,
+                    "short_pairs_per_step": short_pairs,
+                    "long_subset_size": -1 if long_subset_size is None else long_subset_size,
+                    "long_subset_refresh": long_subset_refresh,
+                    "seed_points": -1 if LAYOUT_SEED_POINTS is None else LAYOUT_SEED_POINTS,
+                    "neighbourhood_sample_side": neighbourhood_sample_side,
+                    "short_local_radius": short_local_radius,
+                    "short_energy_radius": short_energy_radius,
+                    "note": "большая раскладка: пар за шаг — доля точек (§5.10); энергия пары — по подмножеству B, "
+                    "затем по выборке ячеек окрестности (§5.9.4)",
+                },
+            )
         LOGGER.event(
             "layout.tune",
             section=LAYOUT_PARAMETERS,
@@ -931,6 +1221,7 @@ class LayoutParameterTuner:
                 "short_local_radius": short_local_radius,
                 "short_energy_radius": short_energy_radius,
                 "short_energy_recalc_every": short_energy_recalc_every,
+                "neighbourhood_sample_side": -1 if neighbourhood_sample_side is None else neighbourhood_sample_side,
                 "lambda_threshold": LAYOUT_LAMBDA_THRESHOLD,
                 "eta": "hard" if LAYOUT_ETA is None else LAYOUT_ETA,
             },
@@ -945,7 +1236,42 @@ class LayoutParameterTuner:
             short_local_radius=short_local_radius,
             short_energy_radius=short_energy_radius,
             short_energy_recalc_every=short_energy_recalc_every,
+            neighbourhood_sample_side=neighbourhood_sample_side,
+            enforce_pair_radius=large_layout,
+            neighbourhood_radius_min=LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN if article_large else None,
+            seed_points=LAYOUT_SEED_POINTS if large_layout else None,
+            device_step=bool(LAYOUT_DEVICE_STEP) and large_layout and not article_large,
+            device_short_step=bool(LAYOUT_DEVICE_STEP) and article_large,
         )
+
+
+def _sparse_layout_options() -> dict[str, object]:
+    """Параметры Layout для ускоренного расчёта энергий с тем же результатом — по ненулевым sim_λ при жёстком
+    пороге и слитым ядром (§5.5.1, §5.5.2, §5.9.5, §5.12): общие для MNIST и pinwheel."""
+    return {
+        "sparse_long": LAYOUT_SPARSE_LONG,
+        "sparse_max_edges": LAYOUT_SPARSE_MAX_EDGES,
+        "sparse_memory_fraction": LAYOUT_SPARSE_MEMORY_FRACTION,
+        "sparse_buffer_bytes": LAYOUT_SPARSE_BUFFER_BYTES,
+        "sparse_entry_budget": LAYOUT_SPARSE_ENTRY_BUDGET,
+        "sparse_screen_min_chunks": LAYOUT_SPARSE_SCREEN_MIN_CHUNKS,
+        "sparse_verify_every": LAYOUT_SPARSE_VERIFY_EVERY,
+        "sparse_verify_chunks": LAYOUT_SPARSE_VERIFY_CHUNKS,
+        "pair_kernel": LAYOUT_PAIR_KERNEL,
+        "pair_kernel_segment": LAYOUT_PAIR_KERNEL_SEGMENT,
+        "compiled_sampler": LAYOUT_COMPILED_SAMPLER,
+        "sampler_verify_every": LAYOUT_SAMPLER_VERIFY_EVERY,
+        "potential_bounds": LAYOUT_POTENTIAL_BOUNDS,
+        "potential_bounds_grid": LAYOUT_POTENTIAL_BOUNDS_GRID,
+        "reduction_replica": LAYOUT_REDUCTION_REPLICA,
+        "replica_max_bytes": LAYOUT_REPLICA_MAX_BYTES,
+        "fused_energy": LAYOUT_FUSED_ENERGY,
+        "fused_table_max_bytes": LAYOUT_FUSED_TABLE_MAX_BYTES,
+        "fused_table_memory_fraction": LAYOUT_FUSED_TABLE_MEMORY_FRACTION,
+        "fused_block_elements": LAYOUT_FUSED_BLOCK_ELEMENTS,
+        "fused_verify_every": LAYOUT_FUSED_VERIFY_EVERY,
+        "fused_similarity_table": LAYOUT_FUSED_SIMILARITY_TABLE,
+    }
 
 
 def _default_layout_params() -> TunedLayoutParams:
@@ -1164,6 +1490,20 @@ class LayoutCacheFile:
     @staticmethod
     def inspect(path: str) -> tuple[int, int | None, bool] | None:
         try:
+            size = os.path.getsize(path)
+            if size > LAYOUT_CACHE_MAX_FILE_BYTES:
+                LOGGER.event(
+                    "layout.cache.too_large",
+                    section=OUTSIDE_ARTICLE,
+                    data={
+                        "path": path,
+                        "size_mb": size / 1e6,
+                        "max_mb": LAYOUT_CACHE_MAX_FILE_BYTES / 1e6,
+                        "note": "файл раскладки слишком велик для чтения кеша (объект на точку): "
+                        "раскладка считается заново",
+                    },
+                )
+                return None
             with open(path, "r", encoding="utf-8") as fp:
                 data = json.load(fp)
         except Exception as exc:
@@ -1308,6 +1648,7 @@ class LayoutCacheFile:
             long_kernel_radius_min=LAYOUT_LONG_KERNEL_RADIUS_MIN,
             long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
             component_period=LAYOUT_COMPONENT_PERIOD,
+            **_sparse_layout_options(),
         )
         if len(layout.positions()) != len(sorted_points):
             raise RuntimeError("layout load mismatch: points count differs")
@@ -1421,62 +1762,350 @@ def _stimulus_metadata(extractor: MnistSobelAngleMap) -> dict[str, object]:
 
 @dataclass(frozen=True)
 class DigitCodes:
-    """Одна цифра набора: метка, углы её углопозиций и их коды (§4.4, §4.6)."""
+    """Одна цифра набора: метка, углы её углопозиций и их коды (§4.4, §4.6).
+
+    Коды хранятся матрицей бит, упакованной по 8 в байт (k × ⌈L/8⌉): объект BitArray на каждый код для
+    больших наборов не помещается в память. codes строит объекты по требованию (активация, декодер).
+    """
 
     label: int
     angles: tuple[float, ...]
-    codes: tuple[BitArray, ...]
+    packed: "np.ndarray"
+    code_length: int
+
+    @property
+    def count(self) -> int:
+        """Число углопозиций цифры."""
+        return len(self.angles)
+
+    @property
+    def codes(self) -> tuple[BitArray, ...]:
+        bits = np.unpackbits(self.packed, axis=1, count=self.code_length)
+        return tuple(
+            BitArray.from_bits(bits[row].tobytes(), np.flatnonzero(bits[row]).tolist()) for row in range(bits.shape[0])
+        )
+
+
+class DigitEncodingWorker:
+    """Кодирование цифр в рабочем процессе: свой кодер и своё извлечение углопозиций (вне статьи).
+
+    Результат — те же углопозиции и коды, что в основном процессе (тот же код, те же константы); журнал
+    рабочего процесса выключен, сводку ведёт основной процесс.
+    """
+
+    _encoder: ClassVar[Encoder | None] = None
+    _extractor: ClassVar[MnistSobelAngleMap | None] = None
+
+    @classmethod
+    def initialize(cls) -> None:
+        LOGGER.mute()
+        cls._encoder = _build_encoder()
+        cls._extractor = _build_extractor()
+
+    @classmethod
+    def encode(cls, task: list[tuple["np.ndarray", int]]) -> list[tuple[int, tuple[float, ...], "np.ndarray"]]:
+        """Цифры задания (изображение, метка) → (метка, углы углопозиций, упакованные коды)."""
+        if cls._encoder is None or cls._extractor is None:
+            cls.initialize()
+        result = []
+        for img, digit in task:
+            item = StimulusCodeCache.encode_digit(cls._encoder, cls._extractor, img, digit, log=False)
+            result.append((item.label, item.angles, item.packed))
+        return result
+
+
+class EncodedCodesFile:
+    """Коды цифр набора на диске (вне статьи): повторный запуск с тем же кодером не кодирует набор заново.
+
+    Файл хранит первые D цифр набора в его порядке: метки, число углопозиций каждой цифры, углы и упакованные
+    коды — те же байты, что дало кодирование. Имя файла содержит отпечаток всего, от чего зависят углопозиции
+    (§4.4) и коды (§4.6): подпись кодера, значения констант MNIST_* и ENCODER_* main.py, тексты модулей
+    кодирования и извлечения стимулов, часть набора и отбор по метке. Изменилось что-то из этого — имя другое,
+    файл не находится, набор кодируется заново.
+    """
+
+    # Модули, от текста которых зависят углопозиции и коды.
+    SOURCES = (
+        os.path.join("damp", "MnistSobelAngleMap.py"),
+        os.path.join("damp", "encoding", "bitarray.py"),
+        os.path.join("damp", "encoding", "damp_encoder.py"),
+        os.path.join("damp", "layout", "code_table.py"),
+    )
+    CONSTANT_PREFIXES = ("MNIST_", "ENCODER_")
+
+    def __init__(self, directory: str, *, encoder: Encoder, split: str, label: int | None) -> None:
+        self._code_length = int(encoder.code_length)
+        self._fingerprint = self._compute_fingerprint(encoder, split, label)
+        suffix = "" if label is None else f"-label{int(label)}"
+        self._path = os.path.join(directory, f"codes-{split}{suffix}-{self._fingerprint[:16]}.npz")
+
+    @classmethod
+    def _compute_fingerprint(cls, encoder: Encoder, split: str, label: int | None) -> str:
+        digest = hashlib.sha256()
+        digest.update(f"{encoder.signature}|{encoder.code_length}|{split}|{label}".encode("utf-8"))
+        constants = globals()
+        for name in sorted(constants):
+            if name.startswith(cls.CONSTANT_PREFIXES):
+                digest.update(f"{name}={constants[name]!r};".encode("utf-8"))
+        root = os.path.dirname(os.path.abspath(__file__))
+        for source in cls.SOURCES:
+            with open(os.path.join(root, source), "rb") as fp:
+                digest.update(fp.read())
+        return digest.hexdigest()
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    def load(self, digits: int) -> "list[DigitCodes] | None":
+        """Первые digits цифр набора из файла; None — файла нет, он от другого кодера или цифр в нём меньше."""
+        if not os.path.exists(self._path):
+            return None
+        started = time.perf_counter()
+        try:
+            with np.load(self._path, allow_pickle=False) as data:
+                if str(data["fingerprint"]) != self._fingerprint or int(data["code_length"]) != self._code_length:
+                    return None
+                counts = data["counts"]
+                if counts.size < digits:
+                    return None
+                counts = counts[:digits].astype(np.int64)
+                total = int(counts.sum())
+                labels = data["labels"][:digits].tolist()
+                angles = data["angles"][:total]
+                packed = data["packed"][:total]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "mnist.encoding.cache.error",
+                section=OUTSIDE_ARTICLE,
+                data={"path": self._path, "error": str(exc), "stage": "read"},
+            )
+            return None
+        stops = np.cumsum(counts).tolist()
+        items: list[DigitCodes] = []
+        start = 0
+        for label, stop in zip(labels, stops):
+            items.append(
+                DigitCodes(
+                    label=int(label),
+                    angles=tuple(angles[start:stop].tolist()),
+                    packed=packed[start:stop],
+                    code_length=self._code_length,
+                )
+            )
+            start = stop
+        LOGGER.event(
+            "mnist.encoding.cache.load",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "path": self._path,
+                "digits": digits,
+                "codes": total,
+                "seconds": time.perf_counter() - started,
+                "note": "углопозиции (§4.4) и коды (§4.6) цифр взяты из файла: кодер, константы MNIST_* и ENCODER_* "
+                "и тексты модулей кодирования — те же, что при записи файла",
+            },
+        )
+        return items
+
+    def save(self, items: "Sequence[DigitCodes]") -> None:
+        """Записать цифры набора (в его порядке), если в файле их меньше."""
+        digits = len(items)
+        try:
+            if os.path.exists(self._path):
+                with np.load(self._path, allow_pickle=False) as data:
+                    if str(data["fingerprint"]) == self._fingerprint and int(data["counts"].size) >= digits:
+                        return
+            started = time.perf_counter()
+            counts = np.asarray([item.count for item in items], dtype=np.int32)
+            total = int(counts.sum())
+            packed = np.zeros((total, -(-self._code_length // 8)), dtype=np.uint8)
+            angles = np.zeros(total, dtype=np.float64)
+            start = 0
+            for item in items:
+                stop = start + item.count
+                if item.count:
+                    packed[start:stop] = item.packed
+                    angles[start:stop] = item.angles
+                start = stop
+            directory = os.path.dirname(self._path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            temporary = self._path + ".tmp.npz"
+            np.savez(
+                temporary,
+                fingerprint=np.asarray(self._fingerprint),
+                code_length=np.asarray(self._code_length),
+                labels=np.asarray([item.label for item in items], dtype=np.int16),
+                counts=counts,
+                angles=angles,
+                packed=packed,
+            )
+            os.replace(temporary, self._path)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.event(
+                "mnist.encoding.cache.error",
+                section=OUTSIDE_ARTICLE,
+                data={"path": self._path, "error": str(exc), "stage": "write"},
+            )
+            return
+        LOGGER.event(
+            "mnist.encoding.cache.save",
+            section=OUTSIDE_ARTICLE,
+            data={"path": self._path, "digits": digits, "codes": total, "seconds": time.perf_counter() - started},
+        )
 
 
 class StimulusCodeCache:
     """Углопозиции и коды цифр считаются один раз: раскладка, калибровка и база эмбеддингов берут их отсюда.
 
-    Цифры идут в порядке набора; все углопозиции цифры кодируются одним батчем (Encoder.encode_batch).
+    Цифры идут в порядке набора; все углопозиции цифры кодируются одним батчем (Encoder.encode_matrix).
     Цифры без углопозиций остаются в списке пустыми: раскладка учитывает их в счётчике цифр, а база
     эмбеддингов пропускает — как и раньше, когда каждый потребитель читал набор заново (вне статьи).
+    Большой набор (от ENCODING_PARALLEL_MIN_DIGITS недостающих цифр) кодируется рабочими процессами.
     """
 
-    def __init__(self, dataset, encoder: Encoder, extractor: MnistSobelAngleMap, *, label: int | None) -> None:
+    def __init__(
+        self,
+        dataset,
+        encoder: Encoder,
+        extractor: MnistSobelAngleMap,
+        *,
+        label: int | None,
+        store: "EncodedCodesFile | None" = None,
+    ) -> None:
         self._iterator = iter(dataset)
         self._encoder = encoder
         self._extractor = extractor
         self._label = label
         self._items: list[DigitCodes] = []
         self._exhausted = False
+        # Файл кодов набора на диске (большие наборы); _skip — сколько цифр набора взято из файла и ещё
+        # не пропущено в самом наборе (набор читается дальше, только если понадобятся следующие цифры).
+        self._store = store
+        self._skip = 0
 
-    def _load_next(self) -> bool:
+    @staticmethod
+    def encode_digit(
+        encoder: Encoder, extractor: MnistSobelAngleMap, img: "np.ndarray", digit: int, *, log: bool = True
+    ) -> DigitCodes:
+        """Углопозиции цифры (§4.4) и их коды (§4.6) одним батчем; log — записи журнала кодера с картинкой цифры."""
+        measurements = extractor.extract(img, digit)[int(digit)]
+        packed = np.zeros((0, -(-encoder.code_length // 8)), dtype=np.uint8)
+        if measurements:
+            bits = encoder.encode_matrix(
+                [(float(a), float(x), float(y)) for a, x, y in measurements],
+                log_image=img if log else None,
+                log_label=int(digit) if log else None,
+                log_measurements=measurements if log else None,
+            )
+            packed = LayoutCodeTable.pack_bits(bits)
+        return DigitCodes(
+            label=int(digit),
+            angles=tuple(float(a) for a, _, _ in measurements),
+            packed=packed,
+            code_length=encoder.code_length,
+        )
+
+    def _next_image(self) -> tuple["np.ndarray", int] | None:
+        """Следующая цифра набора с нужной меткой: изображение и метка; None — набор кончился."""
         for img_tensor, digit in self._iterator:
             if self._label is not None and int(digit) != self._label:
                 continue
-            img = img_tensor.squeeze(0).numpy()
-            measurements = self._extractor.extract(img, digit)[int(digit)]
-            codes: tuple[BitArray, ...] = ()
-            if measurements:
-                encoded = self._encoder.encode_batch(
-                    [(float(a), float(x), float(y)) for a, x, y in measurements],
-                    log_image=img,
-                    log_label=int(digit),
-                    log_measurements=measurements,
-                )
-                codes = tuple(code for _, code in encoded)
-            self._items.append(
-                DigitCodes(label=int(digit), angles=tuple(float(a) for a, _, _ in measurements), codes=codes)
-            )
-            return True
+            if self._skip:
+                # Эта цифра уже взята из файла кодов.
+                self._skip -= 1
+                continue
+            return img_tensor.squeeze(0).numpy(), int(digit)
         self._exhausted = True
-        return False
+        return None
+
+    def _load_next(self) -> bool:
+        image = self._next_image()
+        if image is None:
+            return False
+        self._items.append(self.encode_digit(self._encoder, self._extractor, image[0], image[1]))
+        return True
+
+    @staticmethod
+    def _worker_count() -> int:
+        if ENCODING_WORKERS is not None:
+            return max(1, int(ENCODING_WORKERS))
+        return max(1, min(ENCODING_WORKERS_MAX, (os.cpu_count() or 1) - 1))
+
+    def _load_parallel(self, count: int) -> None:
+        """Следующие count цифр набора — рабочими процессами, в порядке набора."""
+        workers = self._worker_count()
+        if workers <= 1:
+            return
+        started = time.perf_counter()
+        tasks: list[list[tuple["np.ndarray", int]]] = []
+        task: list[tuple["np.ndarray", int]] = []
+        digits = 0
+        while digits < count:
+            image = self._next_image()
+            if image is None:
+                break
+            task.append(image)
+            digits += 1
+            if len(task) >= ENCODING_CHUNK_DIGITS:
+                tasks.append(task)
+                task = []
+        if task:
+            tasks.append(task)
+        if not tasks:
+            return
+        LOGGER.event(
+            "mnist.encoding.parallel",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "digits": digits,
+                "workers": workers,
+                "chunk_digits": ENCODING_CHUNK_DIGITS,
+                "note": "углопозиции (§4.4) и коды (§4.6) этих цифр считают рабочие процессы тем же кодером; "
+                "записи журнала кодера по ним не выводятся",
+            },
+        )
+        code_length = self._encoder.code_length
+        codes = 0
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=min(workers, len(tasks)), initializer=DigitEncodingWorker.initialize
+        ) as executor:
+            for encoded in executor.map(DigitEncodingWorker.encode, tasks):
+                for label, angles, packed in encoded:
+                    self._items.append(DigitCodes(label=label, angles=angles, packed=packed, code_length=code_length))
+                    codes += len(angles)
+        LOGGER.event(
+            "mnist.encoding.parallel.done",
+            section=OUTSIDE_ARTICLE,
+            data={"digits": digits, "codes": codes, "seconds": time.perf_counter() - started},
+        )
 
     def take(self, count: int) -> list[DigitCodes]:
         """Первые count цифр набора (включая цифры без углопозиций)."""
+        store = self._store if count >= ENCODING_CODES_CACHE_MIN_DIGITS else None
+        if store is not None and not self._items and not self._exhausted:
+            cached = store.load(count)
+            if cached is not None:
+                self._items = cached
+                self._skip = len(cached)
+        missing = count - len(self._items)
+        encoded = False
+        if missing >= ENCODING_PARALLEL_MIN_DIGITS and not self._exhausted:
+            self._load_parallel(missing)
+            encoded = True
         while len(self._items) < count and not self._exhausted:
             self._load_next()
+            encoded = True
+        if store is not None and encoded:
+            store.save(self._items[:count])
         return self._items[:count]
 
     def take_nonempty(self, count: int) -> list[DigitCodes]:
         """Первые count цифр, у которых есть хотя бы одна углопозиция."""
-        while sum(1 for item in self._items if item.codes) < count and not self._exhausted:
+        while sum(1 for item in self._items if item.count) < count and not self._exhausted:
             self._load_next()
-        result = [item for item in self._items if item.codes]
+        result = [item for item in self._items if item.count]
         return result[:count]
 
 
@@ -1494,9 +2123,9 @@ def _collect_codes(
     )
     total_codes = 0
     for item in cache.take(count):
-        for angle, code in zip(item.angles, item.codes):
-            payload.add_code(label=item.label, hue=angle, code=code)
-            total_codes += 1
+        # Коды цифры уходят в таблицу массивами, без объекта на каждый код.
+        payload.add_packed(label=item.label, hues=item.angles, packed=item.packed, code_length=item.code_length)
+        total_codes += item.count
     return payload, total_codes
 
 
@@ -1505,7 +2134,7 @@ def _collect_samples(cache: StimulusCodeCache, sample_count: int) -> list[tuple[
 
 
 def _run_layout(
-    codes: dict[float, list],
+    codes: "dict[float, list] | LayoutCodeTable",
     params: TunedLayoutParams | None,
     *,
     count: int,
@@ -1526,7 +2155,70 @@ def _run_layout(
         )
         if cached_layout is not None:
             return cached_layout
-    layout = Layout(
+    return _layout_from_codes(codes, run_params, colorizer, layout_path=layout_path)
+
+
+def _seed_level_points(points: int, seed_points: int) -> int:
+    """Число точек затравки очередного уровня большой раскладки из points точек.
+
+    Режим сглаживания — один уровень: seed_points. Режим статьи — уровней столько, чтобы на точку затравки
+    приходилось не больше LAYOUT_SEED_LEVEL_RATIO_MAX точек следующего уровня; отношение N / seed_points
+    делится между уровнями поровну. Нижний уровень — seed_points точек, он раскладывается целиком.
+    """
+    if LAYOUT_SMOOTH_PINWHEELS or points <= seed_points:
+        return seed_points
+    ratio = points / float(seed_points)
+    levels = max(1, math.ceil(math.log(ratio) / math.log(LAYOUT_SEED_LEVEL_RATIO_MAX) - 1e-9))
+    if levels == 1:
+        return seed_points
+    return max(seed_points, int(math.ceil(points / ratio ** (1.0 / levels))))
+
+
+def _layout_from_codes(
+    codes: "dict[float, list] | LayoutCodeTable",
+    run_params: TunedLayoutParams,
+    colorizer: EncoderCodeColorizer | None,
+    *,
+    layout_path: str | None = None,
+) -> Layout:
+    """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка."""
+    seeded = (
+        run_params.seed_points is not None
+        and isinstance(codes, LayoutCodeTable)
+        and codes.count > run_params.seed_points
+    )
+    if seeded:
+        layout, refine_radius, refine_steps = _seeded_layout(codes, run_params, colorizer)
+    else:
+        layout = _new_layout(codes, run_params, colorizer)
+        refine_radius = refine_steps = None
+    if refine_steps == 0:
+        # Режим статьи: дальний порядок большой раскладки взят у затравки, дальней фазы нет; ближняя фаза
+        # начинается с радиуса в несколько блоков затравки и идёт без ранней отсечки пар (§5.9.1).
+        _run_short_phase(
+            layout,
+            run_params,
+            step_offset=1,
+            start_radius=refine_radius,
+            similarity_cutoff=LAYOUT_SEED_SHORT_SIMILARITY_CUTOFF,
+        )
+        return layout
+    _run_long_phase(
+        layout, run_params, step_offset=1, layout_path=layout_path, start_radius=refine_radius, steps=refine_steps
+    )
+    _run_short_phase(layout, run_params, step_offset=1 + layout.last_steps)
+    return layout
+
+
+def _new_layout(
+    codes: "dict[float, list] | LayoutCodeTable",
+    run_params: TunedLayoutParams,
+    colorizer: EncoderCodeColorizer | None,
+    *,
+    initial_cells: "np.ndarray | None" = None,
+) -> Layout:
+    """Раскладка с параметрами конвейера; initial_cells — начальная расстановка вместо случайной (§5.2)."""
+    return Layout(
         codes,
         empty_ratio=LAYOUT_EMPTY_RATIO,
         similarity=LAYOUT_SIMILARITY,
@@ -1544,12 +2236,114 @@ def _run_layout(
         long_kernel_width=LAYOUT_LONG_KERNEL_WIDTH,
         component_period=LAYOUT_COMPONENT_PERIOD,
         long_subset_min_neighbours=LAYOUT_LONG_SUBSET_MIN_NEIGHBOURS,
+        neighbourhood_sample_side=run_params.neighbourhood_sample_side,
+        enforce_pair_radius=run_params.enforce_pair_radius,
+        neighbourhood_radius_min=run_params.neighbourhood_radius_min,
+        initial_cells=initial_cells,
+        device_step=run_params.device_step,
+        device_short_step=run_params.device_short_step,
+        **_sparse_layout_options(),
     )
-    step_offset = 1
+
+
+def _seeded_layout(
+    codes: LayoutCodeTable,
+    run_params: TunedLayoutParams,
+    colorizer: EncoderCodeColorizer | None,
+) -> tuple[Layout, int, int]:
+    """Большая раскладка от затравки (вне статьи; ср. подмножество §5.9.4): раскладка, радиус и число шагов доводки.
+
+    Случайное подмножество точек раскладывается целиком обычным алгоритмом (дальняя и ближняя фазы с настройкой
+    для своего числа точек); остальные точки ставятся возле самых похожих точек подмножества. Глобальный
+    порядок готов — дальняя фаза большой раскладки начинается с радиуса в несколько блоков затравки и идёт
+    по тому же геометрическому расписанию, что полная фаза (те же шаги на октаву радиуса, §7.1.7).
+    """
+    placement = SeededPlacement(
+        codes,
+        seed_count=_seed_level_points(codes.count, int(run_params.seed_points)),
+        seed=LAYOUT_RANDOM_SEED,
+        similarity=LAYOUT_SIMILARITY,
+    )
+    seed_params = LayoutParameterTuner(
+        empty_ratio=LAYOUT_EMPTY_RATIO, start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR
+    ).tune(placement.seed_count)
+    started = time.perf_counter()
+    # Затравка раскладывается тем же путём: целиком либо, если она сама велика, от своей затравки (уровни).
+    seed_layout = _layout_from_codes(placement.seed_table(), seed_params, colorizer)
+    seed_cells = seed_layout.cells_array()
+    seed_shape = (seed_layout.height, seed_layout.width)
+    seed_lambda = seed_layout.lambda_threshold
+    seed_seconds = time.perf_counter() - started
+    # Таблицы сходства затравки занимают память устройства, нужную большой раскладке.
+    seed_layout.release_device()
+    del seed_layout
+    grid_size = int(math.ceil(math.sqrt(codes.count * (1.0 + LAYOUT_EMPTY_RATIO))))
+    started = time.perf_counter()
+    cells = placement.cells(
+        seed_cells,
+        seed_shape,
+        (grid_size, grid_size),
+        # Режим статьи: место точки в блоке родителя — по похожим на неё точкам затравки (sim ≥ λ затравки).
+        neighbour_threshold=None if LAYOUT_SMOOTH_PINWHEELS else seed_lambda,
+    )
+    layout = _new_layout(codes, run_params, colorizer, initial_cells=cells)
+    if not LAYOUT_SMOOTH_PINWHEELS:
+        # Порог λ большой раскладки продолжает расписание затравки (§7.1.7): её дальний порядок уже установлен.
+        layout.set_similarity_params(lambda_threshold=seed_lambda)
+    full_radius = max(LAYOUT_ADAPTIVE_RADIUS_MIN, int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR))
+    # Начальный радиус доводки — в блоках родителя: дальней фазы сглаживания либо ближней фазы режима статьи.
+    radius_factor = LAYOUT_SEED_REFINE_RADIUS_FACTOR if LAYOUT_SMOOTH_PINWHEELS else LAYOUT_SEED_SHORT_RADIUS_FACTOR
+    refine_radius = min(
+        full_radius,
+        max(LAYOUT_SEED_REFINE_RADIUS_MIN, int(math.ceil(radius_factor * placement.block_side()))),
+    )
+    refine_steps = run_params.long_steps
+    if full_radius > 1 and refine_radius < full_radius:
+        refine_steps = max(1, int(round(run_params.long_steps * math.log(refine_radius) / math.log(full_radius))))
+    if not LAYOUT_SMOOTH_PINWHEELS:
+        refine_steps = 0
+    LOGGER.event(
+        "layout.seed.refine",
+        section=LAYOUT_PARAMETERS,
+        data={
+            "points": codes.count,
+            "seed_points": placement.seed_count,
+            "seed_layout_seconds": seed_seconds,
+            "placement_seconds": time.perf_counter() - started,
+            "block_side": placement.block_side(),
+            "refine_radius": refine_radius,
+            "full_radius": full_radius,
+            "refine_steps": refine_steps,
+            "full_steps": run_params.long_steps,
+            "lambda_threshold": layout.lambda_threshold,
+            "note": (
+                "порядок крупнее блока затравки взят из её раскладки: дальняя фаза идёт с радиуса "
+                "refine_radius по тому же геометрическому расписанию (§7.1.7)"
+                if LAYOUT_SMOOTH_PINWHEELS
+                else "дальний порядок взят из раскладки затравки, порог λ продолжает её расписание (§7.1.7): "
+                "идёт ближняя фаза (§5.5.2) с радиуса выбора пар refine_radius"
+            ),
+        },
+    )
+    return layout, refine_radius, refine_steps
+
+
+def _run_long_phase(
+    layout: Layout,
+    run_params: TunedLayoutParams,
+    *,
+    step_offset: int,
+    layout_path: str | None,
+    start_radius: int | None = None,
+    steps: int | None = None,
+) -> None:
+    """Дальняя фаза раскладки (§5.5.1, §7.1.7); start_radius и steps — начало и длина расписания доводки."""
     long_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
     )
+    if start_radius is not None:
+        long_radius_start = int(start_radius)
     adaptive_long = AdaptiveLayoutConfig(
         start_radius=long_radius_start,
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
@@ -1564,7 +2358,7 @@ def _run_layout(
         temperature_radius_min=LAYOUT_ANNEAL_RADIUS_MIN,
     )
     layout.run(
-        steps=run_params.long_steps,
+        steps=run_params.long_steps if steps is None else int(steps),
         pairs_per_step=run_params.long_pairs_per_step,
         pair_radius=adaptive_long.start_radius,
         mode="long",
@@ -1579,7 +2373,18 @@ def _run_layout(
         adaptive_params=adaptive_long,
         save_on_stop_path=layout_path,
     )
-    step_offset += layout.last_steps
+
+
+def _run_short_phase(
+    layout: Layout,
+    run_params: TunedLayoutParams,
+    *,
+    step_offset: int,
+    start_radius: int | None = None,
+    similarity_cutoff: float | None = None,
+) -> None:
+    """Ближняя фаза раскладки (§5.5.2, §7.1.7); start_radius — начальный радиус выбора пар доводки от затравки,
+    similarity_cutoff — порог ранней отсечки пар (§5.9.1) вместо LAYOUT_SHORT_SIMILARITY_CUTOFF."""
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
         max(
@@ -1591,6 +2396,8 @@ def _run_layout(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         min(short_radius_base, short_radius_max),
     )
+    if start_radius is not None:
+        short_radius_start = max(LAYOUT_ADAPTIVE_RADIUS_MIN, min(short_radius_start, int(start_radius)))
     adaptive_short = AdaptiveLayoutConfig(
         start_radius=short_radius_start,
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
@@ -1606,7 +2413,7 @@ def _run_layout(
         energy_recalc_every=run_params.short_energy_recalc_every,
         energy_eps=LAYOUT_SHORT_ENERGY_EPS,
         use_weighted_first_point=LAYOUT_SHORT_WEIGHTED_FIRST,
-        similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF,
+        similarity_cutoff=LAYOUT_SHORT_SIMILARITY_CUTOFF if similarity_cutoff is None else similarity_cutoff,
         partitions=LAYOUT_SHORT_PARTITIONS,
     )
     layout.run(
@@ -1622,7 +2429,6 @@ def _run_layout(
         adaptive_params=adaptive_short,
         short_optim=short_optim,
     )
-    return layout
 
 
 class MnistLayoutRunner:
@@ -1656,7 +2462,7 @@ class MnistLayoutRunner:
                 "image": image_path,
                 "component_image": component_path,
                 "energy_image": energy_path,
-                "points": len(layout.positions()),
+                "points": layout.point_count,
             },
         )
 
@@ -1667,12 +2473,16 @@ class MnistLayoutRunner:
         label: int | None = None,
         activation_samples: int | None = None,
         reuse_cache: bool = True,
+        layout_only: bool = False,
     ) -> None:
         self.count = count
         self.label = label
         # False (--rebuild) — готовые раскладка, чекпоинт и эмбеддинги игнорируются, всё считается заново
         # и записывается в кеш поверх старого.
         self._reuse_cache = bool(reuse_cache)
+        # True (--layout-only) — конвейер заканчивается раскладкой: JSON и картинки сохраняются,
+        # активация и эмбеддинги не считаются.
+        self._layout_only = bool(layout_only)
         resolved_activation_samples = count if activation_samples is None else int(activation_samples)
         if resolved_activation_samples <= 0:
             raise ValueError("activation_samples must be positive")
@@ -1768,7 +2578,10 @@ class MnistLayoutRunner:
     def _code_cache(self, dataset) -> StimulusCodeCache:
         """Коды цифр набора — один общий кеш для раскладки и активации."""
         if self._codes is None:
-            self._codes = StimulusCodeCache(dataset, self.encoder, self.extractor, label=self.label)
+            store = None
+            if ENCODING_CODES_CACHE:
+                store = EncodedCodesFile(ENCODING_CODES_CACHE_DIR, encoder=self.encoder, split="train", label=self.label)
+            self._codes = StimulusCodeCache(dataset, self.encoder, self.extractor, label=self.label, store=store)
         return self._codes
 
     def _tune_layout(self, total_codes: int) -> TunedLayoutParams:
@@ -1900,6 +2713,26 @@ class MnistLayoutRunner:
             raise ValueError("layout_path must be provided to save embeddings")
         self._embedding_store.save(layout_path, embeddings, metadata=self._activation_metadata)
 
+    def _export_stage(
+        self,
+        layout: Layout,
+        run_params: TunedLayoutParams,
+        *,
+        layout_path: str,
+        save_json: bool,
+        stages: dict[str, bool],
+        embeddings: Sequence[EmbeddingRecord],
+    ) -> None:
+        """Последний этап конвейера: JSON и картинки раскладки, отметка этапа в чекпоинте (вне статьи)."""
+        self._export_layout(layout, run_params, layout_path=layout_path, save_json=save_json)
+        stages["export"] = True
+        self._checkpoint_store.save(
+            layout_path,
+            stages=stages,
+            target_samples=self._activation_samples,
+            embeddings=embeddings,
+        )
+
     def run(self) -> None:
         if self._reuse_cache:
             cached_layout = self._try_load_cached_layout()
@@ -1913,7 +2746,7 @@ class MnistLayoutRunner:
         dataset = self._build_dataset()
         if cached_layout is not None:
             layout, tuned_params, total_codes, layout_path = cached_layout
-            angles = len({float(hue) for hue in layout.hues()})
+            angles = layout.hue_count()
             self._log_dataset(angles, total_codes)
             LOGGER.event(
                 "mnist.encoding.skip",
@@ -1934,13 +2767,15 @@ class MnistLayoutRunner:
                 self.encoder,
                 self.extractor,
             )
-            codes = payload.codes_by_hue()
-            angles = len(codes)
+            # Коды в порядке точек раскладки (группы по углу в порядке первого появления) — таблицей массивов.
+            codes = payload.code_table()
+            angles = codes.hue_count()
             self._log_dataset(angles, total_codes)
             tuned_params = self._tune_layout(total_codes)
             expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
             layout_path = _layout_json_path(self.count, expected_pair_radius)
-            payload.save_base(layout_path)
+            # Файл больше LAYOUT_CACHE_MAX_FILE_BYTES как кеш не читается: до раскладки пишется только заголовок.
+            payload.save_base(layout_path, max_points_bytes=LAYOUT_CACHE_MAX_FILE_BYTES)
             if not self._reuse_cache:
                 self._checkpoint_store.reset(layout_path, target_samples=self._activation_samples)
             encoding_checkpoint = self._checkpoint_store.load(layout_path)
@@ -1973,6 +2808,28 @@ class MnistLayoutRunner:
             target_samples=self._activation_samples,
             embeddings=checkpoint_embeddings,
         )
+        if self._layout_only:
+            # Эмбеддинги чекпоинта остаются как были: обычный запуск возьмёт эту раскладку из кеша
+            # и продолжит с активации.
+            LOGGER.event(
+                "activation.skip",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "path": layout_path,
+                    "reason": "layout_only",
+                    "embeddings": len(checkpoint_embeddings),
+                    "note": "--layout-only: активация и эмбеддинги не считаются",
+                },
+            )
+            self._export_stage(
+                layout,
+                tuned_params,
+                layout_path=layout_path,
+                save_json=save_json,
+                stages=stages,
+                embeddings=checkpoint_embeddings,
+            )
+            return
         try:
             cached_embeddings = self._embedding_store.load(layout_path)
         except FileNotFoundError:
@@ -2009,12 +2866,12 @@ class MnistLayoutRunner:
             target_samples=self._activation_samples,
             embeddings=embeddings,
         )
-        self._export_layout(layout, tuned_params, layout_path=layout_path, save_json=save_json)
-        stages["export"] = True
-        self._checkpoint_store.save(
-            layout_path,
+        self._export_stage(
+            layout,
+            tuned_params,
+            layout_path=layout_path,
+            save_json=save_json,
             stages=stages,
-            target_samples=self._activation_samples,
             embeddings=embeddings,
         )
 
@@ -2333,6 +3190,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="игнорировать готовую раскладку и эмбеддинги в data/: посчитать заново и записать новый кеш "
         "(ход раскладки виден в Rerun)",
     )
+    layout_parser.add_argument(
+        "--layout-only",
+        action="store_true",
+        help="только раскладка: сохранить JSON и картинки раскладки в data/ и выйти, активация и эмбеддинги "
+        "не считаются (обычный запуск потом возьмёт эту раскладку из кеша и продолжит с активации)",
+    )
     predict_parser = subparsers.add_parser("predict", help="декодирование картинки или батча")
     predict_parser.add_argument("--layout-path", type=str, default=None)
     predict_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
@@ -2360,6 +3223,7 @@ def main() -> None:
             label=args.label,
             activation_samples=args.activation_samples,
             reuse_cache=not args.rebuild,
+            layout_only=args.layout_only,
         )
         runner.run()
         return

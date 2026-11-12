@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import colorsys
+import functools
 import hashlib
 import math
+import os
 import random
 from typing import List, Optional, Sequence, Tuple
 
@@ -25,6 +28,13 @@ from damp.article_refs import (
 )
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
+
+
+@functools.lru_cache(maxsize=None)
+def _bit_pseudo_color(index: int, denominator: int, min_hue: float, max_hue: float) -> tuple[float, float, float]:
+    """Псевдоцвет одного бита кода: оттенок по номеру бита, младший бит красный, старший фиолетовый (§5.14)."""
+    hue_degrees = min_hue + (max_hue - min_hue) * index / denominator
+    return colorsys.hsv_to_rgb((hue_degrees % 360.0) / 360.0, 1.0, 1.0)
 
 # Сдвиг каждого слоя на свою долю шага: слои не выстраиваются в начале
 # координат, и плотность кода не зависит от положения стимула (Angle-Encoder).
@@ -719,9 +729,12 @@ class Encoder:
     def _normalize_value(cls, dim: "Dimension", value: float) -> float:
         return float(cls._normalize_values(dim, np.asarray([float(value)]))[0])
 
+    @classmethod
+    def _bit_arrays_from_hits(cls, hits: "np.ndarray") -> list[BitArray]:
+        return cls._bit_arrays_from_bits((hits > 0).astype(np.uint8))
+
     @staticmethod
-    def _bit_arrays_from_hits(hits: "np.ndarray") -> list[BitArray]:
-        bit_matrix = (hits > 0).astype(np.uint8)
+    def _bit_arrays_from_bits(bit_matrix: "np.ndarray") -> list[BitArray]:
         return [
             BitArray.from_bits(bit_matrix[i].tobytes(), np.flatnonzero(bit_matrix[i]).tolist())
             for i in range(bit_matrix.shape[0])
@@ -759,16 +772,56 @@ class Encoder:
         Результат побитово тот же, что у encode для каждого стимула по отдельности; коды считаются
         матрицей (стимулы × биты), поэтому стоимость почти не зависит от числа стимулов.
         """
+        normalized, bit_matrix, first = self._encode_rows(
+            rows, log_image=log_image, log_label=log_label, log_measurements=log_measurements
+        )
+        if first is None:
+            return []
+        codes = [first] + self._bit_arrays_from_bits(bit_matrix[1:])
+        return [(tuple(float(v) for v in normalized[i]), codes[i]) for i in range(len(codes))]
+
+    def encode_matrix(
+        self,
+        rows: Sequence[Sequence[float]],
+        *,
+        log_image: object | None = None,
+        log_label: int | None = None,
+        log_measurements: Sequence[tuple[float, int, int]] | None = None,
+    ) -> "np.ndarray":
+        """Коды набора стимулов матрицей бит (стимулы × длина кода, uint8).
+
+        Те же биты и те же записи журнала, что у encode_batch, но без объекта BitArray на каждый код:
+        так кодируются большие наборы, где объект на код не помещается в память.
+        """
+        _, bit_matrix, _ = self._encode_rows(
+            rows, log_image=log_image, log_label=log_label, log_measurements=log_measurements
+        )
+        return bit_matrix
+
+    def _encode_rows(
+        self,
+        rows: Sequence[Sequence[float]],
+        *,
+        log_image: object | None,
+        log_label: int | None,
+        log_measurements: Sequence[tuple[float, int, int]] | None,
+    ) -> tuple["np.ndarray", "np.ndarray", BitArray | None]:
+        """Нормализованные значения, матрица бит кодов и код первого стимула (для журнала); None — стимулов нет."""
         rows = [tuple(float(v) for v in row) for row in rows]
         if not rows:
-            return []
+            return (
+                np.zeros((0, len(self.dimensions)), dtype=np.float64),
+                np.zeros((0, self.code_length), dtype=np.uint8),
+                None,
+            )
         LOGGER.event(
             "encoder.encode.input",
             section=MULTI_DIM_CODES,
             data={"stimuli": len(rows), "values": rows[0], "dimensions": len(self.dimensions)},
         )
         normalized, hits = self._hit_matrix(rows)
-        codes = self._bit_arrays_from_hits(hits)
+        bit_matrix = (hits > 0).astype(np.uint8)
+        first = self._bit_arrays_from_bits(bit_matrix[:1])[0]
         active_counts = np.count_nonzero(hits > 0, axis=1)
         shared_counts = np.count_nonzero(hits > 1, axis=1)
         LOGGER.event(
@@ -781,11 +834,11 @@ class Encoder:
         code_bits: list[int] | None = None
         patch_meta: dict[str, float | int | str] = {}
         if self.log_every > 0 and self._log_counter % self.log_every < len(rows):
-            code_bits = list(codes[0])
+            code_bits = list(first)
             code_visuals.append(LOGGER.visual_bar_chart("encoding/code_bits", code_bits))
         if log_image is not None or log_measurements:
             patch_meta = self._log_stimulus_image(
-                codes[0], code_bits, log_image=log_image, log_label=log_label, log_measurements=log_measurements
+                first, code_bits, log_image=log_image, log_label=log_label, log_measurements=log_measurements
             )
         LOGGER.event(
             "encoder.encode.code",
@@ -798,16 +851,14 @@ class Encoder:
                 "density": float(active_counts.mean()) / self.code_length,
                 "shared_bits": int(shared_counts[0]),
                 "shared_bits_mean": float(shared_counts.mean()),
-                "code": codes[0],
+                "code": first,
                 "label": int(log_label) if log_label is not None else None,
                 "measurements": len(log_measurements) if log_measurements else 0,
                 **patch_meta,
             },
             visuals=code_visuals if code_visuals else None,
         )
-        return [
-            (tuple(float(v) for v in normalized[i]), codes[i]) for i in range(len(rows))
-        ]
+        return normalized, bit_matrix, first
 
     def _log_stimulus_image(
         self,
@@ -858,6 +909,73 @@ class Encoder:
         return patch_meta
 
     # ------------------------------------------------------------- pseudo colour
+    # Кодов за один проход векторного расчёта цветов (k × L чисел float64 на канал).
+    COLOR_CHUNK_ROWS = 4096
+    # С этого числа порций строк цвета считаются потоками (каждая порция — те же действия numpy, что и по одной;
+    # numpy на время расчёта отпускает блокировку интерпретатора): 5.3 млн кодов — 9 с вместо 57 с.
+    COLOR_PARALLEL_MIN_CHUNKS = 8
+    COLOR_WORKERS_MAX = 8
+
+    @classmethod
+    def colors_from_bits(cls, bits: "np.ndarray", *, min_hue: float, max_hue: float) -> "np.ndarray":
+        """Псевдоцвета кодов матрицы бит (k × L): массив uint8 k × 3 (§5.14).
+
+        Те же числа, что color_from_code для каждого кода: каналы — суммы цветов единичных битов в порядке
+        номеров (накопленная сумма по строке: прибавление 0.0 на месте нулевого бита значения не меняет),
+        масштаб 255 / max и округление до ближайшего чётного, как round().
+        """
+        if max_hue < min_hue:
+            raise ValueError("max_hue must be >= min_hue")
+        bits = np.asarray(bits)
+        if bits.ndim != 2:
+            raise ValueError("bits must be a k × L matrix")
+        count, length = int(bits.shape[0]), int(bits.shape[1])
+        result = np.zeros((count, 3), dtype=np.uint8)
+        if count == 0 or length == 0:
+            return result
+        denominator = max(1, length - 1)
+        palette = np.array(
+            [_bit_pseudo_color(index, denominator, min_hue, max_hue) for index in range(length)], dtype=np.float64
+        )
+
+        compiled = _CompiledColorSums.instance()
+
+        def chunk_colors(start: int) -> None:
+            """Цвета порции строк: суммы каналов по единичным битам в порядке номеров, масштаб, округление."""
+            active = bits[start : start + cls.COLOR_CHUNK_ROWS] != 0
+            sums = np.empty((active.shape[0], 3), dtype=np.float64)
+            if compiled is None or not compiled.sums(active, palette, sums):
+                for channel in range(3):
+                    sums[:, channel] = np.cumsum(np.where(active, palette[:, channel], 0.0), axis=1)[:, -1]
+            lit = active.any(axis=1)
+            scale = 255.0 / np.where(lit, sums.max(axis=1), 1.0)
+            colors = np.rint(sums * scale[:, None])
+            colors[~lit] = 0.0
+            result[start : start + active.shape[0]] = colors.astype(np.uint8)
+
+        starts = range(0, count, cls.COLOR_CHUNK_ROWS)
+        workers = min(len(starts), cls.COLOR_WORKERS_MAX, os.cpu_count() or 1)
+        if len(starts) >= cls.COLOR_PARALLEL_MIN_CHUNKS and workers > 1:
+            # Порции независимы и пишут в разные строки результата: порядок их расчёта чисел не меняет.
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                list(pool.map(chunk_colors, starts))
+        else:
+            for start in starts:
+                chunk_colors(start)
+        LOGGER.event(
+            "encoder.code.colors",
+            section=LAID_OUT_STRUCTURE,
+            data={
+                "codes": count,
+                "code_length": length,
+                "min_hue": min_hue,
+                "max_hue": max_hue,
+                "first_color": tuple(int(v) for v in result[0]),
+                "note": "псевдоцвет кода — сумма цветов единичных битов: младший бит красный, старший фиолетовый",
+            },
+        )
+        return result
+
     @staticmethod
     def color_from_code(
         code: BitArray,
@@ -873,9 +991,10 @@ class Encoder:
             return (0, 0, 0)
         denominator = max(1, len(code) - 1)
         red = green = blue = 0.0
+        bit_color = _bit_pseudo_color
         for index in active:
-            hue_degrees = min_hue + (max_hue - min_hue) * index / denominator
-            r, g, b = colorsys.hsv_to_rgb((hue_degrees % 360.0) / 360.0, 1.0, 1.0)
+            # Цвет бита зависит только от его номера: считается один раз (те же числа, тот же порядок сумм).
+            r, g, b = bit_color(index, denominator, min_hue, max_hue)
             red += r
             green += g
             blue += b
@@ -994,6 +1113,83 @@ class Encoder:
         return grid_x, grid_y
 
 
+try:  # numba — необязательная зависимость: без неё суммы цветов считает numpy.
+    import numba
+except Exception:  # noqa: BLE001
+    numba = None
+
+
+def _channel_sums_py(active, palette, sums):  # noqa: ANN001, ANN201
+    """Суммы цветов единичных битов каждой строки: сложение float64 по порядку номеров битов."""
+    for row in range(active.shape[0]):
+        red = 0.0
+        green = 0.0
+        blue = 0.0
+        for index in range(active.shape[1]):
+            if active[row, index]:
+                red += palette[index, 0]
+                green += palette[index, 1]
+                blue += palette[index, 2]
+        sums[row, 0] = red
+        sums[row, 1] = green
+        sums[row, 2] = blue
+
+
+class _CompiledColorSums:
+    """Суммы цветов единичных битов кода (§5.14) скомпилированным циклом numba — те же числа, что у numpy.
+
+    Сумма канала — сложение цветов единичных битов по порядку номеров. numpy считает её накопленной суммой
+    по строке, где на месте нулевого бита стоит 0.0 (прибавление 0.0 значения не меняет); цикл складывает
+    только единичные биты в том же порядке — те же сложения float64 в том же порядке. Первая порция сверяется
+    с numpy; при расхождении и без numba суммы считает numpy.
+    """
+
+    _INSTANCE: "_CompiledColorSums | None" = None
+    _UNAVAILABLE = False
+
+    def __init__(self, function) -> None:  # noqa: ANN001
+        self._function = function
+        self._verified = False
+        self._enabled = True
+
+    @classmethod
+    def instance(cls) -> "_CompiledColorSums | None":
+        if cls._INSTANCE is None and not cls._UNAVAILABLE:
+            try:
+                if numba is None:
+                    raise ImportError("numba is not installed")
+                # nogil: порции строк считаются потоками Python одновременно.
+                cls._INSTANCE = cls(numba.njit(cache=True, nogil=True)(_channel_sums_py))
+            except Exception:  # noqa: BLE001
+                cls._UNAVAILABLE = True
+        return cls._INSTANCE
+
+    def sums(self, active: "np.ndarray", palette: "np.ndarray", sums: "np.ndarray") -> bool:
+        """Суммы каналов строк active (k × L, bool) в sums (k × 3); False — считать numpy."""
+        if not self._enabled:
+            return False
+        self._function(active, palette, sums)
+        if not self._verified:
+            expected = np.empty_like(sums)
+            for channel in range(3):
+                expected[:, channel] = np.cumsum(np.where(active, palette[:, channel], 0.0), axis=1)[:, -1]
+            matched = bool(np.array_equal(expected, sums))
+            self._verified = True
+            self._enabled = matched
+            LOGGER.event(
+                "encoder.code.colors.compiled",
+                section=LAID_OUT_STRUCTURE,
+                data={
+                    "codes": int(active.shape[0]),
+                    "identical": matched,
+                    "note": "суммы цветов единичных битов скомпилированным циклом сверены с numpy: те же числа",
+                },
+            )
+            if not matched:
+                sums[:] = expected
+        return True
+
+
 @dataclass(frozen=True)
 class EncoderCodeColorizer:
     """Псевдоцвет кода или его компоненты по §5.14 (ср. «corner component» на рис. 16)."""
@@ -1034,6 +1230,15 @@ class EncoderCodeColorizer:
             },
         )
         return colorizer
+
+    def colors(self, bits: "np.ndarray") -> "np.ndarray":
+        """Псевдоцвета кодов матрицы бит (k × L) массивом uint8 k × 3 — те же, что color() каждого кода (§5.14)."""
+        bits = np.asarray(bits)
+        length = int(bits.shape[1])
+        stop = length if self.bit_length is None else self.start_bit + self.bit_length
+        if self.start_bit >= length or stop > length:
+            raise ValueError("color component is outside Encoder code")
+        return Encoder.colors_from_bits(bits[:, self.start_bit : stop], min_hue=self.min_hue, max_hue=self.max_hue)
 
     def color(self, code: BitArray) -> tuple[int, int, int]:
         stop = len(code) if self.bit_length is None else self.start_bit + self.bit_length
