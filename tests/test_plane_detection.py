@@ -10,6 +10,7 @@ import numpy as np  # noqa: E402
 
 from damp.activation.plane_detection import (  # noqa: E402
     BestMatchActivation,
+    LabelMapQuality,
     PlaneDetection,
     PlaneDetectorSpace,
     StimulusSetCodes,
@@ -283,6 +284,50 @@ class PlaneDetectionTests(unittest.TestCase):
         self.assertEqual([code.count() for code in codes.embeddings()], second.ones.tolist())
         stats = codes.log_summary(self.space, similarity="cosine")
         self.assertEqual(stats["sample"], 3)
+
+    def test_summary_returns_requested_similarity_quantiles(self) -> None:
+        table = self.layout.code_table
+        codes = StimulusSetCodes(self.detection.code_length)
+        for label, rows in ((1, [0, 1]), (2, [10, 11]), (1, [20, 21]), (2, [30, 31])):
+            codes.add(label, self.detection.encode_packed(table.packed[rows], label=label))
+        stats = codes.log_summary(self.space, similarity="cosine", quantiles=(0.5, 0.9))
+        bits = codes.bits().astype(np.float64)
+        ones = bits.sum(axis=1)
+        similarity = (bits @ bits.T) / np.sqrt(ones[:, None] * ones[None, :])
+        pairwise = similarity[~np.eye(4, dtype=bool)]
+        self.assertAlmostEqual(stats[codes.quantile_key(0.5)], float(np.quantile(pairwise, 0.5)), places=5)
+        self.assertAlmostEqual(stats[codes.quantile_key(0.9)], float(np.quantile(pairwise, 0.9)), places=5)
+
+
+class LabelMapQualityTests(unittest.TestCase):
+    def test_same_label_share_counts_adjacent_occupied_cells(self) -> None:
+        table = LayoutCodeTable.from_bits(
+            _random_codes(4, 96, 12, seed=2), hues=[0.0, 0.0, 36.0, 36.0], labels=["a", "a", "b", "b"]
+        )
+        layout = Layout(table, empty_ratio=0.5, similarity="cosine", use_gpu=False, seed=0)
+        # a a
+        # b b   — две пары соседей с одной подписью (по горизонтали) и две с разными (по вертикали).
+        layout.place_cells(np.array([[0, 0], [0, 1], [1, 0], [1, 1]]))
+        quality = LabelMapQuality().measure(layout)
+        self.assertEqual(quality["neighbour_pairs"], 4.0)
+        self.assertAlmostEqual(quality["same_label"], 0.5)
+        self.assertAlmostEqual(quality["same_label_random"], 0.5)
+
+
+class LayoutLambdaScheduleTests(unittest.TestCase):
+    def test_schedule_keeps_thresholds_ordered(self) -> None:
+        schedule = main.LayoutLambdaSchedule.from_quantiles(0.5, 0.4, start_quantile=0.82, maximum_quantile=0.982)
+        self.assertEqual((schedule.start, schedule.maximum, schedule.short_cutoff), (0.5, 0.5, 0.5))
+        with self.assertRaises(ValueError):
+            main.LayoutLambdaSchedule(start=0.7, maximum=0.6)
+
+    def test_layout_takes_its_threshold_from_the_schedule(self) -> None:
+        table = LayoutCodeTable.from_bits(_random_codes(30, 96, 12, seed=1), hues=[0.0] * 30, labels=["a"] * 30)
+        params = main.LayoutParameterTuner().tune(table.count)
+        layout = main._new_layout(table, params, None, lambda_threshold=0.31)
+        self.assertAlmostEqual(layout.lambda_threshold, 0.31)
+        default = main._new_layout(table, params, None)
+        self.assertAlmostEqual(default.lambda_threshold, main.LAYOUT_LAMBDA_THRESHOLD)
 
 
 if __name__ == "__main__":

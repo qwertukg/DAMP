@@ -29,6 +29,7 @@ from damp.activation import (
 )
 from damp.activation.plane_detection import (
     BestMatchActivation,
+    LabelMapQuality,
     PlaneDetection,
     PlaneDetectorSpace,
     StimulusSetCodes,
@@ -450,7 +451,10 @@ SECOND_LEVEL_OVERLAP = MNIST_POSITION_OVERLAP
 # 0.85 стороны — два круга по стороне, как MNIST_POSITION_WIDEST_DETECTORS = 2: самый широкий слой
 # накрывает всю карту и даёт сходство кодам любых двух позиций (дальний порядок, §4.5).
 SECOND_LEVEL_RADIUS_MAX = 0.85
-SECOND_LEVEL_RADIUS_MIN = 0.012
+# Самый узкий слой. 2000 обучающих цифр, 1000 тестовых, ближайший сосед по косинусу кодов картинок
+# (по сырым пикселям на тех же данных — 88.4 %): радиус 0.006 — 89.9 %, 0.012 — 92.6 %, 0.02 — 93.6 %;
+# 5 слоёв 0.25…0.03 — 92.8 %. Слишком узкие круги различают отдельные углопозиции и не обобщают.
+SECOND_LEVEL_RADIUS_MIN = 0.02
 SECOND_LEVEL_RANDOM_SEED = ENCODER_RANDOM_SEED
 # Стимул зажигает точки с наибольшим сходством, если оно не ниже λ_a (§6.1); порог тот же, что у активации §6.5.
 SECOND_LEVEL_ACTIVATION_LAMBDA = ACTIVATION_LAMBDA_THRESHOLD
@@ -460,8 +464,18 @@ SECOND_LEVEL_MAX_DENSITY = 0.25
 SECOND_LEVEL_MERGE_KEEP = "short"
 # Подпись и цвет точки второй раскладки — класс цифры: hue = класс · шаг (10 классов на круге 360°).
 SECOND_LEVEL_CLASS_HUE_STEP = 36.0
+# Порог сходства второй раскладки (§5.4, §7.1.7). Сходства кодов картинок лежат в другом диапазоне, чем
+# у первичных кодов (100 цифр: 0.36…0.58 против порога λ = 0.65), поэтому λ задаётся долей похожих пар,
+# как у первичных кодов: LAYOUT_LAMBDA_THRESHOLD = 0.65 — квантиль 0.82 их попарных сходств (18 % пар
+# похожи), LAYOUT_ADAPTIVE_LAMBDA_MAX = 0.8 — квантиль 0.982 (1.8 % пар; замер на 100 цифрах, 8 693 точки).
+SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE = 0.82
+SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE = 0.982
 # Число тестовых картинок проверки нечётким поиском по кодам второго уровня (§2.2.5).
 SECOND_LEVEL_EVALUATE_LIMIT = 200
+# Температура голосования соседей в нечётком поиске по кодам второго уровня. Сходства кодов картинок
+# различаются на сотые (диапазон 0.36…0.58 против 0…1 у прежних эмбеддингов), и при DECODER_SOFTMAX_TEMPERATURE
+# = 0.35 веса всех соседей почти равны: 100 цифр — 44 % на 50 тестовых картинках при 78 % у ближайшего соседа.
+SECOND_LEVEL_DECODER_TEMPERATURE = 0.02
 SECOND_LEVEL_FILE_PREFIX = "data/second"
 
 # §5.10: пары шага считаются спекулятивно по старым позициям; это не влияет на результат, пока обменов
@@ -867,6 +881,57 @@ class TunedLayoutParams:
     device_step: bool = False
     # True — шаг ближней фазы большой раскладки режима статьи выполняется целиком на устройстве.
     device_short_step: bool = False
+
+
+@dataclass(frozen=True)
+class LayoutLambdaSchedule:
+    """Пороги сходства раскладки (§5.4, §7.1.7) для кодов со своим распределением сходств.
+
+    start — порог λ в начале раскладки, он же порог ранней отсечки пар ближней фазы (§5.9.1); maximum —
+    предел роста λ ступенями (§7.1.7). Константы LAYOUT_LAMBDA_THRESHOLD и LAYOUT_ADAPTIVE_LAMBDA_MAX подобраны
+    для первичных кодов; у кодов следующего уровня сходства лежат в другом диапазоне, и пороги для них
+    берутся квантилями попарных сходств — той же долей похожих пар, что у первичных кодов.
+    """
+
+    start: float
+    maximum: float
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.start <= self.maximum <= 1.0:
+            raise ValueError("lambda schedule must satisfy 0 <= start <= maximum <= 1")
+
+    @property
+    def short_cutoff(self) -> float:
+        """Порог ранней отсечки пар ближней фазы (§5.9.1): совпадает с начальным λ."""
+        return self.start
+
+    @classmethod
+    def from_quantiles(
+        cls,
+        start: float,
+        maximum: float,
+        *,
+        start_quantile: float,
+        maximum_quantile: float,
+    ) -> "LayoutLambdaSchedule":
+        """Пороги по квантилям попарных сходств кодов: start и maximum — значения этих квантилей."""
+        schedule = cls(start=float(start), maximum=max(float(start), float(maximum)))
+        LOGGER.event(
+            "layout.lambda_schedule",
+            section=LAYOUT_PARAMETERS,
+            data={
+                "lambda_threshold": schedule.start,
+                "lambda_max": schedule.maximum,
+                "start_quantile": start_quantile,
+                "maximum_quantile": maximum_quantile,
+                "primary_lambda_threshold": LAYOUT_LAMBDA_THRESHOLD,
+                "primary_lambda_max": LAYOUT_ADAPTIVE_LAMBDA_MAX,
+                "note": "§7.1.7: параметры раскладки зависят от задачи; пороги взяты квантилями попарных сходств "
+                "кодов — та же доля похожих пар, что дают первичным кодам LAYOUT_LAMBDA_THRESHOLD и "
+                "LAYOUT_ADAPTIVE_LAMBDA_MAX",
+            },
+        )
+        return schedule
 
 
 @dataclass(frozen=True)
@@ -2269,13 +2334,33 @@ def _layout_from_codes(
     colorizer: EncoderCodeColorizer | None,
     *,
     layout_path: str | None = None,
+    lambda_schedule: LayoutLambdaSchedule | None = None,
 ) -> Layout:
-    """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка."""
+    """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка.
+
+    lambda_schedule — пороги сходства для кодов с другим распределением сходств (коды следующего уровня);
+    None — константы LAYOUT_*. Большая раскладка от затравки идёт только с порогами по умолчанию.
+    """
     seeded = (
         run_params.seed_points is not None
         and isinstance(codes, LayoutCodeTable)
         and codes.count > run_params.seed_points
     )
+    if lambda_schedule is not None:
+        if seeded:
+            raise ValueError("свои пороги сходства не поддержаны для большой раскладки от затравки")
+        layout = _new_layout(codes, run_params, colorizer, lambda_threshold=lambda_schedule.start)
+        _run_long_phase(
+            layout, run_params, step_offset=1, layout_path=layout_path, lambda_max=lambda_schedule.maximum
+        )
+        _run_short_phase(
+            layout,
+            run_params,
+            step_offset=1 + layout.last_steps,
+            similarity_cutoff=lambda_schedule.short_cutoff,
+            lambda_max=lambda_schedule.maximum,
+        )
+        return layout
     if seeded:
         layout, refine_radius, refine_steps = _seeded_layout(codes, run_params, colorizer)
     else:
@@ -2305,13 +2390,15 @@ def _new_layout(
     colorizer: EncoderCodeColorizer | None,
     *,
     initial_cells: "np.ndarray | None" = None,
+    lambda_threshold: float | None = None,
 ) -> Layout:
-    """Раскладка с параметрами конвейера; initial_cells — начальная расстановка вместо случайной (§5.2)."""
+    """Раскладка с параметрами конвейера; initial_cells — начальная расстановка вместо случайной (§5.2),
+    lambda_threshold — порог сходства λ (§5.4) вместо LAYOUT_LAMBDA_THRESHOLD."""
     return Layout(
         codes,
         empty_ratio=LAYOUT_EMPTY_RATIO,
         similarity=LAYOUT_SIMILARITY,
-        lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
+        lambda_threshold=LAYOUT_LAMBDA_THRESHOLD if lambda_threshold is None else float(lambda_threshold),
         eta=LAYOUT_ETA,
         seed=LAYOUT_RANDOM_SEED,
         use_gpu=LAYOUT_USE_GPU,
@@ -2425,8 +2512,10 @@ def _run_long_phase(
     layout_path: str | None,
     start_radius: int | None = None,
     steps: int | None = None,
+    lambda_max: float | None = None,
 ) -> None:
-    """Дальняя фаза раскладки (§5.5.1, §7.1.7); start_radius и steps — начало и длина расписания доводки."""
+    """Дальняя фаза раскладки (§5.5.1, §7.1.7); start_radius и steps — начало и длина расписания доводки,
+    lambda_max — предел роста λ вместо LAYOUT_ADAPTIVE_LAMBDA_MAX."""
     long_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
@@ -2438,7 +2527,7 @@ def _run_long_phase(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
-        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX if lambda_max is None else float(lambda_max),
         radius_schedule=LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
         radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
         swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
@@ -2471,9 +2560,11 @@ def _run_short_phase(
     step_offset: int,
     start_radius: int | None = None,
     similarity_cutoff: float | None = None,
+    lambda_max: float | None = None,
 ) -> None:
     """Ближняя фаза раскладки (§5.5.2, §7.1.7); start_radius — начальный радиус выбора пар доводки от затравки,
-    similarity_cutoff — порог ранней отсечки пар (§5.9.1) вместо LAYOUT_SHORT_SIMILARITY_CUTOFF."""
+    similarity_cutoff — порог ранней отсечки пар (§5.9.1) вместо LAYOUT_SHORT_SIMILARITY_CUTOFF,
+    lambda_max — предел роста λ вместо LAYOUT_ADAPTIVE_LAMBDA_MAX."""
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
         max(
@@ -2492,7 +2583,7 @@ def _run_short_phase(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
-        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX if lambda_max is None else float(lambda_max),
         radius_schedule=LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE,
         radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
         swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
@@ -3297,8 +3388,19 @@ class MnistSecondLevelRunner:
         primary_layout = self._primary.run()
         detection = _build_plane_detection(primary_layout)
         codes = self._encode_digits(detection)
-        codes.log_summary(detection.space, similarity=LAYOUT_SIMILARITY, seed=SECOND_LEVEL_RANDOM_SEED)
-        second_layout = self._layout_codes(codes)
+        summary = codes.log_summary(
+            detection.space,
+            similarity=LAYOUT_SIMILARITY,
+            seed=SECOND_LEVEL_RANDOM_SEED,
+            quantiles=(SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE, SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE),
+        )
+        schedule = LayoutLambdaSchedule.from_quantiles(
+            summary[codes.quantile_key(SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE)],
+            summary[codes.quantile_key(SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE)],
+            start_quantile=SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE,
+            maximum_quantile=SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE,
+        )
+        second_layout = self._layout_codes(codes, schedule)
         self._export(second_layout)
         if self._evaluate_limit == 0:
             return None
@@ -3311,14 +3413,17 @@ class MnistSecondLevelRunner:
             codes.add(item.label, detection.encode_packed(item.packed, label=item.label))
         return codes
 
-    def _layout_codes(self, codes: StimulusSetCodes) -> Layout:
-        """Раскладка кодов картинок тем же алгоритмом и с той же настройкой, что первая (§6.2, §6.6)."""
+    def _layout_codes(self, codes: StimulusSetCodes, schedule: LayoutLambdaSchedule) -> Layout:
+        """Раскладка кодов картинок тем же алгоритмом и с той же настройкой, что первая (§6.2, §6.6);
+        отличается только порог сходства λ — он взят по распределению сходств самих кодов (§7.1.7)."""
         table = codes.table(hue_step=SECOND_LEVEL_CLASS_HUE_STEP).grouped_by_hue()
         tuner = LayoutParameterTuner(
             empty_ratio=LAYOUT_EMPTY_RATIO,
             start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
         )
-        return _layout_from_codes(table, tuner.tune(table.count), self._primary.colorizer)
+        return _layout_from_codes(
+            table, tuner.tune(table.count), self._primary.colorizer, lambda_schedule=schedule
+        )
 
     def _export(self, layout: Layout) -> None:
         """JSON и карты второй раскладки: псевдоцвета кода, раскраска по классу цифры, яркость по энергии."""
@@ -3330,6 +3435,8 @@ class MnistSecondLevelRunner:
             image_path=f"{stem}.png",
             energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
         )
+        # Собрала ли раскладка картинки одного класса рядом (класс в раскладке не участвует).
+        LabelMapQuality().measure(layout)
 
     def _evaluate(self, detection: PlaneDetection, codes: StimulusSetCodes) -> float:
         """Нечёткий поиск (§2.2.5): класс тестовой картинки — по самым похожим кодам обучающих картинок."""
@@ -3343,7 +3450,7 @@ class MnistSecondLevelRunner:
             ],
             DecoderConfig(
                 similarity=DECODER_SIMILARITY,
-                temperature=DECODER_SOFTMAX_TEMPERATURE,
+                temperature=SECOND_LEVEL_DECODER_TEMPERATURE,
                 min_confidence=DECODER_MIN_CONFIDENCE,
                 expected_classes=DECODER_EXPECTED_CLASSES,
                 knn_top_k=DECODER_KNN_TOP_K,

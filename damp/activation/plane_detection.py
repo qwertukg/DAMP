@@ -26,6 +26,7 @@ import numpy as np
 from damp.article_refs import (
     CODE_SPACE_ACTIVATION,
     DETECTOR_HIERARCHY,
+    MAPPING_CONTINUITY,
     OUTSIDE_ARTICLE,
     SIMILARITY_MEASURES,
     SPARSE_BIT_VECTORS,
@@ -625,8 +626,19 @@ class StimulusSetCodes:
             ones=np.asarray(self._ones, dtype=np.int32),
         )
 
-    def log_summary(self, space: PlaneDetectorSpace, *, similarity: str, seed: int = 0) -> dict[str, float]:
-        """Сводка набора: плотность кодов (§2), заполнение цветовых полос слоёв (§3.2), сходство по классам (§2.2.4)."""
+    def log_summary(
+        self,
+        space: PlaneDetectorSpace,
+        *,
+        similarity: str,
+        seed: int = 0,
+        quantiles: Sequence[float] = (),
+    ) -> dict[str, float]:
+        """Сводка набора: плотность кодов (§2), заполнение цветовых полос слоёв (§3.2), сходство по классам (§2.2.4).
+
+        quantiles — квантили попарных сходств кодов, которые нужно вернуть (ключи similarity_q<квантиль>):
+        по ним задаётся порог λ раскладки следующего уровня.
+        """
         count = len(self)
         if count == 0:
             raise ValueError("no codes to summarise")
@@ -665,7 +677,7 @@ class StimulusSetCodes:
                 "band_constant — доля битов полосы, одинаковых у всех кодов (§2: плотность не выше 25 %)",
             },
         )
-        stats = self._similarity_stats(similarity, rows, bits)
+        stats = self._similarity_stats(similarity, rows, bits, quantiles)
         LOGGER.event(
             "plane_detection.codes.similarity",
             section=SIMILARITY_MEASURES,
@@ -685,7 +697,18 @@ class StimulusSetCodes:
             return np.arange(count, dtype=np.int64)
         return np.sort(np.random.default_rng(seed).choice(count, size=self.SIMILARITY_SAMPLE, replace=False))
 
-    def _similarity_stats(self, similarity: str, rows: "np.ndarray", bits: "np.ndarray") -> dict[str, float]:
+    @staticmethod
+    def quantile_key(quantile: float) -> str:
+        """Ключ квантиля попарных сходств в сводке набора."""
+        return f"similarity_q{float(quantile):g}"
+
+    def _similarity_stats(
+        self,
+        similarity: str,
+        rows: "np.ndarray",
+        bits: "np.ndarray",
+        quantiles: Sequence[float] = (),
+    ) -> dict[str, float]:
         bits = bits.astype(np.float32)
         labels = np.asarray(self._labels, dtype=np.int64)[rows]
         ones = bits.sum(axis=1)
@@ -699,14 +722,60 @@ class StimulusSetCodes:
         off_diagonal = ~np.eye(rows.shape[0], dtype=bool)
         same_pairs = same & off_diagonal
         other_pairs = ~same
+        pairwise = matrix[off_diagonal]
+        requested = {
+            self.quantile_key(quantile): float(np.quantile(pairwise, float(quantile))) if pairwise.size else 0.0
+            for quantile in quantiles
+        }
         np.fill_diagonal(matrix, -1.0)
         nearest = matrix.argmax(axis=1)
         return {
+            **requested,
             "sample": int(rows.shape[0]),
             "same_class_mean": float(matrix[same_pairs].mean()) if same_pairs.any() else 0.0,
             "other_class_mean": float(matrix[other_pairs].mean()) if other_pairs.any() else 0.0,
-            "similarity_p05": float(np.quantile(matrix[off_diagonal], 0.05)) if off_diagonal.any() else 0.0,
-            "similarity_p50": float(np.quantile(matrix[off_diagonal], 0.50)) if off_diagonal.any() else 0.0,
-            "similarity_p95": float(np.quantile(matrix[off_diagonal], 0.95)) if off_diagonal.any() else 0.0,
+            "similarity_p05": float(np.quantile(pairwise, 0.05)) if pairwise.size else 0.0,
+            "similarity_p50": float(np.quantile(pairwise, 0.50)) if pairwise.size else 0.0,
+            "similarity_p95": float(np.quantile(pairwise, 0.95)) if pairwise.size else 0.0,
             "nearest_same_class": float(np.mean(labels[nearest] == labels)) if rows.shape[0] > 1 else 0.0,
         }
+
+
+class LabelMapQuality:
+    """Согласие подписей соседних точек на карте раскладки (диагностика; ср. рис. 16, §5.13.2).
+
+    Подпись в раскладке не участвует: это известное свойство стимула (класс картинки), по которому видно,
+    собрала ли раскладка похожие коды рядом. Мера — доля пар соседних занятых ячеек (по горизонтали и
+    вертикали) с одинаковой подписью; для сравнения даётся её ожидание при случайной расстановке, Σ p_c².
+    """
+
+    def measure(self, layout: Layout) -> dict[str, float]:
+        cells = layout.cells_array()
+        labels = np.asarray(layout.code_table.label_index, dtype=np.int64)
+        grid = np.full((int(layout.height), int(layout.width)), -1, dtype=np.int64)
+        grid[cells[:, 0], cells[:, 1]] = labels
+        pairs = same = 0
+        for first, second in ((grid[:, :-1], grid[:, 1:]), (grid[:-1, :], grid[1:, :])):
+            occupied = (first >= 0) & (second >= 0)
+            pairs += int(np.count_nonzero(occupied))
+            same += int(np.count_nonzero(occupied & (first == second)))
+        shares = np.bincount(labels).astype(np.float64) / max(1, labels.shape[0])
+        quality = {
+            "neighbour_pairs": float(pairs),
+            "same_label": same / pairs if pairs else 0.0,
+            "same_label_random": float(np.sum(shares * shares)),
+        }
+        LOGGER.event(
+            "plane_detection.map",
+            section=MAPPING_CONTINUITY,
+            data={
+                "points": int(labels.shape[0]),
+                "labels": int(np.count_nonzero(shares)),
+                "neighbour_pairs": pairs,
+                "same_label": quality["same_label"],
+                "same_label_random": quality["same_label_random"],
+                "note": "доля пар соседних занятых ячеек с одинаковой подписью; same_label_random — её ожидание "
+                "при случайной расстановке (подпись в раскладке не участвует)",
+            },
+        )
+        return quality
