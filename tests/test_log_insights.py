@@ -1,12 +1,14 @@
 """Инварианты анализа логов: кодирование строк по §7.1.3–§7.1.4, числа по §4.2.1 и конвейер на синтетическом логе."""
 from __future__ import annotations
 
+import gzip
 import itertools
 import math
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("RERUN", "off")
 
@@ -24,6 +26,8 @@ from damp.encoding.log_encoder import (  # noqa: E402
     NumericValueEncoder,
     TokenAlphabet,
     VariableSlots,
+    limit_words,
+    truncated,
 )
 from damp.logging import LOGGER  # noqa: E402
 import log_insights  # noqa: E402
@@ -119,6 +123,44 @@ class ReaderTests(unittest.TestCase):
     def test_line_is_truncated_to_words_max(self) -> None:
         self.assertEqual(_words("alpha beta gamma delta epsilon", line_words_max=3), ("alpha", "beta", "gamma"))
 
+    def test_json_record_is_unfolded_into_keys_and_values(self) -> None:
+        text = '{"@timestamp":"2026-11-12T16:51:30.898+05:00","message":"Kafka version: 3.9.1","level":"INFO","level_value":20000}'
+        units, numbers, shape = _reader().parse_record(text)
+        words = LogLine(source="test", number=1, text=text, units=units, numbers=numbers).words
+        self.assertEqual(words, ("timestamp", "message", "kafka", "version", VALUE, "level", "info", "level", "value"))
+        self.assertEqual(numbers, (("level value", 20000.0),))
+        # Формы записи: «json» и набор ключей объекта — записи с одним набором ключей устроены одинаково.
+        self.assertEqual(shape, ("json", "json:@timestamp|level|level_value|message"))
+        self.assertEqual(_reader().parse_record("plain text line")[2], ())
+
+    def test_broken_json_record_stays_text_and_keeps_its_keys(self) -> None:
+        text = r'{"message":"Config values: \n\tallow.auto = true\n\tretries = 5","level":"INF'
+        units, numbers, shape = _reader().parse_record(text)
+        words = LogLine(source="test", number=1, text=text, units=units, numbers=numbers).words
+        # Экранированные перевод строки и табуляция не склеиваются со словами («tallow», «nretries»).
+        self.assertEqual(words, ("message", "config", "values", "allow", "auto", "true", "retries", VALUE, "level", "inf"))
+        self.assertEqual(shape, ("json", "json:level|message"))
+
+    def test_identifiers_are_values_not_words(self) -> None:
+        self.assertEqual(
+            _words("consumer bd869f0e-eefd-4824-a608-79d8dd24e822 joined group"), ("consumer", VALUE, "joined", "group")
+        )
+        self.assertEqual(_words("device aa:bb:cc:dd:ee:ff added to queue"), ("device", VALUE, "added", "to", "queue"))
+        self.assertEqual(
+            _words("commit deadbeef12 by cafe-0a1b-22cc feed updated"), ("commit", VALUE, "by", VALUE, "feed", "updated")
+        )
+
+    def test_terminal_colour_codes_are_removed(self) -> None:
+        self.assertEqual(
+            _words("\x1b[32m17:38:36.949\x1b[0;39m \x1b[34mINFO \x1b[0;39m: session opened"), ("info", "session", "opened")
+        )
+        self.assertEqual(_words("\x1b[1;31mERROR\x1b[0m disk full"), ("error", "disk", "full"))
+
+    def test_time_zone_offset_belongs_to_the_timestamp(self) -> None:
+        for stamp in ("2026-11-12T09:35:59.298+0500", "2026-11-12T09:35:59.298+05:00", "2026-11-12 09:35:59Z"):
+            units, numbers = _reader().parse(f"{stamp} session opened")
+            self.assertEqual((units, numbers), ((("session",), ("opened",)), ()), stamp)
+
 
 class BackgroundAndVariableTests(unittest.TestCase):
     """Заголовок и переменные места строки находятся по статистике эталона, без знания формата (вне статьи)."""
@@ -159,6 +201,110 @@ class BackgroundAndVariableTests(unittest.TestCase):
         lines = [_units("mode", "long", "accepted", "swaps"), _units("mode", "short", "accepted", "swaps")]
         variables = VariableSlots(lines, min_values=3, min_context=2)
         self.assertEqual(variables.mask(lines[0]), lines[0])
+
+    def test_background_is_searched_inside_each_record_shape(self) -> None:
+        shape = ("json", "json:level|message")
+
+        def record(*words: str) -> LogLine:
+            return LogLine(source="test", number=1, text=" ".join(words), units=_units(*words), numbers=(), shape=shape)
+
+        lines = [self._line("disk", "full", "on", "node")] * 300
+        lines += [record("message", "session", "opened", "level", "info")] * 30
+        lines += [record("message", "queue", "drained", "level", "info")] * 30
+        background = BackgroundWords(lines, share=0.9, min_lines=50)
+        # Во всём логе слова обёртки редки, но стоят в каждой записи своей формы.
+        self.assertEqual(background.words, frozenset())
+        self.assertEqual(background.shape_words[shape[1]], frozenset({"message", "level", "info"}))
+        cleaned = background.clean(lines)
+        self.assertEqual(cleaned[300].words, ("session", "opened"))
+        self.assertEqual(cleaned[0].words, ("disk", "full", "on", "node"))
+
+    def test_line_is_cut_to_the_word_limit_after_cleaning(self) -> None:
+        units = (("alpha", "beta"), (), ("gamma", "delta", "epsilon"), ("zeta",))
+        self.assertEqual(truncated(units, 3), (("alpha", "beta"), (), ("gamma",)))
+        line = LogLine(source="test", number=1, text="", units=units, numbers=())
+        self.assertEqual(limit_words([line], 3)[0].words, ("alpha", "beta", VALUE, "gamma"))
+        self.assertIs(limit_words([line], 10)[0], line)
+
+
+class AnyInputTests(unittest.TestCase):
+    """Любой вход (вне статьи): каталоги, архивы, двоичные файлы, другие кодировки, сверхдлинные строки."""
+
+    def setUp(self) -> None:
+        self._directory = tempfile.TemporaryDirectory()
+        self.root = Path(self._directory.name)
+
+    def tearDown(self) -> None:
+        self._directory.cleanup()
+
+    def _read(self, **options) -> tuple[LogLineReader, list[LogLine]]:
+        reader = LogLineReader(
+            word_min=main.LOG_WORD_MIN, word_max=main.LOG_WORD_MAX, line_words_max=main.LOG_LINE_PARSE_WORDS_MAX,
+            slot_words=main.LOG_NUMBER_SLOT_WORDS, **options,
+        )
+        return reader, reader.read_sources([str(self.root)])
+
+    def test_directory_is_read_with_archives_encodings_and_garbage(self) -> None:
+        (self.root / "sub").mkdir()
+        (self.root / "plain.log").write_text("service started\n###### 12345 ######\n\nservice stopped\n", encoding="utf-8")
+        (self.root / "sub" / "packed.log.gz").write_bytes(gzip.compress("queue drained\n".encode("utf-8")))
+        (self.root / "sub" / "wide.log").write_text("служба запущена\n", encoding="utf-16")
+        (self.root / "sub" / "old.log").write_bytes("ошибка диска\n".encode("cp1251"))
+        (self.root / "binary.bin").write_bytes(bytes(range(256)) * 8)
+        (self.root / "broken.gz").write_bytes(b"\x1f\x8b" + b"not an archive")
+        (self.root / "empty.log").write_bytes(b"")
+        reader, lines = self._read()
+        self.assertEqual(
+            sorted(line.words for line in lines),
+            sorted([("service", "started"), ("service", "stopped"), ("queue", "drained"), ("служба", "запущена"),
+                    ("ошибка", "диска")]),
+        )
+        notes = {Path(item["source"]).name: item for item in reader.files}
+        self.assertEqual(len(notes), 7)
+        self.assertEqual(notes["plain.log"]["without_words"], 2)
+        self.assertIn("двоичный", notes["binary.bin"]["note"])
+        self.assertIn("не прочитан", notes["broken.gz"]["note"])
+        self.assertEqual(notes["empty.log"]["lines"], 0)
+
+    def test_long_line_is_cut_and_reading_stops_at_the_line_limit(self) -> None:
+        (self.root / "a.log").write_text("head word " + "x" * 5000 + " tail\nsecond line\nthird line\n", encoding="utf-8")
+        reader, lines = self._read(line_chars_max=100, lines_max=2)
+        self.assertEqual([line.words for line in lines], [("head", "word"), ("second", "line")])
+        self.assertEqual(reader.files[0]["cut_lines"], 1)
+        self.assertIn("предел", reader.files[0]["note"])
+
+    def test_pile_checks_the_end_of_each_file_against_the_rest(self) -> None:
+        def lines(source: str, count: int) -> list[LogLine]:
+            return [
+                LogLine(source=source, number=number, text="x", units=_units("word"), numbers=())
+                for number in range(1, count + 1)
+            ]
+
+        pile = log_insights.LogPile(
+            lines("big.log", 400) + lines("small.log", 50), target_share=0.25, min_lines=200, mark=" (конец)"
+        )
+        self.assertEqual(len(pile.reference), 350)
+        self.assertEqual({line.source for line in pile.target}, {"big.log (конец)"})
+        self.assertEqual([line.number for line in pile.target], list(range(301, 401)))
+        self.assertEqual(pile.split, {"big.log": 301})
+
+    def test_space_keeps_the_most_frequent_lines_within_the_point_limit(self) -> None:
+        frequent = [f"frequent event number {name} happened again" for name in ("one", "two", "three")]
+        rare = [f"rare thing {name} occurred once somewhere" for name in ("alpha", "beta", "gamma", "delta")]
+        reader = _reader()
+        reference = []
+        for number, line in enumerate(frequent * 20 + rare, start=1):
+            units, numbers = reader.parse(line)
+            reference.append(LogLine(source="a.log", number=number, text=line, units=units, numbers=numbers))
+        corpus = log_insights.LogCorpus(reference, [])
+        encoder = _encoder(corpus.stimuli)
+        with mock.patch.object(log_insights, "LOG_SPACE_POINTS_MAX", 30):
+            space = log_insights.LogCodeSpace(corpus, encoder)
+        self.assertLessEqual(len(space.points), 30)
+        self.assertEqual(space.budget["stimuli_inside"], 3)
+        self.assertEqual({corpus.stimuli[index][0] for index in space.outside}, {"rare"})
+        # Без предела в пространство входят все строки.
+        self.assertEqual(log_insights.LogCodeSpace(corpus, encoder).outside, frozenset())
 
 
 class DictionaryTests(unittest.TestCase):
@@ -412,6 +558,68 @@ class PipelineTests(unittest.TestCase):
         for rule in self.insights["rules"]:
             self.assertGreaterEqual(rule["confidence"], main.LOG_RELATION_MIN_CONFIDENCE)
             self.assertGreaterEqual(rule["lift"], main.LOG_RELATION_MIN_LIFT)
+
+
+class PileTests(unittest.TestCase):
+    """Куча логов без деления на эталон и цель: сигналы ищутся во всех файлах, итог — дашборд (вне статьи)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._directory = tempfile.TemporaryDirectory()
+        root = Path(cls._directory.name)
+        (root / "logs").mkdir()
+        for index in range(3):
+            lines = PipelineTests._run_lines(index, rounds=12)
+            if index == 0:
+                # Редкое событие в начале файла: новым оно не будет, но останется редким.
+                lines.insert(40, "raid controller degraded array rebuild required")
+            if index == 2:
+                # Новое событие в конце файла.
+                lines.insert(len(lines) - 20, "kernel panic: unable to mount root filesystem on device")
+            (root / "logs" / f"service{index}.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (root / "logs" / "core.dump").write_bytes(bytes(range(256)) * 16)
+        (root / "logs" / "noise.txt").write_text("#### ---- ####\n12345 67890\n", encoding="utf-8")
+        cls.out = root / "out"
+        cls.insights = log_insights.LogInsightsExperiment(pile=[str(root / "logs")]).run(out_dir=str(cls.out))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._directory.cleanup()
+
+    def test_garbage_files_are_reported_and_do_not_stop_the_run(self) -> None:
+        files = {Path(item["source"]).name: item for item in self.insights["input"]["files"]}
+        self.assertEqual(self.insights["input"]["mode"], "pile")
+        self.assertIn("двоичный", files["core.dump"]["note"])
+        self.assertEqual((files["noise.txt"]["lines"], files["noise.txt"]["without_words"]), (0, 2))
+        self.assertEqual(len(self.insights["input"]["pile_split"]), 3)
+
+    def test_new_line_at_the_end_of_a_file_is_found(self) -> None:
+        new = [item for item in self.insights["new_lines"] if "kernel panic" in item["text"]]
+        self.assertEqual(len(new), 1)
+        self.assertIn(main.LOG_PILE_TAIL_MARK, new[0]["where"])
+
+    def test_rare_line_at_the_start_of_a_file_and_new_line_at_the_end_give_incidents(self) -> None:
+        signals = [signal["text"] for item in self.insights["incidents"] for signal in item["signals"]]
+        self.assertTrue(any("raid controller degraded" in text for text in signals), signals)
+        self.assertTrue(any("kernel panic" in text for text in signals), signals)
+
+    def test_timeline_covers_every_line_of_every_file(self) -> None:
+        timeline = self.insights["timeline"]
+        self.assertEqual(sum(row["lines"] for row in timeline), self.insights["summary"]["lines"])
+        for row in timeline:
+            self.assertEqual(sum(cell["lines"] for cell in row["cells"]), row["lines"])
+            self.assertLessEqual(len(row["cells"]), main.LOG_DASHBOARD_TIMELINE_COLUMNS)
+        self.assertGreater(sum(cell["signals"] for row in timeline for cell in row["cells"]), 0)
+
+    def test_dashboard_is_one_self_contained_page(self) -> None:
+        page = (self.out / Path(main.LOG_INSIGHTS_DASHBOARD_PATH).name).read_text(encoding="utf-8")
+        for part in ("Инсайты из логов", "Главное", "Карта событий", "Лента сигналов", "Инциденты", "Что было на входе",
+                     "kernel panic", '<canvas id="map">', "data:image/png;base64,"):
+            self.assertIn(part, page)
+        # Ни одной внешней ссылки: страница открывается без сети.
+        self.assertNotIn("://", page)
+        self.assertNotIn("<script src", page)
+        self.assertNotIn("<link", page)
 
 
 if __name__ == "__main__":

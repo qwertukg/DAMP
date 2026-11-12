@@ -23,15 +23,19 @@
 """
 from __future__ import annotations
 
+import codecs
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from functools import cached_property
 import glob
+import gzip
 import hashlib
+import json
 import math
 import os
 import re
 from typing import Iterable, Mapping, Sequence
+import zlib
 
 import numpy as np
 
@@ -84,12 +88,26 @@ def _normalised(units: Sequence[tuple[str, ...]]) -> Units:
     return tuple(result)
 
 
+def truncated(units: Sequence[tuple[str, ...]], words_max: int) -> Units:
+    """Единицы строки, в которых слов не больше words_max: слова сверх предела отбрасываются."""
+    result: list[tuple[str, ...]] = []
+    left = int(words_max)
+    for unit in units:
+        if not unit:
+            result.append(unit)
+        elif left > 0:
+            result.append(tuple(unit[:left]))
+            left -= len(result[-1])
+    return _normalised(result)
+
+
 @dataclass(frozen=True)
 class LogLine:
     """Строка лога.
 
     units — единицы строки по порядку: слова одного токена либо пустой кортеж на месте значения
-    (числа, идентификатора, переменного слова). numbers — числа строки со слотами.
+    (числа, идентификатора, переменного слова). numbers — числа строки со слотами. shape — формы записи:
+    у записи-объекта JSON это «json» и «json:<ключи объекта>», у обычной строки форм нет.
     """
 
     source: str
@@ -97,6 +115,7 @@ class LogLine:
     text: str
     units: Units
     numbers: tuple[tuple[str, float], ...]
+    shape: tuple[str, ...] = ()
 
     @cached_property
     def words(self) -> tuple[str, ...]:
@@ -118,6 +137,11 @@ class LogLineReader:
     единицей измерения: 35ms, 12%) записывается со слотом. Метка времени — ISO, syslog, asctime, журнала
     веб-сервера или просто время — убирается до деления на токены: названия месяцев и дней недели в ней
     словами не становятся. Слова строки после ``line_words_max`` отбрасываются.
+
+    Строка, которая целиком является объектом JSON, сначала разворачивается в пары «ключ значение»: иначе
+    экранированные перевод строки и табуляция приклеивают букву к следующему слову. UUID и адрес
+    устройства — значения целиком. В токене, где есть хотя бы две шестнадцатеричные группы с цифрами
+    (идентификатор), группы из одних букв a–f тоже считаются частью идентификатора, а не словами.
     """
 
     _MONTH = (
@@ -127,27 +151,61 @@ class LogLineReader:
     _WEEKDAY = r"(?:Mon|Tue(?:s)?|Wed(?:nes)?|Thu(?:rs)?|Fri|Sat(?:ur)?|Sun)(?:day)?"
     _TIME = r"\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?"
     _STAMP = re.compile(
-        rf"\d{{4}}-\d{{2}}-\d{{2}}(?:[T ]{_TIME})?Z?"
+        rf"\d{{4}}-\d{{2}}-\d{{2}}(?:[T ]{_TIME}(?:Z|[+-]\d{{2}}:?\d{{2}}(?!\d))?)?Z?"
         rf"|\d{{1,2}}/{_MONTH}/\d{{4}}(?::{_TIME})?(?:\s[+-]\d{{4}})?"
         rf"|(?<![^\W\d_])(?:{_WEEKDAY},?\s+)?{_MONTH}\s+\d{{1,2}}(?!\d)(?:\s+{_TIME})?(?:\s+\d{{4}}(?!\d))?"
         rf"|(?<![\w.])\d{{1,2}}\s+{_MONTH}\s+\d{{4}}(?!\d)(?:\s+{_TIME})?"
         rf"|(?<![\w.:]){_TIME}(?![\w:])"
     )
+    # UUID и адрес устройства — значения целиком.
+    _IDENTIFIER = re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+        r"|(?<![0-9a-fA-F:])(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}(?![0-9a-fA-F:])"
+    )
+    # Чем заменяется идентификатор: группа с цифрой, которая не читается ни как слово, ни как число.
+    _ID_MARK = "0a0"
+    # Управляющие последовательности терминала (цвет): оформление, а не содержание строки.
+    _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+    # Ключ записи JSON, которая не разбирается целиком (оборвана или продолжается на следующей строке).
+    _JSON_KEY = re.compile(r'"([^"\\]{1,40})"\s*:')
+    # Экранированные перевод строки, возврат каретки и табуляция внутри оборванной записи JSON.
+    _ESCAPED_SPACE = re.compile(r"\\[nrt]")
+    _HEX_WITH_DIGIT = re.compile(r"(?=[0-9a-fA-F]*\d)[0-9a-fA-F]+")
+    _HEX_LETTERS = re.compile(r"[a-fA-F]+")
     _SEPARATORS = re.compile(r"[\s=,;()\[\]{}\"'<>|]+")
     _RUN = re.compile(r"[^\W_]+")
     # Число, возможно с короткой единицей измерения.
     _MEASURE = re.compile(r"([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)(?:[^\W\d_]{1,3}|%)?")
     _EDGES = ".:!?#*/\\"
 
-    def __init__(self, *, word_min: int, word_max: int, line_words_max: int, slot_words: int) -> None:
+    def __init__(
+        self,
+        *,
+        word_min: int,
+        word_max: int,
+        line_words_max: int,
+        slot_words: int,
+        line_chars_max: int | None = None,
+        lines_max: int | None = None,
+        binary_probe_bytes: int = 8192,
+    ) -> None:
         if word_min <= 0 or word_max < word_min:
             raise ValueError("word length bounds must satisfy 0 < word_min <= word_max")
         if line_words_max <= 0 or slot_words <= 0:
             raise ValueError("line_words_max and slot_words must be positive")
+        if (line_chars_max is not None and line_chars_max <= 0) or (lines_max is not None and lines_max <= 0):
+            raise ValueError("line_chars_max and lines_max must be positive")
         self._word_min = int(word_min)
         self._word_max = int(word_max)
         self._line_words_max = int(line_words_max)
         self._slot_words = int(slot_words)
+        # Пределы входа: знаков в строке и строк всего; None — без предела.
+        self._line_chars_max = line_chars_max
+        self._lines_max = lines_max
+        self._binary_probe_bytes = int(binary_probe_bytes)
+        self._lines_read = 0
+        # Что прочитано из каждого файла: строк взято, строк без слов, строк обрезано, пометка.
+        self.files: list[dict] = []
         LOGGER.event(
             "logs.reader.init",
             section=MORPHOLOGY_DICTIONARY,
@@ -179,11 +237,62 @@ class LogLineReader:
             return []
         return [part.lower() for part in self._camel_parts(run) if self._word_min <= len(part) <= self._word_max]
 
+    def _token_words(self, token: str) -> list[str]:
+        """Слова токена; в шестнадцатеричном идентификаторе группы из одних букв a–f словами не считаются."""
+        runs = self._RUN.findall(token)
+        identifier = sum(1 for run in runs if self._HEX_WITH_DIGIT.fullmatch(run)) >= 2
+        return [
+            word
+            for run in runs
+            if not (identifier and self._HEX_LETTERS.fullmatch(run))
+            for word in self._run_words(run)
+        ]
+
+    @classmethod
+    def _unfolded(cls, text: str) -> tuple[str, tuple[str, ...]]:
+        """Строка-объект JSON, развёрнутая в пары «ключ значение», и формы записи; остальные строки — как есть.
+
+        Запись, которая начинается как объект JSON, но не разбирается (оборвана), остаётся текстом; в ней
+        экранированные перевод строки и табуляция заменяются пробелом. Формы записи-объекта — «json» и
+        «json:<ключи>»: записи с одним набором ключей устроены одинаково.
+        """
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            return text, ()
+        try:
+            record = json.loads(stripped)
+        except ValueError:
+            keys = sorted(set(cls._JSON_KEY.findall(stripped)))
+            return cls._ESCAPED_SPACE.sub(" ", text), ("json", "json:" + "|".join(keys))
+        if not isinstance(record, dict):
+            return text, ()
+        parts: list[str] = []
+
+        def unfold(value: object) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    parts.append(str(key))
+                    unfold(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    unfold(item)
+            elif value is not None:
+                parts.append(str(value))
+
+        unfold(record)
+        return " ".join(parts), ("json", "json:" + "|".join(sorted(str(key) for key in record)))
+
     def parse(self, text: str) -> tuple[Units, tuple[tuple[str, float], ...]]:
-        """Единицы строки и её числа со слотами.
+        """Единицы строки и её числа со слотами."""
+        units, numbers, _ = self.parse_record(text)
+        return units, numbers
+
+    def parse_record(self, text: str) -> tuple[Units, tuple[tuple[str, float], ...], tuple[str, ...]]:
+        """Единицы строки, её числа со слотами и формы записи.
 
         Слот числа — последние слова перед ним (после прошлого числа). Числа, идущие подряд без слов между
         ними (список значений, колонки без подписей), получают слот прошлого числа с порядковым номером.
+        Цветовые коды терминала из строки убираются.
         """
         units: list[tuple[str, ...]] = []
         numbers: list[tuple[str, float]] = []
@@ -191,7 +300,9 @@ class LogLineReader:
         last_slot = ""
         run_length = 0
         words_total = 0
-        for token in self._SEPARATORS.split(self._STAMP.sub(" ", text)):
+        text, shape = self._unfolded(self._ANSI.sub("", text))
+        text = self._IDENTIFIER.sub(self._ID_MARK, self._STAMP.sub(" ", text))
+        for token in self._SEPARATORS.split(text):
             token = token.strip(self._EDGES)
             if not token:
                 continue
@@ -210,15 +321,14 @@ class LogLineReader:
                     since_number = []
                 units.append(())
                 continue
-            words = [word for run in self._RUN.findall(token) for word in self._run_words(run)]
-            words = words[: max(0, self._line_words_max - words_total)]
+            words = self._token_words(token)[: max(0, self._line_words_max - words_total)]
             if words:
                 words_total += len(words)
                 units.append(tuple(words))
                 since_number.extend(words)
             elif any(char.isalnum() for char in token):
                 units.append(())
-        return _normalised(units), tuple(numbers)
+        return _normalised(units), tuple(numbers), shape
 
     @staticmethod
     def _decode(data: bytes) -> str:
@@ -230,32 +340,87 @@ class LogLineReader:
         return data.decode("utf-8", errors="replace")
 
     def read(self, path: str) -> list[LogLine]:
-        """Строки файла, в которых есть хотя бы одно слово; файл — один запуск."""
-        with open(path, "rb") as handle:
-            text = self._decode(handle.read())
+        """Строки файла, в которых есть хотя бы одно слово; файл — один запуск.
+
+        Файл, который не читается как текст, даёт пустой список; что с ним случилось, записано в files.
+        """
         source = os.path.normpath(path).replace("\\", "/")
+        text, note = self._content(path)
+        if text is None:
+            self._record(source, lines=0, without_words=0, cut_lines=0, note=note)
+            return []
         lines: list[LogLine] = []
         skipped = 0
+        cut = 0
         for number, raw in enumerate(text.splitlines(), start=1):
-            units, numbers = self.parse(raw)
+            if self._lines_max is not None and self._lines_read >= self._lines_max:
+                note = "прочитан не полностью: достигнут предел числа строк"
+                break
+            if self._line_chars_max is not None and len(raw) > self._line_chars_max:
+                raw = raw[: self._line_chars_max]
+                cut += 1
+            units, numbers, shape = self.parse_record(raw)
             if not any(units):
                 skipped += 1
                 continue
-            lines.append(LogLine(source=source, number=number, text=raw.rstrip(), units=units, numbers=numbers))
+            self._lines_read += 1
+            lines.append(
+                LogLine(source=source, number=number, text=raw.rstrip(), units=units, numbers=numbers, shape=shape)
+            )
+        self._record(source, lines=len(lines), without_words=skipped, cut_lines=cut, note=note)
+        return lines
+
+    def _record(self, source: str, *, lines: int, without_words: int, cut_lines: int, note: str) -> None:
+        """Запись о прочитанном файле: сколько строк взято, сколько без слов, сколько обрезано и почему."""
+        entry = {"source": source, "lines": lines, "without_words": without_words, "cut_lines": cut_lines, "note": note}
+        self.files.append(entry)
         LOGGER.event(
             "logs.reader.file",
             section=OUTSIDE_ARTICLE,
-            data={"source": source, "lines": len(lines), "skipped_without_words": skipped},
+            data={"source": source, "lines": lines, "skipped_without_words": without_words,
+                  "cut_lines": cut_lines, "note": note},
         )
-        return lines
 
-    def read_sources(self, patterns: Iterable[str]) -> list[LogLine]:
-        """Все файлы по шаблонам glob в порядке шаблонов; каждый файл — отдельный запуск."""
+    def _content(self, path: str) -> tuple[str | None, str]:
+        """Текст файла и пометка; None — файл не читается как текст (двоичный, повреждён, недоступен).
+
+        Сжатый gzip распаковывается. Файл с меткой UTF-16 читается в этой кодировке; файл с нулевыми
+        байтами в начале считается двоичным.
+        """
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+            if data[:2] == b"\x1f\x8b":
+                data = gzip.decompress(data)
+        except (OSError, EOFError, zlib.error) as error:
+            return None, f"не прочитан: {type(error).__name__}"
+        if data[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
+            return data.decode("utf-16", errors="replace"), ""
+        if b"\x00" in data[: self._binary_probe_bytes]:
+            return None, "пропущен: двоичный файл"
+        return self._decode(data), ""
+
+    @staticmethod
+    def expand(patterns: Iterable[str]) -> list[str]:
+        """Файлы по путям и шаблонам glob в порядке шаблонов; каталог раскрывается со всеми вложенными."""
         paths: list[str] = []
         for pattern in patterns:
-            for path in sorted(glob.glob(pattern)):
+            if os.path.isdir(pattern):
+                found = [
+                    os.path.join(folder, name)
+                    for folder, _, names in os.walk(pattern)
+                    for name in names
+                ]
+            else:
+                found = glob.glob(pattern, recursive=True)
+            for path in sorted(found):
                 if os.path.isfile(path) and path not in paths:
                     paths.append(path)
+        return paths
+
+    def read_sources(self, patterns: Iterable[str]) -> list[LogLine]:
+        """Все файлы по путям и шаблонам glob в порядке шаблонов; каждый файл — отдельный запуск."""
+        paths = self.expand(patterns)
         lines: list[LogLine] = []
         for path in paths:
             lines.extend(self.read(path))
@@ -275,6 +440,11 @@ class BackgroundWords:
     то самое паразитное сходство, из-за которого статья меняла коды (§7.1.8.3, §7.1.8.4). Слово считается
     фоновым, если встречается не меньше чем в доле ``share`` строк эталона; формат лога для этого знать
     не нужно. Строка, целиком состоящая из фоновых слов, остаётся как есть.
+
+    В одном логе бывают записи разных форм: обычные строки и записи-объекты JSON с разными наборами
+    ключей. Слова обёртки («message», «logger», имя сервиса) стоят в каждой записи своей формы, но не
+    в каждой строке лога. Поэтому фон ищется ещё и внутри каждой формы (LogLine.shape); у строки
+    убираются фоновые слова всего лога и её форм.
     """
 
     def __init__(self, lines: Iterable[LogLine], *, share: float, min_lines: int) -> None:
@@ -282,29 +452,65 @@ class BackgroundWords:
             raise ValueError("share must be in (0, 1]")
         counts: Counter[str] = Counter()
         total = 0
+        shape_counts: dict[str, Counter[str]] = {}
+        shape_total: Counter[str] = Counter()
         for line in lines:
+            words = list(dict.fromkeys(content(line.words)))
             total += 1
-            counts.update(list(dict.fromkeys(content(line.words))))
+            counts.update(words)
+            for shape in line.shape:
+                shape_total[shape] += 1
+                shape_counts.setdefault(shape, Counter()).update(words)
         # На нескольких строках доля ничего не говорит: фон ищется только в достаточно большом эталоне.
         found = [word for word, count in counts.items() if total >= min_lines and count >= share * total]
         self.words = frozenset(found)
+        self.shape_words: dict[str, frozenset[str]] = {}
+        for shape, lines_of_shape in shape_total.items():
+            if lines_of_shape < min_lines:
+                continue
+            extra = frozenset(
+                word for word, count in shape_counts[shape].items() if count >= share * lines_of_shape
+            ) - self.words
+            if extra:
+                self.shape_words[shape] = extra
         LOGGER.event(
             "logs.background",
             section=OUTSIDE_ARTICLE,
-            data={"lines": total, "share": share, "words": sorted(found)},
+            data={
+                "lines": total,
+                "share": share,
+                "words": sorted(found),
+                "shapes": {shape: sorted(words) for shape, words in self.shape_words.items()},
+            },
         )
 
-    def strip(self, units: Sequence[tuple[str, ...]]) -> Units:
+    def _background(self, shape: Sequence[str]) -> frozenset[str]:
+        """Фоновые слова строки: всего лога и каждой её формы."""
+        words = self.words
+        for name in shape:
+            words = words | self.shape_words.get(name, frozenset())
+        return words
+
+    def strip(self, units: Sequence[tuple[str, ...]], shape: Sequence[str] = ()) -> Units:
         """Единицы строки без фоновых слов; единица из одних фоновых слов уходит целиком."""
-        kept = [tuple(word for word in unit if word not in self.words) for unit in units]
+        background = self._background(shape)
+        kept = [tuple(word for word in unit if word not in background) for unit in units]
         result = _normalised([unit for unit, original in zip(kept, units) if unit or not original])
         return result if any(result) else tuple(units)
 
     def clean(self, lines: Sequence[LogLine]) -> list[LogLine]:
         """Строки без фоновых слов."""
-        if not self.words:
+        if not self.words and not self.shape_words:
             return list(lines)
-        return [replace(line, units=self.strip(line.units)) for line in lines]
+        cache: dict[tuple[Units, tuple[str, ...]], Units] = {}
+        result = []
+        for line in lines:
+            key = (line.units, line.shape)
+            kept = cache.get(key)
+            if kept is None:
+                kept = cache[key] = self.strip(line.units, line.shape)
+            result.append(line if kept == line.units else replace(line, units=kept))
+        return result
 
 
 class VariableSlots:
@@ -760,6 +966,15 @@ class NumericValueEncoder:
         return 2.0 * detectors[0].half_width if detectors else 2.0 * self._decades
 
 
+def limit_words(lines: Sequence[LogLine], words_max: int) -> list[LogLine]:
+    """Строки, обрезанные до words_max слов (длина стимула ограничена, §7.1.3)."""
+    result = []
+    for line in lines:
+        units = truncated(line.units, words_max)
+        result.append(line if units == line.units else replace(line, units=units))
+    return result
+
+
 __all__ = [
     "VALUE",
     "BackgroundWords",
@@ -773,4 +988,6 @@ __all__ = [
     "TokenAlphabet",
     "VariableSlots",
     "content",
+    "limit_words",
+    "truncated",
 ]

@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import colorsys
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
+import os
 from typing import Sequence
 
 import numpy as np
@@ -72,10 +74,28 @@ from damp.encoding.log_encoder import (
     NumericValueEncoder,
     TokenAlphabet,
     VariableSlots,
+    limit_words,
 )
 from damp.layout.code_table import LayoutCodeTable
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
 from damp.logging import LOGGER
+from log_dashboard import LogInsightsDashboard
+from main import (  # общий режим: любой вход, куча логов, предел пространства, дашборд
+    LOG_BINARY_PROBE_BYTES,
+    LOG_DASHBOARD_TIMELINE_COLUMNS,
+    LOG_INCIDENT_SEARCH_MAX,
+    LOG_INSIGHTS_DASHBOARD_PATH,
+    LOG_INSIGHTS_OUT_DIR,
+    LOG_LINE_CHARS_MAX,
+    LOG_LINES_MAX,
+    LOG_PILE_MIN_LINES,
+    LOG_PILE_TAIL_MARK,
+    LOG_PILE_TARGET_SHARE,
+    LOG_RARE_TYPE_LINES_MIN,
+    LOG_RARE_TYPE_SHARE,
+    LOG_SPACE_POINTS_MAX,
+    LOG_WINDOW_MEMORY_MAX,
+)
 from main import (
     ACTIVATION_USE_GPU,
     LAYOUT_ENERGY_EVAL_EVERY,
@@ -137,6 +157,7 @@ from main import (
     LOG_LAYOUT_SIMILARITY,
     LOG_LAYOUT_SWAP_TRIGGER,
     LOG_LAYOUT_SWAP_WINDOW,
+    LOG_LINE_PARSE_WORDS_MAX,
     LOG_LINE_WORDS_MAX,
     LOG_NUMBER_SLOT_WORDS,
     LOG_NUMERIC_CODE_BITS,
@@ -268,6 +289,45 @@ class LogCorpus:
         return f"{line.source}:{line.number}"
 
 
+class LogPile:
+    """Куча логов без деления на эталон и цель (вне статьи).
+
+    Записи файла идут по времени, поэтому конец каждого файла — последняя доля target_share его строк —
+    проверяется по всему остальному: по началу этого файла и других файлов. Конец файла становится
+    отдельным запуском с пометкой mark в имени. Файл короче min_lines строк не делится и целиком идёт
+    в эталон.
+    """
+
+    def __init__(self, lines: Sequence[LogLine], *, target_share: float, min_lines: int, mark: str) -> None:
+        if not 0.0 <= target_share < 1.0:
+            raise ValueError("target_share must be in [0, 1)")
+        by_source: dict[str, list[LogLine]] = defaultdict(list)
+        for line in lines:
+            by_source[line.source].append(line)
+        self.reference: list[LogLine] = []
+        self.target: list[LogLine] = []
+        # Номер строки файла, с которой начинается его проверяемый конец.
+        self.split: dict[str, int] = {}
+        for source, rows in by_source.items():
+            tail = int(round(len(rows) * target_share)) if len(rows) >= min_lines else 0
+            head = len(rows) - tail
+            self.reference.extend(rows[:head])
+            if tail:
+                self.split[source] = rows[head].number
+                self.target.extend(replace(line, source=source + mark) for line in rows[head:])
+        LOGGER.event(
+            "logs.pile",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "files": len(by_source),
+                "split_files": len(self.split),
+                "reference_lines": len(self.reference),
+                "target_lines": len(self.target),
+                "target_share": target_share,
+            },
+        )
+
+
 # ------------------------------------------------------------------------------------------- детекция
 class LayeredDetection:
     """Детекция по слоям иерархии детекторов (§6.5, §7.1.10).
@@ -359,8 +419,13 @@ class LogCodeSpace:
         self.points: list[LineCode] = []
         self.point_stimuli: list[list[int]] = []
         index_of: dict[bytes, int] = {}
-        for stimulus in np.flatnonzero(corpus.reference_count > 0):
-            for item in self.stimulus_codes[int(stimulus)]:
+        reference = [int(stimulus) for stimulus in np.flatnonzero(corpus.reference_count > 0)]
+        self.budget: dict = {}
+        self.outside = self._outside(reference)
+        for stimulus in reference:
+            if stimulus in self.outside:
+                continue
+            for item in self.stimulus_codes[stimulus]:
                 key = bytes(item.code._bits)
                 found = index_of.get(key)
                 if found is None:
@@ -634,10 +699,48 @@ class LogCodeSpace:
             },
         )
 
+    def primary_code(self, stimulus: int, view: str) -> BitArray:
+        """Первичный код строки для взгляда view: код первого разбиения с этим взглядом, иначе код целой строки."""
+        codes = self.stimulus_codes[stimulus]
+        for item in codes:
+            if item.view == view:
+                return item.code
+        return codes[0].code
+
     def _stimuli_codes(self, stimuli: Sequence[int]) -> list[BitArray]:
         return [item.code for index in stimuli for item in self.stimulus_codes[index]]
 
     # ------------------------------------------------------------------ детекция
+    def _outside(self, reference: Sequence[int]) -> frozenset[int]:
+        """Строки эталона, не вошедшие в пространство из-за предела точек LOG_SPACE_POINTS_MAX (вне статьи).
+
+        Если кодов эталона больше предела, пространство заполняют коды самых частых видов строк. Остальные
+        строки считаются известными (в эталоне они были), а к типам и семействам относятся по отклику
+        детекторов, как любая строка не из пространства (§7.1.13.3).
+        """
+        counts = self.corpus.reference_count
+        codes = sum(len(self.stimulus_codes[stimulus]) for stimulus in reference)
+        inside = set(reference)
+        if codes > LOG_SPACE_POINTS_MAX:
+            inside = set()
+            used = 0
+            for stimulus in sorted(reference, key=lambda index: (-int(counts[index]), index)):
+                used += len(self.stimulus_codes[stimulus])
+                if used > LOG_SPACE_POINTS_MAX:
+                    break
+                inside.add(stimulus)
+        lines = int(sum(int(counts[stimulus]) for stimulus in reference))
+        lines_inside = int(sum(int(counts[stimulus]) for stimulus in inside))
+        self.budget = {
+            "points_max": LOG_SPACE_POINTS_MAX,
+            "codes": int(codes),
+            "stimuli": len(reference),
+            "stimuli_inside": len(inside),
+            "lines_inside_share": round(lines_inside / lines, 4) if lines else 0.0,
+        }
+        LOGGER.event("logs.space.budget", section=OUTSIDE_ARTICLE, data=self.budget)
+        return frozenset(reference) - inside
+
     def reaction(self, stimulus: int) -> LineReaction:
         """Активация пространства кодами разбиений строки и её эмбеддинг (§7.1.11, §7.1.12).
 
@@ -663,7 +766,8 @@ class LogCodeSpace:
             best[row] = float(similarity[point])
             if best[row] > nearest_value:
                 nearest_value, nearest = best[row], point
-        exact = bool(best.size) and bool((best >= LOG_EXACT_SIMILARITY).all())
+        # Строка эталона, не вошедшая в пространство из-за предела точек, тоже известна: в эталоне она была.
+        exact = (bool(best.size) and bool((best >= LOG_EXACT_SIMILARITY).all())) or stimulus in self.outside
         status = STATUS_EXACT if exact else (STATUS_PARTIAL if active else STATUS_UNKNOWN)
         fine = [
             item for item in self._view_active(stimulus, "whole")
@@ -769,7 +873,8 @@ class EventTypes:
     Центр очередного типа — самая частая строка без типа; в тип входят строки без типа, чей код типа
     (отклик на строку целиком, детекторы верхних слоёв) похож на код центра не меньше LOG_TYPE_LAMBDA.
     Семейства строятся так же по коду семейства (отклик на начало строки, детекторы нижних слоёв) с порогом
-    LOG_FAMILY_LAMBDA. Строка без активных детекторов нужных слоёв образует свой тип и своё семейство.
+    LOG_FAMILY_LAMBDA. Строки без активных детекторов нужных слоёв группируются между собой по первичным
+    кодам (_with_silent).
     """
 
     def __init__(self, corpus: LogCorpus, space: LogCodeSpace) -> None:
@@ -780,7 +885,9 @@ class EventTypes:
         self.embeddings = [reaction.embedding for reaction in reactions]
         self.codes = [reaction.type_code for reaction in reactions]
         self.memory = CodeMemory(self.codes)
-        self.type_of, groups = self._groups(self.memory, self.codes, LOG_TYPE_LAMBDA)
+        self.type_of, groups = self._with_silent(
+            *self._groups(self.memory, self.codes, LOG_TYPE_LAMBDA), self.codes, "whole", LOG_TYPE_LAYER_LAMBDA
+        )
         self.types = [
             EventType(
                 index=index,
@@ -794,7 +901,10 @@ class EventTypes:
             for index, members in enumerate(groups)
         ]
         family_codes = [reaction.family_code for reaction in reactions]
-        self.family_of, groups = self._groups(CodeMemory(family_codes), family_codes, LOG_FAMILY_LAMBDA)
+        self.family_of, groups = self._with_silent(
+            *self._groups(CodeMemory(family_codes), family_codes, LOG_FAMILY_LAMBDA),
+            family_codes, "head", LOG_FAMILY_LAYER_LAMBDA,
+        )
         self.families = [
             EventFamily(index=index, members=members, label=self._label(members, limit=4),
                         lines=int(corpus.count[members].sum()))
@@ -826,18 +936,47 @@ class EventTypes:
             },
         )
 
-    def _groups(self, memory: CodeMemory, codes: Sequence[BitArray], threshold: float) -> tuple[np.ndarray, list[list[int]]]:
+    def _groups(
+        self, memory: CodeMemory, codes: Sequence[BitArray], threshold: float, indices: Sequence[int] | None = None
+    ) -> tuple[np.ndarray, list[list[int]]]:
         """Группы вокруг центров: центр — самая частая строка без группы, члены — нечёткий поиск по её коду."""
+        indices = np.arange(len(codes)) if indices is None else np.asarray(indices, dtype=np.int64)
         group_of = np.full(len(codes), -1, dtype=np.int64)
         groups: list[list[int]] = []
-        for centre in np.argsort(-self.corpus.count, kind="stable"):
+        for centre in np.argsort(-self.corpus.count[indices], kind="stable"):
             centre = int(centre)
             if group_of[centre] >= 0:
                 continue
             similar = (memory.search(codes[centre]) >= threshold) & (group_of < 0)
             members = [centre] + [int(i) for i in np.flatnonzero(similar) if int(i) != centre]
             group_of[members] = len(groups)
-            groups.append(members)
+            groups.append([int(indices[member]) for member in members])
+        return group_of, groups
+
+    def _with_silent(
+        self, group_of: np.ndarray, groups: list[list[int]], codes: Sequence[BitArray], view: str, threshold: float
+    ) -> tuple[np.ndarray, list[list[int]]]:
+        """Группы, в которых строки без отклика детекторов собраны по первичным кодам (§2.2.5).
+
+        Строка, на которую не откликнулся ни один детектор нужных слоёв, кода группы не имеет. Таких строк
+        много, когда пространство меньше лога: в нём только самые частые виды строк. Между собой они
+        сравниваются напрямую — нечётким поиском по первичным кодам взгляда view с порогом нижнего из
+        слоёв детекторов, которые дали бы этот код.
+        """
+        silent = [index for index, code in enumerate(codes) if code.count() == 0]
+        if len(silent) < 2:
+            return group_of, groups
+        primary = [self.space.primary_code(index, view) for index in silent]
+        _, found = self._groups(CodeMemory(primary), primary, threshold, silent)
+        groups = [members for members in groups if codes[members[0]].count() > 0] + found
+        group_of = np.full(len(codes), -1, dtype=np.int64)
+        for index, members in enumerate(groups):
+            group_of[members] = index
+        LOGGER.event(
+            "logs.groups.silent",
+            section=FUZZY_SEARCH,
+            data={"view": view, "stimuli": len(silent), "groups": len(found), "threshold": threshold},
+        )
         return group_of, groups
 
     def _label(self, members: Sequence[int], *, limit: int = 8) -> str:
@@ -982,11 +1121,13 @@ class NoveltyFinder:
         """Эталонные строки, не вошедшие в структуру: у всех их точек низкая энергия (§5.7, §5.14)."""
         corpus = self.corpus
         best = np.zeros(len(corpus.stimuli), dtype=np.float64)
+        inside = np.zeros(len(corpus.stimuli), dtype=bool)
         for point, owners in enumerate(self.space.point_stimuli):
             for stimulus in owners:
                 best[stimulus] = max(best[stimulus], float(self.space.energies[point]))
+                inside[stimulus] = True
         result = []
-        for stimulus in np.flatnonzero((corpus.reference_count > 0) & (best < LOG_ACTIVATION_ENERGY_THRESHOLD)):
+        for stimulus in np.flatnonzero(inside & (best < LOG_ACTIVATION_ENERGY_THRESHOLD)):
             stimulus = int(stimulus)
             result.append({
                 "energy": round(float(best[stimulus]), 3),
@@ -1092,12 +1233,20 @@ class IncidentFinder:
     Запуск режется на окна по LOG_WINDOW_LINES строк. Эмбеддинг окна — детекция набора его строк S
     (a_ji = max по s ∈ S, §6.5). Инцидент — подряд идущие окна целевого запуска со строками-сигналами;
     похожие окна ищутся нечётким поиском по эмбеддингам окон эталона.
+
+    В куче логов (everywhere) инциденты ищутся во всех запусках, а сигналом считается ещё и строка редкого
+    типа: событие в начале файла новым не будет, но останется редким (вне статьи).
     """
 
-    def __init__(self, corpus: LogCorpus, space: LogCodeSpace, types: EventTypes) -> None:
+    def __init__(self, corpus: LogCorpus, space: LogCodeSpace, types: EventTypes, *, everywhere: bool = False) -> None:
         self.corpus = corpus
         self.space = space
         self.types = types
+        self._everywhere = bool(everywhere)
+        rare_lines = max(LOG_RARE_TYPE_LINES_MIN, LOG_RARE_TYPE_SHARE * len(corpus.lines))
+        self._rare = np.array(
+            [everywhere and types.types[int(kind)].lines <= rare_lines for kind in types.type_of], dtype=bool
+        )
         self._reference_sources = set(corpus.reference_sources)
         self.windows: list[LogWindow] = []
         for source in corpus.sources:
@@ -1106,16 +1255,19 @@ class IncidentFinder:
                 chunk = rows[start:start + LOG_WINDOW_LINES]
                 if chunk:
                     self.windows.append(self._window(source, chunk))
-        space.size_window_code([window.stimuli for window in self.windows])
-        self.embeddings = [space.window_embedding(window.stimuli) for window in self.windows]
-        self.reference = [i for i, w in enumerate(self.windows) if w.source in self._reference_sources]
-        self.memory = CodeMemory([self.embeddings[i] for i in self.reference])
+        # Память окон эталона для поиска похожих: не больше LOG_WINDOW_MEMORY_MAX окон, взятых равномерно.
+        reference = [i for i, w in enumerate(self.windows) if w.source in self._reference_sources]
+        self.reference = reference[:: max(1, math.ceil(len(reference) / LOG_WINDOW_MEMORY_MAX))]
+        space.size_window_code([self.windows[i].stimuli for i in self.reference])
+        self.embeddings = [space.window_embedding(self.windows[i].stimuli) for i in self.reference]
+        self.memory = CodeMemory(self.embeddings)
         LOGGER.event(
             "logs.windows",
             section=STIMULUS_DETECTION,
             data={
                 "windows": len(self.windows),
-                "reference_windows": len(self.reference),
+                "reference_windows": len(reference),
+                "memory_windows": len(self.reference),
                 "lines": LOG_WINDOW_LINES,
                 "stride": LOG_WINDOW_STRIDE,
                 "bits_mean": float(np.mean([code.count() for code in self.embeddings])) if self.embeddings else 0.0,
@@ -1133,9 +1285,13 @@ class IncidentFinder:
         """Строка-сигнал: новая для пространства (§7.1.13.3) либо проблемная и редкая.
 
         Проблемная строка, которая есть в большинстве эталонных запусков, — привычный шум, а не сигнал.
+        В куче логов файлы разные, и правило «есть в большинстве запусков» не годится: там сигнал — новая
+        строка либо строка редкого типа, а частая строка со словами ошибок — привычный шум своего файла.
         """
-        if self.space.reaction(stimulus).status != STATUS_EXACT:
+        if self.space.reaction(stimulus).status != STATUS_EXACT or bool(self._rare[stimulus]):
             return True
+        if self._everywhere:
+            return False
         seen = len(self.corpus.stimulus_runs[stimulus] & self._reference_sources)
         return bool(self.corpus.problem[stimulus]) and 2 * seen < len(self._reference_sources)
 
@@ -1153,9 +1309,53 @@ class IncidentFinder:
                 break
         return [self.corpus.text(stimulus, limit=90) for stimulus in seen]
 
+    def timeline(self, columns: int) -> list[dict]:
+        """Лента каждого запуска: его строки делятся на равные отрезки, в отрезке считаются сигналы.
+
+        Отрезок: номер первой строки, число строк, строк-сигналов и проблемных строк.
+        """
+        corpus = self.corpus
+        signal = np.array([self._signal(stimulus) for stimulus in range(len(corpus.stimuli))], dtype=np.int64)
+        problem = corpus.problem.astype(np.int64)
+        result = []
+        for source in corpus.sources:
+            rows = np.asarray(corpus.run_lines[source], dtype=np.int64)
+            if not rows.size:
+                continue
+            stimuli = corpus.stimulus_of[rows]
+            edges = np.linspace(0, rows.size, min(int(columns), rows.size) + 1).astype(np.int64)
+            starts = edges[:-1]
+            result.append({
+                "source": source,
+                "target": source in set(corpus.target_sources),
+                "lines": int(rows.size),
+                "cells": [
+                    {"line": corpus.lines[int(rows[start])].number, "lines": int(size), "signals": int(found),
+                     "problems": int(bad)}
+                    for start, size, found, bad in zip(
+                        starts, np.diff(edges), np.add.reduceat(signal[stimuli], starts),
+                        np.add.reduceat(problem[stimuli], starts),
+                    )
+                ],
+            })
+        LOGGER.event("logs.timeline", section=OUTSIDE_ARTICLE, data={"runs": len(result), "columns": int(columns)})
+        return result
+
+    def _similar(self, incident: LogWindow) -> list[tuple[float, int]]:
+        """До трёх окон памяти эталона из других запусков, похожих на инцидент: нечёткий поиск (§2.2.5)."""
+        similarity = self.memory.search(self.space.window_embedding(incident.stimuli))
+        best: dict[str, tuple[float, int]] = {}
+        for position, value in enumerate(similarity):
+            window = self.windows[self.reference[position]]
+            if window.source == incident.source or value < LOG_INCIDENT_LAMBDA:
+                continue
+            if window.source not in best or value > best[window.source][0]:
+                best[window.source] = (float(value), self.reference[position])
+        return sorted(best.values(), reverse=True)[:3]
+
     def incidents(self) -> list[dict]:
         corpus = self.corpus
-        target = set(corpus.target_sources)
+        target = set(corpus.sources) if self._everywhere else set(corpus.target_sources)
         groups: list[list[int]] = []
         for index, window in enumerate(self.windows):
             if window.source not in target or not any(self._signal(s) for s in window.stimuli):
@@ -1164,20 +1364,9 @@ class IncidentFinder:
                 groups[-1].append(index)
             else:
                 groups.append([index])
-        result = []
+        found = []
         for group in groups:
             rows = sorted({row for index in group for row in self.windows[index].rows})
-            incident = self._window(self.windows[group[0]].source, rows)
-            embedding = self.space.window_embedding(incident.stimuli)
-            similarity = self.memory.search(embedding)
-            best: dict[str, tuple[float, int]] = {}
-            for position, value in enumerate(similarity):
-                window = self.windows[self.reference[position]]
-                if window.source == incident.source or value < LOG_INCIDENT_LAMBDA:
-                    continue
-                if window.source not in best or value > best[window.source][0]:
-                    best[window.source] = (float(value), self.reference[position])
-            matches = sorted(best.values(), reverse=True)[:3]
             signals = Counter()
             first_signal = None
             for row in rows:
@@ -1186,6 +1375,13 @@ class IncidentFinder:
                     signals[stimulus] += 1
                     if first_signal is None:
                         first_signal = row
+            found.append((self._window(self.windows[group[0]].source, rows), rows, signals, first_signal))
+        # Похожие окна ищутся для самых насыщенных сигналами инцидентов: детекция окна долгая.
+        ranked = sorted(range(len(found)), key=lambda index: -sum(found[index][2].values()))
+        searched = set(ranked[:LOG_INCIDENT_SEARCH_MAX])
+        result = []
+        for index, (incident, rows, signals, first_signal) in enumerate(found):
+            matches = self._similar(incident) if index in searched else []
             problems = [s for s in signals if corpus.problem[s]]
             shown = list(dict.fromkeys(problems + [s for s, _ in signals.most_common()]))[:4]
             item = {
@@ -1489,29 +1685,53 @@ class LogInsightsReport:
 
 # ------------------------------------------------------------------------------------------- эксперимент
 class LogInsightsExperiment:
-    """Полный конвейер; параметры — константы LOG_* из main.py."""
+    """Полный конвейер; параметры — константы LOG_* из main.py.
+
+    Вход — либо эталонные и целевые логи, либо куча логов pile: файлы, каталоги и шаблоны без деления
+    на эталон и цель (LogPile).
+    """
 
     def __init__(
         self,
         reference: Sequence[str] = LOG_INSIGHTS_REFERENCE,
         target: Sequence[str] = LOG_INSIGHTS_TARGET,
+        *,
+        pile: Sequence[str] | None = None,
     ) -> None:
         self._reference = tuple(reference)
         self._target = tuple(target)
+        self._pile = None if pile is None else tuple(pile)
+        self._split: dict[str, int] = {}
         self._reader = LogLineReader(
             word_min=LOG_WORD_MIN,
             word_max=LOG_WORD_MAX,
-            line_words_max=LOG_LINE_WORDS_MAX,
+            line_words_max=LOG_LINE_PARSE_WORDS_MAX,
             slot_words=LOG_NUMBER_SLOT_WORDS,
+            line_chars_max=LOG_LINE_CHARS_MAX,
+            lines_max=LOG_LINES_MAX,
+            binary_probe_bytes=LOG_BINARY_PROBE_BYTES,
         )
 
     def read_lines(self) -> tuple[list[LogLine], list[LogLine]]:
         """Строки эталонных и целевых логов после предобработки.
 
-        Фоновые слова и переменные места находятся по эталону и убираются из строк обоих наборов.
+        Фоновые слова и переменные места находятся по эталону и убираются из строк обоих наборов; после
+        этого строка обрезается до LOG_LINE_WORDS_MAX слов. Обрезка идёт последней: иначе служебные поля
+        в конце длинной строки не попадали бы в подсчёт фоновых слов.
         """
-        reference = self._reader.read_sources(self._reference)
-        target = self._reader.read_sources(self._target)
+        if self._pile is not None:
+            pile = LogPile(
+                self._reader.read_sources(self._pile),
+                target_share=LOG_PILE_TARGET_SHARE,
+                min_lines=LOG_PILE_MIN_LINES,
+                mark=LOG_PILE_TAIL_MARK,
+            )
+            reference, target, self._split = pile.reference, pile.target, pile.split
+        else:
+            reference = self._reader.read_sources(self._reference)
+            target = self._reader.read_sources(self._target)
+        if not reference:
+            raise ValueError("во входных файлах нет ни одной строки со словами")
         background = BackgroundWords(reference, share=LOG_BACKGROUND_SHARE, min_lines=LOG_BACKGROUND_MIN_LINES)
         reference, target = background.clean(reference), background.clean(target)
         variables = VariableSlots(
@@ -1519,7 +1739,10 @@ class LogInsightsExperiment:
             min_values=LOG_VARIABLE_MIN_VALUES,
             min_context=LOG_VARIABLE_MIN_CONTEXT,
         )
-        return variables.clean(reference), variables.clean(target)
+        return (
+            limit_words(variables.clean(reference), LOG_LINE_WORDS_MAX),
+            limit_words(variables.clean(target), LOG_LINE_WORDS_MAX),
+        )
 
     def build_space(self) -> tuple[LogCorpus, LogCodeSpace]:
         corpus = LogCorpus(*self.read_lines())
@@ -1535,7 +1758,20 @@ class LogInsightsExperiment:
         space.build_detectors()
         return corpus, space
 
-    def run(self, *, save: bool = True) -> dict:
+    def _input(self, space: LogCodeSpace) -> dict:
+        """Что подано на вход и что из этого взято: файлы, пределы, деление кучи, предел пространства."""
+        return {
+            "mode": "pile" if self._pile is not None else "reference_target",
+            "files": list(self._reader.files),
+            "lines_max": LOG_LINES_MAX,
+            "line_chars_max": LOG_LINE_CHARS_MAX,
+            "pile_split": dict(self._split),
+            "pile_target_share": LOG_PILE_TARGET_SHARE,
+            "space": dict(space.budget),
+        }
+
+    def run(self, *, save: bool = True, out_dir: str | None = None) -> dict:
+        """Весь анализ; out_dir — каталог результатов (по умолчанию пути LOG_INSIGHTS_* как есть)."""
         corpus, space = self.build_space()
         types = EventTypes(corpus, space)
         novelty = NoveltyFinder(corpus, space, types)
@@ -1549,9 +1785,11 @@ class LogInsightsExperiment:
             code_length=LOG_NUMERIC_CODE_BITS,
             seed=LOG_SEED,
         ))
-        incidents = IncidentFinder(corpus, space, types)
+        incidents = IncidentFinder(corpus, space, types, everywhere=self._pile is not None)
         relations = TransitionMemory(corpus, types, depth=LOG_RELATION_DEPTH)
         insights = {
+            "input": self._input(space),
+            "timeline": incidents.timeline(LOG_DASHBOARD_TIMELINE_COLUMNS),
             "summary": {
                 "lines": len(corpus.lines),
                 "stimuli": len(corpus.stimuli),
@@ -1572,9 +1810,18 @@ class LogInsightsExperiment:
             "precursors": relations.precursors([t.index for t in types.types if t.problem]),
         }
         if save:
-            space.save_maps(LOG_INSIGHTS_MAP_PATH, LOG_INSIGHTS_ENERGY_MAP_PATH)
-            types.save_map(LOG_INSIGHTS_TYPES_MAP_PATH)
-            LogInsightsReport(corpus, space, types, insights).save(LOG_INSIGHTS_REPORT_PATH, LOG_INSIGHTS_JSON_PATH)
+            if out_dir is not None:
+                os.makedirs(out_dir, exist_ok=True)
+
+            def path(name: str) -> str:
+                return name if out_dir is None else os.path.join(out_dir, os.path.basename(name))
+
+            space.save_maps(path(LOG_INSIGHTS_MAP_PATH), path(LOG_INSIGHTS_ENERGY_MAP_PATH))
+            types.save_map(path(LOG_INSIGHTS_TYPES_MAP_PATH))
+            LogInsightsReport(corpus, space, types, insights).save(
+                path(LOG_INSIGHTS_REPORT_PATH), path(LOG_INSIGHTS_JSON_PATH)
+            )
+            LogInsightsDashboard(corpus, space, types, insights).save(path(LOG_INSIGHTS_DASHBOARD_PATH))
         LOGGER.event(
             "logs.insights.done",
             section=MORPHOLOGICAL_EMBEDDINGS,
@@ -1590,9 +1837,17 @@ class LogInsightsExperiment:
         return insights
 
 
-def main() -> None:
+def main(arguments: Sequence[str] | None = None) -> None:
+    """Без путей — логи из констант main.py; с путями — куча логов: файлы, каталоги, шаблоны."""
+    parser = argparse.ArgumentParser(description="Инсайты из логов на DAMP: отчёт и дашборд.")
+    parser.add_argument("paths", nargs="*", help="файлы, каталоги или шаблоны логов в любом формате")
+    parser.add_argument("--out", default=None, help="каталог результатов")
+    options = parser.parse_args(arguments)
     configure_logging()
-    LogInsightsExperiment().run()
+    if options.paths:
+        LogInsightsExperiment(pile=options.paths).run(out_dir=options.out or LOG_INSIGHTS_OUT_DIR)
+    else:
+        LogInsightsExperiment().run(out_dir=options.out)
 
 
 if __name__ == "__main__":

@@ -103,8 +103,8 @@ class SameEventsInDifferentFormatsTests(unittest.TestCase):
 class LoghubTests(unittest.TestCase):
     """Публичные логи пяти форматов с разметкой шаблонов (loghub, по 2000 строк); разметка — только для оценки."""
 
-    # Набор → наименьшая доля точно сгруппированных строк (измерено: 1.00, 1.00, 0.96, 0.69, 0.49).
-    EXPECTED = {"Apache": 0.95, "HDFS": 0.95, "Zookeeper": 0.9, "Linux": 0.6, "OpenSSH": 0.45}
+    # Набор → наименьшая доля точно сгруппированных строк (измерено: 1.00, 1.00, 0.96, 0.68, 0.68).
+    EXPECTED = {"Apache": 0.95, "HDFS": 0.95, "Zookeeper": 0.9, "Linux": 0.6, "OpenSSH": 0.6}
 
     def test_types_follow_templates(self) -> None:
         for name, minimum in self.EXPECTED.items():
