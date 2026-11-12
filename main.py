@@ -54,6 +54,10 @@ from damp.layout.seeded import SeededPlacement
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding, MnistDecoder, PredictionResult
+# Второй уровень, вариант «код на углопозицию».
+from damp.article_refs import MAPPING_CONTINUITY
+from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, ThresholdActivation
+from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
 
 LOG_INTERVAL_DEFAULT = 1
 LOG_INTERVAL_INIT = 1
@@ -489,6 +493,59 @@ SECOND_LEVEL_EVALUATE_LIMIT = 200
 SECOND_LEVEL_DECODER_TEMPERATURE = 0.02
 SECOND_LEVEL_FILE_PREFIX = "data/second"
 
+# --- Второй уровень, вариант «код на углопозицию» (§4.3, §6.2; расширение статьи; эксперимент).
+# Каждая точка первой раскладки получает код своего места на карте: стимул точки зажигает точки с тем же
+# кодом, зажжённые точки активируют детекторы-круги (§4.3). Кодов столько же, сколько точек первой раскладки;
+# они несут только топологию карты и раскладываются тем же Layout. Точка второй раскладки сохраняет угол и
+# подпись исходной точки, поэтому две карты сравниваются точка в точку (StimulusMapMeter).
+# Код фиксированной длины: каждому кругу назначен один случайный бит цветовой полосы своего слоя (§3.2,
+# §4.2.1), активный круг зажигает свой бит, биты не отбираются и не отбрасываются (colour merge не применяется).
+# Длина кода подобрана под среднюю плотность 25 % (§2) на карте 100 цифр (8693 точки): одну позицию накрывает
+# ≈ π / (4 · (1 − overlap)²) кругов слоя, всего ≈ 390 кругов. На карте 300 цифр кодов, стоящих в нескольких
+# местах, больше, и средняя плотность выше (26 %).
+# Число слоёв и перекрытие — такие, чтобы проверка дальнего порядка (Encoder.long_range_order, §4.5, §5.13.1)
+# проходила устойчиво: при 10 слоях и перекрытии 0.7 (≈ 80 единиц в коде) случайные совпадения бит дают разброс
+# сходства пары ±0.04, и проверка проходит через раз (5 из 12 значений seed на карте 115 × 115); здесь —
+# 12 из 12 на карте 115 × 115 и 11 из 12 на карте 199 × 199.
+SECOND_LEVEL_POINT_CODE_LENGTH = 1428
+SECOND_LEVEL_POINT_LAYERS = 12
+SECOND_LEVEL_POINT_OVERLAP = 0.85
+# Самый широкий слой — доля стороны карты (как SECOND_LEVEL_RADIUS_MAX: круг накрывает всю карту, §4.5).
+SECOND_LEVEL_POINT_RADIUS_MAX = 0.85
+# Самый узкий слой — в ячейках карты, а не в долях стороны: код места должен различать соседние ячейки
+# при любом размере карты.
+SECOND_LEVEL_POINT_RADIUS_MIN_CELLS = 1.4
+SECOND_LEVEL_POINT_RANDOM_SEED = ENCODER_RANDOM_SEED
+# Правило зажигания точек стимулом точки (ключ --activation команды second-points).
+# "best" — только точки с самым похожим (тем же) кодом: правило, выбранное для второго уровня. Код точки —
+# код её места; кодер — SECOND_LEVEL_POINT_*.
+# "threshold" — все точки со сходством не ниже SECOND_LEVEL_POINT_ACTIVATION_LAMBDA, как активация §6.1, §6.5:
+# отход от выбранного правила. Код точки — код набора мест всех похожих на неё кодов; кодер —
+# SECOND_LEVEL_POINT_THRESHOLD_*.
+SECOND_LEVEL_POINT_ACTIVATION = "best"
+SECOND_LEVEL_POINT_ACTIVATION_RULES = ("best", "threshold")
+SECOND_LEVEL_POINT_ACTIVATION_LAMBDA = ACTIVATION_LAMBDA_THRESHOLD
+# Кодер правила "threshold". При λ_a = 0.7 стимул точки зажигает ≈ 9 % карты (в среднем 820 точек из 8693 на
+# 100 цифрах), как набор углопозиций картинки, поэтому слои и перекрытие — как у координат X, Y стимула, а самый
+# узкий круг задан долей стороны карты (набор занимает долю карты, а не число ячеек). Длина кода — под среднюю
+# плотность 25 % на карте 100 цифр (≈ 4500 активных кругов на код); на карте 300 цифр зажжённые точки
+# разбросаны по большему числу областей и средняя плотность выше (28 %).
+SECOND_LEVEL_POINT_THRESHOLD_CODE_LENGTH = 12160
+SECOND_LEVEL_POINT_THRESHOLD_LAYERS = MNIST_POSITION_LAYERS
+SECOND_LEVEL_POINT_THRESHOLD_OVERLAP = MNIST_POSITION_OVERLAP
+SECOND_LEVEL_POINT_THRESHOLD_RADIUS_MIN = 0.012
+# Сравнение первой и второй карт (§5.13.2): «стенка» — соседние ячейки, стимулы которых различаются по углу
+# больше чем на 30° или по позиции окна больше чем на 3 окна; разрыв — соседи, стоявшие на другой карте
+# дальше стольких ячеек.
+SECOND_LEVEL_POINT_ANGLE_JUMP = 30.0
+SECOND_LEVEL_POINT_POSITION_JUMP = 3.0
+SECOND_LEVEL_POINT_TEAR_DISTANCE = 10.0
+SECOND_LEVEL_POINT_FILE_PREFIX = "data/second-points"
+# Суффиксы карт «место точки на первой карте» (цветовой круг): вторая карта и первая карта как легенда.
+SECOND_LEVEL_POINT_SOURCE_IMAGE_SUFFIX = ".source.png"
+SECOND_LEVEL_POINT_SOURCE_LEGEND_SUFFIX = ".source-first.png"
+LOG_INTERVAL_SECOND_LEVEL_POINT = 1000
+
 # §5.10: пары шага считаются спекулятивно по старым позициям; это не влияет на результат, пока обменов
 # за шаг много меньше числа точек. В режиме статьи число пар за шаг (а значит, и обменов) ограничено
 # долей LAYOUT_PAIRS_POINT_FRACTION от числа точек в обеих фазах; None — без ограничения (режим сглаживания,
@@ -812,6 +869,13 @@ LOG_INTERVALS = {
     "plane_detection.code": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
     "plane_detection.visual": LOG_INTERVAL_SECOND_LEVEL_VISUAL,
 }
+
+# Второй уровень, вариант «код на углопозицию»: событие на каждую точку — раз в столько точек.
+LOG_INTERVALS.update(
+    {
+        "point_codes.activation": LOG_INTERVAL_SECOND_LEVEL_POINT,
+    }
+)
 
 LAYOUT_CACHE_PATTERNS = (
     f"data/layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
@@ -1903,6 +1967,72 @@ def _build_plane_detection(layout: Layout, calibration: Sequence["np.ndarray"]) 
         lambda length: _build_plane_encoder(layout, length, check_order=False),
     )
     return PlaneDetection(activation, PlaneDetectorSpace(layout, _build_plane_encoder(layout, code_length)))
+
+
+def _build_point_plane_encoder(layout: Layout, activation: str | None = None) -> Encoder:
+    """Кодер двумерной позиции на карте раскладки (§4.3) для варианта «код на углопозицию».
+
+    activation — правило зажигания (None — SECOND_LEVEL_POINT_ACTIVATION): "best" — код одного места,
+    "threshold" — код набора мест (SECOND_LEVEL_POINT_THRESHOLD_*).
+    """
+    rule = SECOND_LEVEL_POINT_ACTIVATION if activation is None else activation
+    if rule == "best":
+        side = float(max(layout.height, layout.width))
+        code_length = SECOND_LEVEL_POINT_CODE_LENGTH
+        layers = plane_detector_layers(
+            layers_count=SECOND_LEVEL_POINT_LAYERS,
+            widest_radius=SECOND_LEVEL_POINT_RADIUS_MAX,
+            narrowest_radius=SECOND_LEVEL_POINT_RADIUS_MIN_CELLS / side,
+            overlap=SECOND_LEVEL_POINT_OVERLAP,
+        )
+    elif rule == "threshold":
+        code_length = SECOND_LEVEL_POINT_THRESHOLD_CODE_LENGTH
+        layers = plane_detector_layers(
+            layers_count=SECOND_LEVEL_POINT_THRESHOLD_LAYERS,
+            widest_radius=SECOND_LEVEL_POINT_RADIUS_MAX,
+            narrowest_radius=SECOND_LEVEL_POINT_THRESHOLD_RADIUS_MIN,
+            overlap=SECOND_LEVEL_POINT_THRESHOLD_OVERLAP,
+        )
+    else:
+        raise ValueError(f"activation rule must be one of {SECOND_LEVEL_POINT_ACTIVATION_RULES}")
+    encoder = Encoder(
+        PlaneDimension(
+            "Map",
+            PlaneDetectorSpace.plane_size(layout),
+            layers,
+            code_length=code_length,
+        ),
+        random_seed=SECOND_LEVEL_POINT_RANDOM_SEED,
+        layer_phase=ENCODER_LAYER_PHASE,
+    )
+    # §4.5, §5.13.1: Encoder.long_range_order сам логирует профиль и предупреждение.
+    encoder.long_range_order("Map")
+    return encoder
+
+
+def _build_point_plane_detection(layout: Layout, activation: str | None = None) -> PlaneDetection:
+    """Детекторы-круги над раскладкой и правило зажигания для кода одной точки (§4.3, §6.1, §6.5).
+
+    activation — правило зажигания; None — SECOND_LEVEL_POINT_ACTIVATION.
+
+    "best" — стимул точки зажигает точки с тем же кодом: код точки — код её места.
+    "threshold" — стимул точки зажигает все точки со сходством не ниже λ_a (§6.5): код точки — код набора мест.
+    Код — биты активных кругов (OR, §2.2.1) без отбора: colour merge не применяется, плотность задаёт длина кода.
+    """
+    rule = SECOND_LEVEL_POINT_ACTIVATION if activation is None else activation
+    if rule not in SECOND_LEVEL_POINT_ACTIVATION_RULES:
+        raise ValueError(f"activation rule must be one of {SECOND_LEVEL_POINT_ACTIVATION_RULES}")
+    activation_class: type[BestMatchActivation] | type[ThresholdActivation] = (
+        BestMatchActivation if rule == "best" else ThresholdActivation
+    )
+    space = PlaneDetectorSpace(layout, _build_point_plane_encoder(layout, rule))
+    lighting = activation_class(
+        layout.code_table,
+        similarity=LAYOUT_SIMILARITY,
+        lambda_threshold=SECOND_LEVEL_POINT_ACTIVATION_LAMBDA,
+        use_gpu=ACTIVATION_USE_GPU,
+    )
+    return PlaneDetection(lighting, space)
 
 
 def _build_extractor(
@@ -3502,6 +3632,260 @@ class MnistSecondLevelRunner:
         return 0.0 if accuracy is None else float(accuracy)
 
 
+@dataclass(frozen=True)
+class SecondLevelPointReport:
+    """Итог варианта «код на углопозицию»: коды второго уровня и сравнение первой и второй карт."""
+
+    codes: PointCodeSummary
+    first: MapContinuity  # первая карта
+    second: MapContinuity  # вторая карта (те же углопозиции на новых местах)
+    first_energy: MapEnergy  # исходные коды на местах первой раскладки
+    second_energy: MapEnergy  # исходные коды на местах второй раскладки
+    place_energy: float  # Ē второй раскладки на её собственных кодах (кодах мест)
+    correspondence: MapCorrespondence
+    image_path: str
+
+
+class MnistSecondLevelPointRunner:
+    """Второй уровень на MNIST, вариант «код на углопозицию» (§4.3, §6.2; расширение статьи; эксперимент).
+
+    1. Первая раскладка углопозиций — обычным конвейером (MnistLayoutRunner, только раскладка).
+    2. Каждая её точка получает код второго уровня (LayoutPointCodes): стимул точки зажигает точки первой
+       раскладки, зажжённые точки активируют детекторы-круги (§4.3). Правило "best" — зажигаются точки с тем
+       же кодом, код точки — код её места; правило "threshold" — все точки со сходством ≥ λ_a (§6.5), код
+       точки — код набора мест всех похожих на неё кодов.
+    3. Эти коды раскладываются тем же Layout с той же настройкой. Точка второй раскладки — та же углопозиция
+       (тот же угол и подпись), поэтому карты сравниваются точка в точку.
+    4. Сравнение карт (StimulusMapMeter): стенки по углу и позиции окна (§5.13.2), качество Ē исходных кодов
+       на новых местах (§5.8), соответствие расстановок.
+    """
+
+    def __init__(self, *, count: int, reuse_cache: bool = True, activation: str | None = None) -> None:
+        self.count = int(count)
+        self._activation = SECOND_LEVEL_POINT_ACTIVATION if activation is None else activation
+        if self._activation not in SECOND_LEVEL_POINT_ACTIVATION_RULES:
+            raise ValueError(f"activation rule must be one of {SECOND_LEVEL_POINT_ACTIVATION_RULES}")
+        self._primary = MnistLayoutRunner(count=count, reuse_cache=reuse_cache, layout_only=True)
+        self._params: TunedLayoutParams | None = None
+
+    def run(self) -> SecondLevelPointReport:
+        """Первая раскладка, коды мест её точек, вторая раскладка и сравнение двух карт."""
+        first = self._primary.run()
+        detection = _build_point_plane_detection(first, self._activation)
+        codes = LayoutPointCodes(detection, first.code_table)
+        summary = codes.log_summary(
+            first.cells_array(),
+            similarity=LAYOUT_SIMILARITY,
+            lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
+            seed=SECOND_LEVEL_POINT_RANDOM_SEED,
+        )
+        # Память устройства первой раскладки нужна второй; дальше от первой берутся только ячейки и коды.
+        first.release_device()
+        second = self._layout_codes(codes)
+        image_path = self._export(second)
+        return self._compare(first, second, summary, image_path)
+
+    def _layout_codes(self, codes: LayoutPointCodes) -> Layout:
+        """Раскладка кодов мест тем же алгоритмом и с той же настройкой, что первая (§6.2, §6.6).
+
+        Порядок точек таблицы не меняется: i-я точка второй раскладки — i-я точка первой.
+        """
+        table = codes.table()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        self._params = tuner.tune(table.count)
+        return _layout_from_codes(table, self._params, self._primary.colorizer)
+
+    def _export(self, layout: Layout) -> str:
+        """JSON и карты второй раскладки: псевдоцвета кода места, раскраска по углу стимула, яркость по энергии."""
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        # Файлы правила "best" — без пометки; у другого правила его имя входит в имя файла.
+        rule = "" if self._activation == "best" else f"-{self._activation}"
+        stem = f"{SECOND_LEVEL_POINT_FILE_PREFIX}{rule}-{self.count}-{suffix}"
+        layout.save_json(f"{stem}-{LAYOUT_CACHE_TAG}.json")
+        image_path = f"{stem}.png"
+        MnistLayoutRunner._save_layout_images(
+            layout,
+            image_path=image_path,
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
+        )
+        return image_path
+
+    def _stimulus_positions(self, table: LayoutCodeTable) -> "np.ndarray":
+        """Позиция окна (X, Y) стимула каждой точки раскладки — только для сравнения карт (вне статьи).
+
+        Таблица кодов хранит угол стимула (hue), но не окно. Углопозиции цифр набора извлекаются заново тем же
+        экстрактором и кодируются тем же кодером; окно точки находится по её коду.
+        """
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
+        encoder = self._primary.encoder
+        extractor = self._primary.extractor
+        windows: dict[bytes, tuple[float, float]] = {}
+        ambiguous = 0
+        for index, (image, digit) in enumerate(dataset):
+            if index >= self.count:
+                break
+            measurements = extractor.extract(image.squeeze(0).numpy(), int(digit))[int(digit)]
+            if not measurements:
+                continue
+            packed = LayoutCodeTable.pack_bits(
+                encoder.encode_matrix([(float(a), float(x), float(y)) for a, x, y in measurements])
+            )
+            for row, (_, x, y) in enumerate(measurements):
+                window = (float(x), float(y))
+                if windows.setdefault(packed[row].tobytes(), window) != window:
+                    ambiguous += 1
+        positions = np.zeros((table.count, 2), dtype=np.float64)
+        source = table.packed
+        for index in range(table.count):
+            window = windows.get(source[index].tobytes())
+            if window is None:
+                raise ValueError("a layout point has no stimulus among the first digits of the dataset")
+            positions[index] = window
+        LOGGER.event(
+            "second_level.points.stimulus_positions",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "points": table.count,
+                "codes": len(windows),
+                "ambiguous": ambiguous,
+                "note": "окно (X, Y) стимула точки найдено по её коду; ambiguous — стимулы с тем же кодом, "
+                "но другим окном (берётся первое)",
+            },
+        )
+        return positions
+
+    def _source_energy(
+        self, meter: StimulusMapMeter, table: LayoutCodeTable, cells: "np.ndarray", name: str
+    ) -> MapEnergy:
+        """Качество Ē (§5.8) исходных кодов точек, расставленных по ячейкам cells."""
+        if self._params is None:
+            raise ValueError("the second layout must be built first")
+        layout = _new_layout(table, self._params, self._primary.colorizer, initial_cells=cells)
+        try:
+            return meter.energy(layout, LAYOUT_ENERGY_RADIUS, name=name)
+        finally:
+            layout.release_device()
+
+    def _save_source_images(
+        self,
+        meter: StimulusMapMeter,
+        first_cells: "np.ndarray",
+        second_cells: "np.ndarray",
+        shape: tuple[int, int],
+        image_path: str,
+    ) -> None:
+        """Карты «место точки на первой карте»: вторая карта и первая как легенда (цветовой круг)."""
+        from PIL import Image
+
+        stem = os.path.splitext(image_path)[0]
+        source_path = stem + SECOND_LEVEL_POINT_SOURCE_IMAGE_SUFFIX
+        legend_path = stem + SECOND_LEVEL_POINT_SOURCE_LEGEND_SUFFIX
+        Image.fromarray(meter.source_position_image(first_cells, second_cells, shape, name="second")).save(source_path)
+        Image.fromarray(meter.source_position_image(first_cells, first_cells, shape, name="first")).save(legend_path)
+        LOGGER.event(
+            "second_level.points.visual.save",
+            section=OUTSIDE_ARTICLE,
+            data={"source_image": source_path, "legend_image": legend_path},
+        )
+
+    def _compare(
+        self,
+        first: Layout,
+        second: Layout,
+        summary: PointCodeSummary,
+        image_path: str,
+    ) -> SecondLevelPointReport:
+        """Сравнение первой и второй карт по стимулам соседей, качеству исходных кодов и соответствию мест."""
+        table = first.code_table
+        shape = (first.height, first.width)
+        if (second.height, second.width) != shape:
+            raise ValueError("the second layout must have the grid of the first one")
+        first_cells = first.cells_array()
+        second_cells = second.cells_array()
+        place_energy = second.average_local_energy(LAYOUT_ENERGY_RADIUS)
+        second.release_device()
+        meter = StimulusMapMeter(
+            table,
+            angle_period=LAYOUT_COMPONENT_PERIOD,
+            angle_jump=SECOND_LEVEL_POINT_ANGLE_JUMP,
+            similarity=LAYOUT_SIMILARITY,
+            similarity_floor=LAYOUT_LAMBDA_THRESHOLD,
+            positions=self._stimulus_positions(table),
+            position_jump=SECOND_LEVEL_POINT_POSITION_JUMP,
+            tear_distance=SECOND_LEVEL_POINT_TEAR_DISTANCE,
+        )
+        first_map = meter.continuity(first_cells, shape, name="first")
+        second_map = meter.continuity(second_cells, shape, name="second")
+        first_energy = self._source_energy(meter, table, first_cells, "first")
+        second_energy = self._source_energy(meter, table, second_cells, "second")
+        correspondence = meter.correspondence(first_cells, second_cells, shape)
+        self._save_source_images(meter, first_cells, second_cells, shape, image_path)
+        LOGGER.event(
+            "second_level.points.summary",
+            section=MAPPING_CONTINUITY,
+            data={
+                "count": self.count,
+                "points": table.count,
+                "activation": self._activation,
+                "code_density": summary.density_mean,
+                "codes_ordered": summary.ordered,
+                "wall_ratio_first": first_map.wall_ratio,
+                "wall_ratio_second": second_map.wall_ratio,
+                "angle_jump_ratio_first": first_map.angle_jump_ratio,
+                "angle_jump_ratio_second": second_map.angle_jump_ratio,
+                "low_similarity_ratio_first": first_map.low_similarity_ratio,
+                "low_similarity_ratio_second": second_map.low_similarity_ratio,
+                "energy_first": first_energy.average,
+                "energy_second": second_energy.average,
+                "energy_mean_first": first_energy.mean,
+                "energy_mean_second": second_energy.mean,
+                "kept_neighbours_ratio": correspondence.kept_neighbours_ratio,
+                "fit_explained": correspondence.fit_explained,
+                "image": image_path,
+                "note": "первая карта против второй (те же углопозиции на местах второй раскладки): стенки по "
+                "стимулам соседей (§5.13.2) и качество Ē исходных кодов (§5.8)",
+            },
+        )
+        return SecondLevelPointReport(
+            codes=summary,
+            first=first_map,
+            second=second_map,
+            first_energy=first_energy,
+            second_energy=second_energy,
+            place_energy=float(place_energy),
+            correspondence=correspondence,
+            image_path=image_path,
+        )
+
+
+def _add_second_points_parser(subparsers) -> None:  # noqa: ANN001
+    """Команда варианта «код на углопозицию»."""
+    parser = subparsers.add_parser(
+        "second-points",
+        help="второй уровень, код на углопозицию: код места каждой точки первой раскладки, раскладка этих "
+        "кодов и сравнение двух карт",
+    )
+    parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="игнорировать готовую первую раскладку в data/ и посчитать её заново",
+    )
+    parser.add_argument(
+        "--activation",
+        choices=SECOND_LEVEL_POINT_ACTIVATION_RULES,
+        default=SECOND_LEVEL_POINT_ACTIVATION,
+        help="правило зажигания: best — точки с тем же кодом (код места точки); threshold — все точки со "
+        "сходством не ниже порога активации (§6.5)",
+    )
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DAMP MNIST demo")
     subparsers = parser.add_subparsers(dest="command")
@@ -3557,6 +3941,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="число картинок проверки нечётким поиском; 0 — без проверки",
     )
     second_parser.add_argument("--split", choices=["train", "test"], default="test")
+    _add_second_points_parser(subparsers)
     return parser
 
 
@@ -3624,6 +4009,11 @@ def main() -> None:
         second_accuracy = second_runner.run()
         if second_accuracy is not None:
             print(f"second level: dataset={args.split} samples={args.limit} accuracy={second_accuracy:.4f}")
+        return
+    if command == "second-points":
+        MnistSecondLevelPointRunner(
+            count=args.count, reuse_cache=not args.rebuild, activation=args.activation
+        ).run()
         return
     parser.error(f"unknown command {command}")
 
