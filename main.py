@@ -531,6 +531,142 @@ PINWHEEL_COMPONENT_OUTPUT_PATH = "pinwheel_test.angle.png"
 PINWHEEL_ENERGY_OUTPUT_PATH = "pinwheel_test.energy.png"
 PINWHEEL_LAYOUT_PATH = "pinwheel_test.json"
 
+# --- Анализ логов (log_insights.py, docs/LOG_INSIGHTS.md). Строка лога — стимул: она кодируется как слово
+# в морфологии (§7.1), коды разбиений раскладываются (§5), над раскладкой строится иерархия детекторов (§6.4),
+# активность детекторов даёт структурный эмбеддинг строки и окна строк (§6.5, §7.1.12).
+# Эталонные логи — по ним строится пространство; целевые — в них ищутся новизна и инциденты.
+# Шаблоны glob; каждый файл — один запуск. Целевой файл может входить и в эталон.
+LOG_INSIGHTS_REFERENCE = (
+    "layout.log",
+    "evaluate.log",
+    "log_samples/baseline_run2.log",
+    "log_samples/combined_run.log",
+    "log_samples/full_run.log",
+)
+LOG_INSIGHTS_TARGET = ("log_samples/baseline_run.log",)
+LOG_SEED = 0
+# Предобработка (§7.1.3): длина слова в символах, длина строки в словах; слот числа — столько слов перед ним.
+LOG_WORD_MIN = 2
+LOG_WORD_MAX = 20
+LOG_LINE_WORDS_MAX = 32
+LOG_NUMBER_SLOT_WORDS = 2
+# Словарь фрагментов и разбиения строки (§7.1.3, §7.1.4, табл. 1): фрагмент словаря — до стольких слов,
+# разбиений строки — по одному на каждое число фрагментов от 1 до LOG_FRAGMENTS_MAX.
+LOG_FRAGMENT_WORDS_MAX = 8
+LOG_FRAGMENTS_MAX = 5
+# Код разбиения (§7.1.4.1, §7.1.8.1): длина кода и число цветных бит на «позицию × слово».
+LOG_CODE_BITS = 256
+LOG_TOKEN_BITS = 40
+# Бюджет насыщенности фрагмента по числу фрагментов и номеру фрагмента (табл. 3, §7.1.4.4).
+LOG_FRAGMENT_SATURATION = {
+    1: (15,),
+    2: (15, 5),
+    3: (15, 7, 3),
+    4: (15, 7, 3, 2),
+    5: (15, 6, 5, 3, 1),
+}
+# Раскладка пространства строк (§7.1.6, §7.1.7): запас пустых ячеек 15 %, cosine, λ от 0.65 до 0.8 шагом 0.05
+# с жёстким порогом (η = ∞), радиус пар от d/2 к 1; λ и r меняются, когда обмены падают до 1 % от начала этапа.
+LOG_LAYOUT_EMPTY_RATIO = 0.15
+LOG_LAYOUT_SIMILARITY = "cosine"
+# Дальняя энергия φ = Σ s·d по всему пространству с евклидовым d (§5.5.1); в ближней — d² без корня (§5.9.2).
+LOG_LAYOUT_LONG_KERNEL = "distance"
+LOG_LAYOUT_LONG_DISTANCE = "euclidean"
+LOG_LAYOUT_SHORT_DISTANCE = "squared"
+# Период оттенка диагностической раскраски точек по первому слову строки (в раскладке не участвует).
+LOG_LAYOUT_HUE_PERIOD = 360.0
+LOG_LAYOUT_LAMBDA = 0.65
+LOG_LAYOUT_LAMBDA_STEP = 0.05
+LOG_LAYOUT_LAMBDA_MAX = 0.8
+LOG_LAYOUT_ETA = None
+LOG_LAYOUT_RADIUS_START_FACTOR = 0.5
+LOG_LAYOUT_RADIUS_FACTOR = 0.5
+LOG_LAYOUT_SWAP_TRIGGER = 0.01
+LOG_LAYOUT_SWAP_WINDOW = 10
+LOG_LAYOUT_MIN_SWAP_RATIO = 0.0001
+LOG_LAYOUT_SHORT_MIN_SWAP_RATIO = 0.005
+LOG_LAYOUT_MIN_SWAP_WINDOW = 20
+# Матрица сходства точек предвычисляется (§5.9.5), пока точек не больше этого числа.
+LOG_LAYOUT_MAX_PRECOMPUTE = 8000
+LOG_LAYOUT_LOG_EVERY_LONG = 500
+LOG_LAYOUT_LOG_EVERY_SHORT = 100
+# Радиус r_e энергии точки (§5.7: «r_e ≤ 5 достаточно»): одна матрица Ê для качества раскладки и детекторов.
+LOG_ENERGY_RADIUS = 3
+# Иерархия детекторов (§6.4, §7.1.10, табл. 5): порог λ_d слоя, радиус активации r_a в долях стороны карты
+# и наименьшее число точек кластера. Нижние слои — области и гиперкластеры, верхние — кластеры и их части.
+LOG_DETECTOR_LAYER_SPECS = (
+    (0.50, 0.35, 6),
+    (0.60, 0.28, 5),
+    (0.70, 0.22, 4),
+    (0.75, 0.16, 3),
+    (0.80, 0.12, 3),
+    (0.85, 0.08, 2),
+)
+LOG_DETECTOR_RADIUS_MIN = 1
+LOG_DETECTOR_ATTEMPTS_WITHOUT_CHANGE = 400
+LOG_DBSCAN_EPS = 1.5
+LOG_DBSCAN_MIN_SAMPLES = 2
+# Детекция (§6.5, §7.1.10, §7.1.11) послойная: детекторы слоя оцениваются по активации пространства с порогом
+# своего слоя λ_d («каждое значение λ_a задаёт свой слой иерархии», §7.1.10) — с тем же, с каким считалась
+# энергия детектора e_d (§6.3). При одном общем λ_a = 0.5 любая строка семейства активирует все детекторы
+# семейства и типы событий сливаются (подбор: крупнейший тип — 101 вид строк из 243; послойно — 5).
+# μ_e — порог энергии точки, μ_d — порог уровня активации детектора.
+LOG_ACTIVATION_ENERGY_THRESHOLD = 0.05
+LOG_ACTIVATION_DETECTOR_THRESHOLD = 0.5
+# Порог сходства в энергии точки Ê (§5.7): порог нижнего слоя детекторов, заметно выше шума кодов (§7.1.10).
+LOG_ENERGY_LAMBDA = 0.5
+# Выходной код (§6.6, §7.1.12): длина и насыщенность — по среднему числу активных детекторов.
+LOG_EMBEDDING_BITS_MIN = 256
+LOG_EMBEDDING_MAX_DENSITY = 0.25
+LOG_EMBEDDING_SATURATION_MIN = 8
+LOG_EMBEDDING_SATURATION_MAX = 128
+LOG_WINDOW_EMBEDDING_SATURATION_MAX = 256
+# Два масштаба эмбеддинга строки (§7.1.10: слои иерархии описывают структуру разного масштаба): код типа —
+# детекторы слоёв с λ_d не ниже LOG_TYPE_LAYER_LAMBDA (кластеры и их части), код семейства — слоёв с λ_d
+# не выше LOG_FAMILY_LAYER_LAMBDA (области и гиперкластеры).
+LOG_TYPE_LAYER_LAMBDA = 0.75
+LOG_FAMILY_LAYER_LAMBDA = 0.6
+# Типы и семейства событий: строки, чей код типа (семейства) близок к коду центра (нечёткий поиск, §2.2.5).
+LOG_TYPE_LAMBDA = 0.6
+LOG_FAMILY_LAMBDA = 0.5
+# Новизна (§7.1.13.3): строка известна точно, по частям или неизвестна; порог сходства «точно».
+LOG_EXACT_SIMILARITY = 0.999
+# Слова, помечающие строку как проблемную (вне статьи: знание о логах, в код строки не входит).
+LOG_PROBLEM_WORDS = ("error", "exception", "traceback", "fatal", "failed", "failure", "crash", "panic")
+# Числа (§4.1, §4.2.1): знаковая логарифмическая шкала ±LOG_NUMERIC_DECADES порядков от LOG_NUMERIC_UNIT,
+# слои широких детекторов от самого широкого к самому узкому.
+LOG_NUMERIC_UNIT = 1e-6
+LOG_NUMERIC_DECADES = 18.0
+LOG_NUMERIC_LAYERS = 8
+LOG_NUMERIC_WIDEST = 2
+LOG_NUMERIC_NARROWEST = 144
+LOG_NUMERIC_OVERLAP = 0.5
+LOG_NUMERIC_CODE_BITS = 256
+# Число считается новым, если известных бит его кода меньше этой доли (§2.2.2); слот нужен с таким числом значений.
+LOG_NUMERIC_KNOWN_RATIO = 0.5
+LOG_NUMERIC_MIN_VALUES = 10
+# Окна строк одного запуска (§6.5: детекция набора стимулов S): длина и шаг окна в строках.
+LOG_WINDOW_LINES = 40
+LOG_WINDOW_STRIDE = 20
+# Порог сходства окна с инцидентом при поиске похожих окон (§2.2.5).
+LOG_INCIDENT_LAMBDA = 0.5
+# Связи (§2.3.1, §2.3.2): память пар соседних событий, запрос маской; порог сходства с ключом запроса,
+# наименьшая поддержка, уверенность и подъём правила; глубина поиска предвестников в событиях.
+LOG_RELATION_LAMBDA = 0.5
+LOG_RELATION_MIN_SUPPORT = 3
+LOG_RELATION_MIN_CONFIDENCE = 0.5
+LOG_RELATION_MIN_LIFT = 2.0
+LOG_RELATION_DEPTH = 3
+LOG_INSIGHTS_TOP = 12
+LOG_INSIGHTS_REPORT_PATH = "log_insights.md"
+LOG_INSIGHTS_JSON_PATH = "log_insights.json"
+LOG_INSIGHTS_MAP_PATH = "log_insights.png"
+LOG_INSIGHTS_ENERGY_MAP_PATH = "log_insights.energy.png"
+LOG_INSIGHTS_TYPES_MAP_PATH = "log_insights.types.png"
+LOG_INSIGHTS_MAP_SCALE = 8
+# Записи журнала на каждую строку пишутся раз в столько строк.
+LOG_INTERVAL_LOGS_LINE = 50
+
 # --- Визуализация первичных детекторов угла и позиции (detectors_visual.py): слои, рецептивные поля,
 # их перекрытие и цветовые полосы бит (§4.1, §4.2.1, §3.2). Детекторы, активные для примера стимула
 # (угол, X, Y), выделяются; остальные рисуются с прозрачностью DETECTORS_VIEW_INACTIVE_ALPHA.
@@ -568,6 +704,8 @@ DIGITS_CONTOUR_OUTPUT_PATH = "digits_contour_test.png"
 DIGITS_CONTOUR_ENTITY_PATH = "/digits_contour"
 LOG_INTERVAL_ANGLE_LINES = 100
 LOG_INTERVALS = {
+    "logs.encoder.line": LOG_INTERVAL_LOGS_LINE,
+    "logs.line.reaction": LOG_INTERVAL_LOGS_LINE,
     "detectors.init": LOG_INTERVAL_INIT,
     "detectors.geometric_layers": LOG_INTERVAL_INIT,
     "encoder.random_bits": LOG_INTERVAL_INIT,

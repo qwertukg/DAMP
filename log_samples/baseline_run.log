@@ -1,0 +1,432 @@
+detectors.geometric_layers layers_count=10 widest=2 narrowest=180 overlap=0.7 counts=[2, 3, 5, 9, 15, 24, 40, 66, ...] ratio=1.64869 [4.5]
+2026-11-12T07:10:55.940715Z  INFO re_perf_telemetry::telemetry: Telemetry initialized enabled=false service=rerun trace_mode="off" traces=off logs=off metrics=off tracy=false
+2026-11-12T07:10:55.947988Z  INFO re_grpc_server: Listening for gRPC connections on 0.0.0.0:9876. Connect by running `rerun --connect rerun+http://127.0.0.1:9876/proxy` gui_notification=false
+detectors.init count=2 overlap=0.7 [4.1]
+detectors.init count=3 overlap=0.7 [4.1]
+detectors.init count=5 overlap=0.7 [4.1]
+detectors.init count=9 overlap=0.7 [4.1]
+detectors.init count=15 overlap=0.7 [4.1]
+detectors.init count=24 overlap=0.7 [4.1]
+detectors.init count=40 overlap=0.7 [4.1]
+detectors.init count=66 overlap=0.7 [4.1]
+detectors.init count=109 overlap=0.7 [4.1]
+detectors.init count=180 overlap=0.7 [4.1]
+detectors.geometric_layers layers_count=10 widest=2 narrowest=28 overlap=0.7 counts=[2, 3, 4, 5, 6, 9, 12, 16, ...] ratio=1.34075 [4.5]
+detectors.init count=2 overlap=0.7 [4.1]
+detectors.init count=3 overlap=0.7 [4.1]
+detectors.init count=4 overlap=0.7 [4.1]
+detectors.init count=5 overlap=0.7 [4.1]
+detectors.init count=6 overlap=0.7 [4.1]
+detectors.init count=9 overlap=0.7 [4.1]
+detectors.init count=12 overlap=0.7 [4.1]
+detectors.init count=16 overlap=0.7 [4.1]
+detectors.init count=21 overlap=0.7 [4.1]
+detectors.init count=28 overlap=0.7 [4.1]
+dimension.init title=Angle min_value=0 max_value=360 closed=true period=360 code_length=512 edge_detectors=false layer_specs=[(2, 0.7), (3, 0.7), (5, 0.7), (9, 0.7), (15, 0.7), (24, 0.7), (40, 0.7), (66, 0.7), ...] [4.2]
+dimension.closed title=Angle period=360 [4.4]
+dimension.init title=X min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false layer_specs=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), ...] [4.2]
+dimension.init title=Y min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false layer_specs=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), ...] [4.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=0 count=2 detectors=2 overlap=0.7 width=360 step=180 half_width=180 phase=0 center_min=0 center_max=180 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=1 count=3 detectors=3 overlap=0.7 width=360 step=120 half_width=180 phase=0.618034 center_min=74.1641 center_max=314.164 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=1 colour_rank=1 band_start=51 band_length=51 detectors=3 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=2 count=5 detectors=5 overlap=0.7 width=240 step=72 half_width=120 phase=0.236068 center_min=16.9969 center_max=304.997 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=2 colour_rank=2 band_start=102 band_length=51 detectors=5 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=3 count=9 detectors=9 overlap=0.7 width=133.333 step=40 half_width=66.6667 phase=0.854102 center_min=34.1641 center_max=354.164 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=3 colour_rank=3 band_start=153 band_length=51 detectors=9 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+2026-11-12T07:10:56.949240Z  WARN egui_wgpu::winit: Transparent window was requested, but the active wgpu surface does not support a `CompositeAlphaMode` with transparency.
+encoder.layer dimension=Angle dimension_index=0 layer_index=4 count=15 detectors=15 overlap=0.7 width=80 step=24 half_width=40 phase=0.472136 center_min=11.3313 center_max=347.331 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=4 colour_rank=4 band_start=204 band_length=51 detectors=15 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=5 count=24 detectors=24 overlap=0.7 width=50 step=15 half_width=25 phase=0.0901699 center_min=1.35255 center_max=346.353 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=5 colour_rank=5 band_start=255 band_length=51 detectors=24 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=6 count=40 detectors=40 overlap=0.7 width=30 step=9 half_width=15 phase=0.708204 center_min=6.37384 center_max=357.374 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=6 colour_rank=6 band_start=306 band_length=51 detectors=40 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=7 count=66 detectors=66 overlap=0.7 width=18.1818 step=5.45455 half_width=9.09091 phase=0.326238 center_min=1.77948 center_max=356.325 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=7 colour_rank=7 band_start=357 band_length=51 detectors=66 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=8 count=109 detectors=109 overlap=0.7 width=11.0092 step=3.30275 half_width=5.50459 phase=0.944272 center_min=3.1187 center_max=359.816 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=8 colour_rank=8 band_start=408 band_length=52 detectors=109 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=9 count=180 detectors=180 overlap=0.7 width=6.66667 step=2 half_width=3.33333 phase=0.562306 center_min=1.12461 center_max=359.125 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=9 colour_rank=9 band_start=460 band_length=52 detectors=180 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.random_bits dimension=Angle dimension_index=0 detectors=453 code_length=512 used_bits=253 shared_bits=119 max_detectors_per_bit=4 expected_density=0.0636334 random_seed=0 [4.2.1]
+encoder.layer dimension=X dimension_index=1 layer_index=0 count=2 detectors=2 overlap=0.7 width=48.3333 step=14.5 half_width=24.1667 phase=0.5 center_min=6.25 center_max=20.75 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=1 count=3 detectors=3 overlap=0.7 width=32.2222 step=9.66667 half_width=16.1111 phase=0.5 center_min=3.83333 center_max=23.1667 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=1 colour_rank=1 band_start=51 band_length=51 detectors=3 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=2 count=4 detectors=4 overlap=0.7 width=24.1667 step=7.25 half_width=12.0833 phase=0.5 center_min=2.625 center_max=24.375 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=2 colour_rank=2 band_start=102 band_length=51 detectors=4 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=3 count=5 detectors=5 overlap=0.7 width=19.3333 step=5.8 half_width=9.66667 phase=0.5 center_min=1.9 center_max=25.1 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=3 colour_rank=3 band_start=153 band_length=51 detectors=5 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=4 count=6 detectors=6 overlap=0.7 width=16.1111 step=4.83333 half_width=8.05556 phase=0.5 center_min=1.41667 center_max=25.5833 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=4 colour_rank=4 band_start=204 band_length=51 detectors=6 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=5 count=9 detectors=9 overlap=0.7 width=10.7407 step=3.22222 half_width=5.37037 phase=0.5 center_min=0.611111 center_max=26.3889 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=5 colour_rank=5 band_start=255 band_length=51 detectors=9 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=6 count=12 detectors=12 overlap=0.7 width=8.05556 step=2.41667 half_width=4.02778 phase=0.5 center_min=0.208333 center_max=26.7917 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=6 colour_rank=6 band_start=306 band_length=51 detectors=12 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=7 count=16 detectors=16 overlap=0.7 width=6.04167 step=1.8125 half_width=3.02083 phase=0.5 center_min=-0.09375 center_max=27.0938 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=7 colour_rank=7 band_start=357 band_length=51 detectors=16 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=8 count=21 detectors=21 overlap=0.7 width=4.60317 step=1.38095 half_width=2.30159 phase=0.5 center_min=-0.309524 center_max=27.3095 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=8 colour_rank=8 band_start=408 band_length=52 detectors=21 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=9 count=28 detectors=28 overlap=0.7 width=3.45238 step=1.03571 half_width=1.72619 phase=0.5 center_min=-0.482143 center_max=27.4821 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=9 colour_rank=9 band_start=460 band_length=52 detectors=28 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.random_bits dimension=X dimension_index=1 detectors=106 code_length=512 used_bits=106 shared_bits=0 max_detectors_per_bit=1 expected_density=0.0636334 random_seed=0 [4.2.1]
+encoder.layer dimension=Y dimension_index=2 layer_index=0 count=2 detectors=2 overlap=0.7 width=48.3333 step=14.5 half_width=24.1667 phase=0.5 center_min=6.25 center_max=20.75 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=1 count=3 detectors=3 overlap=0.7 width=32.2222 step=9.66667 half_width=16.1111 phase=0.5 center_min=3.83333 center_max=23.1667 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=1 colour_rank=1 band_start=51 band_length=51 detectors=3 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=2 count=4 detectors=4 overlap=0.7 width=24.1667 step=7.25 half_width=12.0833 phase=0.5 center_min=2.625 center_max=24.375 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=2 colour_rank=2 band_start=102 band_length=51 detectors=4 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=3 count=5 detectors=5 overlap=0.7 width=19.3333 step=5.8 half_width=9.66667 phase=0.5 center_min=1.9 center_max=25.1 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=3 colour_rank=3 band_start=153 band_length=51 detectors=5 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=4 count=6 detectors=6 overlap=0.7 width=16.1111 step=4.83333 half_width=8.05556 phase=0.5 center_min=1.41667 center_max=25.5833 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=4 colour_rank=4 band_start=204 band_length=51 detectors=6 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=5 count=9 detectors=9 overlap=0.7 width=10.7407 step=3.22222 half_width=5.37037 phase=0.5 center_min=0.611111 center_max=26.3889 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=5 colour_rank=5 band_start=255 band_length=51 detectors=9 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=6 count=12 detectors=12 overlap=0.7 width=8.05556 step=2.41667 half_width=4.02778 phase=0.5 center_min=0.208333 center_max=26.7917 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=6 colour_rank=6 band_start=306 band_length=51 detectors=12 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=7 count=16 detectors=16 overlap=0.7 width=6.04167 step=1.8125 half_width=3.02083 phase=0.5 center_min=-0.09375 center_max=27.0938 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=7 colour_rank=7 band_start=357 band_length=51 detectors=16 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=8 count=21 detectors=21 overlap=0.7 width=4.60317 step=1.38095 half_width=2.30159 phase=0.5 center_min=-0.309524 center_max=27.3095 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=8 colour_rank=8 band_start=408 band_length=52 detectors=21 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=9 count=28 detectors=28 overlap=0.7 width=3.45238 step=1.03571 half_width=1.72619 phase=0.5 center_min=-0.482143 center_max=27.4821 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=9 colour_rank=9 band_start=460 band_length=52 detectors=28 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.random_bits dimension=Y dimension_index=2 detectors=106 code_length=512 used_bits=106 shared_bits=0 max_detectors_per_bit=1 expected_density=0.0636334 random_seed=0 [4.2.1]
+encoder.init dimensions=3 random_seed=0 layer_phase=true log_every=50 dims=[Angle:closed range=(0.0,360.0) bits=512 layers=[(2, 0.7), (3, 0.7), (5, 0.7), (9, 0.7), (15, 0.7), (24, 0.7), (40, 0.7), (66, 0.7), (109, 0.7), (180, 0.7)], X:open range=(-1.0,28.0) bits=512 layers=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), (21, 0.7), (28, 0.7)], Y:open range=(-1.0,28.0) bits=512 layers=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), (21, 0.7), (28, 0.7)]] [4.6]
+encoder.code_length mode=merge code_length=512 segments=[(0, 512), (0, 512), (0, 512)] expected_density=0.17901 note=§2.2.3: слияние сохраняет длину, но повышает плотность и коллизии (OR, §2.2.1); конкатенация сохраняет коды координат, но удлиняет код [2.2.3]
+encoder.detectors detectors=665 [4.1]
+encoder.long_range_order dimension=Angle samples=25 monotone=true decreasing=true far_similarity=true plateau=false ordered=true profile=[(14.4, 0.588), (28.8, 0.446), (43.2, 0.383), (57.6, 0.336), (72, 0.304), (86.4, 0.279), (100.8, 0.263), (115.2, 0.247), ...] note=сходство должно убывать с расстоянием на всём диапазоне (§4.5), иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1) [5.13.1]
+encoder.long_range_order dimension=X samples=30 monotone=true decreasing=true far_similarity=true plateau=false ordered=true profile=[(1, 0.898), (2, 0.79), (3, 0.678), (4, 0.586), (5, 0.516), (6, 0.457), (7, 0.418), (8, 0.381), ...] note=сходство должно убывать с расстоянием на всём диапазоне (§4.5), иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1) [5.13.1]
+encoder.long_range_order dimension=Y samples=30 monotone=true decreasing=true far_similarity=true plateau=false ordered=true profile=[(1, 0.898), (2, 0.79), (3, 0.678), (4, 0.586), (5, 0.516), (6, 0.457), (7, 0.418), (8, 0.381), ...] note=сходство должно убывать с расстоянием на всём диапазоне (§4.5), иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1) [5.13.1]
+pinwheel.stimulus positions=((10, 10), (20, 10), (10, 20), (20, 20)) segments={Angle=(0, 512), X=(0, 512), Y=(0, 512)} angles_per_position=360 stimuli=1440 [4.6]
+encoder.encode.input stimuli=1 values=(0, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(0, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(25, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(25, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=89 active_bits_mean=89 density=0.173828 shared_bits=7 shared_bits_mean=7 code=BitArray(len=512, ones=89) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(50, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(50, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=4 shared_bits_mean=4 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(75, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(75, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(100, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(100, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(125, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(125, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=4 shared_bits_mean=4 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(150, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(150, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=89 active_bits_mean=89 density=0.173828 shared_bits=6 shared_bits_mean=6 code=BitArray(len=512, ones=89) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(175, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(175, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(200, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(200, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(225, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(225, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=2 shared_bits_mean=2 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(250, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(250, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=94 active_bits_mean=94 density=0.183594 shared_bits=3 shared_bits_mean=3 code=BitArray(len=512, ones=94) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(275, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(275, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=3 shared_bits_mean=3 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(300, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(300, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=6 shared_bits_mean=6 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(325, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(325, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=3 shared_bits_mean=3 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(350, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(350, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+pinwheel.codes angles=360 positions=4 stimuli=1440 code_length=512 expected_density=0.17901 [4.6]
+C:\Projects\DAMP\.venv\Lib\site-packages\rerun\dynamic_archetype.py:152: RerunWarning: Converting data for 'positions': ArrowTypeError(Expected a string or bytes dtype, got int64)
+  archetype._optional_archetype(None, drop_untyped_nones, components=kwargs)
+layout.tune points=1440 grid_size_est=38 empty_ratio=0 start_radius_factor=0.5 long_pairs_per_step=144 long_steps=50000 long_subset_size=-1 long_subset_mode=full_space long_subset_refresh=80 short_pairs_per_step=144 short_steps=2500 short_local_radius=3 short_energy_radius=3 short_energy_recalc_every=416 neighbourhood_sample_side=-1 lambda_threshold=0.65 eta=hard [7.1.7]
+layout.energy.neighbourhood_sample.config sample_side=-1 mode=full_window note=энергия окрестности гауссова ядра по случайной выборке её ячеек: окно делится на слои side × side, из слоя берётся одна случайная ячейка (§5.9.4); None — по всем ячейкам [5.9.4]
+layout.sim_matrix.ready points=1440 code_len=512 [5.9.5]
+layout.init points=1440 labels=360 seed=0 [5.2]
+layout.grid grid_size=38 empty_ratio=0 [7.1.6]
+layout.similarity similarity=cosine [2.2.4]
+layout.thresholds lambda_threshold=0.65 eta=None [5.4]
+layout.energy.distance long_distance=euclidean short_distance=squared note=euclidean = d из §5.5; squared = сумма квадратов без корня (§5.9.2) [5.9.2]
+layout.energy.long.kernel kernel=distance radius_min=3 width=1 note=distance — φ = Σ s·d по всему V (§5.5.1); gauss — расширение статьи: φ = Σ s·exp(−d²/2σ²) по окрестности r(t) = радиусу выбора пар (§7.1.7), σ = width·r, максимизация [5.5.1]
+layout.similarity_threshold lambda_threshold=0.65 eta=0 eta_mode=hard_cutoff function=sim if sim >= lambda else 0 [5.4]
+C:\Projects\DAMP\.venv\Lib\site-packages\rerun\dynamic_archetype.py:152: RerunWarning: Converting data for 'eta': ArrowTypeError(Expected a string or bytes dtype, got float64)
+  archetype._optional_archetype(None, drop_untyped_nones, components=kwargs)
+layout.precompute precompute_similarity=true [5.9.5]
+layout.precompute_limit max_precompute=2000 [5.9.5]
+layout.energy.subset.config long_subset_size=-1 long_subset_refresh=80 long_subset_min_neighbours=50 points=1440 [5.9.4]
+layout.parallel parallel_workers=None [5.10]
+layout.gpu.config use_gpu=true [5.12]
+layout.codes code_length=512 ones_min=79 ones_max=97 ones_avg=87.2104 [2]
+layout.distance_eps distance_eps=1e-06 [вне статьи]
+layout.gpu.pair_energy.unavailable error=No module named 'torch' [5.12]
+layout.gpu.import_failed error=No module named 'moderngl' [5.12]
+layout.gpu.tensor.unavailable error=No module named 'torch' [5.12]
+layout.gpu.disabled status=cpu [5.12]
+layout.parallel.cpu_count cpu_count=14 [5.10]
+layout.sim_cache.start point_count=1440 [5.9.5]
+layout.sim_cache.similarity similarity=cosine [2.2.4]
+layout.sim_cache.parallel workers=14 [5.10]
+layout.sim_cache.gpu use_gpu=true [5.12]
+detectors.geometric_layers layers_count=10 widest=2 narrowest=180 overlap=0.7 counts=[2, 3, 5, 9, 15, 24, 40, 66, ...] ratio=1.64869 [4.5]
+detectors.init count=2 overlap=0.7 [4.1]
+detectors.init count=3 overlap=0.7 [4.1]
+detectors.init count=5 overlap=0.7 [4.1]
+detectors.init count=9 overlap=0.7 [4.1]
+detectors.init count=15 overlap=0.7 [4.1]
+detectors.init count=24 overlap=0.7 [4.1]
+detectors.init count=40 overlap=0.7 [4.1]
+detectors.init count=66 overlap=0.7 [4.1]
+detectors.init count=109 overlap=0.7 [4.1]
+detectors.init count=180 overlap=0.7 [4.1]
+detectors.geometric_layers layers_count=10 widest=2 narrowest=28 overlap=0.7 counts=[2, 3, 4, 5, 6, 9, 12, 16, ...] ratio=1.34075 [4.5]
+detectors.init count=2 overlap=0.7 [4.1]
+detectors.init count=3 overlap=0.7 [4.1]
+detectors.init count=4 overlap=0.7 [4.1]
+detectors.init count=5 overlap=0.7 [4.1]
+detectors.init count=6 overlap=0.7 [4.1]
+detectors.init count=9 overlap=0.7 [4.1]
+detectors.init count=12 overlap=0.7 [4.1]
+detectors.init count=16 overlap=0.7 [4.1]
+detectors.init count=21 overlap=0.7 [4.1]
+detectors.init count=28 overlap=0.7 [4.1]
+dimension.init title=Angle min_value=0 max_value=360 closed=true period=360 code_length=512 edge_detectors=false layer_specs=[(2, 0.7), (3, 0.7), (5, 0.7), (9, 0.7), (15, 0.7), (24, 0.7), (40, 0.7), (66, 0.7), ...] [4.2]
+dimension.closed title=Angle period=360 [4.4]
+dimension.init title=X min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false layer_specs=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), ...] [4.2]
+dimension.init title=Y min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false layer_specs=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), ...] [4.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=0 count=2 detectors=2 overlap=0.7 width=360 step=180 half_width=180 phase=0 center_min=0 center_max=180 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=1 count=3 detectors=3 overlap=0.7 width=360 step=120 half_width=180 phase=0.618034 center_min=74.1641 center_max=314.164 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=1 colour_rank=1 band_start=51 band_length=51 detectors=3 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=2 count=5 detectors=5 overlap=0.7 width=240 step=72 half_width=120 phase=0.236068 center_min=16.9969 center_max=304.997 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=2 colour_rank=2 band_start=102 band_length=51 detectors=5 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=3 count=9 detectors=9 overlap=0.7 width=133.333 step=40 half_width=66.6667 phase=0.854102 center_min=34.1641 center_max=354.164 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=3 colour_rank=3 band_start=153 band_length=51 detectors=9 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=4 count=15 detectors=15 overlap=0.7 width=80 step=24 half_width=40 phase=0.472136 center_min=11.3313 center_max=347.331 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=4 colour_rank=4 band_start=204 band_length=51 detectors=15 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=5 count=24 detectors=24 overlap=0.7 width=50 step=15 half_width=25 phase=0.0901699 center_min=1.35255 center_max=346.353 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=5 colour_rank=5 band_start=255 band_length=51 detectors=24 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=6 count=40 detectors=40 overlap=0.7 width=30 step=9 half_width=15 phase=0.708204 center_min=6.37384 center_max=357.374 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=6 colour_rank=6 band_start=306 band_length=51 detectors=40 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=7 count=66 detectors=66 overlap=0.7 width=18.1818 step=5.45455 half_width=9.09091 phase=0.326238 center_min=1.77948 center_max=356.325 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=7 colour_rank=7 band_start=357 band_length=51 detectors=66 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=8 count=109 detectors=109 overlap=0.7 width=11.0092 step=3.30275 half_width=5.50459 phase=0.944272 center_min=3.1187 center_max=359.816 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=8 colour_rank=8 band_start=408 band_length=52 detectors=109 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Angle dimension_index=0 layer_index=9 count=180 detectors=180 overlap=0.7 width=6.66667 step=2 half_width=3.33333 phase=0.562306 center_min=1.12461 center_max=359.125 closed=true [4.2.1]
+encoder.colour_band dimension=Angle layer_index=9 colour_rank=9 band_start=460 band_length=52 detectors=180 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.random_bits dimension=Angle dimension_index=0 detectors=453 code_length=512 used_bits=253 shared_bits=119 max_detectors_per_bit=4 expected_density=0.0636334 random_seed=0 [4.2.1]
+encoder.layer dimension=X dimension_index=1 layer_index=0 count=2 detectors=2 overlap=0.7 width=48.3333 step=14.5 half_width=24.1667 phase=0.5 center_min=6.25 center_max=20.75 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=1 count=3 detectors=3 overlap=0.7 width=32.2222 step=9.66667 half_width=16.1111 phase=0.5 center_min=3.83333 center_max=23.1667 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=1 colour_rank=1 band_start=51 band_length=51 detectors=3 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=2 count=4 detectors=4 overlap=0.7 width=24.1667 step=7.25 half_width=12.0833 phase=0.5 center_min=2.625 center_max=24.375 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=2 colour_rank=2 band_start=102 band_length=51 detectors=4 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=3 count=5 detectors=5 overlap=0.7 width=19.3333 step=5.8 half_width=9.66667 phase=0.5 center_min=1.9 center_max=25.1 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=3 colour_rank=3 band_start=153 band_length=51 detectors=5 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=4 count=6 detectors=6 overlap=0.7 width=16.1111 step=4.83333 half_width=8.05556 phase=0.5 center_min=1.41667 center_max=25.5833 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=4 colour_rank=4 band_start=204 band_length=51 detectors=6 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=5 count=9 detectors=9 overlap=0.7 width=10.7407 step=3.22222 half_width=5.37037 phase=0.5 center_min=0.611111 center_max=26.3889 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=5 colour_rank=5 band_start=255 band_length=51 detectors=9 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=6 count=12 detectors=12 overlap=0.7 width=8.05556 step=2.41667 half_width=4.02778 phase=0.5 center_min=0.208333 center_max=26.7917 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=6 colour_rank=6 band_start=306 band_length=51 detectors=12 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=7 count=16 detectors=16 overlap=0.7 width=6.04167 step=1.8125 half_width=3.02083 phase=0.5 center_min=-0.09375 center_max=27.0938 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=7 colour_rank=7 band_start=357 band_length=51 detectors=16 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=8 count=21 detectors=21 overlap=0.7 width=4.60317 step=1.38095 half_width=2.30159 phase=0.5 center_min=-0.309524 center_max=27.3095 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=8 colour_rank=8 band_start=408 band_length=52 detectors=21 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=X dimension_index=1 layer_index=9 count=28 detectors=28 overlap=0.7 width=3.45238 step=1.03571 half_width=1.72619 phase=0.5 center_min=-0.482143 center_max=27.4821 closed=false [4.2.1]
+encoder.colour_band dimension=X layer_index=9 colour_rank=9 band_start=460 band_length=52 detectors=28 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.random_bits dimension=X dimension_index=1 detectors=106 code_length=512 used_bits=106 shared_bits=0 max_detectors_per_bit=1 expected_density=0.0636334 random_seed=0 [4.2.1]
+encoder.layer dimension=Y dimension_index=2 layer_index=0 count=2 detectors=2 overlap=0.7 width=48.3333 step=14.5 half_width=24.1667 phase=0.5 center_min=6.25 center_max=20.75 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=1 count=3 detectors=3 overlap=0.7 width=32.2222 step=9.66667 half_width=16.1111 phase=0.5 center_min=3.83333 center_max=23.1667 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=1 colour_rank=1 band_start=51 band_length=51 detectors=3 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=2 count=4 detectors=4 overlap=0.7 width=24.1667 step=7.25 half_width=12.0833 phase=0.5 center_min=2.625 center_max=24.375 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=2 colour_rank=2 band_start=102 band_length=51 detectors=4 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=3 count=5 detectors=5 overlap=0.7 width=19.3333 step=5.8 half_width=9.66667 phase=0.5 center_min=1.9 center_max=25.1 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=3 colour_rank=3 band_start=153 band_length=51 detectors=5 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=4 count=6 detectors=6 overlap=0.7 width=16.1111 step=4.83333 half_width=8.05556 phase=0.5 center_min=1.41667 center_max=25.5833 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=4 colour_rank=4 band_start=204 band_length=51 detectors=6 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=5 count=9 detectors=9 overlap=0.7 width=10.7407 step=3.22222 half_width=5.37037 phase=0.5 center_min=0.611111 center_max=26.3889 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=5 colour_rank=5 band_start=255 band_length=51 detectors=9 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=6 count=12 detectors=12 overlap=0.7 width=8.05556 step=2.41667 half_width=4.02778 phase=0.5 center_min=0.208333 center_max=26.7917 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=6 colour_rank=6 band_start=306 band_length=51 detectors=12 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=7 count=16 detectors=16 overlap=0.7 width=6.04167 step=1.8125 half_width=3.02083 phase=0.5 center_min=-0.09375 center_max=27.0938 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=7 colour_rank=7 band_start=357 band_length=51 detectors=16 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=8 count=21 detectors=21 overlap=0.7 width=4.60317 step=1.38095 half_width=2.30159 phase=0.5 center_min=-0.309524 center_max=27.3095 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=8 colour_rank=8 band_start=408 band_length=52 detectors=21 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.layer dimension=Y dimension_index=2 layer_index=9 count=28 detectors=28 overlap=0.7 width=3.45238 step=1.03571 half_width=1.72619 phase=0.5 center_min=-0.482143 center_max=27.4821 closed=false [4.2.1]
+encoder.colour_band dimension=Y layer_index=9 colour_rank=9 band_start=460 band_length=52 detectors=28 note=§3.2: цвет бита — важность; широкий слой — красные младшие биты, узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1) [3.2]
+encoder.random_bits dimension=Y dimension_index=2 detectors=106 code_length=512 used_bits=106 shared_bits=0 max_detectors_per_bit=1 expected_density=0.0636334 random_seed=0 [4.2.1]
+encoder.init dimensions=3 random_seed=0 layer_phase=true log_every=50 dims=[Angle:closed range=(0.0,360.0) bits=512 layers=[(2, 0.7), (3, 0.7), (5, 0.7), (9, 0.7), (15, 0.7), (24, 0.7), (40, 0.7), (66, 0.7), (109, 0.7), (180, 0.7)], X:open range=(-1.0,28.0) bits=512 layers=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), (21, 0.7), (28, 0.7)], Y:open range=(-1.0,28.0) bits=512 layers=[(2, 0.7), (3, 0.7), (4, 0.7), (5, 0.7), (6, 0.7), (9, 0.7), (12, 0.7), (16, 0.7), (21, 0.7), (28, 0.7)]] [4.6]
+encoder.code_length mode=merge code_length=512 segments=[(0, 512), (0, 512), (0, 512)] expected_density=0.17901 note=§2.2.3: слияние сохраняет длину, но повышает плотность и коллизии (OR, §2.2.1); конкатенация сохраняет коды координат, но удлиняет код [2.2.3]
+encoder.detectors detectors=665 [4.1]
+encoder.long_range_order dimension=Angle samples=25 monotone=true decreasing=true far_similarity=true plateau=false ordered=true profile=[(14.4, 0.588), (28.8, 0.446), (43.2, 0.383), (57.6, 0.336), (72, 0.304), (86.4, 0.279), (100.8, 0.263), (115.2, 0.247), ...] note=сходство должно убывать с расстоянием на всём диапазоне (§4.5), иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1) [5.13.1]
+encoder.long_range_order dimension=X samples=30 monotone=true decreasing=true far_similarity=true plateau=false ordered=true profile=[(1, 0.898), (2, 0.79), (3, 0.678), (4, 0.586), (5, 0.516), (6, 0.457), (7, 0.418), (8, 0.381), ...] note=сходство должно убывать с расстоянием на всём диапазоне (§4.5), иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1) [5.13.1]
+encoder.long_range_order dimension=Y samples=30 monotone=true decreasing=true far_similarity=true plateau=false ordered=true profile=[(1, 0.898), (2, 0.79), (3, 0.678), (4, 0.586), (5, 0.516), (6, 0.457), (7, 0.418), (8, 0.381), ...] note=сходство должно убывать с расстоянием на всём диапазоне (§4.5), иначе раскладка не воспроизведёт дальний порядок координаты (§5.13.1) [5.13.1]
+pinwheel.stimulus positions=((10, 10), (20, 10), (10, 20), (20, 20)) segments={Angle=(0, 512), X=(0, 512), Y=(0, 512)} angles_per_position=360 stimuli=1440 [4.6]
+encoder.encode.input stimuli=1 values=(0, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(0, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(25, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(25, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=89 active_bits_mean=89 density=0.173828 shared_bits=7 shared_bits_mean=7 code=BitArray(len=512, ones=89) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(50, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(50, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=4 shared_bits_mean=4 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(75, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(75, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(100, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(100, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(125, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(125, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=4 shared_bits_mean=4 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(150, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(150, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=89 active_bits_mean=89 density=0.173828 shared_bits=6 shared_bits_mean=6 code=BitArray(len=512, ones=89) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(175, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(175, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(200, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(200, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(225, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(225, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=2 shared_bits_mean=2 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(250, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(250, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=94 active_bits_mean=94 density=0.183594 shared_bits=3 shared_bits_mean=3 code=BitArray(len=512, ones=94) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(275, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(275, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=91 active_bits_mean=91 density=0.177734 shared_bits=3 shared_bits_mean=3 code=BitArray(len=512, ones=91) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(300, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(300, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=6 shared_bits_mean=6 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(325, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(325, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=93 active_bits_mean=93 density=0.181641 shared_bits=3 shared_bits_mean=3 code=BitArray(len=512, ones=93) label=None measurements=0 [2]
+encoder.encode.input stimuli=1 values=(350, 10, 10) dimensions=3 [4.6]
+encoder.encode.normalized stimuli=1 values=(350, 10, 10) [4.4]
+encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits=5 shared_bits_mean=5 code=BitArray(len=512, ones=90) label=None measurements=0 [2]
+pinwheel.codes angles=360 positions=4 stimuli=1440 code_length=512 expected_density=0.17901 [4.6]
+C:\Projects\DAMP\.venv\Lib\site-packages\rerun\dynamic_archetype.py:152: RerunWarning: Converting data for 'positions': ArrowTypeError(Expected a string or bytes dtype, got int64)
+  archetype._optional_archetype(None, drop_untyped_nones, components=kwargs)
+layout.tune points=1440 grid_size_est=38 empty_ratio=0 start_radius_factor=0.5 long_pairs_per_step=144 long_steps=50000 long_subset_size=-1 long_subset_mode=full_space long_subset_refresh=80 short_pairs_per_step=144 short_steps=2500 short_local_radius=3 short_energy_radius=3 short_energy_recalc_every=416 neighbourhood_sample_side=-1 lambda_threshold=0.65 eta=hard [7.1.7]
+layout.energy.neighbourhood_sample.config sample_side=-1 mode=full_window note=энергия окрестности гауссова ядра по случайной выборке её ячеек: окно делится на слои side × side, из слоя берётся одна случайная ячейка (§5.9.4); None — по всем ячейкам [5.9.4]
+layout.sim_matrix.ready points=1440 code_len=512 [5.9.5]
+layout.init points=1440 labels=360 seed=0 [5.2]
+layout.grid grid_size=38 empty_ratio=0 [7.1.6]
+layout.similarity similarity=cosine [2.2.4]
+layout.thresholds lambda_threshold=0.65 eta=None [5.4]
+layout.energy.distance long_distance=euclidean short_distance=squared note=euclidean = d из §5.5; squared = сумма квадратов без корня (§5.9.2) [5.9.2]
+layout.energy.long.kernel kernel=distance radius_min=3 width=1 note=distance — φ = Σ s·d по всему V (§5.5.1); gauss — расширение статьи: φ = Σ s·exp(−d²/2σ²) по окрестности r(t) = радиусу выбора пар (§7.1.7), σ = width·r, максимизация [5.5.1]
+layout.similarity_threshold lambda_threshold=0.65 eta=0 eta_mode=hard_cutoff function=sim if sim >= lambda else 0 [5.4]
+C:\Projects\DAMP\.venv\Lib\site-packages\rerun\dynamic_archetype.py:152: RerunWarning: Converting data for 'eta': ArrowTypeError(Expected a string or bytes dtype, got float64)
+  archetype._optional_archetype(None, drop_untyped_nones, components=kwargs)
+layout.precompute precompute_similarity=true [5.9.5]
+layout.precompute_limit max_precompute=2000 [5.9.5]
+layout.energy.subset.config long_subset_size=-1 long_subset_refresh=80 long_subset_min_neighbours=50 points=1440 [5.9.4]
+layout.parallel parallel_workers=None [5.10]
+layout.gpu.config use_gpu=true [5.12]
+layout.codes code_length=512 ones_min=79 ones_max=97 ones_avg=87.2104 [2]
+layout.distance_eps distance_eps=1e-06 [вне статьи]
+layout.gpu.pair_energy.unavailable error=No module named 'torch' [5.12]
+layout.gpu.import_failed error=No module named 'moderngl' [5.12]
+layout.gpu.tensor.unavailable error=No module named 'torch' [5.12]
+layout.gpu.disabled status=cpu [5.12]
+layout.parallel.cpu_count cpu_count=14 [5.10]
+layout.sim_cache.start point_count=1440 [5.9.5]
+layout.sim_cache.similarity similarity=cosine [2.2.4]
+layout.sim_cache.parallel workers=14 [5.10]
+layout.sim_cache.gpu use_gpu=true [5.12]
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=3032, pipe_handle=932)
+                                                  ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\spawn.py", line 122, in spawn_main
+    exitcode = _main(fd, parent_sentinel)
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\spawn.py", line 131, in _main
+    prepare(preparation_data)
+    ~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\spawn.py", line 246, in prepare
+    _fixup_main_from_path(data['init_main_from_path'])
+    ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\spawn.py", line 297, in _fixup_main_from_path
+    main_content = runpy.run_path(main_path,
+                                  run_name="__mp_main__")
+  File "<frozen runpy>", line 294, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\USER~1\AppData\Local\Temp\claude\b575fa1b03f2dfc0\93b2e406-adca-4fb8-b843-cc038e18844d\scratchpad\damp_only_baseline.py", line 15, in <module>
+    ).run()
+      ~~~^^
+  File "C:\Projects\DAMP\pinwheel_test.py", line 308, in run
+    layout = self.build_layout(codes, params=run_params, initial_cells=initial_cells)
+  File "C:\Projects\DAMP\pinwheel_test.py", line 270, in build_layout
+    return Layout(
+        codes,
+    ...<19 lines>...
+        **_sparse_layout_options(),
+    )
+  File "C:\Projects\DAMP\damp\layout\damp_layout.py", line 1985, in __init__
+    self._build_similarity_cache()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Projects\DAMP\damp\layout\damp_layout.py", line 6315, in _build_similarity_cache
+    for chunk in executor.map(_compute_similarity_stride, tasks):
+                 ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\concurrent\futures\process.py", line 850, in map
+    results = super().map(partial(_process_chunk, fn),
+                          itertools.batched(zip(*iterables), chunksize),
+                          timeout=timeout,
+                          buffersize=buffersize)
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\concurrent\futures\_base.py", line 618, in map
+    fs = [self.submit(fn, *args) for args in zipped_iterables]
+          ~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\concurrent\futures\process.py", line 816, in submit
+    self._adjust_process_count()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\concurrent\futures\process.py", line 775, in _adjust_process_count
+    self._spawn_process()
+    ~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\concurrent\futures\process.py", line 793, in _spawn_process
+    p.start()
+    ~~~~~~~^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\process.py", line 121, in start
+    self._popen = self._Popen(self)
+                  ~~~~~~~~~~~^^^^^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\context.py", line 343, in _Popen
+    return Popen(process_obj)
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\popen_spawn_win32.py", line 47, in __init__
+    prep_data = spawn.get_preparation_data(process_obj._name)
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\spawn.py", line 164, in get_preparation_data
+    _check_not_importing_main()
+    ~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\spawn.py", line 140, in _check_not_importing_main
+    raise RuntimeError('''
+    ...<16 lines>...
+    ''')
+RuntimeError: 
+        An attempt has been made to start a new process before the
+        current process has finished its bootstrapping phase.
+
+        This probably means that you are not using fork to start your
+        child processes and you have forgotten to use the proper idiom
+        in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce an executable.
+
+        To fix this issue, refer to the "Safe importing of main module"
+        section in https://docs.python.org/3/library/multiprocessing.html
+        
+2026-11-12T07:12:05.754669Z ERROR re_grpc_server: Error while receiving messages: h2 protocol error: error reading a body from connection
