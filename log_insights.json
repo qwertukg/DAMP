@@ -12,15 +12,14 @@
   "families": [
     {
       "family": 0,
-      "label": "layout (видов строк: 85)",
-      "lines": 5470,
-      "types": 55,
+      "label": "layout (видов строк: 77)",
+      "lines": 5448,
+      "types": 70,
       "members": [
         "layout.short.parallel pairs=144 workers=8 partitions=8 chunk_size=18 [5.10]",
         "layout.cache.miss count=100 label=None [7.1.7]",
         "layout.run.progress step=1 mode=long accepted_swaps=1106 evaluated_pairs=4000 swap_ratio=0.2765 avg_ratio=0.2…",
         "layout.energy.long.progress step=1 energy=0.283335 energy_prev=None energy_minimization=0 radius=15 [5.8]",
-        "layout.energy.long.progress step=26 energy=0.360289 energy_prev=0.283335 energy_minimization=-0.0769539 radiu…",
         "layout.run.done mode=long final_step=5226 steps=5226 total_swaps=217141 avg_swaps=41.5501 [5.2]",
         "layout.run.progress step=5231 mode=short accepted_swaps=16 evaluated_pairs=199 swap_ratio=0.080402 avg_ratio=…",
         "layout.run.done mode=short final_step=6602 steps=1376 total_swaps=1938 avg_swaps=1.40843 [5.2]",
@@ -57,6 +56,7 @@
         "layout.run.mode mode=long local_radius=None [5.5.1]",
         "layout.run.settings steps=50000 min_swap_ratio=0.0001 min_swap_window=20 log_every=150 log_visuals=true step_…",
         "layout.run.energy_monitor energy_radius=3 [5.8]",
+        "layout.run.energy_target every=200 energy_radius=3 energy_target=None note=шаги повторяются, пока число обмен…",
         "layout.run.swap_monitor min_swap_ratio=0.0001 window=20 pairs_per_step=144 [5.6]",
         "layout.energy.subset.full points=1440 selected=1440 [5.9.4]",
         "layout.energy.long.similarity similarity=cosine pairs=144 points=1440 [2.2.4]",
@@ -71,9 +71,7 @@
         "layout.energy.long.progress step=1 energy=0.463622 energy_prev=None energy_gain=0 radius=3 [5.8]",
         "layout.adaptive.radius step=1 pair_radius=19 swap_rate=None stage_initial_swaps=None swap_ratio=None lambda_t…",
         "layout.visual step=151 points=1440 grid_size=38 energy=0.463622 energy_diff=None energy_radius=None energy_so…",
-        "layout.energy.long.progress step=201 energy=0.744318 energy_prev=0.463622 energy_gain=0.280697 radius=3 [5.8]",
         "layout.adaptive.radius step=201 pair_radius=19 swap_rate=9.3 stage_initial_swaps=59.4 swap_ratio=0.156566 lam…",
-        "layout.visual step=301 points=1440 grid_size=38 energy=0.744318 energy_diff=0.280697 energy_radius=None energ…",
         "layout.adaptive.trigger step=1173 swap_rate=0.5 stage_initial_swaps=59.4 swap_ratio=0.00841751 swap_ratio_tri…",
         "layout.similarity_threshold.cache_reset reason=adaptive_lambda lambda_threshold=0.7 eta=None dropped_rows=144…",
         "layout.adaptive.lambda step=1173 lambda_threshold=0.7 swap_ratio=0.00841751 [7.1.7]",
@@ -91,65 +89,57 @@
         "layout.render_component_image height=38 width=38 coloring=stimulus_component period=360 [5.13.2]",
         "layout.point_energy.map radius=3 points=1440 energy_max=13.9544 energy_mean_normalized=0.828709 [5.7]",
         "layout.render_energy_image height=38 width=38 coloring=code_bits_times_energy energy_mean=0.828709 [5.14]",
+        "layout.payload.base path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-c…",
         "layout.export.json path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-cc…",
-        "layout.visual step=1 points=1440 grid_size=47 energy=None energy_diff=None energy_radius=None energy_source=N…",
         "layout.adaptive.lambda step=896 lambda_threshold=0.75 swap_ratio=None [7.1.7]",
-        "layout.payload.base path=elastic_pinwheel_damp.json points=1440 points_written=true similarity=cosine lambda_…",
-        "layout.export.json path=elastic_pinwheel_damp.json points=1440 width=47 height=47 [вне статьи]",
-        "layout.payload.base path=elastic_pinwheel_damp_full.json points=1440 points_written=true similarity=cosine la…",
-        "layout.export.json path=elastic_pinwheel_damp_full.json points=1440 width=38 height=38 [вне статьи]",
-        "layout = self.build_layout(codes, params=run_params, initial_cells=initial_cells)",
-        "File \"C:\\Projects\\DAMP\\pinwheel_test.py\", line 270, in build_layout",
-        "return Layout("
+        "layout = self.build_layout(codes, params=run_params, initial_cells=initial_cells)"
       ]
     },
     {
       "family": 1,
-      "label": "detectors (видов строк: 4)",
-      "lines": 167,
-      "types": 4,
+      "label": "encoder (видов строк: 8)",
+      "lines": 624,
+      "types": 8,
       "members": [
-        "detectors.init count=2 overlap=0.7 [4.1]",
-        "activation.detector.scale.resolve layout_width=77 layout_height=77 reference_extent=51 scale_factor=1.5098 ra…",
-        "detectors.geometric_layers layers_count=10 widest=2 narrowest=180 overlap=0.7 counts=[2, 3, 5, 9, 15, 24, 40,…",
-        "encoder.detectors detectors=665 [4.1]"
-      ]
-    },
-    {
-      "family": 2,
-      "label": "encoder (видов строк: 7)",
-      "lines": 633,
-      "types": 5,
-      "members": [
-        "encoder.layer dimension=X dimension_index=1 layer_index=0 count=2 detectors=2 overlap=0.7 width=48.3333 step=…",
-        "encoder.layer dimension=Angle dimension_index=0 layer_index=0 count=2 detectors=2 overlap=0.7 width=360 step=…",
         "encoder.colour_band dimension=Angle layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=…",
-        "encoder.colour_band dimension=X layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2…",
+        "encoder.layer dimension=Angle dimension_index=0 layer_index=0 count=2 detectors=2 overlap=0.7 width=360 step=…",
+        "encoder.random_bits dimension=Angle dimension_index=0 detectors=453 code_length=512 used_bits=253 shared_bits…",
         "encoder.init dimensions=3 random_seed=0 layer_phase=true log_every=50 dims=[Angle:closed range=(0.0,360.0) bi…",
+        "encoder.detectors detectors=665 [4.1]",
         "encoder.encode.input stimuli=1 values=(0, 10, 10) dimensions=3 [4.6]",
-        "encoder.encode.normalized stimuli=1 values=(0, 10, 10) [4.4]"
-      ]
-    },
-    {
-      "family": 3,
-      "label": "encoder encode code stimuli …",
-      "lines": 103,
-      "types": 1,
-      "members": [
+        "encoder.encode.normalized stimuli=1 values=(0, 10, 10) [4.4]",
         "encoder.encode.code stimuli=1 code_length=512 active_bits=90 active_bits_mean=90 density=0.175781 shared_bits…"
       ]
     },
     {
+      "family": 2,
+      "label": "detectors count * overlap (видов строк: 2)",
+      "lines": 154,
+      "types": 2,
+      "members": [
+        "detectors.init count=2 overlap=0.7 [4.1]",
+        "detectors.geometric_layers layers_count=10 widest=2 narrowest=180 overlap=0.7 counts=[2, 3, 5, 9, 15, 24, 40,…"
+      ]
+    },
+    {
+      "family": 3,
+      "label": "encoder layer dimension * …",
+      "lines": 140,
+      "types": 1,
+      "members": [
+        "encoder.layer dimension=X dimension_index=1 layer_index=0 count=2 detectors=2 overlap=0.7 width=48.3333 step=…"
+      ]
+    },
+    {
       "family": 4,
-      "label": "hierarchy (видов строк: 5)",
-      "lines": 122,
+      "label": "hierarchy * (видов строк: 4)",
+      "lines": 121,
       "types": 4,
       "members": [
         "hierarchy.composition.encode features=9 active_bits=875 code_length=26624 density=0.0328651 [4.6]",
         "hierarchy.training.samples split=train layout_images=100 embedding_images=100 layout_source_indices=[0, 1, 2,…",
         "hierarchy.local.encode level=1 windows=9 nonempty=9 [6.2]",
-        "hierarchy.parts.encode level=2 parts=9 nonempty=9 [6.2]",
-        "hierarchy.training.completed levels=3 train_images=100 local_windows=857 parts_points=780 composition_points=…"
+        "hierarchy.parts.encode level=2 parts=9 nonempty=9 [6.2]"
       ]
     },
     {
@@ -163,6 +153,18 @@
     },
     {
       "family": 6,
+      "label": "layout * (видов строк: 4)",
+      "lines": 32,
+      "types": 4,
+      "members": [
+        "layout.visual step=1 points=1440 grid_size=47 energy=None energy_diff=None energy_radius=None energy_source=N…",
+        "layout.continuity.start sweeps=500 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …",
+        "layout.energy.neighbourhood_sample.config sample_side=-1 mode=full_window note=энергия окрестности гауссова я…",
+        "layout.pair_sampling.merged_draws merged=true note=смещения dy, dx второй точки пары (§5.3) одним запросом к …"
+      ]
+    },
+    {
+      "family": 7,
       "label": "activation detector layer lambda …",
       "lines": 18,
       "types": 1,
@@ -171,30 +173,20 @@
       ]
     },
     {
-      "family": 7,
-      "label": "dimension init title min … (видов строк: 2)",
+      "family": 8,
+      "label": "dimension init title * … (видов строк: 2)",
       "lines": 21,
-      "types": 1,
+      "types": 2,
       "members": [
         "dimension.init title=X min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false …",
         "dimension.init title=Angle min_value=0 max_value=360 closed=true period=360 code_length=512 edge_detectors=fa…"
       ]
     },
     {
-      "family": 8,
-      "label": "encoder random bits dimension … (видов строк: 2)",
-      "lines": 21,
-      "types": 2,
-      "members": [
-        "encoder.random_bits dimension=X dimension_index=1 detectors=106 code_length=512 used_bits=106 shared_bits=0 m…",
-        "encoder.random_bits dimension=Angle dimension_index=0 detectors=453 code_length=512 used_bits=253 shared_bits…"
-      ]
-    },
-    {
       "family": 9,
       "label": "encoder long range order … (видов строк: 2)",
       "lines": 21,
-      "types": 1,
+      "types": 2,
       "members": [
         "encoder.long_range_order dimension=X samples=30 monotone=true decreasing=true far_similarity=true plateau=fal…",
         "encoder.long_range_order dimension=Angle samples=25 monotone=true decreasing=true far_similarity=true plateau…"
@@ -202,9 +194,9 @@
     },
     {
       "family": 10,
-      "label": "decoder (видов строк: 6)",
+      "label": "decoder * (видов строк: 6)",
       "lines": 24,
-      "types": 4,
+      "types": 5,
       "members": [
         "decoder.evaluation.sample sample=21 expected=9 predicted=7 correct=false running_accuracy=0.47619 confidence=…",
         "decoder.parameters.scale.resolve embeddings=1000 reference_embeddings=100 scale_factor=10 knn_top_k=5 tempera…",
@@ -225,7 +217,7 @@
     },
     {
       "family": 12,
-      "label": "elastic map epochs width …",
+      "label": "elastic map * epochs …",
       "lines": 10,
       "types": 1,
       "members": [
@@ -252,24 +244,24 @@
     },
     {
       "family": 15,
-      "label": "layout (видов строк: 10)",
-      "lines": 25,
-      "types": 9,
+      "label": "layout run settings steps …",
+      "lines": 6,
+      "types": 1,
       "members": [
-        "layout.run.settings steps=5000 min_swap_ratio=0.001 min_swap_window=50 log_every=150 log_visuals=true step_of…",
-        "layout.continuity.start sweeps=500 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …",
-        "layout.long.quality.structural dynamics_converged=true local_quality_accepted=true local_discontinuity_ratio=…",
-        "layout.continuity.start sweeps=100 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …",
-        "decoder.build layout_path=data\\layout-1000-7-direction-absolute-hierarchy-v5-strict-v2.json hierarchy_layouts…",
-        "layout.energy.neighbourhood_sample.config sample_side=-1 mode=full_window note=энергия окрестности гауссова я…",
-        "layout.pair_sampling.merged_draws merged=true note=смещения dy, dx второй точки пары (§5.3) одним запросом к …",
-        "layout.run.energy_target every=200 energy_radius=3 energy_target=None note=шаги повторяются, пока число обмен…",
-        "layout.run.speculative mode=short pairs_per_step=144 points=1440 pairs_per_point=0.1 note=пары шага считаются…",
-        "layout.payload.base path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-c…"
+        "layout.run.settings steps=5000 min_swap_ratio=0.001 min_swap_window=50 log_every=150 log_visuals=true step_of…"
       ]
     },
     {
       "family": 16,
+      "label": "activation detector scale resolve …",
+      "lines": 6,
+      "types": 1,
+      "members": [
+        "activation.detector.scale.resolve layout_width=77 layout_height=77 reference_extent=51 scale_factor=1.5098 ra…"
+      ]
+    },
+    {
+      "family": 17,
       "label": "activation engine init points … (видов строк: 2)",
       "lines": 12,
       "types": 2,
@@ -279,7 +271,7 @@
       ]
     },
     {
-      "family": 17,
+      "family": 18,
       "label": "batch any batch value …",
       "lines": 6,
       "types": 1,
@@ -288,21 +280,14 @@
       ]
     },
     {
-      "family": 18,
-      "label": "pinwheel stimulus positions segments …",
-      "lines": 5,
-      "types": 1,
-      "members": [
-        "pinwheel.stimulus positions=((10, 10), (20, 10), (10, 20), (20, 20)) segments={Angle=(0, 512), X=(0, 512), Y=…"
-      ]
-    },
-    {
       "family": 19,
-      "label": "pinwheel codes angles positions …",
-      "lines": 5,
-      "types": 1,
+      "label": "pinwheel * (видов строк: 3)",
+      "lines": 13,
+      "types": 3,
       "members": [
-        "pinwheel.codes angles=360 positions=4 stimuli=1440 code_length=512 expected_density=0.17901 [4.6]"
+        "pinwheel.stimulus positions=((10, 10), (20, 10), (10, 20), (20, 20)) segments={Angle=(0, 512), X=(0, 512), Y=…",
+        "pinwheel.codes angles=360 positions=4 stimuli=1440 code_length=512 expected_density=0.17901 [4.6]",
+        "pinwheel.long_range opposite_angle_similarity=0.748073 lambda_threshold=0.65 note=Противоположные углы сравни…"
       ]
     },
     {
@@ -317,9 +302,9 @@
     },
     {
       "family": 21,
-      "label": "layout tune points grid … (видов строк: 2)",
+      "label": "layout tune points * … (видов строк: 2)",
       "lines": 8,
-      "types": 1,
+      "types": 2,
       "members": [
         "layout.tune points=1440 grid_size_est=38 empty_ratio=0 start_radius_factor=0.5 long_pairs_per_step=144 long_s…",
         "layout.tune points=3886 grid_size_est=77 empty_ratio=0.5 start_radius_factor=0.5 long_pairs_per_step=4000 lon…"
@@ -327,12 +312,13 @@
     },
     {
       "family": 22,
-      "label": "activation embedding saturation resolve … (видов строк: 2)",
-      "lines": 6,
-      "types": 1,
+      "label": "activation embedding (видов строк: 3)",
+      "lines": 7,
+      "types": 2,
       "members": [
         "activation.embedding.saturation.resolve output_bits=2048 scale_factor=1.5098 base_active_bits=125 saturation_…",
-        "activation.embedding.saturation.resolve output_bits=2048 scale_factor=0.254902 base_active_bits=125 saturatio…"
+        "activation.embedding.saturation.resolve output_bits=2048 scale_factor=0.254902 base_active_bits=125 saturatio…",
+        "pinwheel.image.save image=elastic_pinwheel_damp.png component_image=elastic_pinwheel_damp.angle.png energy_im…"
       ]
     },
     {
@@ -365,17 +351,26 @@
     },
     {
       "family": 26,
-      "label": "layout ratio max min (видов строк: 3)",
-      "lines": 6,
+      "label": "layout run speculative mode … (видов строк: 2)",
+      "lines": 5,
       "types": 1,
       "members": [
-        "layout.adaptive.config mode=short start_radius=3 end_radius=1 radius_schedule=swaps radius_factor=0.5 swap_ra…",
-        "layout.long.quality.structural dynamics_converged=true local_quality_accepted=false local_discontinuity_ratio…",
-        "layout.adaptive.config mode=long start_radius=19 end_radius=1 radius_schedule=swaps radius_factor=0.5 swap_ra…"
+        "layout.run.speculative mode=short pairs_per_step=144 points=1440 pairs_per_point=0.1 note=пары шага считаются…",
+        "layout.run.speculative mode=long pairs_per_step=144 points=1440 pairs_per_point=0.1 note=пары шага считаются …"
       ]
     },
     {
       "family": 27,
+      "label": "layout adaptive config mode … (видов строк: 2)",
+      "lines": 5,
+      "types": 1,
+      "members": [
+        "layout.adaptive.config mode=short start_radius=3 end_radius=1 radius_schedule=swaps radius_factor=0.5 swap_ra…",
+        "layout.adaptive.config mode=long start_radius=19 end_radius=1 radius_schedule=swaps radius_factor=0.5 swap_ra…"
+      ]
+    },
+    {
+      "family": 28,
       "label": "pinwheel quality mean neighbour …",
       "lines": 3,
       "types": 1,
@@ -384,21 +379,12 @@
       ]
     },
     {
-      "family": 28,
-      "label": "pinwheel long range opposite …",
-      "lines": 3,
+      "family": 29,
+      "label": "layout continuity start sweeps …",
+      "lines": 2,
       "types": 1,
       "members": [
-        "pinwheel.long_range opposite_angle_similarity=0.748073 lambda_threshold=0.65 note=Противоположные углы сравни…"
-      ]
-    },
-    {
-      "family": 29,
-      "label": "layout run speculative mode …",
-      "lines": 2,
-      "types": 0,
-      "members": [
-        "layout.run.speculative mode=long pairs_per_step=144 points=1440 pairs_per_point=0.1 note=пары шага считаются …"
+        "layout.continuity.start sweeps=100 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …"
       ]
     },
     {
@@ -450,7 +436,7 @@
       "family": 35,
       "label": "sharp transition ratio",
       "lines": 2,
-      "types": 0,
+      "types": 1,
       "members": [
         "\"sharp_transition_ratio\": 0.2601994560290118,"
       ]
@@ -502,12 +488,11 @@
     },
     {
       "family": 41,
-      "label": "points (видов строк: 2)",
-      "lines": 3,
+      "label": "points",
+      "lines": 2,
       "types": 1,
       "members": [
-        "\"points\": 1440,",
-        "mnist.codes count=100 label=all angles=3758 points=3886 [1.2.2]"
+        "\"points\": 1440,"
       ]
     },
     {
@@ -539,20 +524,49 @@
     },
     {
       "family": 45,
-      "label": "save path data layout … (видов строк: 6)",
-      "lines": 6,
-      "types": 3,
+      "label": "path data layout direction … (видов строк: 7)",
+      "lines": 7,
+      "types": 6,
       "members": [
         "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…",
         "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…",
         "activation.embedding.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.10903b8804e02…",
         "hierarchy.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.local-codes-v…",
         "hierarchy.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.hierarchy-v1.…",
-        "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…"
+        "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…",
+        "decoder.build layout_path=data\\layout-1000-7-direction-absolute-hierarchy-v5-strict-v2.json hierarchy_layouts…"
       ]
     },
     {
       "family": 46,
+      "label": "mnist codes count * …",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "mnist.codes count=100 label=all angles=3758 points=3886 [1.2.2]"
+      ]
+    },
+    {
+      "family": 47,
+      "label": "layout long quality structural … (видов строк: 2)",
+      "lines": 2,
+      "types": 1,
+      "members": [
+        "layout.long.quality.structural dynamics_converged=true local_quality_accepted=true local_discontinuity_ratio=…",
+        "layout.long.quality.structural dynamics_converged=true local_quality_accepted=false local_discontinuity_ratio…"
+      ]
+    },
+    {
+      "family": 48,
+      "label": "hierarchy training completed levels …",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "hierarchy.training.completed levels=3 train_images=100 local_windows=857 parts_points=780 composition_points=…"
+      ]
+    },
+    {
+      "family": 49,
       "label": "раскладка завершена elapsed seconds …",
       "lines": 1,
       "types": 1,
@@ -561,7 +575,7 @@
       ]
     },
     {
-      "family": 47,
+      "family": 50,
       "label": "decoder layout use path …",
       "lines": 1,
       "types": 1,
@@ -570,7 +584,7 @@
       ]
     },
     {
-      "family": 48,
+      "family": 51,
       "label": "тестирование завершено elapsed seconds …",
       "lines": 1,
       "types": 1,
@@ -579,7 +593,7 @@
       ]
     },
     {
-      "family": 49,
+      "family": 52,
       "label": "pinwheel image save image …",
       "lines": 1,
       "types": 1,
@@ -588,38 +602,35 @@
       ]
     },
     {
-      "family": 50,
-      "label": "pinwheel initial cells points … (видов строк: 2)",
-      "lines": 2,
-      "types": 2,
-      "members": [
-        "pinwheel.initial_cells points=1440 width=47 height=47 note=дальний порядок задан внешней расстановкой: дальня…",
-        "pinwheel.initial_cells points=1440 width=38 height=38 long_phase=true note=случайная расстановка §5.2 заменен…"
-      ]
-    },
-    {
-      "family": 51,
-      "label": "pinwheel image save image …",
+      "family": 53,
+      "label": "pinwheel initial cells points …",
       "lines": 1,
       "types": 1,
       "members": [
-        "pinwheel.image.save image=elastic_pinwheel_damp.png component_image=elastic_pinwheel_damp.angle.png energy_im…"
+        "pinwheel.initial_cells points=1440 width=47 height=47 note=дальний порядок задан внешней расстановкой: дальня…"
       ]
     },
     {
-      "family": 52,
-      "label": "error (видов строк: 4)",
-      "lines": 4,
-      "types": 4,
+      "family": 54,
+      "label": "error re grpc messages (видов строк: 2)",
+      "lines": 2,
+      "types": 2,
       "members": [
         "2026-11-12T07:08:04.660986Z ERROR re_grpc_client::write: Write messages call failed: transport error",
-        "raise RuntimeError('''",
-        "RuntimeError:",
         "2026-11-12T07:12:05.754669Z ERROR re_grpc_server: Error while receiving messages: h2 protocol error: error re…"
       ]
     },
     {
-      "family": 53,
+      "family": 55,
+      "label": "pinwheel initial cells points …",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "pinwheel.initial_cells points=1440 width=38 height=38 long_phase=true note=случайная расстановка §5.2 заменен…"
+      ]
+    },
+    {
+      "family": 56,
       "label": "pinwheel image save image …",
       "lines": 1,
       "types": 1,
@@ -628,7 +639,7 @@
       ]
     },
     {
-      "family": 54,
+      "family": 57,
       "label": "error re sdk recording …",
       "lines": 1,
       "types": 1,
@@ -637,7 +648,7 @@
       ]
     },
     {
-      "family": 55,
+      "family": 58,
       "label": "traceback most recent call …",
       "lines": 1,
       "types": 1,
@@ -646,8 +657,8 @@
       ]
     },
     {
-      "family": 56,
-      "label": "file string line in …",
+      "family": 59,
+      "label": "file string line * …",
       "lines": 1,
       "types": 1,
       "members": [
@@ -655,7 +666,7 @@
       ]
     },
     {
-      "family": 57,
+      "family": 60,
       "label": "from multiprocessing spawn import …",
       "lines": 1,
       "types": 1,
@@ -664,7 +675,7 @@
       ]
     },
     {
-      "family": 58,
+      "family": 61,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -673,7 +684,7 @@
       ]
     },
     {
-      "family": 59,
+      "family": 62,
       "label": "exitcode main fd parent …",
       "lines": 1,
       "types": 1,
@@ -682,7 +693,7 @@
       ]
     },
     {
-      "family": 60,
+      "family": 63,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -691,7 +702,7 @@
       ]
     },
     {
-      "family": 61,
+      "family": 64,
       "label": "prepare preparation data",
       "lines": 1,
       "types": 1,
@@ -700,7 +711,7 @@
       ]
     },
     {
-      "family": 62,
+      "family": 65,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -709,7 +720,7 @@
       ]
     },
     {
-      "family": 63,
+      "family": 66,
       "label": "fixup main from path …",
       "lines": 1,
       "types": 1,
@@ -718,7 +729,7 @@
       ]
     },
     {
-      "family": 64,
+      "family": 67,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -727,7 +738,7 @@
       ]
     },
     {
-      "family": 65,
+      "family": 68,
       "label": "main content runpy run …",
       "lines": 1,
       "types": 1,
@@ -736,7 +747,7 @@
       ]
     },
     {
-      "family": 66,
+      "family": 69,
       "label": "run name mp main",
       "lines": 1,
       "types": 1,
@@ -745,7 +756,7 @@
       ]
     },
     {
-      "family": 67,
+      "family": 70,
       "label": "file frozen runpy line …",
       "lines": 1,
       "types": 1,
@@ -754,7 +765,7 @@
       ]
     },
     {
-      "family": 68,
+      "family": 71,
       "label": "file frozen runpy line …",
       "lines": 1,
       "types": 1,
@@ -763,7 +774,7 @@
       ]
     },
     {
-      "family": 69,
+      "family": 72,
       "label": "file frozen runpy line …",
       "lines": 1,
       "types": 1,
@@ -772,7 +783,7 @@
       ]
     },
     {
-      "family": 70,
+      "family": 73,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -781,7 +792,7 @@
       ]
     },
     {
-      "family": 71,
+      "family": 74,
       "label": "run",
       "lines": 1,
       "types": 1,
@@ -790,7 +801,7 @@
       ]
     },
     {
-      "family": 72,
+      "family": 75,
       "label": "file projects damp pinwheel …",
       "lines": 1,
       "types": 1,
@@ -799,7 +810,25 @@
       ]
     },
     {
-      "family": 73,
+      "family": 76,
+      "label": "file projects damp pinwheel …",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "File \"C:\\Projects\\DAMP\\pinwheel_test.py\", line 270, in build_layout"
+      ]
+    },
+    {
+      "family": 77,
+      "label": "return layout",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "return Layout("
+      ]
+    },
+    {
+      "family": 78,
       "label": "codes",
       "lines": 1,
       "types": 1,
@@ -808,7 +837,7 @@
       ]
     },
     {
-      "family": 74,
+      "family": 79,
       "label": "sparse layout options",
       "lines": 1,
       "types": 1,
@@ -817,7 +846,7 @@
       ]
     },
     {
-      "family": 75,
+      "family": 80,
       "label": "file projects damp damp …",
       "lines": 1,
       "types": 1,
@@ -826,7 +855,7 @@
       ]
     },
     {
-      "family": 76,
+      "family": 81,
       "label": "self build similarity cache",
       "lines": 1,
       "types": 1,
@@ -835,7 +864,7 @@
       ]
     },
     {
-      "family": 77,
+      "family": 82,
       "label": "file projects damp damp …",
       "lines": 1,
       "types": 1,
@@ -844,7 +873,7 @@
       ]
     },
     {
-      "family": 78,
+      "family": 83,
       "label": "for chunk in executor …",
       "lines": 1,
       "types": 1,
@@ -853,7 +882,7 @@
       ]
     },
     {
-      "family": 79,
+      "family": 84,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -862,7 +891,7 @@
       ]
     },
     {
-      "family": 80,
+      "family": 85,
       "label": "results super map partial …",
       "lines": 1,
       "types": 1,
@@ -871,7 +900,7 @@
       ]
     },
     {
-      "family": 81,
+      "family": 86,
       "label": "itertools batched zip iterables …",
       "lines": 1,
       "types": 1,
@@ -880,7 +909,7 @@
       ]
     },
     {
-      "family": 82,
+      "family": 87,
       "label": "timeout timeout",
       "lines": 1,
       "types": 1,
@@ -889,7 +918,7 @@
       ]
     },
     {
-      "family": 83,
+      "family": 88,
       "label": "buffersize buffersize",
       "lines": 1,
       "types": 1,
@@ -898,7 +927,7 @@
       ]
     },
     {
-      "family": 84,
+      "family": 89,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -907,7 +936,7 @@
       ]
     },
     {
-      "family": 85,
+      "family": 90,
       "label": "fs self submit fn …",
       "lines": 1,
       "types": 1,
@@ -916,7 +945,7 @@
       ]
     },
     {
-      "family": 86,
+      "family": 91,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -925,7 +954,7 @@
       ]
     },
     {
-      "family": 87,
+      "family": 92,
       "label": "self adjust process count",
       "lines": 1,
       "types": 1,
@@ -934,7 +963,7 @@
       ]
     },
     {
-      "family": 88,
+      "family": 93,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -943,7 +972,7 @@
       ]
     },
     {
-      "family": 89,
+      "family": 94,
       "label": "self spawn process",
       "lines": 1,
       "types": 1,
@@ -952,7 +981,7 @@
       ]
     },
     {
-      "family": 90,
+      "family": 95,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -961,7 +990,7 @@
       ]
     },
     {
-      "family": 91,
+      "family": 96,
       "label": "start",
       "lines": 1,
       "types": 1,
@@ -970,7 +999,7 @@
       ]
     },
     {
-      "family": 92,
+      "family": 97,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -979,7 +1008,7 @@
       ]
     },
     {
-      "family": 93,
+      "family": 98,
       "label": "self popen self popen …",
       "lines": 1,
       "types": 1,
@@ -988,7 +1017,7 @@
       ]
     },
     {
-      "family": 94,
+      "family": 99,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -997,7 +1026,7 @@
       ]
     },
     {
-      "family": 95,
+      "family": 100,
       "label": "return popen process obj",
       "lines": 1,
       "types": 1,
@@ -1006,7 +1035,7 @@
       ]
     },
     {
-      "family": 96,
+      "family": 101,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -1015,7 +1044,7 @@
       ]
     },
     {
-      "family": 97,
+      "family": 102,
       "label": "prep data spawn get …",
       "lines": 1,
       "types": 1,
@@ -1024,7 +1053,7 @@
       ]
     },
     {
-      "family": 98,
+      "family": 103,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -1033,7 +1062,7 @@
       ]
     },
     {
-      "family": 99,
+      "family": 104,
       "label": "check not importing main",
       "lines": 1,
       "types": 1,
@@ -1042,7 +1071,7 @@
       ]
     },
     {
-      "family": 100,
+      "family": 105,
       "label": "file users user app …",
       "lines": 1,
       "types": 1,
@@ -1051,7 +1080,25 @@
       ]
     },
     {
-      "family": 101,
+      "family": 106,
+      "label": "raise runtime error",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "raise RuntimeError('''"
+      ]
+    },
+    {
+      "family": 107,
+      "label": "runtime error",
+      "lines": 1,
+      "types": 1,
+      "members": [
+        "RuntimeError:"
+      ]
+    },
+    {
+      "family": 108,
       "label": "an attempt has been …",
       "lines": 1,
       "types": 1,
@@ -1060,7 +1107,7 @@
       ]
     },
     {
-      "family": 102,
+      "family": 109,
       "label": "current process has finished …",
       "lines": 1,
       "types": 1,
@@ -1069,7 +1116,7 @@
       ]
     },
     {
-      "family": 103,
+      "family": 110,
       "label": "this probably means that …",
       "lines": 1,
       "types": 1,
@@ -1078,7 +1125,7 @@
       ]
     },
     {
-      "family": 104,
+      "family": 111,
       "label": "child processes and you …",
       "lines": 1,
       "types": 1,
@@ -1087,7 +1134,7 @@
       ]
     },
     {
-      "family": 105,
+      "family": 112,
       "label": "in the main module",
       "lines": 1,
       "types": 1,
@@ -1096,7 +1143,7 @@
       ]
     },
     {
-      "family": 106,
+      "family": 113,
       "label": "if name main",
       "lines": 1,
       "types": 1,
@@ -1105,7 +1152,7 @@
       ]
     },
     {
-      "family": 107,
+      "family": 114,
       "label": "freeze support",
       "lines": 1,
       "types": 1,
@@ -1114,7 +1161,7 @@
       ]
     },
     {
-      "family": 108,
+      "family": 115,
       "label": "the freeze support line …",
       "lines": 1,
       "types": 1,
@@ -1123,7 +1170,7 @@
       ]
     },
     {
-      "family": 109,
+      "family": 116,
       "label": "is not going to …",
       "lines": 1,
       "types": 1,
@@ -1132,7 +1179,7 @@
       ]
     },
     {
-      "family": 110,
+      "family": 117,
       "label": "to fix this issue …",
       "lines": 1,
       "types": 1,
@@ -1141,7 +1188,7 @@
       ]
     },
     {
-      "family": 111,
+      "family": 118,
       "label": "section in https docs …",
       "lines": 1,
       "types": 1,
@@ -1153,26 +1200,22 @@
   "types": [
     {
       "type": 0,
-      "label": "layout (видов строк: 4)",
+      "label": "layout short parallel pairs * workers * partitions …",
       "family": 0,
-      "lines": 2182,
+      "lines": 2132,
       "runs": [
-        "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
         "log_samples/combined_run.log",
         "log_samples/full_run.log"
       ],
       "problem": false,
       "members": [
-        "layout.short.parallel pairs=144 workers=8 partitions=8 chunk_size=18 [5.10]",
-        "layout.grid grid_size=38 empty_ratio=0 [7.1.6]",
-        "layout.short.partition_pairs requested=144 produced=144 partitions=9 remaining_fallback=0 [5.10]",
-        "return Layout("
+        "layout.short.parallel pairs=144 workers=8 partitions=8 chunk_size=18 [5.10]"
       ]
     },
     {
       "type": 1,
-      "label": "layout run progress step mode accepted swaps evaluated … (видов строк: 2)",
+      "label": "layout run progress step * mode accepted swaps … (видов строк: 2)",
       "family": 0,
       "lines": 1836,
       "runs": [
@@ -1186,9 +1229,9 @@
     },
     {
       "type": 2,
-      "label": "layout energy long progress step prev radius (видов строк: 2)",
+      "label": "layout energy long progress step * prev radius (видов строк: 2)",
       "family": 0,
-      "lines": 356,
+      "lines": 361,
       "runs": [
         "layout.log",
         "log_samples/baseline_run2.log",
@@ -1196,13 +1239,13 @@
       ],
       "problem": false,
       "members": [
-        "layout.energy.long.progress step=26 energy=0.360289 energy_prev=0.283335 energy_minimization=-0.0769539 radiu…",
-        "layout.energy.long.progress step=201 energy=0.744318 energy_prev=0.463622 energy_gain=0.280697 radius=3 [5.8]"
+        "layout.energy.long.progress step=1 energy=0.283335 energy_prev=None energy_minimization=0 radius=15 [5.8]",
+        "layout.energy.long.progress step=1 energy=0.463622 energy_prev=None energy_gain=0 radius=3 [5.8]"
       ]
     },
     {
       "type": 3,
-      "label": "layout run swap ratio step swap ratio avg …",
+      "label": "layout run swap ratio step * swap ratio …",
       "family": 0,
       "lines": 293,
       "runs": [
@@ -1217,7 +1260,23 @@
     },
     {
       "type": 4,
-      "label": "layout continuity sweep sweep swaps gain worst defect",
+      "label": "encoder colour band dimension * layer index * …",
+      "family": 1,
+      "lines": 210,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "encoder.colour_band dimension=Angle layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=…"
+      ]
+    },
+    {
+      "type": 5,
+      "label": "layout continuity sweep sweep * swaps * gain …",
       "family": 0,
       "lines": 196,
       "runs": [
@@ -1229,9 +1288,9 @@
       ]
     },
     {
-      "type": 5,
-      "label": "detectors init count overlap",
-      "family": 1,
+      "type": 6,
+      "label": "detectors init count * overlap",
+      "family": 2,
       "lines": 140,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1245,9 +1304,9 @@
       ]
     },
     {
-      "type": 6,
-      "label": "encoder layer dimension dimension index layer index count …",
-      "family": 2,
+      "type": 7,
+      "label": "encoder layer dimension * dimension index * layer …",
+      "family": 3,
       "lines": 140,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1261,43 +1320,56 @@
       ]
     },
     {
-      "type": 7,
-      "label": "encoder colour band dimension layer index rank start … (видов строк: 2)",
-      "family": 2,
-      "lines": 210,
-      "runs": [
-        "log_samples/baseline_run.log",
-        "log_samples/baseline_run2.log",
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "encoder.colour_band dimension=X layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=§3.2…",
-        "encoder.colour_band dimension=Angle layer_index=0 colour_rank=0 band_start=0 band_length=51 detectors=2 note=…"
-      ]
-    },
-    {
       "type": 8,
-      "label": "encoder encode stimuli values (видов строк: 2)",
-      "family": 2,
-      "lines": 206,
+      "label": "layout visual step * points grid size energy … (видов строк: 2)",
+      "family": 0,
+      "lines": 107,
       "runs": [
-        "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
-        "log_samples/combined_run.log",
         "log_samples/full_run.log"
       ],
       "problem": false,
       "members": [
-        "encoder.encode.input stimuli=1 values=(0, 10, 10) dimensions=3 [4.6]",
-        "encoder.encode.normalized stimuli=1 values=(0, 10, 10) [4.4]"
+        "layout.visual step=151 points=1440 grid_size=38 energy=0.463622 energy_diff=None energy_radius=None energy_so…",
+        "layout.visual step=1 points=1440 grid_size=38 energy=0.463622 energy_diff=None energy_radius=3 energy_source=…"
       ]
     },
     {
       "type": 9,
-      "label": "encoder encode code stimuli code length active bits …",
-      "family": 3,
+      "label": "encoder encode input stimuli * values * dimensions",
+      "family": 1,
+      "lines": 103,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "encoder.encode.input stimuli=1 values=(0, 10, 10) dimensions=3 [4.6]"
+      ]
+    },
+    {
+      "type": 10,
+      "label": "encoder encode normalized stimuli * values",
+      "family": 1,
+      "lines": 103,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "encoder.encode.normalized stimuli=1 values=(0, 10, 10) [4.4]"
+      ]
+    },
+    {
+      "type": 11,
+      "label": "encoder encode code stimuli * code length * …",
+      "family": 1,
       "lines": 103,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1311,8 +1383,8 @@
       ]
     },
     {
-      "type": 10,
-      "label": "hierarchy composition encode features active bits code length …",
+      "type": 12,
+      "label": "hierarchy composition encode features * active bits * …",
       "family": 4,
       "lines": 100,
       "runs": [
@@ -1324,10 +1396,10 @@
       ]
     },
     {
-      "type": 11,
-      "label": "layout adaptive radius step pair swap rate stage … (видов строк: 2)",
+      "type": 13,
+      "label": "layout adaptive radius step * pair radius * …",
       "family": 0,
-      "lines": 75,
+      "lines": 72,
       "runs": [
         "log_samples/baseline_run2.log",
         "log_samples/combined_run.log",
@@ -1335,14 +1407,13 @@
       ],
       "problem": false,
       "members": [
-        "layout.adaptive.radius step=201 pair_radius=19 swap_rate=9.3 stage_initial_swaps=59.4 swap_ratio=0.156566 lam…",
-        "layout.adaptive.radius step=1 pair_radius=19 swap_rate=None stage_initial_swaps=None swap_ratio=None lambda_t…"
+        "layout.adaptive.radius step=201 pair_radius=19 swap_rate=9.3 stage_initial_swaps=59.4 swap_ratio=0.156566 lam…"
       ]
     },
     {
-      "type": 12,
-      "label": "encoder layer dimension angle dimension index layer index …",
-      "family": 2,
+      "type": 14,
+      "label": "encoder layer dimension angle dimension index * layer …",
+      "family": 1,
       "lines": 70,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1356,37 +1427,8 @@
       ]
     },
     {
-      "type": 13,
-      "label": "layout visual step points grid size energy diff … (видов строк: 2)",
-      "family": 0,
-      "lines": 63,
-      "runs": [
-        "log_samples/baseline_run2.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "layout.visual step=301 points=1440 grid_size=38 energy=0.744318 energy_diff=0.280697 energy_radius=None energ…",
-        "layout.visual step=1 points=1440 grid_size=38 energy=0.463622 energy_diff=None energy_radius=3 energy_source=…"
-      ]
-    },
-    {
-      "type": 14,
-      "label": "layout visual step points grid size energy energy …",
-      "family": 0,
-      "lines": 44,
-      "runs": [
-        "log_samples/baseline_run2.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "layout.visual step=151 points=1440 grid_size=38 energy=0.463622 energy_diff=None energy_radius=None energy_so…"
-      ]
-    },
-    {
       "type": 15,
-      "label": "layout short tiles partitions row parts col parts …",
+      "label": "layout short tiles partitions * row parts * …",
       "family": 0,
       "lines": 44,
       "runs": [
@@ -1401,7 +1443,22 @@
     },
     {
       "type": 16,
-      "label": "layout short pair sampling pairs requested pairs generated …",
+      "label": "layout short partition pairs requested * produced * …",
+      "family": 0,
+      "lines": 44,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.short.partition_pairs requested=144 produced=144 partitions=9 remaining_fallback=0 [5.10]"
+      ]
+    },
+    {
+      "type": 17,
+      "label": "layout short pair sampling pairs requested * pairs …",
       "family": 0,
       "lines": 40,
       "runs": [
@@ -1415,7 +1472,7 @@
       ]
     },
     {
-      "type": 17,
+      "type": 18,
       "label": "sign",
       "family": 5,
       "lines": 35,
@@ -1429,9 +1486,9 @@
       ]
     },
     {
-      "type": 18,
-      "label": "layout visual step points grid size energy none …",
-      "family": 0,
+      "type": 19,
+      "label": "layout visual step * points * grid size …",
+      "family": 6,
       "lines": 23,
       "runs": [
         "log_samples/combined_run.log"
@@ -1442,9 +1499,25 @@
       ]
     },
     {
-      "type": 19,
-      "label": "activation detector layer lambda layer detectors per layer …",
-      "family": 6,
+      "type": 20,
+      "label": "encoder random bits dimension * dimension index * …",
+      "family": 1,
+      "lines": 21,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "encoder.random_bits dimension=Angle dimension_index=0 detectors=453 code_length=512 used_bits=253 shared_bits…"
+      ]
+    },
+    {
+      "type": 21,
+      "label": "activation detector layer lambda * layer detectors * …",
+      "family": 7,
       "lines": 18,
       "runs": [
         "layout.log"
@@ -1455,42 +1528,24 @@
       ]
     },
     {
-      "type": 20,
-      "label": "ratio (видов строк: 2)",
-      "family": 1,
-      "lines": 16,
-      "runs": [
-        "log_samples/baseline_run.log",
-        "log_samples/baseline_run2.log",
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "detectors.geometric_layers layers_count=10 widest=2 narrowest=180 overlap=0.7 counts=[2, 3, 5, 9, 15, 24, 40,…",
-        "\"sharp_transition_ratio\": 0.2601994560290118,"
-      ]
-    },
-    {
-      "type": 21,
-      "label": "dimension init title min value max closed false … (видов строк: 2)",
-      "family": 7,
-      "lines": 21,
-      "runs": [
-        "log_samples/baseline_run.log",
-        "log_samples/baseline_run2.log",
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "dimension.init title=X min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false …",
-        "dimension.init title=Angle min_value=0 max_value=360 closed=true period=360 code_length=512 edge_detectors=fa…"
-      ]
-    },
-    {
       "type": 22,
-      "label": "encoder random bits dimension dimension index detectors code …",
+      "label": "detectors geometric layers layers count * widest * …",
+      "family": 2,
+      "lines": 14,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "detectors.geometric_layers layers_count=10 widest=2 narrowest=180 overlap=0.7 counts=[2, 3, 5, 9, 15, 24, 40,…"
+      ]
+    },
+    {
+      "type": 23,
+      "label": "dimension init title * min value * max …",
       "family": 8,
       "lines": 14,
       "runs": [
@@ -1501,14 +1556,14 @@
       ],
       "problem": false,
       "members": [
-        "encoder.random_bits dimension=X dimension_index=1 detectors=106 code_length=512 used_bits=106 shared_bits=0 m…"
+        "dimension.init title=X min_value=-1 max_value=28 closed=false period=29 code_length=512 edge_detectors=false …"
       ]
     },
     {
-      "type": 23,
-      "label": "encoder long range order dimension samples monotone true … (видов строк: 2)",
+      "type": 24,
+      "label": "encoder long range order dimension * samples * …",
       "family": 9,
-      "lines": 21,
+      "lines": 14,
       "runs": [
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
@@ -1517,30 +1572,53 @@
       ],
       "problem": false,
       "members": [
-        "encoder.long_range_order dimension=X samples=30 monotone=true decreasing=true far_similarity=true plateau=fal…",
-        "encoder.long_range_order dimension=Angle samples=25 monotone=true decreasing=true far_similarity=true plateau…"
+        "encoder.long_range_order dimension=X samples=30 monotone=true decreasing=true far_similarity=true plateau=fal…"
       ]
     },
     {
-      "type": 24,
-      "label": "layout energy (видов строк: 5)",
+      "type": 25,
+      "label": "layout energy long similarity similarity cosine pairs * …",
       "family": 0,
-      "lines": 58,
+      "lines": 14,
       "runs": [
         "log_samples/baseline_run2.log",
         "log_samples/full_run.log"
       ],
       "problem": false,
       "members": [
-        "layout.energy.long.similarity similarity=cosine pairs=144 points=1440 [2.2.4]",
-        "layout.energy.subset.full points=1440 selected=1440 [5.9.4]",
-        "layout.energy.long.sim_lambda lambda_threshold=0.65 eta=None cutoff=0.65 [5.4]",
-        "layout.energy.long.threshold lambda_threshold=0.65 eta=None cutoff=0.65 [5.4]",
-        "layout.energy.long.space space_size=(38, 38) points=1440 empty_cells=4 eval_points=1440 [5.5.1]"
+        "layout.energy.long.similarity similarity=cosine pairs=144 points=1440 [2.2.4]"
       ]
     },
     {
-      "type": 25,
+      "type": 26,
+      "label": "layout energy long sim lambda lambda threshold * …",
+      "family": 0,
+      "lines": 14,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.energy.long.sim_lambda lambda_threshold=0.65 eta=None cutoff=0.65 [5.4]"
+      ]
+    },
+    {
+      "type": 27,
+      "label": "layout energy long threshold lambda threshold * eta …",
+      "family": 0,
+      "lines": 14,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.energy.long.threshold lambda_threshold=0.65 eta=None cutoff=0.65 [5.4]"
+      ]
+    },
+    {
+      "type": 28,
       "label": "layout energy pair ignore self skip pair points …",
       "family": 0,
       "lines": 14,
@@ -1554,8 +1632,22 @@
       ]
     },
     {
-      "type": 26,
-      "label": "decoder evaluation sample expected predicted correct running accuracy … (видов строк: 2)",
+      "type": 29,
+      "label": "layout energy long space space size * points …",
+      "family": 0,
+      "lines": 14,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.energy.long.space space_size=(38, 38) points=1440 empty_cells=4 eval_points=1440 [5.5.1]"
+      ]
+    },
+    {
+      "type": 30,
+      "label": "decoder evaluation sample * expected predicted correct running … (видов строк: 2)",
       "family": 10,
       "lines": 20,
       "runs": [
@@ -1568,21 +1660,33 @@
       ]
     },
     {
-      "type": 27,
-      "label": "hierarchy encode level nonempty (видов строк: 2)",
+      "type": 31,
+      "label": "hierarchy local encode level * windows * nonempty",
       "family": 4,
-      "lines": 20,
+      "lines": 10,
       "runs": [
         "layout.log"
       ],
       "problem": false,
       "members": [
-        "hierarchy.local.encode level=1 windows=9 nonempty=9 [6.2]",
+        "hierarchy.local.encode level=1 windows=9 nonempty=9 [6.2]"
+      ]
+    },
+    {
+      "type": 32,
+      "label": "hierarchy parts encode level * parts * nonempty",
+      "family": 4,
+      "lines": 10,
+      "runs": [
+        "layout.log"
+      ],
+      "problem": false,
+      "members": [
         "hierarchy.parts.encode level=2 parts=9 nonempty=9 [6.2]"
       ]
     },
     {
-      "type": 28,
+      "type": 33,
       "label": "archetype optional archetype none drop untyped nones components …",
       "family": 11,
       "lines": 10,
@@ -1598,8 +1702,8 @@
       ]
     },
     {
-      "type": 29,
-      "label": "elastic map epochs width tau",
+      "type": 34,
+      "label": "elastic map * epochs width * tau",
       "family": 12,
       "lines": 10,
       "runs": [
@@ -1612,8 +1716,8 @@
       ]
     },
     {
-      "type": 30,
-      "label": "layout adaptive trigger step swap rate stage initial …",
+      "type": 35,
+      "label": "layout adaptive trigger step * swap rate * …",
       "family": 0,
       "lines": 9,
       "runs": [
@@ -1627,7 +1731,7 @@
       ]
     },
     {
-      "type": 31,
+      "type": 36,
       "label": "layout similarity threshold cache reset reason adaptive lambda …",
       "family": 0,
       "lines": 9,
@@ -1642,8 +1746,8 @@
       ]
     },
     {
-      "type": 32,
-      "label": "layout energy long pair pair index idx idx …",
+      "type": 37,
+      "label": "layout energy long pair pair index * idx …",
       "family": 0,
       "lines": 8,
       "runs": [
@@ -1656,7 +1760,23 @@
       ]
     },
     {
-      "type": 33,
+      "type": 38,
+      "label": "dimension init title angle min value * max …",
+      "family": 8,
+      "lines": 7,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "dimension.init title=Angle min_value=0 max_value=360 closed=true period=360 code_length=512 edge_detectors=fa…"
+      ]
+    },
+    {
+      "type": 39,
       "label": "dimension closed title angle period",
       "family": 13,
       "lines": 7,
@@ -1672,25 +1792,9 @@
       ]
     },
     {
-      "type": 34,
-      "label": "encoder random bits dimension angle dimension index detectors …",
-      "family": 8,
-      "lines": 7,
-      "runs": [
-        "log_samples/baseline_run.log",
-        "log_samples/baseline_run2.log",
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "encoder.random_bits dimension=Angle dimension_index=0 detectors=453 code_length=512 used_bits=253 shared_bits…"
-      ]
-    },
-    {
-      "type": 35,
-      "label": "encoder init dimensions random seed layer phase true …",
-      "family": 2,
+      "type": 40,
+      "label": "encoder init dimensions * random seed * layer …",
+      "family": 1,
       "lines": 7,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1704,8 +1808,8 @@
       ]
     },
     {
-      "type": 36,
-      "label": "encoder code length mode merge code length segments …",
+      "type": 41,
+      "label": "encoder code length mode merge code length * …",
       "family": 14,
       "lines": 7,
       "runs": [
@@ -1720,7 +1824,7 @@
       ]
     },
     {
-      "type": 37,
+      "type": 42,
       "label": "encoder detectors detectors",
       "family": 1,
       "lines": 7,
@@ -1736,8 +1840,24 @@
       ]
     },
     {
-      "type": 38,
-      "label": "layout adaptive lambda step threshold swap ratio (видов строк: 2)",
+      "type": 43,
+      "label": "encoder long range order dimension angle samples * …",
+      "family": 9,
+      "lines": 7,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "encoder.long_range_order dimension=Angle samples=25 monotone=true decreasing=true far_similarity=true plateau…"
+      ]
+    },
+    {
+      "type": 44,
+      "label": "layout adaptive lambda step * threshold swap ratio (видов строк: 2)",
       "family": 0,
       "lines": 9,
       "runs": [
@@ -1752,8 +1872,8 @@
       ]
     },
     {
-      "type": 39,
-      "label": "layout short energy weights energy radius points step …",
+      "type": 45,
+      "label": "layout short energy weights energy radius * points …",
       "family": 0,
       "lines": 7,
       "runs": [
@@ -1767,26 +1887,22 @@
       ]
     },
     {
-      "type": 40,
-      "label": "layout run settings steps min swap ratio window … (видов строк: 2)",
+      "type": 46,
+      "label": "layout run settings steps * min swap ratio …",
       "family": 15,
-      "lines": 11,
+      "lines": 6,
       "runs": [
-        "layout.log",
-        "log_samples/baseline_run2.log",
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
+        "layout.log"
       ],
       "problem": false,
       "members": [
-        "layout.run.settings steps=5000 min_swap_ratio=0.001 min_swap_window=50 log_every=150 log_visuals=true step_of…",
-        "layout.run.settings steps=50000 min_swap_ratio=0.0001 min_swap_window=20 log_every=150 log_visuals=true step_…"
+        "layout.run.settings steps=5000 min_swap_ratio=0.001 min_swap_window=50 log_every=150 log_visuals=true step_of…"
       ]
     },
     {
-      "type": 41,
-      "label": "activation detector scale resolve layout width layout height …",
-      "family": 1,
+      "type": 47,
+      "label": "activation detector scale resolve layout width * layout …",
+      "family": 16,
       "lines": 6,
       "runs": [
         "evaluate.log",
@@ -1798,9 +1914,9 @@
       ]
     },
     {
-      "type": 42,
-      "label": "activation engine init points lambda threshold eta similarity …",
-      "family": 16,
+      "type": 48,
+      "label": "activation engine init points * lambda threshold * …",
+      "family": 17,
       "lines": 6,
       "runs": [
         "evaluate.log",
@@ -1812,9 +1928,9 @@
       ]
     },
     {
-      "type": 43,
-      "label": "activation engine init detectors points energy threshold detector …",
-      "family": 16,
+      "type": 49,
+      "label": "activation engine init detectors * points * energy …",
+      "family": 17,
       "lines": 6,
       "runs": [
         "evaluate.log",
@@ -1826,9 +1942,9 @@
       ]
     },
     {
-      "type": 44,
+      "type": 50,
       "label": "batch any batch value descriptor value drop untyped …",
-      "family": 17,
+      "family": 18,
       "lines": 6,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -1841,9 +1957,9 @@
       ]
     },
     {
-      "type": 45,
-      "label": "pinwheel stimulus positions segments angle angles per position …",
-      "family": 18,
+      "type": 51,
+      "label": "pinwheel stimulus positions * segments angle * angles …",
+      "family": 19,
       "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1857,8 +1973,8 @@
       ]
     },
     {
-      "type": 46,
-      "label": "pinwheel codes angles positions stimuli code length expected …",
+      "type": 52,
+      "label": "pinwheel codes angles * positions * stimuli * …",
       "family": 19,
       "lines": 5,
       "runs": [
@@ -1873,7 +1989,7 @@
       ]
     },
     {
-      "type": 47,
+      "type": 53,
       "label": "projects damp venv lib site packages rerun dynamic … (видов строк: 2)",
       "family": 20,
       "lines": 10,
@@ -1890,12 +2006,11 @@
       ]
     },
     {
-      "type": 48,
-      "label": "layout tune points grid size est empty ratio … (видов строк: 2)",
+      "type": 54,
+      "label": "layout tune points * grid size est * …",
       "family": 21,
-      "lines": 8,
+      "lines": 5,
       "runs": [
-        "layout.log",
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
         "log_samples/combined_run.log",
@@ -1903,14 +2018,13 @@
       ],
       "problem": false,
       "members": [
-        "layout.tune points=1440 grid_size_est=38 empty_ratio=0 start_radius_factor=0.5 long_pairs_per_step=144 long_s…",
-        "layout.tune points=3886 grid_size_est=77 empty_ratio=0.5 start_radius_factor=0.5 long_pairs_per_step=4000 lon…"
+        "layout.tune points=1440 grid_size_est=38 empty_ratio=0 start_radius_factor=0.5 long_pairs_per_step=144 long_s…"
       ]
     },
     {
-      "type": 49,
-      "label": "layout energy neighbourhood sample config sample side mode …",
-      "family": 15,
+      "type": 55,
+      "label": "layout energy neighbourhood sample config sample side * …",
+      "family": 6,
       "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
@@ -1924,10 +2038,10 @@
       ]
     },
     {
-      "type": 50,
-      "label": "layout sim (видов строк: 6)",
+      "type": 56,
+      "label": "layout sim matrix ready points * code len",
       "family": 0,
-      "lines": 28,
+      "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
@@ -1936,17 +2050,12 @@
       ],
       "problem": false,
       "members": [
-        "layout.sim_matrix.ready points=1440 code_len=512 [5.9.5]",
-        "layout.sim_cache.start point_count=1440 [5.9.5]",
-        "layout.sim_cache.similarity similarity=cosine [2.2.4]",
-        "layout.sim_cache.parallel workers=14 [5.10]",
-        "layout.sim_cache.gpu use_gpu=true [5.12]",
-        "layout.sim_cache.done mode=cpu [5.9.5]"
+        "layout.sim_matrix.ready points=1440 code_len=512 [5.9.5]"
       ]
     },
     {
-      "type": 51,
-      "label": "layout init points labels seed",
+      "type": 57,
+      "label": "layout init points * labels * seed",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -1961,7 +2070,23 @@
       ]
     },
     {
-      "type": 52,
+      "type": 58,
+      "label": "layout grid grid size * empty ratio",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.grid grid_size=38 empty_ratio=0 [7.1.6]"
+      ]
+    },
+    {
+      "type": 59,
       "label": "layout similarity similarity cosine",
       "family": 0,
       "lines": 5,
@@ -1977,8 +2102,8 @@
       ]
     },
     {
-      "type": 53,
-      "label": "layout thresholds lambda threshold eta none",
+      "type": 60,
+      "label": "layout thresholds lambda threshold * eta none",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -1993,7 +2118,7 @@
       ]
     },
     {
-      "type": 54,
+      "type": 61,
       "label": "layout energy distance long distance euclidean short distance …",
       "family": 0,
       "lines": 5,
@@ -2009,7 +2134,7 @@
       ]
     },
     {
-      "type": 55,
+      "type": 62,
       "label": "layout energy long kernel kernel distance radius min …",
       "family": 0,
       "lines": 5,
@@ -2025,8 +2150,8 @@
       ]
     },
     {
-      "type": 56,
-      "label": "layout similarity threshold lambda threshold eta eta mode …",
+      "type": 63,
+      "label": "layout similarity threshold lambda threshold * eta * …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2041,10 +2166,10 @@
       ]
     },
     {
-      "type": 57,
-      "label": "layout precompute (видов строк: 2)",
+      "type": 64,
+      "label": "layout precompute precompute similarity true",
       "family": 0,
-      "lines": 10,
+      "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
@@ -2053,13 +2178,28 @@
       ],
       "problem": false,
       "members": [
-        "layout.precompute precompute_similarity=true [5.9.5]",
+        "layout.precompute precompute_similarity=true [5.9.5]"
+      ]
+    },
+    {
+      "type": 65,
+      "label": "layout precompute limit max precompute",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
         "layout.precompute_limit max_precompute=2000 [5.9.5]"
       ]
     },
     {
-      "type": 58,
-      "label": "layout energy subset config long subset size long …",
+      "type": 66,
+      "label": "layout energy subset config long subset size * …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2074,10 +2214,10 @@
       ]
     },
     {
-      "type": 59,
-      "label": "layout parallel (видов строк: 2)",
+      "type": 67,
+      "label": "layout parallel parallel workers none",
       "family": 0,
-      "lines": 10,
+      "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
@@ -2086,15 +2226,14 @@
       ],
       "problem": false,
       "members": [
-        "layout.parallel parallel_workers=None [5.10]",
-        "layout.parallel.cpu_count cpu_count=14 [5.10]"
+        "layout.parallel parallel_workers=None [5.10]"
       ]
     },
     {
-      "type": 60,
-      "label": "layout gpu (видов строк: 2)",
+      "type": 68,
+      "label": "layout gpu config use gpu true",
       "family": 0,
-      "lines": 10,
+      "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
@@ -2103,13 +2242,12 @@
       ],
       "problem": false,
       "members": [
-        "layout.gpu.config use_gpu=true [5.12]",
-        "layout.gpu.disabled status=cpu [5.12]"
+        "layout.gpu.config use_gpu=true [5.12]"
       ]
     },
     {
-      "type": 61,
-      "label": "layout codes code length ones min ones max …",
+      "type": 69,
+      "label": "layout codes code length * ones min * …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2124,8 +2262,8 @@
       ]
     },
     {
-      "type": 62,
-      "label": "layout distance eps distance eps вне статьи",
+      "type": 70,
+      "label": "layout distance eps distance eps * вне статьи",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2140,10 +2278,10 @@
       ]
     },
     {
-      "type": 63,
-      "label": "layout gpu error no module named (видов строк: 3)",
+      "type": 71,
+      "label": "layout gpu pair energy unavailable error no module …",
       "family": 0,
-      "lines": 15,
+      "lines": 5,
       "runs": [
         "log_samples/baseline_run.log",
         "log_samples/baseline_run2.log",
@@ -2152,13 +2290,139 @@
       ],
       "problem": true,
       "members": [
-        "layout.gpu.pair_energy.unavailable error=No module named 'torch' [5.12]",
-        "layout.gpu.import_failed error=No module named 'moderngl' [5.12]",
+        "layout.gpu.pair_energy.unavailable error=No module named 'torch' [5.12]"
+      ]
+    },
+    {
+      "type": 72,
+      "label": "layout gpu import failed error no module named …",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": true,
+      "members": [
+        "layout.gpu.import_failed error=No module named 'moderngl' [5.12]"
+      ]
+    },
+    {
+      "type": 73,
+      "label": "layout gpu tensor unavailable error no module named …",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": true,
+      "members": [
         "layout.gpu.tensor.unavailable error=No module named 'torch' [5.12]"
       ]
     },
     {
-      "type": 64,
+      "type": 74,
+      "label": "layout gpu disabled status cpu",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.gpu.disabled status=cpu [5.12]"
+      ]
+    },
+    {
+      "type": 75,
+      "label": "layout parallel cpu count cpu count",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.parallel.cpu_count cpu_count=14 [5.10]"
+      ]
+    },
+    {
+      "type": 76,
+      "label": "layout sim cache start point count",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.sim_cache.start point_count=1440 [5.9.5]"
+      ]
+    },
+    {
+      "type": 77,
+      "label": "layout sim cache similarity similarity cosine",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.sim_cache.similarity similarity=cosine [2.2.4]"
+      ]
+    },
+    {
+      "type": 78,
+      "label": "layout sim cache parallel workers",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.sim_cache.parallel workers=14 [5.10]"
+      ]
+    },
+    {
+      "type": 79,
+      "label": "layout sim cache gpu use gpu true",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run.log",
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.sim_cache.gpu use_gpu=true [5.12]"
+      ]
+    },
+    {
+      "type": 80,
       "label": "layout pair radius update pair radius",
       "family": 0,
       "lines": 5,
@@ -2173,8 +2437,8 @@
       ]
     },
     {
-      "type": 65,
-      "label": "layout run selection pairs per step pair radius …",
+      "type": 81,
+      "label": "layout run selection pairs per step * pair …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2188,8 +2452,23 @@
       ]
     },
     {
-      "type": 66,
-      "label": "layout run swap monitor min swap ratio window …",
+      "type": 82,
+      "label": "layout run settings steps * min swap ratio …",
+      "family": 0,
+      "lines": 5,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.run.settings steps=50000 min_swap_ratio=0.0001 min_swap_window=20 log_every=150 log_visuals=true step_…"
+      ]
+    },
+    {
+      "type": 83,
+      "label": "layout run swap monitor min swap ratio * …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2203,8 +2482,8 @@
       ]
     },
     {
-      "type": 67,
-      "label": "layout run swap stability stop step window min …",
+      "type": 84,
+      "label": "layout run swap stability stop step * window …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2218,8 +2497,8 @@
       ]
     },
     {
-      "type": 68,
-      "label": "layout run done steps total swaps avg swaps",
+      "type": 85,
+      "label": "layout run done steps * total swaps * …",
       "family": 0,
       "lines": 5,
       "runs": [
@@ -2233,8 +2512,8 @@
       ]
     },
     {
-      "type": 69,
-      "label": "activation embedding saturation resolve output bits scale factor … (видов строк: 2)",
+      "type": 86,
+      "label": "activation embedding saturation resolve output bits * scale … (видов строк: 2)",
       "family": 22,
       "lines": 6,
       "runs": [
@@ -2248,8 +2527,8 @@
       ]
     },
     {
-      "type": 70,
-      "label": "layout adaptive stage forced step avg swaps min …",
+      "type": 87,
+      "label": "layout adaptive stage forced step * avg swaps …",
       "family": 0,
       "lines": 4,
       "runs": [
@@ -2263,24 +2542,21 @@
       ]
     },
     {
-      "type": 71,
-      "label": "layout energy long progress step prev none radius (видов строк: 2)",
-      "family": 0,
-      "lines": 5,
+      "type": 88,
+      "label": "layout tune points * grid size est * …",
+      "family": 21,
+      "lines": 3,
       "runs": [
-        "layout.log",
-        "log_samples/baseline_run2.log",
-        "log_samples/full_run.log"
+        "layout.log"
       ],
       "problem": false,
       "members": [
-        "layout.energy.long.progress step=1 energy=0.283335 energy_prev=None energy_minimization=0 radius=15 [5.8]",
-        "layout.energy.long.progress step=1 energy=0.463622 energy_prev=None energy_gain=0 radius=3 [5.8]"
+        "layout.tune points=3886 grid_size_est=77 empty_ratio=0.5 start_radius_factor=0.5 long_pairs_per_step=4000 lon…"
       ]
     },
     {
-      "type": 72,
-      "label": "layout run done mode final step steps total … (видов строк: 2)",
+      "type": 89,
+      "label": "layout run done mode final step * steps … (видов строк: 2)",
       "family": 0,
       "lines": 6,
       "runs": [
@@ -2293,8 +2569,8 @@
       ]
     },
     {
-      "type": 73,
-      "label": "layout continuity done swaps sweeps score cache entries",
+      "type": 90,
+      "label": "layout continuity done swaps * sweeps * score …",
       "family": 0,
       "lines": 3,
       "runs": [
@@ -2306,8 +2582,8 @@
       ]
     },
     {
-      "type": 74,
-      "label": "activation detector layers resolve layout width layout height …",
+      "type": 91,
+      "label": "activation detector layers resolve layout width * layout …",
       "family": 23,
       "lines": 3,
       "runs": [
@@ -2319,9 +2595,24 @@
       ]
     },
     {
-      "type": 75,
+      "type": 92,
+      "label": "layout sim cache done mode cpu",
+      "family": 0,
+      "lines": 3,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.sim_cache.done mode=cpu [5.9.5]"
+      ]
+    },
+    {
+      "type": 93,
       "label": "layout pair sampling merged draws merged true note …",
-      "family": 15,
+      "family": 6,
       "lines": 3,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -2334,7 +2625,7 @@
       ]
     },
     {
-      "type": 76,
+      "type": 94,
       "label": "layout pair sampling compiled unavailable note numba не …",
       "family": 0,
       "lines": 3,
@@ -2349,7 +2640,7 @@
       ]
     },
     {
-      "type": 77,
+      "type": 95,
       "label": "projects damp venv lib site packages rerun dynamic … (видов строк: 2)",
       "family": 24,
       "lines": 6,
@@ -2365,8 +2656,8 @@
       ]
     },
     {
-      "type": 78,
-      "label": "encoder code colors codes code length min hue …",
+      "type": 96,
+      "label": "encoder code colors codes * code length * …",
       "family": 25,
       "lines": 3,
       "runs": [
@@ -2380,9 +2671,24 @@
       ]
     },
     {
-      "type": 79,
-      "label": "layout run speculative mode pairs per step points … (видов строк: 2)",
-      "family": 15,
+      "type": 97,
+      "label": "layout adaptive radius step * pair radius * …",
+      "family": 0,
+      "lines": 3,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.adaptive.radius step=1 pair_radius=19 swap_rate=None stage_initial_swaps=None swap_ratio=None lambda_t…"
+      ]
+    },
+    {
+      "type": 98,
+      "label": "layout run speculative mode pairs per step * … (видов строк: 2)",
+      "family": 26,
       "lines": 5,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -2396,7 +2702,7 @@
       ]
     },
     {
-      "type": 80,
+      "type": 99,
       "label": "layout run mode local radius (видов строк: 2)",
       "family": 0,
       "lines": 5,
@@ -2412,7 +2718,7 @@
       ]
     },
     {
-      "type": 81,
+      "type": 100,
       "label": "layout run energy monitor radius (видов строк: 2)",
       "family": 0,
       "lines": 5,
@@ -2428,9 +2734,9 @@
       ]
     },
     {
-      "type": 82,
-      "label": "layout adaptive config mode start radius end schedule … (видов строк: 2)",
-      "family": 26,
+      "type": 101,
+      "label": "layout adaptive config mode start radius * end … (видов строк: 2)",
+      "family": 27,
       "lines": 5,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -2444,8 +2750,8 @@
       ]
     },
     {
-      "type": 83,
-      "label": "layout short optim config energy radius energy recalc …",
+      "type": 102,
+      "label": "layout short optim config energy radius * energy …",
       "family": 0,
       "lines": 3,
       "runs": [
@@ -2459,9 +2765,9 @@
       ]
     },
     {
-      "type": 84,
-      "label": "pinwheel quality mean neighbour delta sharp transition ratio …",
-      "family": 27,
+      "type": 103,
+      "label": "pinwheel quality mean neighbour delta * sharp transition …",
+      "family": 28,
       "lines": 3,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -2474,9 +2780,9 @@
       ]
     },
     {
-      "type": 85,
-      "label": "pinwheel long range opposite angle similarity lambda threshold …",
-      "family": 28,
+      "type": 104,
+      "label": "pinwheel long range opposite angle similarity * lambda …",
+      "family": 19,
       "lines": 3,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -2489,8 +2795,8 @@
       ]
     },
     {
-      "type": 86,
-      "label": "layout render image height width coloring code bits",
+      "type": 105,
+      "label": "layout render image height * width * coloring …",
       "family": 0,
       "lines": 3,
       "runs": [
@@ -2504,8 +2810,8 @@
       ]
     },
     {
-      "type": 87,
-      "label": "layout render component image height width coloring stimulus …",
+      "type": 106,
+      "label": "layout render component image height * width * …",
       "family": 0,
       "lines": 3,
       "runs": [
@@ -2519,8 +2825,8 @@
       ]
     },
     {
-      "type": 88,
-      "label": "layout point energy map radius points energy max …",
+      "type": 107,
+      "label": "layout point energy map radius * points * …",
       "family": 0,
       "lines": 3,
       "runs": [
@@ -2534,8 +2840,8 @@
       ]
     },
     {
-      "type": 89,
-      "label": "layout render energy image height width coloring code …",
+      "type": 108,
+      "label": "layout render energy image height * width * …",
       "family": 0,
       "lines": 3,
       "runs": [
@@ -2549,23 +2855,52 @@
       ]
     },
     {
-      "type": 90,
-      "label": "layout continuity start sweeps defect points candidates per … (видов строк: 2)",
-      "family": 15,
+      "type": 109,
+      "label": "layout payload base path * points * points …",
+      "family": 0,
       "lines": 3,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.payload.base path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-c…"
+      ]
+    },
+    {
+      "type": 110,
+      "label": "layout export json path * points * width …",
+      "family": 0,
+      "lines": 3,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.export.json path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-cc…"
+      ]
+    },
+    {
+      "type": 111,
+      "label": "layout continuity start sweeps * defect points * …",
+      "family": 29,
+      "lines": 2,
       "runs": [
         "layout.log"
       ],
       "problem": false,
       "members": [
-        "layout.continuity.start sweeps=100 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …",
-        "layout.continuity.start sweeps=500 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …"
+        "layout.continuity.start sweeps=100 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …"
       ]
     },
     {
-      "type": 91,
-      "label": "layout run energy target every energy radius energy …",
-      "family": 15,
+      "type": 112,
+      "label": "layout run energy target every * energy radius …",
+      "family": 0,
       "lines": 2,
       "runs": [
         "log_samples/baseline_run2.log",
@@ -2577,8 +2912,22 @@
       ]
     },
     {
-      "type": 92,
-      "label": "layout energy average radius energy energy max points …",
+      "type": 113,
+      "label": "layout energy subset full points * selected",
+      "family": 0,
+      "lines": 2,
+      "runs": [
+        "log_samples/baseline_run2.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.energy.subset.full points=1440 selected=1440 [5.9.4]"
+      ]
+    },
+    {
+      "type": 114,
+      "label": "layout energy average radius * energy * energy …",
       "family": 0,
       "lines": 2,
       "runs": [
@@ -2591,7 +2940,7 @@
       ]
     },
     {
-      "type": 93,
+      "type": 115,
       "label": "info re perf telemetry telemetry telemetry initialized enabled …",
       "family": 30,
       "lines": 2,
@@ -2605,7 +2954,7 @@
       ]
     },
     {
-      "type": 94,
+      "type": 116,
       "label": "info re grpc server listening for rpc connections …",
       "family": 31,
       "lines": 2,
@@ -2619,7 +2968,7 @@
       ]
     },
     {
-      "type": 95,
+      "type": 117,
       "label": "warn egui wgpu winit transparent window was requested …",
       "family": 32,
       "lines": 2,
@@ -2633,8 +2982,8 @@
       ]
     },
     {
-      "type": 96,
-      "label": "using original damp encoder codes bits positions",
+      "type": 118,
+      "label": "using original damp encoder * codes * bits …",
       "family": 33,
       "lines": 2,
       "runs": [
@@ -2647,7 +2996,7 @@
       ]
     },
     {
-      "type": 97,
+      "type": 119,
       "label": "mean neighbour delta",
       "family": 34,
       "lines": 2,
@@ -2661,7 +3010,21 @@
       ]
     },
     {
-      "type": 98,
+      "type": 120,
+      "label": "sharp transition ratio",
+      "family": 35,
+      "lines": 2,
+      "runs": [
+        "log_samples/combined_run.log",
+        "log_samples/full_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "\"sharp_transition_ratio\": 0.2601994560290118,"
+      ]
+    },
+    {
+      "type": 121,
       "label": "singularities",
       "family": 36,
       "lines": 2,
@@ -2675,7 +3038,7 @@
       ]
     },
     {
-      "type": 99,
+      "type": 122,
       "label": "neighbour pairs",
       "family": 37,
       "lines": 2,
@@ -2689,7 +3052,7 @@
       ]
     },
     {
-      "type": 100,
+      "type": 123,
       "label": "winding centers",
       "family": 38,
       "lines": 2,
@@ -2703,7 +3066,7 @@
       ]
     },
     {
-      "type": 101,
+      "type": 124,
       "label": "long range similarity floor",
       "family": 39,
       "lines": 2,
@@ -2717,7 +3080,7 @@
       ]
     },
     {
-      "type": 102,
+      "type": 125,
       "label": "assignment feature mse",
       "family": 40,
       "lines": 2,
@@ -2731,23 +3094,21 @@
       ]
     },
     {
-      "type": 103,
-      "label": "points (видов строк: 2)",
+      "type": 126,
+      "label": "points",
       "family": 41,
-      "lines": 3,
+      "lines": 2,
       "runs": [
-        "layout.log",
         "log_samples/combined_run.log",
         "log_samples/full_run.log"
       ],
       "problem": false,
       "members": [
-        "\"points\": 1440,",
-        "mnist.codes count=100 label=all angles=3758 points=3886 [1.2.2]"
+        "\"points\": 1440,"
       ]
     },
     {
-      "type": 104,
+      "type": 127,
       "label": "grid size",
       "family": 42,
       "lines": 2,
@@ -2761,7 +3122,7 @@
       ]
     },
     {
-      "type": 105,
+      "type": 128,
       "label": "saved elastic pinwheel png elastic pinwheel json",
       "family": 43,
       "lines": 2,
@@ -2775,7 +3136,7 @@
       ]
     },
     {
-      "type": 106,
+      "type": 129,
       "label": "lines",
       "family": 44,
       "lines": 2,
@@ -2788,8 +3149,8 @@
       ]
     },
     {
-      "type": 107,
-      "label": "layout cache miss count label none",
+      "type": 130,
+      "label": "layout cache miss count * label none",
       "family": 0,
       "lines": 1,
       "runs": [
@@ -2801,23 +3162,48 @@
       ]
     },
     {
-      "type": 108,
-      "label": "pipeline checkpoint save path data layout direction absolute … (видов строк: 3)",
+      "type": 131,
+      "label": "pipeline checkpoint save path data layout direction absolute … (видов строк: 2)",
       "family": 45,
-      "lines": 3,
+      "lines": 2,
       "runs": [
         "layout.log"
       ],
       "problem": false,
       "members": [
         "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…",
-        "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…",
         "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…"
       ]
     },
     {
-      "type": 109,
-      "label": "hierarchy training samples split train layout images embedding …",
+      "type": 132,
+      "label": "mnist codes count * label all angles * …",
+      "family": 46,
+      "lines": 1,
+      "runs": [
+        "layout.log"
+      ],
+      "problem": false,
+      "members": [
+        "mnist.codes count=100 label=all angles=3758 points=3886 [1.2.2]"
+      ]
+    },
+    {
+      "type": 133,
+      "label": "layout continuity start sweeps * defect points * …",
+      "family": 6,
+      "lines": 1,
+      "runs": [
+        "layout.log"
+      ],
+      "problem": false,
+      "members": [
+        "layout.continuity.start sweeps=500 defect_points=192 candidates_per_point=128 min_gain=1e-06 stall_sweeps=15 …"
+      ]
+    },
+    {
+      "type": 134,
+      "label": "hierarchy training samples split train layout images * …",
       "family": 4,
       "lines": 1,
       "runs": [
@@ -2829,9 +3215,9 @@
       ]
     },
     {
-      "type": 110,
+      "type": 135,
       "label": "layout long quality structural dynamics converged true local … (видов строк: 2)",
-      "family": 15,
+      "family": 47,
       "lines": 2,
       "runs": [
         "layout.log"
@@ -2843,7 +3229,7 @@
       ]
     },
     {
-      "type": 111,
+      "type": 136,
       "label": "activation embedding save path data layout direction absolute …",
       "family": 45,
       "lines": 1,
@@ -2856,23 +3242,35 @@
       ]
     },
     {
-      "type": 112,
-      "label": "hierarchy checkpoint save path data layout direction absolute … (видов строк: 2)",
+      "type": 137,
+      "label": "hierarchy checkpoint save path data layout direction absolute …",
       "family": 45,
-      "lines": 2,
+      "lines": 1,
       "runs": [
         "layout.log"
       ],
       "problem": false,
       "members": [
-        "hierarchy.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.local-codes-v…",
+        "hierarchy.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.local-codes-v…"
+      ]
+    },
+    {
+      "type": 138,
+      "label": "hierarchy checkpoint save path data layout direction absolute …",
+      "family": 45,
+      "lines": 1,
+      "runs": [
+        "layout.log"
+      ],
+      "problem": false,
+      "members": [
         "hierarchy.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.hierarchy-v1.…"
       ]
     },
     {
-      "type": 113,
-      "label": "hierarchy training completed levels train images local windows …",
-      "family": 4,
+      "type": 139,
+      "label": "hierarchy training completed levels * train images * …",
+      "family": 48,
       "lines": 1,
       "runs": [
         "layout.log"
@@ -2883,9 +3281,22 @@
       ]
     },
     {
-      "type": 114,
-      "label": "раскладка завершена elapsed seconds elapsed minutes images embeddings …",
-      "family": 46,
+      "type": 140,
+      "label": "pipeline checkpoint save path data layout direction absolute …",
+      "family": 45,
+      "lines": 1,
+      "runs": [
+        "layout.log"
+      ],
+      "problem": false,
+      "members": [
+        "pipeline.checkpoint.save path=data/layout-100-3-direction-absolute-hierarchy-v5-strict-v2.json.checkpoint.jso…"
+      ]
+    },
+    {
+      "type": 141,
+      "label": "раскладка завершена elapsed seconds * elapsed minutes * …",
+      "family": 49,
       "lines": 1,
       "runs": [
         "layout.log"
@@ -2896,9 +3307,9 @@
       ]
     },
     {
-      "type": 115,
+      "type": 142,
       "label": "decoder layout use path data layout direction absolute …",
-      "family": 47,
+      "family": 50,
       "lines": 1,
       "runs": [
         "evaluate.log"
@@ -2909,8 +3320,8 @@
       ]
     },
     {
-      "type": 116,
-      "label": "decoder parameters scale resolve embeddings reference embeddings scale …",
+      "type": 143,
+      "label": "decoder parameters scale resolve embeddings * reference embeddings …",
       "family": 10,
       "lines": 1,
       "runs": [
@@ -2922,9 +3333,9 @@
       ]
     },
     {
-      "type": 117,
+      "type": 144,
       "label": "decoder build layout path data layout direction absolute …",
-      "family": 15,
+      "family": 45,
       "lines": 1,
       "runs": [
         "evaluate.log"
@@ -2935,8 +3346,8 @@
       ]
     },
     {
-      "type": 118,
-      "label": "decoder evaluation summary samples accuracy errors mean confidence …",
+      "type": 145,
+      "label": "decoder evaluation summary samples * accuracy * errors …",
       "family": 10,
       "lines": 1,
       "runs": [
@@ -2948,23 +3359,35 @@
       ]
     },
     {
-      "type": 119,
-      "label": "decoder samples accuracy temperature (видов строк: 2)",
+      "type": 146,
+      "label": "decoder predict batch samples * accuracy * temperature",
       "family": 10,
-      "lines": 2,
+      "lines": 1,
       "runs": [
         "evaluate.log"
       ],
       "problem": false,
       "members": [
-        "decoder.predict.batch samples=200 accuracy=0.39 temperature=0.05 [6.5]",
+        "decoder.predict.batch samples=200 accuracy=0.39 temperature=0.05 [6.5]"
+      ]
+    },
+    {
+      "type": 147,
+      "label": "decoder dataset eval split test samples * accuracy …",
+      "family": 10,
+      "lines": 1,
+      "runs": [
+        "evaluate.log"
+      ],
+      "problem": false,
+      "members": [
         "decoder.dataset.eval split=test samples=200 accuracy=0.39 temperature=0.05 [6.5]"
       ]
     },
     {
-      "type": 120,
-      "label": "тестирование завершено elapsed seconds elapsed minutes samples average …",
-      "family": 48,
+      "type": 148,
+      "label": "тестирование завершено elapsed seconds * elapsed minutes * …",
+      "family": 51,
       "lines": 1,
       "runs": [
         "evaluate.log"
@@ -2975,23 +3398,9 @@
       ]
     },
     {
-      "type": 121,
-      "label": "layout path users user app data local temp … (видов строк: 2)",
-      "family": 15,
-      "lines": 2,
-      "runs": [
-        "log_samples/baseline_run2.log"
-      ],
-      "problem": false,
-      "members": [
-        "layout.payload.base path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-c…",
-        "layout.export.json path=C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-cc…"
-      ]
-    },
-    {
-      "type": 122,
+      "type": 149,
       "label": "pinwheel image save image users user app data …",
-      "family": 49,
+      "family": 52,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run2.log"
@@ -3002,9 +3411,9 @@
       ]
     },
     {
-      "type": 123,
-      "label": "pinwheel initial cells points width height note дальний …",
-      "family": 50,
+      "type": 150,
+      "label": "pinwheel initial cells points * width * height …",
+      "family": 53,
       "lines": 1,
       "runs": [
         "log_samples/combined_run.log"
@@ -3015,39 +3424,9 @@
       ]
     },
     {
-      "type": 124,
-      "label": "layout payload base path elastic pinwheel damp json … (видов строк: 2)",
-      "family": 0,
-      "lines": 2,
-      "runs": [
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "layout.payload.base path=elastic_pinwheel_damp.json points=1440 points_written=true similarity=cosine lambda_…",
-        "layout.payload.base path=elastic_pinwheel_damp_full.json points=1440 points_written=true similarity=cosine la…"
-      ]
-    },
-    {
-      "type": 125,
-      "label": "layout export json path elastic pinwheel damp points … (видов строк: 2)",
-      "family": 0,
-      "lines": 2,
-      "runs": [
-        "log_samples/combined_run.log",
-        "log_samples/full_run.log"
-      ],
-      "problem": false,
-      "members": [
-        "layout.export.json path=elastic_pinwheel_damp.json points=1440 width=47 height=47 [вне статьи]",
-        "layout.export.json path=elastic_pinwheel_damp_full.json points=1440 width=38 height=38 [вне статьи]"
-      ]
-    },
-    {
-      "type": 126,
+      "type": 151,
       "label": "pinwheel image save image elastic pinwheel damp png …",
-      "family": 51,
+      "family": 22,
       "lines": 1,
       "runs": [
         "log_samples/combined_run.log"
@@ -3058,9 +3437,9 @@
       ]
     },
     {
-      "type": 127,
+      "type": 152,
       "label": "error re grpc client write write messages call …",
-      "family": 52,
+      "family": 54,
       "lines": 1,
       "runs": [
         "log_samples/full_run.log"
@@ -3071,9 +3450,9 @@
       ]
     },
     {
-      "type": 128,
-      "label": "pinwheel initial cells points width height long phase …",
-      "family": 50,
+      "type": 153,
+      "label": "pinwheel initial cells points * width * height …",
+      "family": 55,
       "lines": 1,
       "runs": [
         "log_samples/full_run.log"
@@ -3084,9 +3463,9 @@
       ]
     },
     {
-      "type": 129,
+      "type": 154,
       "label": "pinwheel image save image elastic pinwheel damp full …",
-      "family": 53,
+      "family": 56,
       "lines": 1,
       "runs": [
         "log_samples/full_run.log"
@@ -3097,9 +3476,9 @@
       ]
     },
     {
-      "type": 130,
+      "type": 155,
       "label": "error re sdk recording stream failed to flush …",
-      "family": 54,
+      "family": 57,
       "lines": 1,
       "runs": [
         "log_samples/full_run.log"
@@ -3110,9 +3489,9 @@
       ]
     },
     {
-      "type": 131,
+      "type": 156,
       "label": "traceback most recent call last",
-      "family": 55,
+      "family": 58,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3123,9 +3502,9 @@
       ]
     },
     {
-      "type": 132,
-      "label": "file string line in module",
-      "family": 56,
+      "type": 157,
+      "label": "file string line * in module",
+      "family": 59,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3136,9 +3515,9 @@
       ]
     },
     {
-      "type": 133,
+      "type": 158,
       "label": "from multiprocessing spawn import spawn main spawn main …",
-      "family": 57,
+      "family": 60,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3149,9 +3528,9 @@
       ]
     },
     {
-      "type": 134,
+      "type": 159,
       "label": "file users user app data local python pythoncore …",
-      "family": 58,
+      "family": 61,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3162,9 +3541,9 @@
       ]
     },
     {
-      "type": 135,
+      "type": 160,
       "label": "exitcode main fd parent sentinel",
-      "family": 59,
+      "family": 62,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3175,9 +3554,9 @@
       ]
     },
     {
-      "type": 136,
+      "type": 161,
       "label": "file users user app data local python pythoncore …",
-      "family": 60,
+      "family": 63,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3188,9 +3567,9 @@
       ]
     },
     {
-      "type": 137,
+      "type": 162,
       "label": "prepare preparation data",
-      "family": 61,
+      "family": 64,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3201,9 +3580,9 @@
       ]
     },
     {
-      "type": 138,
+      "type": 163,
       "label": "file users user app data local python pythoncore …",
-      "family": 62,
+      "family": 65,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3214,9 +3593,9 @@
       ]
     },
     {
-      "type": 139,
+      "type": 164,
       "label": "fixup main from path data init main from …",
-      "family": 63,
+      "family": 66,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3227,9 +3606,9 @@
       ]
     },
     {
-      "type": 140,
+      "type": 165,
       "label": "file users user app data local python pythoncore …",
-      "family": 64,
+      "family": 67,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3240,9 +3619,9 @@
       ]
     },
     {
-      "type": 141,
+      "type": 166,
       "label": "main content runpy run path main path",
-      "family": 65,
+      "family": 68,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3253,9 +3632,9 @@
       ]
     },
     {
-      "type": 142,
+      "type": 167,
       "label": "run name mp main",
-      "family": 66,
+      "family": 69,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3266,9 +3645,9 @@
       ]
     },
     {
-      "type": 143,
-      "label": "file frozen runpy line in run path",
-      "family": 67,
+      "type": 168,
+      "label": "file frozen runpy line * in run path",
+      "family": 70,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3279,9 +3658,9 @@
       ]
     },
     {
-      "type": 144,
-      "label": "file frozen runpy line in run module code",
-      "family": 68,
+      "type": 169,
+      "label": "file frozen runpy line * in run module …",
+      "family": 71,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3292,9 +3671,9 @@
       ]
     },
     {
-      "type": 145,
-      "label": "file frozen runpy line in run code",
-      "family": 69,
+      "type": 170,
+      "label": "file frozen runpy line * in run code",
+      "family": 72,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3305,9 +3684,9 @@
       ]
     },
     {
-      "type": 146,
+      "type": 171,
       "label": "file users user app data local temp claude …",
-      "family": 70,
+      "family": 73,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3318,9 +3697,9 @@
       ]
     },
     {
-      "type": 147,
+      "type": 172,
       "label": "run",
-      "family": 71,
+      "family": 74,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3331,9 +3710,9 @@
       ]
     },
     {
-      "type": 148,
-      "label": "file projects damp pinwheel test py line in …",
-      "family": 72,
+      "type": 173,
+      "label": "file projects damp pinwheel test py line * …",
+      "family": 75,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3344,7 +3723,7 @@
       ]
     },
     {
-      "type": 149,
+      "type": 174,
       "label": "layout self build layout codes params run params …",
       "family": 0,
       "lines": 1,
@@ -3357,9 +3736,9 @@
       ]
     },
     {
-      "type": 150,
-      "label": "file projects damp pinwheel test py line in …",
-      "family": 0,
+      "type": 175,
+      "label": "file projects damp pinwheel test py line * …",
+      "family": 76,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3370,9 +3749,22 @@
       ]
     },
     {
-      "type": 151,
+      "type": 176,
+      "label": "return layout",
+      "family": 77,
+      "lines": 1,
+      "runs": [
+        "log_samples/baseline_run.log"
+      ],
+      "problem": false,
+      "members": [
+        "return Layout("
+      ]
+    },
+    {
+      "type": 177,
       "label": "codes",
-      "family": 73,
+      "family": 78,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3383,9 +3775,9 @@
       ]
     },
     {
-      "type": 152,
+      "type": 178,
       "label": "sparse layout options",
-      "family": 74,
+      "family": 79,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3396,9 +3788,9 @@
       ]
     },
     {
-      "type": 153,
+      "type": 179,
       "label": "file projects damp damp layout damp layout py …",
-      "family": 75,
+      "family": 80,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3409,9 +3801,9 @@
       ]
     },
     {
-      "type": 154,
+      "type": 180,
       "label": "self build similarity cache",
-      "family": 76,
+      "family": 81,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3422,9 +3814,9 @@
       ]
     },
     {
-      "type": 155,
+      "type": 181,
       "label": "file projects damp damp layout damp layout py …",
-      "family": 77,
+      "family": 82,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3435,9 +3827,9 @@
       ]
     },
     {
-      "type": 156,
+      "type": 182,
       "label": "for chunk in executor map compute similarity stride …",
-      "family": 78,
+      "family": 83,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3448,9 +3840,9 @@
       ]
     },
     {
-      "type": 157,
+      "type": 183,
       "label": "file users user app data local python pythoncore …",
-      "family": 79,
+      "family": 84,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3461,9 +3853,9 @@
       ]
     },
     {
-      "type": 158,
+      "type": 184,
       "label": "results super map partial process chunk fn",
-      "family": 80,
+      "family": 85,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3474,9 +3866,9 @@
       ]
     },
     {
-      "type": 159,
+      "type": 185,
       "label": "itertools batched zip iterables chunksize",
-      "family": 81,
+      "family": 86,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3487,9 +3879,9 @@
       ]
     },
     {
-      "type": 160,
+      "type": 186,
       "label": "timeout timeout",
-      "family": 82,
+      "family": 87,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3500,9 +3892,9 @@
       ]
     },
     {
-      "type": 161,
+      "type": 187,
       "label": "buffersize buffersize",
-      "family": 83,
+      "family": 88,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3513,9 +3905,9 @@
       ]
     },
     {
-      "type": 162,
+      "type": 188,
       "label": "file users user app data local python pythoncore …",
-      "family": 84,
+      "family": 89,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3526,9 +3918,9 @@
       ]
     },
     {
-      "type": 163,
+      "type": 189,
       "label": "fs self submit fn args for args in …",
-      "family": 85,
+      "family": 90,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3539,9 +3931,9 @@
       ]
     },
     {
-      "type": 164,
+      "type": 190,
       "label": "file users user app data local python pythoncore …",
-      "family": 86,
+      "family": 91,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3552,9 +3944,9 @@
       ]
     },
     {
-      "type": 165,
+      "type": 191,
       "label": "self adjust process count",
-      "family": 87,
+      "family": 92,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3565,9 +3957,9 @@
       ]
     },
     {
-      "type": 166,
+      "type": 192,
       "label": "file users user app data local python pythoncore …",
-      "family": 88,
+      "family": 93,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3578,9 +3970,9 @@
       ]
     },
     {
-      "type": 167,
+      "type": 193,
       "label": "self spawn process",
-      "family": 89,
+      "family": 94,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3591,9 +3983,9 @@
       ]
     },
     {
-      "type": 168,
+      "type": 194,
       "label": "file users user app data local python pythoncore …",
-      "family": 90,
+      "family": 95,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3604,9 +3996,9 @@
       ]
     },
     {
-      "type": 169,
+      "type": 195,
       "label": "start",
-      "family": 91,
+      "family": 96,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3617,9 +4009,9 @@
       ]
     },
     {
-      "type": 170,
+      "type": 196,
       "label": "file users user app data local python pythoncore …",
-      "family": 92,
+      "family": 97,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3630,9 +4022,9 @@
       ]
     },
     {
-      "type": 171,
+      "type": 197,
       "label": "self popen self popen self",
-      "family": 93,
+      "family": 98,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3643,9 +4035,9 @@
       ]
     },
     {
-      "type": 172,
+      "type": 198,
       "label": "file users user app data local python pythoncore …",
-      "family": 94,
+      "family": 99,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3656,9 +4048,9 @@
       ]
     },
     {
-      "type": 173,
+      "type": 199,
       "label": "return popen process obj",
-      "family": 95,
+      "family": 100,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3669,9 +4061,9 @@
       ]
     },
     {
-      "type": 174,
+      "type": 200,
       "label": "file users user app data local python pythoncore …",
-      "family": 96,
+      "family": 101,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3682,9 +4074,9 @@
       ]
     },
     {
-      "type": 175,
+      "type": 201,
       "label": "prep data spawn get preparation data process obj …",
-      "family": 97,
+      "family": 102,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3695,9 +4087,9 @@
       ]
     },
     {
-      "type": 176,
+      "type": 202,
       "label": "file users user app data local python pythoncore …",
-      "family": 98,
+      "family": 103,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3708,9 +4100,9 @@
       ]
     },
     {
-      "type": 177,
+      "type": 203,
       "label": "check not importing main",
-      "family": 99,
+      "family": 104,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3721,9 +4113,9 @@
       ]
     },
     {
-      "type": 178,
+      "type": 204,
       "label": "file users user app data local python pythoncore …",
-      "family": 100,
+      "family": 105,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3734,9 +4126,9 @@
       ]
     },
     {
-      "type": 179,
+      "type": 205,
       "label": "raise runtime error",
-      "family": 52,
+      "family": 106,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3747,9 +4139,9 @@
       ]
     },
     {
-      "type": 180,
+      "type": 206,
       "label": "runtime error",
-      "family": 52,
+      "family": 107,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3760,9 +4152,9 @@
       ]
     },
     {
-      "type": 181,
-      "label": "an attempt has been made to start new …",
-      "family": 101,
+      "type": 207,
+      "label": "an attempt has been made to start * …",
+      "family": 108,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3773,9 +4165,9 @@
       ]
     },
     {
-      "type": 182,
+      "type": 208,
       "label": "current process has finished its bootstrapping phase",
-      "family": 102,
+      "family": 109,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3786,9 +4178,9 @@
       ]
     },
     {
-      "type": 183,
+      "type": 209,
       "label": "this probably means that you are not using …",
-      "family": 103,
+      "family": 110,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3799,9 +4191,9 @@
       ]
     },
     {
-      "type": 184,
+      "type": 210,
       "label": "child processes and you have forgotten to use …",
-      "family": 104,
+      "family": 111,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3812,9 +4204,9 @@
       ]
     },
     {
-      "type": 185,
+      "type": 211,
       "label": "in the main module",
-      "family": 105,
+      "family": 112,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3825,9 +4217,9 @@
       ]
     },
     {
-      "type": 186,
+      "type": 212,
       "label": "if name main",
-      "family": 106,
+      "family": 113,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3838,9 +4230,9 @@
       ]
     },
     {
-      "type": 187,
+      "type": 213,
       "label": "freeze support",
-      "family": 107,
+      "family": 114,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3851,9 +4243,9 @@
       ]
     },
     {
-      "type": 188,
+      "type": 214,
       "label": "the freeze support line can be omitted if …",
-      "family": 108,
+      "family": 115,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3864,9 +4256,9 @@
       ]
     },
     {
-      "type": 189,
+      "type": 215,
       "label": "is not going to be frozen to produce …",
-      "family": 109,
+      "family": 116,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3877,9 +4269,9 @@
       ]
     },
     {
-      "type": 190,
+      "type": 216,
       "label": "to fix this issue refer to the safe …",
-      "family": 110,
+      "family": 117,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3890,9 +4282,9 @@
       ]
     },
     {
-      "type": 191,
+      "type": 217,
       "label": "section in https docs python org library multiprocessing …",
-      "family": 111,
+      "family": 118,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3903,9 +4295,9 @@
       ]
     },
     {
-      "type": 192,
+      "type": 218,
       "label": "error re grpc server error while receiving messages …",
-      "family": 52,
+      "family": 54,
       "lines": 1,
       "runs": [
         "log_samples/baseline_run.log"
@@ -3918,68 +4310,68 @@
   ],
   "summary": {
     "lines": 6879,
-    "stimuli": 243,
-    "points": 1625,
+    "stimuli": 234,
+    "points": 1541,
     "grid": [
-      44,
-      44
+      43,
+      43
     ],
-    "detectors": 880,
-    "families": 112,
-    "types": 193
+    "detectors": 790,
+    "families": 119,
+    "types": 219
   },
   "embedding_quality": {
-    "pairs": 16471,
-    "correlation": 0.821,
-    "similar_primary_pairs": 3037,
-    "embedding_similarity_of_similar": 0.37,
-    "embedding_similarity_of_others": 0.036,
+    "pairs": 14878,
+    "correlation": 0.773,
+    "similar_primary_pairs": 2699,
+    "embedding_similarity_of_similar": 0.334,
+    "embedding_similarity_of_others": 0.028,
     "stimuli_without_detectors": 61
   },
   "structure": [
     {
       "lambda": 0.5,
-      "detectors": 44,
-      "radius_mean": 1.73,
-      "points_mean": 10.8,
-      "active_per_line": 5.4,
+      "detectors": 42,
+      "radius_mean": 1.63,
+      "points_mean": 9.3,
+      "active_per_line": 4.1,
       "role": "семейство"
     },
     {
       "lambda": 0.6,
-      "detectors": 63,
+      "detectors": 64,
       "radius_mean": 1.58,
-      "points_mean": 9.4,
-      "active_per_line": 4.6,
+      "points_mean": 8.8,
+      "active_per_line": 5.7,
       "role": "семейство"
     },
     {
       "lambda": 0.7,
-      "detectors": 116,
-      "radius_mean": 1.25,
-      "points_mean": 6.0,
-      "active_per_line": 3.9,
+      "detectors": 105,
+      "radius_mean": 1.31,
+      "points_mean": 6.4,
+      "active_per_line": 3.5,
       "role": "промежуточный"
     },
     {
       "lambda": 0.75,
-      "detectors": 187,
+      "detectors": 165,
       "radius_mean": 1.1,
       "points_mean": 4.6,
-      "active_per_line": 3.0,
+      "active_per_line": 2.8,
       "role": "тип"
     },
     {
       "lambda": 0.8,
-      "detectors": 157,
+      "detectors": 128,
       "radius_mean": 1.06,
       "points_mean": 4.3,
-      "active_per_line": 1.8,
+      "active_per_line": 1.6,
       "role": "тип"
     },
     {
       "lambda": 0.85,
-      "detectors": 313,
+      "detectors": 286,
       "radius_mean": 1.01,
       "points_mean": 2.6,
       "active_per_line": 2.6,
@@ -3996,18 +4388,18 @@
       "where": "log_samples/baseline_run.log:348",
       "text": "Traceback (most recent call last):",
       "nearest_known": "",
-      "stimulus": 179
+      "stimulus": 170
     },
     {
       "status": "по частям",
-      "familiarity": 0.41,
+      "familiarity": 0.4,
       "active_detectors": 1,
       "count": 1,
       "problem": true,
       "where": "log_samples/baseline_run.log:414",
       "text": "RuntimeError:",
       "nearest_known": "2026-11-12T07:08:04.660986Z ERROR re_grpc_client::write: Write messages call fa…",
-      "stimulus": 230
+      "stimulus": 221
     },
     {
       "status": "по частям",
@@ -4018,7 +4410,7 @@
       "where": "log_samples/baseline_run.log:411",
       "text": "raise RuntimeError('''",
       "nearest_known": "2026-11-12T07:08:04.660986Z ERROR re_grpc_client::write: Write messages call fa…",
-      "stimulus": 229
+      "stimulus": 220
     },
     {
       "status": "по частям",
@@ -4029,7 +4421,7 @@
       "where": "log_samples/baseline_run.log:432",
       "text": "2026-11-12T07:12:05.754669Z ERROR re_grpc_server: Error while receiving messages: h2 protocol error: error re…",
       "nearest_known": "2026-11-12T07:08:04.660986Z ERROR re_grpc_client::write: Write messages call fa…",
-      "stimulus": 242
+      "stimulus": 233
     },
     {
       "status": "неизвестна",
@@ -4040,18 +4432,7 @@
       "where": "log_samples/baseline_run.log:374",
       "text": "...<19 lines>...",
       "nearest_known": "",
-      "stimulus": 201
-    },
-    {
-      "status": "неизвестна",
-      "familiarity": 0.28,
-      "active_detectors": 0,
-      "count": 1,
-      "problem": false,
-      "where": "log_samples/baseline_run.log:422",
-      "text": "if __name__ == '__main__':",
-      "nearest_known": "",
-      "stimulus": 236
+      "stimulus": 192
     },
     {
       "status": "неизвестна",
@@ -4062,7 +4443,7 @@
       "where": "log_samples/baseline_run.log:350",
       "text": "from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=3032, pipe_handle=932)",
       "nearest_known": "",
-      "stimulus": 181
+      "stimulus": 172
     },
     {
       "status": "неизвестна",
@@ -4073,7 +4454,7 @@
       "where": "log_samples/baseline_run.log:386",
       "text": "timeout=timeout,",
       "nearest_known": "",
-      "stimulus": 210
+      "stimulus": 201
     },
     {
       "status": "неизвестна",
@@ -4083,6 +4464,17 @@
       "problem": false,
       "where": "log_samples/baseline_run.log:408",
       "text": "_check_not_importing_main()",
+      "nearest_known": "",
+      "stimulus": 218
+    },
+    {
+      "status": "неизвестна",
+      "familiarity": 0.29,
+      "active_detectors": 0,
+      "count": 1,
+      "problem": false,
+      "where": "log_samples/baseline_run.log:422",
+      "text": "if __name__ == '__main__':",
       "nearest_known": "",
       "stimulus": 227
     },
@@ -4095,7 +4487,7 @@
       "where": "log_samples/baseline_run.log:429",
       "text": "To fix this issue, refer to the \"Safe importing of main module\"",
       "nearest_known": "",
-      "stimulus": 240
+      "stimulus": 231
     },
     {
       "status": "неизвестна",
@@ -4106,7 +4498,7 @@
       "where": "log_samples/baseline_run.log:349",
       "text": "File \"<string>\", line 1, in <module>",
       "nearest_known": "",
-      "stimulus": 180
+      "stimulus": 171
     },
     {
       "status": "неизвестна",
@@ -4117,7 +4509,7 @@
       "where": "log_samples/baseline_run.log:385",
       "text": "itertools.batched(zip(*iterables), chunksize),",
       "nearest_known": "",
-      "stimulus": 209
+      "stimulus": 200
     },
     {
       "status": "неизвестна",
@@ -4128,7 +4520,7 @@
       "where": "log_samples/baseline_run.log:395",
       "text": "self._spawn_process()",
       "nearest_known": "",
-      "stimulus": 217
+      "stimulus": 208
     },
     {
       "status": "неизвестна",
@@ -4139,7 +4531,7 @@
       "where": "log_samples/baseline_run.log:404",
       "text": "return Popen(process_obj)",
       "nearest_known": "",
-      "stimulus": 223
+      "stimulus": 214
     },
     {
       "status": "неизвестна",
@@ -4150,7 +4542,7 @@
       "where": "log_samples/baseline_run.log:418",
       "text": "This probably means that you are not using fork to start your",
       "nearest_known": "",
-      "stimulus": 233
+      "stimulus": 224
     },
     {
       "status": "неизвестна",
@@ -4161,7 +4553,7 @@
       "where": "log_samples/baseline_run.log:426",
       "text": "The \"freeze_support()\" line can be omitted if the program",
       "nearest_known": "",
-      "stimulus": 238
+      "stimulus": 229
     },
     {
       "status": "неизвестна",
@@ -4172,7 +4564,18 @@
       "where": "log_samples/baseline_run.log:430",
       "text": "section in https://docs.python.org/3/library/multiprocessing.html",
       "nearest_known": "",
-      "stimulus": 241
+      "stimulus": 232
+    },
+    {
+      "status": "неизвестна",
+      "familiarity": 0.31,
+      "active_detectors": 0,
+      "count": 1,
+      "problem": false,
+      "where": "log_samples/baseline_run.log:355",
+      "text": "prepare(preparation_data)",
+      "nearest_known": "",
+      "stimulus": 176
     },
     {
       "status": "неизвестна",
@@ -4183,7 +4586,7 @@
       "where": "log_samples/baseline_run.log:384",
       "text": "results = super().map(partial(_process_chunk, fn),",
       "nearest_known": "",
-      "stimulus": 208
+      "stimulus": 199
     },
     {
       "status": "неизвестна",
@@ -4194,7 +4597,7 @@
       "where": "log_samples/baseline_run.log:389",
       "text": "fs = [self.submit(fn, *args) for args in zipped_iterables]",
       "nearest_known": "",
-      "stimulus": 213
+      "stimulus": 204
     },
     {
       "status": "неизвестна",
@@ -4205,7 +4608,7 @@
       "where": "log_samples/baseline_run.log:401",
       "text": "self._popen = self._Popen(self)",
       "nearest_known": "",
-      "stimulus": 221
+      "stimulus": 212
     },
     {
       "status": "неизвестна",
@@ -4216,7 +4619,7 @@
       "where": "log_samples/baseline_run.log:419",
       "text": "child processes and you have forgotten to use the proper idiom",
       "nearest_known": "",
-      "stimulus": 234
+      "stimulus": 225
     },
     {
       "status": "неизвестна",
@@ -4227,7 +4630,7 @@
       "where": "log_samples/baseline_run.log:423",
       "text": "freeze_support()",
       "nearest_known": "",
-      "stimulus": 237
+      "stimulus": 228
     },
     {
       "status": "неизвестна",
@@ -4238,18 +4641,7 @@
       "where": "log_samples/baseline_run.log:353",
       "text": "exitcode = _main(fd, parent_sentinel)",
       "nearest_known": "",
-      "stimulus": 183
-    },
-    {
-      "status": "неизвестна",
-      "familiarity": 0.32,
-      "active_detectors": 0,
-      "count": 1,
-      "problem": false,
-      "where": "log_samples/baseline_run.log:355",
-      "text": "prepare(preparation_data)",
-      "nearest_known": "",
-      "stimulus": 185
+      "stimulus": 174
     },
     {
       "status": "неизвестна",
@@ -4260,7 +4652,7 @@
       "where": "log_samples/baseline_run.log:361",
       "text": "main_content = runpy.run_path(main_path,",
       "nearest_known": "",
-      "stimulus": 189
+      "stimulus": 180
     },
     {
       "status": "неизвестна",
@@ -4268,10 +4660,10 @@
       "active_detectors": 0,
       "count": 1,
       "problem": false,
-      "where": "log_samples/baseline_run.log:383",
-      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\process.py\", line 850, in …",
+      "where": "log_samples/baseline_run.log:365",
+      "text": "File \"<frozen runpy>\", line 88, in _run_code",
       "nearest_known": "",
-      "stimulus": 207
+      "stimulus": 184
     },
     {
       "status": "неизвестна",
@@ -4282,18 +4674,7 @@
       "where": "log_samples/baseline_run.log:387",
       "text": "buffersize=buffersize)",
       "nearest_known": "",
-      "stimulus": 211
-    },
-    {
-      "status": "неизвестна",
-      "familiarity": 0.32,
-      "active_detectors": 0,
-      "count": 1,
-      "problem": false,
-      "where": "log_samples/baseline_run.log:388",
-      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\_base.py\", line 618, in map",
-      "nearest_known": "",
-      "stimulus": 212
+      "stimulus": 202
     },
     {
       "status": "неизвестна",
@@ -4304,7 +4685,7 @@
       "where": "log_samples/baseline_run.log:398",
       "text": "p.start()",
       "nearest_known": "",
-      "stimulus": 219
+      "stimulus": 210
     },
     {
       "status": "неизвестна",
@@ -4315,7 +4696,7 @@
       "where": "log_samples/baseline_run.log:406",
       "text": "prep_data = spawn.get_preparation_data(process_obj._name)",
       "nearest_known": "",
-      "stimulus": 225
+      "stimulus": 216
     },
     {
       "status": "неизвестна",
@@ -4326,7 +4707,7 @@
       "where": "log_samples/baseline_run.log:415",
       "text": "An attempt has been made to start a new process before the",
       "nearest_known": "",
-      "stimulus": 231
+      "stimulus": 222
     },
     {
       "status": "неизвестна",
@@ -4337,7 +4718,7 @@
       "where": "log_samples/baseline_run.log:416",
       "text": "current process has finished its bootstrapping phase.",
       "nearest_known": "",
-      "stimulus": 232
+      "stimulus": 223
     },
     {
       "status": "неизвестна",
@@ -4348,7 +4729,7 @@
       "where": "log_samples/baseline_run.log:420",
       "text": "in the main module:",
       "nearest_known": "",
-      "stimulus": 235
+      "stimulus": 226
     },
     {
       "status": "неизвестна",
@@ -4359,7 +4740,7 @@
       "where": "log_samples/baseline_run.log:352",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 122, in spawn…",
       "nearest_known": "",
-      "stimulus": 182
+      "stimulus": 173
     },
     {
       "status": "неизвестна",
@@ -4370,7 +4751,7 @@
       "where": "log_samples/baseline_run.log:354",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 131, in _main",
       "nearest_known": "",
-      "stimulus": 184
+      "stimulus": 175
     },
     {
       "status": "неизвестна",
@@ -4381,7 +4762,7 @@
       "where": "log_samples/baseline_run.log:357",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 246, in prepa…",
       "nearest_known": "",
-      "stimulus": 186
+      "stimulus": 177
     },
     {
       "status": "неизвестна",
@@ -4389,10 +4770,10 @@
       "active_detectors": 0,
       "count": 1,
       "problem": false,
-      "where": "log_samples/baseline_run.log:365",
-      "text": "File \"<frozen runpy>\", line 88, in _run_code",
+      "where": "log_samples/baseline_run.log:383",
+      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\process.py\", line 850, in …",
       "nearest_known": "",
-      "stimulus": 193
+      "stimulus": 198
     },
     {
       "status": "неизвестна",
@@ -4400,21 +4781,10 @@
       "active_detectors": 0,
       "count": 1,
       "problem": false,
-      "where": "log_samples/baseline_run.log:366",
-      "text": "File \"C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-cc038e18844d\\scratch…",
+      "where": "log_samples/baseline_run.log:388",
+      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\_base.py\", line 618, in map",
       "nearest_known": "",
-      "stimulus": 194
-    },
-    {
-      "status": "неизвестна",
-      "familiarity": 0.33,
-      "active_detectors": 0,
-      "count": 1,
-      "problem": false,
-      "where": "log_samples/baseline_run.log:391",
-      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\process.py\", line 816, in …",
-      "nearest_known": "",
-      "stimulus": 214
+      "stimulus": 203
     },
     {
       "status": "неизвестна",
@@ -4425,7 +4795,7 @@
       "where": "log_samples/baseline_run.log:397",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\process.py\", line 793, in …",
       "nearest_known": "",
-      "stimulus": 218
+      "stimulus": 209
     },
     {
       "status": "неизвестна",
@@ -4436,7 +4806,7 @@
       "where": "log_samples/baseline_run.log:400",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\process.py\", line 121, in sta…",
       "nearest_known": "",
-      "stimulus": 220
+      "stimulus": 211
     },
     {
       "status": "неизвестна",
@@ -4447,7 +4817,7 @@
       "where": "log_samples/baseline_run.log:403",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\context.py\", line 343, in _Po…",
       "nearest_known": "",
-      "stimulus": 222
+      "stimulus": 213
     },
     {
       "status": "неизвестна",
@@ -4458,7 +4828,7 @@
       "where": "log_samples/baseline_run.log:410",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 140, in _chec…",
       "nearest_known": "",
-      "stimulus": 228
+      "stimulus": 219
     },
     {
       "status": "неизвестна",
@@ -4466,10 +4836,10 @@
       "active_detectors": 0,
       "count": 1,
       "problem": false,
-      "where": "log_samples/baseline_run.log:360",
-      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 297, in _fixu…",
+      "where": "log_samples/baseline_run.log:363",
+      "text": "File \"<frozen runpy>\", line 294, in run_path",
       "nearest_known": "",
-      "stimulus": 188
+      "stimulus": 182
     },
     {
       "status": "неизвестна",
@@ -4480,7 +4850,7 @@
       "where": "log_samples/baseline_run.log:364",
       "text": "File \"<frozen runpy>\", line 98, in _run_module_code",
       "nearest_known": "",
-      "stimulus": 192
+      "stimulus": 183
     },
     {
       "status": "неизвестна",
@@ -4491,7 +4861,18 @@
       "where": "log_samples/baseline_run.log:381",
       "text": "for chunk in executor.map(_compute_similarity_stride, tasks):",
       "nearest_known": "",
-      "stimulus": 206
+      "stimulus": 197
+    },
+    {
+      "status": "неизвестна",
+      "familiarity": 0.34,
+      "active_detectors": 0,
+      "count": 1,
+      "problem": false,
+      "where": "log_samples/baseline_run.log:391",
+      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\process.py\", line 816, in …",
+      "nearest_known": "",
+      "stimulus": 205
     },
     {
       "status": "неизвестна",
@@ -4502,7 +4883,7 @@
       "where": "log_samples/baseline_run.log:407",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 164, in get_p…",
       "nearest_known": "",
-      "stimulus": 226
+      "stimulus": 217
     },
     {
       "status": "неизвестна",
@@ -4513,7 +4894,7 @@
       "where": "log_samples/baseline_run.log:427",
       "text": "is not going to be frozen to produce an executable.",
       "nearest_known": "",
-      "stimulus": 239
+      "stimulus": 230
     },
     {
       "status": "неизвестна",
@@ -4521,10 +4902,10 @@
       "active_detectors": 0,
       "count": 1,
       "problem": false,
-      "where": "log_samples/baseline_run.log:363",
-      "text": "File \"<frozen runpy>\", line 294, in run_path",
+      "where": "log_samples/baseline_run.log:360",
+      "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\spawn.py\", line 297, in _fixu…",
       "nearest_known": "",
-      "stimulus": 191
+      "stimulus": 179
     },
     {
       "status": "неизвестна",
@@ -4535,7 +4916,7 @@
       "where": "log_samples/baseline_run.log:369",
       "text": "File \"C:\\Projects\\DAMP\\pinwheel_test.py\", line 308, in run",
       "nearest_known": "",
-      "stimulus": 196
+      "stimulus": 187
     },
     {
       "status": "неизвестна",
@@ -4546,7 +4927,7 @@
       "where": "log_samples/baseline_run.log:373",
       "text": "codes,",
       "nearest_known": "",
-      "stimulus": 200
+      "stimulus": 191
     },
     {
       "status": "неизвестна",
@@ -4557,7 +4938,7 @@
       "where": "log_samples/baseline_run.log:358",
       "text": "_fixup_main_from_path(data['init_main_from_path'])",
       "nearest_known": "",
-      "stimulus": 187
+      "stimulus": 178
     },
     {
       "status": "неизвестна",
@@ -4565,10 +4946,21 @@
       "active_detectors": 0,
       "count": 1,
       "problem": false,
+      "where": "log_samples/baseline_run.log:366",
+      "text": "File \"C:\\Users\\USER~1\\AppData\\Local\\Temp\\claude\\b575fa1b03f2dfc0\\93b2e406-adca-4fb8-b843-cc038e18844d\\scratch…",
+      "nearest_known": "",
+      "stimulus": 185
+    },
+    {
+      "status": "неизвестна",
+      "familiarity": 0.37,
+      "active_detectors": 0,
+      "count": 1,
+      "problem": false,
       "where": "log_samples/baseline_run.log:378",
       "text": "self._build_similarity_cache()",
       "nearest_known": "",
-      "stimulus": 204
+      "stimulus": 195
     },
     {
       "status": "неизвестна",
@@ -4579,7 +4971,7 @@
       "where": "log_samples/baseline_run.log:405",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\multiprocessing\\popen_spawn_win32.py\", line 4…",
       "nearest_known": "",
-      "stimulus": 224
+      "stimulus": 215
     },
     {
       "status": "неизвестна",
@@ -4590,7 +4982,7 @@
       "where": "log_samples/baseline_run.log:380",
       "text": "File \"C:\\Projects\\DAMP\\damp\\layout\\damp_layout.py\", line 6315, in _build_similarity_cache",
       "nearest_known": "",
-      "stimulus": 205
+      "stimulus": 196
     },
     {
       "status": "неизвестна",
@@ -4601,7 +4993,7 @@
       "where": "log_samples/baseline_run.log:362",
       "text": "run_name=\"__mp_main__\")",
       "nearest_known": "",
-      "stimulus": 190
+      "stimulus": 181
     },
     {
       "status": "неизвестна",
@@ -4612,7 +5004,7 @@
       "where": "log_samples/baseline_run.log:377",
       "text": "File \"C:\\Projects\\DAMP\\damp\\layout\\damp_layout.py\", line 1985, in __init__",
       "nearest_known": "",
-      "stimulus": 203
+      "stimulus": 194
     },
     {
       "status": "неизвестна",
@@ -4623,7 +5015,7 @@
       "where": "log_samples/baseline_run.log:375",
       "text": "**_sparse_layout_options(),",
       "nearest_known": "",
-      "stimulus": 202
+      "stimulus": 193
     },
     {
       "status": "неизвестна",
@@ -4634,7 +5026,7 @@
       "where": "log_samples/baseline_run.log:367",
       "text": ").run()",
       "nearest_known": "",
-      "stimulus": 195
+      "stimulus": 186
     },
     {
       "status": "неизвестна",
@@ -4645,7 +5037,7 @@
       "where": "log_samples/baseline_run.log:394",
       "text": "File \"C:\\Users\\user\\AppData\\Local\\Python\\pythoncore-3.14-64\\Lib\\concurrent\\futures\\process.py\", line 775, in …",
       "nearest_known": "",
-      "stimulus": 216
+      "stimulus": 207
     },
     {
       "status": "по частям",
@@ -4656,7 +5048,7 @@
       "where": "log_samples/baseline_run.log:372",
       "text": "return Layout(",
       "nearest_known": "layout.cache.miss count=100 label=None [7.1.7]",
-      "stimulus": 199
+      "stimulus": 190
     },
     {
       "status": "по частям",
@@ -4667,29 +5059,29 @@
       "where": "log_samples/baseline_run.log:392",
       "text": "self._adjust_process_count()",
       "nearest_known": "layout.parallel.cpu_count cpu_count=14 [5.10]",
-      "stimulus": 215
+      "stimulus": 206
     },
     {
       "status": "по частям",
       "familiarity": 0.49,
-      "active_detectors": 21,
+      "active_detectors": 18,
       "count": 1,
       "problem": false,
       "where": "log_samples/baseline_run.log:371",
       "text": "File \"C:\\Projects\\DAMP\\pinwheel_test.py\", line 270, in build_layout",
       "nearest_known": "layout.continuity.sweep sweep=0 swaps=10 gain=2.38443 worst_defect=92850.9 [5.5…",
-      "stimulus": 198
+      "stimulus": 189
     },
     {
       "status": "по частям",
       "familiarity": 0.51,
-      "active_detectors": 12,
+      "active_detectors": 15,
       "count": 1,
       "problem": false,
       "where": "log_samples/baseline_run.log:370",
       "text": "layout = self.build_layout(codes, params=run_params, initial_cells=initial_cells)",
       "nearest_known": "layout.gpu.disabled status=cpu [5.12]",
-      "stimulus": 197
+      "stimulus": 188
     }
   ],
   "new_numbers": [],
@@ -4752,14 +5144,14 @@
       "similar": [
         {
           "span": "log_samples/full_run.log:459-498",
-          "similarity": 0.81
-        },
-        {
-          "span": "log_samples/baseline_run2.log:141-180",
-          "similarity": 0.75
+          "similarity": 0.82
         },
         {
           "span": "log_samples/combined_run.log:315-354",
+          "similarity": 0.74
+        },
+        {
+          "span": "log_samples/baseline_run2.log:141-180",
           "similarity": 0.74
         }
       ]
@@ -4777,14 +5169,14 @@
     "matrix": [
       [
         1.0,
-        0.22,
-        0.14,
-        0.12,
-        0.16,
+        0.18,
+        0.15,
+        0.15,
+        0.15,
         0.13
       ],
       [
-        0.22,
+        0.18,
         1.0,
         0.02,
         0.02,
@@ -4792,634 +5184,732 @@
         0.04
       ],
       [
-        0.14,
+        0.15,
         0.02,
         1.0,
+        0.82,
+        0.93,
+        0.48
+      ],
+      [
+        0.15,
+        0.02,
+        0.82,
+        1.0,
         0.8,
-        0.94,
         0.55
       ],
       [
-        0.12,
+        0.15,
         0.02,
+        0.93,
         0.8,
         1.0,
-        0.81,
-        0.59
-      ],
-      [
-        0.16,
-        0.02,
-        0.94,
-        0.81,
-        1.0,
-        0.54
+        0.47
       ],
       [
         0.13,
         0.04,
+        0.48,
         0.55,
-        0.59,
-        0.54,
+        0.47,
         1.0
       ]
     ]
   },
   "rules": [
     {
-      "after": "layout run progress step mode accepted swaps evaluated … (видов строк: 2)",
-      "then": "layout energy long progress step prev radius (видов строк: 2)",
+      "after": "layout run progress step * mode accepted swaps … (видов строк: 2)",
+      "then": "layout energy long progress step * prev radius (видов строк: 2)",
       "support": 300,
-      "confidence": 0.98,
-      "lift": 6.9
+      "confidence": 0.99,
+      "lift": 7.5
     },
     {
-      "after": "layout energy long progress step prev radius (видов строк: 2)",
-      "then": "layout run progress step mode accepted swaps evaluated … (видов строк: 2)",
-      "support": 356,
+      "after": "layout energy long progress step * prev radius (видов строк: 2)",
+      "then": "layout run progress step * mode accepted swaps … (видов строк: 2)",
+      "support": 361,
       "confidence": 0.82,
-      "lift": 6.9
+      "lift": 7.5
     },
     {
-      "after": "encoder layer dimension dimension index layer index count …",
-      "then": "encoder colour band dimension layer index rank start … (видов строк: 2)",
+      "after": "encoder layer dimension * dimension index * layer …",
+      "then": "encoder colour band dimension * layer index * …",
       "support": 140,
       "confidence": 1.0,
-      "lift": 12.0
+      "lift": 13.0
     },
     {
-      "after": "encoder colour band dimension layer index rank start … (видов строк: 2)",
-      "then": "encoder layer dimension dimension index layer index count …",
+      "after": "encoder colour band dimension * layer index * …",
+      "then": "encoder layer dimension * dimension index * layer …",
       "support": 210,
       "confidence": 0.6,
-      "lift": 10.8
+      "lift": 11.7
     },
     {
-      "after": "encoder encode stimuli values (видов строк: 2)",
-      "then": "encoder encode code stimuli code length active bits …",
+      "after": "encoder encode input stimuli * values * dimensions",
+      "then": "encoder encode normalized stimuli * values",
       "support": 103,
       "confidence": 1.0,
-      "lift": 24.4
+      "lift": 26.5
     },
     {
-      "after": "encoder encode code stimuli code length active bits …",
-      "then": "encoder encode stimuli values (видов строк: 2)",
+      "after": "encoder encode normalized stimuli * values",
+      "then": "encoder encode code stimuli * code length * …",
+      "support": 103,
+      "confidence": 1.0,
+      "lift": 26.5
+    },
+    {
+      "after": "encoder encode code stimuli * code length * …",
+      "then": "encoder encode input stimuli * values * dimensions",
       "support": 103,
       "confidence": 0.93,
-      "lift": 22.7
+      "lift": 24.7
     },
     {
-      "after": "encoder layer dimension angle dimension index layer index …",
-      "then": "encoder colour band dimension layer index rank start … (видов строк: 2)",
+      "after": "encoder layer dimension angle dimension index * layer …",
+      "then": "encoder colour band dimension * layer index * …",
       "support": 70,
       "confidence": 1.0,
-      "lift": 12.0
+      "lift": 13.0
     },
     {
-      "after": "layout adaptive radius step pair swap rate stage … (видов строк: 2)",
-      "then": "layout run swap ratio step swap ratio avg …",
-      "support": 75,
-      "confidence": 0.81,
-      "lift": 11.1
+      "after": "layout adaptive radius step * pair radius * …",
+      "then": "layout run swap ratio step * swap ratio …",
+      "support": 72,
+      "confidence": 0.82,
+      "lift": 12.2
     },
     {
-      "after": "layout visual step points grid size energy diff … (видов строк: 2)",
-      "then": "layout run swap ratio step swap ratio avg …",
-      "support": 63,
-      "confidence": 0.81,
-      "lift": 11.0
-    },
-    {
-      "after": "layout short pair sampling pairs requested pairs generated …",
-      "then": "layout (видов строк: 4)",
-      "support": 40,
+      "after": "layout short partition pairs requested * produced * …",
+      "then": "layout short parallel pairs * workers * partitions …",
+      "support": 44,
       "confidence": 1.0,
-      "lift": 15.3
+      "lift": 17.3
     },
     {
-      "after": "layout short tiles partitions row parts col parts …",
-      "then": "layout (видов строк: 4)",
+      "after": "layout short tiles partitions * row parts * …",
+      "then": "layout short partition pairs requested * produced * …",
       "support": 44,
       "confidence": 0.89,
-      "lift": 13.6
+      "lift": 55.0
     },
     {
-      "after": "layout visual step points grid size energy none …",
-      "then": "layout (видов строк: 4)",
+      "after": "layout short pair sampling pairs requested * pairs …",
+      "then": "layout short parallel pairs * workers * partitions …",
+      "support": 40,
+      "confidence": 0.88,
+      "lift": 15.1
+    },
+    {
+      "after": "layout visual step * points * grid size …",
+      "then": "layout short parallel pairs * workers * partitions …",
       "support": 23,
       "confidence": 0.74,
-      "lift": 11.3
+      "lift": 12.8
     },
     {
-      "after": "encoder random bits dimension dimension index detectors code …",
-      "then": "encoder layer dimension dimension index layer index count …",
+      "after": "encoder random bits dimension * dimension index * …",
+      "then": "encoder layer dimension * dimension index * layer …",
       "support": 21,
       "confidence": 0.67,
-      "lift": 12.0
+      "lift": 13.0
     },
     {
-      "after": "encoder random bits dimension angle dimension index detectors …",
-      "then": "encoder layer dimension dimension index layer index count …",
-      "support": 21,
-      "confidence": 0.67,
-      "lift": 12.0
+      "after": "layout energy long similarity similarity cosine pairs * …",
+      "then": "layout energy long sim lambda lambda threshold * …",
+      "support": 14,
+      "confidence": 1.0,
+      "lift": 194.9
     },
     {
-      "after": "layout energy (видов строк: 5)",
+      "after": "layout energy long sim lambda lambda threshold * …",
+      "then": "layout energy long threshold lambda threshold * eta …",
+      "support": 14,
+      "confidence": 1.0,
+      "lift": 194.9
+    },
+    {
+      "after": "layout energy long threshold lambda threshold * eta …",
       "then": "layout energy pair ignore self skip pair points …",
-      "support": 28,
-      "confidence": 0.5,
-      "lift": 89.6
+      "support": 14,
+      "confidence": 1.0,
+      "lift": 194.9
     },
     {
       "after": "layout energy pair ignore self skip pair points …",
-      "then": "layout energy (видов строк: 5)",
+      "then": "layout energy long space space size * points …",
       "support": 14,
       "confidence": 1.0,
-      "lift": 89.6
+      "lift": 194.9
     },
     {
-      "after": "ratio (видов строк: 2)",
-      "then": "detectors init count overlap",
-      "support": 16,
-      "confidence": 0.75,
-      "lift": 134.5
+      "after": "detectors geometric layers layers count * widest * …",
+      "then": "detectors init count * overlap",
+      "support": 14,
+      "confidence": 0.86,
+      "lift": 167.1
+    },
+    {
+      "after": "layout energy long space space size * points …",
+      "then": "layout run swap ratio step * swap ratio …",
+      "support": 14,
+      "confidence": 0.86,
+      "lift": 12.7
     },
     {
       "after": "projects damp venv lib site packages rerun dynamic … (видов строк: 2)",
       "then": "archetype optional archetype none drop untyped nones components …",
       "support": 10,
       "confidence": 1.0,
-      "lift": 251.0
+      "lift": 272.9
     },
     {
       "after": "layout similarity threshold cache reset reason adaptive lambda …",
-      "then": "layout adaptive lambda step threshold swap ratio (видов строк: 2)",
+      "then": "layout adaptive lambda step * threshold swap ratio (видов строк: 2)",
       "support": 9,
       "confidence": 1.0,
-      "lift": 278.9
+      "lift": 303.2
     },
     {
-      "after": "layout energy long pair pair index idx idx …",
-      "then": "layout run swap ratio step swap ratio avg …",
+      "after": "layout energy long pair pair index * idx …",
+      "then": "layout run swap ratio step * swap ratio …",
       "support": 8,
       "confidence": 1.0,
-      "lift": 13.6
+      "lift": 14.8
     },
     {
-      "after": "layout adaptive trigger step swap rate stage initial …",
+      "after": "layout adaptive trigger step * swap rate * …",
       "then": "layout similarity threshold cache reset reason adaptive lambda …",
       "support": 9,
       "confidence": 0.78,
-      "lift": 216.9
+      "lift": 235.8
     },
     {
-      "after": "detectors init count overlap",
-      "then": "ratio (видов строк: 2)",
+      "after": "detectors init count * overlap",
+      "then": "detectors geometric layers layers count * widest * …",
       "support": 14,
       "confidence": 0.5,
-      "lift": 104.6
+      "lift": 136.4
     },
     {
-      "after": "detectors init count overlap",
-      "then": "dimension init title min value max closed false … (видов строк: 2)",
+      "after": "detectors init count * overlap",
+      "then": "dimension init title angle min value * max …",
       "support": 14,
       "confidence": 0.5,
-      "lift": 89.6
+      "lift": 194.9
     },
     {
-      "after": "dimension init title min value max closed false … (видов строк: 2)",
-      "then": "encoder layer dimension angle dimension index layer index …",
-      "support": 14,
-      "confidence": 0.5,
-      "lift": 17.9
+      "after": "dimension init title * min value * max …",
+      "then": "encoder layer dimension angle dimension index * layer …",
+      "support": 7,
+      "confidence": 1.0,
+      "lift": 39.0
     },
     {
-      "after": "dimension init title min value max closed false … (видов строк: 2)",
+      "after": "dimension init title angle min value * max …",
       "then": "dimension closed title angle period",
-      "support": 14,
-      "confidence": 0.5,
-      "lift": 179.3
+      "support": 7,
+      "confidence": 1.0,
+      "lift": 389.9
     },
     {
       "after": "dimension closed title angle period",
-      "then": "dimension init title min value max closed false … (видов строк: 2)",
+      "then": "dimension init title * min value * max …",
       "support": 7,
       "confidence": 1.0,
-      "lift": 179.3
+      "lift": 389.9
     },
     {
-      "after": "encoder init dimensions random seed layer phase true …",
-      "then": "encoder code length mode merge code length segments …",
+      "after": "encoder init dimensions * random seed * layer …",
+      "then": "encoder code length mode merge code length * …",
       "support": 7,
       "confidence": 1.0,
-      "lift": 358.6
+      "lift": 389.9
     },
     {
-      "after": "encoder code length mode merge code length segments …",
+      "after": "encoder code length mode merge code length * …",
       "then": "encoder detectors detectors",
       "support": 7,
       "confidence": 1.0,
-      "lift": 358.6
+      "lift": 389.9
     },
     {
       "after": "encoder detectors detectors",
-      "then": "encoder long range order dimension samples monotone true … (видов строк: 2)",
+      "then": "encoder long range order dimension angle samples * …",
       "support": 7,
       "confidence": 1.0,
-      "lift": 358.6
+      "lift": 389.9
     },
     {
-      "after": "layout adaptive lambda step threshold swap ratio (видов строк: 2)",
-      "then": "layout run swap ratio step swap ratio avg …",
+      "after": "encoder long range order dimension angle samples * …",
+      "then": "encoder long range order dimension * samples * …",
+      "support": 7,
+      "confidence": 1.0,
+      "lift": 389.9
+    },
+    {
+      "after": "layout adaptive lambda step * threshold swap ratio (видов строк: 2)",
+      "then": "layout run swap ratio step * swap ratio …",
       "support": 9,
       "confidence": 0.67,
-      "lift": 9.1
+      "lift": 9.9
     },
     {
-      "after": "activation engine init points lambda threshold eta similarity …",
-      "then": "activation engine init detectors points energy threshold detector …",
+      "after": "activation engine init points * lambda threshold * …",
+      "then": "activation engine init detectors * points * energy …",
       "support": 6,
       "confidence": 1.0,
-      "lift": 418.3
+      "lift": 454.8
     },
     {
-      "after": "activation embedding saturation resolve output bits scale factor … (видов строк: 2)",
-      "then": "activation engine init points lambda threshold eta similarity …",
+      "after": "activation embedding saturation resolve output bits * scale … (видов строк: 2)",
+      "then": "activation engine init points * lambda threshold * …",
       "support": 6,
       "confidence": 1.0,
-      "lift": 418.3
+      "lift": 454.8
     },
     {
       "after": "projects damp venv lib site packages rerun dynamic … (видов строк: 2)",
       "then": "batch any batch value descriptor value drop untyped …",
       "support": 6,
       "confidence": 1.0,
-      "lift": 418.3
+      "lift": 454.8
     },
     {
       "after": "archetype optional archetype none drop untyped nones components …",
-      "then": "layout tune points grid size est empty ratio … (видов строк: 2)",
+      "then": "layout tune points * grid size est * …",
       "support": 10,
       "confidence": 0.5,
-      "lift": 156.9
+      "lift": 272.9
     },
     {
       "after": "archetype optional archetype none drop untyped nones components …",
-      "then": "layout precompute (видов строк: 2)",
+      "then": "layout precompute precompute similarity true",
       "support": 10,
       "confidence": 0.5,
-      "lift": 251.0
+      "lift": 272.9
     },
     {
-      "after": "pinwheel stimulus positions segments angle angles per position …",
-      "then": "encoder encode stimuli values (видов строк: 2)",
+      "after": "pinwheel stimulus positions * segments angle * angles …",
+      "then": "encoder encode input stimuli * values * dimensions",
       "support": 5,
       "confidence": 1.0,
-      "lift": 24.4
+      "lift": 26.5
     },
     {
-      "after": "pinwheel codes angles positions stimuli code length expected …",
+      "after": "pinwheel codes angles * positions * stimuli * …",
       "then": "projects damp venv lib site packages rerun dynamic … (видов строк: 2)",
       "support": 5,
       "confidence": 1.0,
-      "lift": 251.0
+      "lift": 272.9
     },
     {
-      "after": "layout energy neighbourhood sample config sample side mode …",
-      "then": "layout sim (видов строк: 6)",
+      "after": "layout tune points * grid size est * …",
+      "then": "layout energy neighbourhood sample config sample side * …",
       "support": 5,
       "confidence": 1.0,
-      "lift": 228.2
+      "lift": 545.8
+    },
+    {
+      "after": "layout energy neighbourhood sample config sample side * …",
+      "then": "layout sim matrix ready points * code len",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout sim matrix ready points * code len",
+      "then": "layout init points * labels * seed",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout init points * labels * seed",
+      "then": "layout grid grid size * empty ratio",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout grid grid size * empty ratio",
+      "then": "layout similarity similarity cosine",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
     },
     {
       "after": "layout similarity similarity cosine",
-      "then": "layout thresholds lambda threshold eta none",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
+      "then": "layout thresholds lambda threshold * eta none",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
     },
     {
-      "after": "layout similarity similarity cosine",
-      "then": "layout energy subset config long subset size long …",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
+      "after": "layout thresholds lambda threshold * eta none",
+      "then": "layout energy distance long distance euclidean short distance …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
     },
     {
       "after": "layout energy distance long distance euclidean short distance …",
       "then": "layout energy long kernel kernel distance radius min …",
       "support": 5,
       "confidence": 1.0,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
       "after": "layout energy long kernel kernel distance radius min …",
-      "then": "layout similarity threshold lambda threshold eta eta mode …",
+      "then": "layout similarity threshold lambda threshold * eta * …",
       "support": 5,
       "confidence": 1.0,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
-      "after": "layout similarity threshold lambda threshold eta eta mode …",
+      "after": "layout similarity threshold lambda threshold * eta * …",
       "then": "projects damp venv lib site packages rerun dynamic … (видов строк: 2)",
       "support": 5,
       "confidence": 1.0,
-      "lift": 251.0
+      "lift": 272.9
     },
     {
-      "after": "layout precompute (видов строк: 2)",
-      "then": "layout thresholds lambda threshold eta none",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
-    },
-    {
-      "after": "layout precompute (видов строк: 2)",
-      "then": "layout energy subset config long subset size long …",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
-    },
-    {
-      "after": "layout energy subset config long subset size long …",
-      "then": "layout parallel (видов строк: 2)",
+      "after": "layout precompute precompute similarity true",
+      "then": "layout precompute limit max precompute",
       "support": 5,
       "confidence": 1.0,
-      "lift": 251.0
+      "lift": 545.8
     },
     {
-      "after": "layout gpu (видов строк: 2)",
-      "then": "layout codes code length ones min ones max …",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
-    },
-    {
-      "after": "layout gpu (видов строк: 2)",
-      "then": "layout parallel (видов строк: 2)",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 125.5
-    },
-    {
-      "after": "layout codes code length ones min ones max …",
-      "then": "layout distance eps distance eps вне статьи",
+      "after": "layout precompute limit max precompute",
+      "then": "layout energy subset config long subset size * …",
       "support": 5,
       "confidence": 1.0,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
-      "after": "layout gpu error no module named (видов строк: 3)",
-      "then": "layout gpu (видов строк: 2)",
+      "after": "layout energy subset config long subset size * …",
+      "then": "layout parallel parallel workers none",
       "support": 5,
       "confidence": 1.0,
-      "lift": 251.0
+      "lift": 545.8
+    },
+    {
+      "after": "layout parallel parallel workers none",
+      "then": "layout gpu config use gpu true",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout gpu config use gpu true",
+      "then": "layout codes code length * ones min * …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout codes code length * ones min * …",
+      "then": "layout distance eps distance eps * вне статьи",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout distance eps distance eps * вне статьи",
+      "then": "layout gpu pair energy unavailable error no module …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout gpu pair energy unavailable error no module …",
+      "then": "layout gpu import failed error no module named …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout gpu import failed error no module named …",
+      "then": "layout gpu tensor unavailable error no module named …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout gpu tensor unavailable error no module named …",
+      "then": "layout gpu disabled status cpu",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout gpu disabled status cpu",
+      "then": "layout parallel cpu count cpu count",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout parallel cpu count cpu count",
+      "then": "layout sim cache start point count",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout sim cache start point count",
+      "then": "layout sim cache similarity similarity cosine",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout sim cache similarity similarity cosine",
+      "then": "layout sim cache parallel workers",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout sim cache parallel workers",
+      "then": "layout sim cache gpu use gpu true",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
     },
     {
       "after": "layout pair radius update pair radius",
-      "then": "layout run settings steps min swap ratio window … (видов строк: 2)",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 114.1
+      "then": "layout run selection pairs per step * pair …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
     },
     {
-      "after": "layout pair radius update pair radius",
-      "then": "layout run selection pairs per step pair radius …",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
-    },
-    {
-      "after": "layout run selection pairs per step pair radius …",
+      "after": "layout run selection pairs per step * pair …",
       "then": "layout run mode local radius (видов строк: 2)",
       "support": 5,
       "confidence": 1.0,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
-      "after": "layout run swap monitor min swap ratio window …",
-      "then": "layout adaptive config mode start radius end schedule … (видов строк: 2)",
+      "after": "layout run settings steps * min swap ratio …",
+      "then": "layout run energy monitor radius (видов строк: 2)",
       "support": 5,
       "confidence": 1.0,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
-      "after": "layout run speculative mode pairs per step points … (видов строк: 2)",
+      "after": "layout run swap monitor min swap ratio * …",
+      "then": "layout adaptive config mode start radius * end … (видов строк: 2)",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
+    },
+    {
+      "after": "layout run speculative mode pairs per step * … (видов строк: 2)",
       "then": "layout pair radius update pair radius",
       "support": 5,
       "confidence": 1.0,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
       "after": "layout run mode local radius (видов строк: 2)",
-      "then": "layout run settings steps min swap ratio window … (видов строк: 2)",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 114.1
+      "then": "layout run settings steps * min swap ratio …",
+      "support": 5,
+      "confidence": 1.0,
+      "lift": 545.8
     },
     {
-      "after": "layout run mode local radius (видов строк: 2)",
-      "then": "layout run selection pairs per step pair radius …",
-      "support": 10,
-      "confidence": 0.5,
-      "lift": 251.0
-    },
-    {
-      "after": "encoder long range order dimension samples monotone true … (видов строк: 2)",
-      "then": "pinwheel stimulus positions segments angle angles per position …",
+      "after": "encoder long range order dimension * samples * …",
+      "then": "pinwheel stimulus positions * segments angle * angles …",
       "support": 7,
       "confidence": 0.71,
-      "lift": 358.6
+      "lift": 389.9
     },
     {
-      "after": "layout tune points grid size est empty ratio … (видов строк: 2)",
-      "then": "layout energy neighbourhood sample config sample side mode …",
-      "support": 8,
-      "confidence": 0.62,
-      "lift": 313.8
+      "after": "layout run settings steps * min swap ratio …",
+      "then": "layout run progress step * mode accepted swaps … (видов строк: 2)",
+      "support": 6,
+      "confidence": 0.67,
+      "lift": 6.1
     },
     {
-      "after": "layout short energy weights energy radius points step …",
-      "then": "layout (видов строк: 4)",
+      "after": "layout short energy weights energy radius * points …",
+      "then": "layout short parallel pairs * workers * partitions …",
       "support": 7,
       "confidence": 0.57,
-      "lift": 8.7
+      "lift": 9.9
     },
     {
-      "after": "layout continuity sweep sweep swaps gain worst defect",
-      "then": "layout continuity done swaps sweeps score cache entries",
+      "after": "layout continuity sweep sweep * swaps * gain …",
+      "then": "layout continuity done swaps * sweeps * score …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
-      "after": "activation detector layer lambda layer detectors per layer …",
-      "then": "activation embedding saturation resolve output bits scale factor … (видов строк: 2)",
+      "after": "activation detector layer lambda * layer detectors * …",
+      "then": "activation embedding saturation resolve output bits * scale … (видов строк: 2)",
       "support": 3,
       "confidence": 1.0,
-      "lift": 418.3
+      "lift": 454.8
     },
     {
-      "after": "activation detector scale resolve layout width layout height …",
-      "then": "activation detector layers resolve layout width layout height …",
+      "after": "activation detector scale resolve layout width * layout …",
+      "then": "activation embedding saturation resolve output bits * scale … (видов строк: 2)",
       "support": 6,
       "confidence": 0.5,
-      "lift": 418.3
+      "lift": 227.4
     },
     {
-      "after": "activation detector scale resolve layout width layout height …",
-      "then": "activation embedding saturation resolve output bits scale factor … (видов строк: 2)",
+      "after": "activation detector scale resolve layout width * layout …",
+      "then": "activation detector layers resolve layout width * layout …",
       "support": 6,
       "confidence": 0.5,
-      "lift": 209.2
+      "lift": 454.8
     },
     {
-      "after": "layout run swap stability stop step window min …",
-      "then": "layout run done steps total swaps avg swaps",
+      "after": "layout run swap stability stop step * window …",
+      "then": "layout run done steps * total swaps * …",
       "support": 5,
       "confidence": 0.6,
-      "lift": 301.2
+      "lift": 327.5
     },
     {
-      "after": "layout run done steps total swaps avg swaps",
-      "then": "pinwheel quality mean neighbour delta sharp transition ratio …",
+      "after": "layout run done steps * total swaps * …",
+      "then": "pinwheel quality mean neighbour delta * sharp transition …",
       "support": 5,
       "confidence": 0.6,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
-      "after": "layout energy long progress step prev none radius (видов строк: 2)",
-      "then": "layout run progress step mode accepted swaps evaluated … (видов строк: 2)",
-      "support": 5,
-      "confidence": 0.6,
-      "lift": 5.0
-    },
-    {
-      "after": "layout run done mode final step steps total … (видов строк: 2)",
-      "then": "layout continuity start sweeps defect points candidates per … (видов строк: 2)",
-      "support": 6,
-      "confidence": 0.5,
-      "lift": 418.3
-    },
-    {
-      "after": "activation detector layers resolve layout width layout height …",
-      "then": "activation detector layer lambda layer detectors per layer …",
+      "after": "activation detector layers resolve layout width * layout …",
+      "then": "activation detector layer lambda * layer detectors * …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
+    },
+    {
+      "after": "layout sim cache done mode cpu",
+      "then": "layout pair sampling merged draws merged true note …",
+      "support": 3,
+      "confidence": 1.0,
+      "lift": 909.7
     },
     {
       "after": "layout pair sampling merged draws merged true note …",
       "then": "layout pair sampling compiled unavailable note numba не …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
       "after": "layout run energy monitor radius (видов строк: 2)",
-      "then": "layout run swap monitor min swap ratio window …",
+      "then": "layout run swap monitor min swap ratio * …",
       "support": 5,
       "confidence": 0.6,
-      "lift": 301.2
+      "lift": 327.5
     },
     {
-      "after": "layout adaptive config mode start radius end schedule … (видов строк: 2)",
-      "then": "layout short optim config energy radius energy recalc …",
+      "after": "layout adaptive config mode start radius * end … (видов строк: 2)",
+      "then": "layout short optim config energy radius * energy …",
       "support": 5,
       "confidence": 0.6,
-      "lift": 502.0
+      "lift": 545.8
     },
     {
-      "after": "layout short optim config energy radius energy recalc …",
-      "then": "layout short energy weights energy radius points step …",
+      "after": "layout short optim config energy radius * energy …",
+      "then": "layout short energy weights energy radius * points …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 358.6
+      "lift": 389.9
     },
     {
-      "after": "pinwheel quality mean neighbour delta sharp transition ratio …",
-      "then": "pinwheel long range opposite angle similarity lambda threshold …",
+      "after": "pinwheel quality mean neighbour delta * sharp transition …",
+      "then": "pinwheel long range opposite angle similarity * lambda …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
-      "after": "pinwheel long range opposite angle similarity lambda threshold …",
-      "then": "layout render image height width coloring code bits",
+      "after": "pinwheel long range opposite angle similarity * lambda …",
+      "then": "layout render image height * width * coloring …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
-      "after": "layout render component image height width coloring stimulus …",
-      "then": "layout point energy map radius points energy max …",
+      "after": "layout render component image height * width * …",
+      "then": "layout point energy map radius * points * …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
-      "after": "layout point energy map radius points energy max …",
-      "then": "layout render energy image height width coloring code …",
+      "after": "layout point energy map radius * points * …",
+      "then": "layout render energy image height * width * …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
-      "after": "layout continuity start sweeps defect points candidates per … (видов строк: 2)",
-      "then": "layout continuity sweep sweep swaps gain worst defect",
+      "after": "layout render energy image height * width * …",
+      "then": "layout payload base path * points * points …",
       "support": 3,
       "confidence": 1.0,
-      "lift": 836.7
+      "lift": 909.7
     },
     {
-      "after": "layout continuity done swaps sweeps score cache entries",
-      "then": "activation detector scale resolve layout width layout height …",
+      "after": "layout payload base path * points * points …",
+      "then": "layout export json path * points * width …",
+      "support": 3,
+      "confidence": 1.0,
+      "lift": 909.7
+    },
+    {
+      "after": "layout tune points * grid size est * …",
+      "then": "layout run settings steps * min swap ratio …",
       "support": 3,
       "confidence": 0.67,
-      "lift": 278.9
+      "lift": 303.2
     },
     {
-      "after": "encoder code colors codes code length min hue …",
-      "then": "layout energy average radius energy energy max points …",
+      "after": "layout continuity done swaps * sweeps * score …",
+      "then": "activation detector scale resolve layout width * layout …",
       "support": 3,
       "confidence": 0.67,
-      "lift": 836.7
+      "lift": 303.2
     },
     {
-      "after": "layout render image height width coloring code bits",
-      "then": "layout render component image height width coloring stimulus …",
+      "after": "encoder code colors codes * code length * …",
+      "then": "layout energy average radius * energy * energy …",
       "support": 3,
       "confidence": 0.67,
-      "lift": 557.8
+      "lift": 909.7
     },
     {
-      "after": "layout render energy image height width coloring code …",
-      "then": "layout payload base path elastic pinwheel damp json … (видов строк: 2)",
+      "after": "layout render image height * width * coloring …",
+      "then": "layout render component image height * width * …",
       "support": 3,
       "confidence": 0.67,
-      "lift": 836.7
+      "lift": 606.4
     },
     {
-      "after": "points (видов строк: 2)",
-      "then": "grid size",
-      "support": 3,
-      "confidence": 0.67,
-      "lift": 836.7
-    },
-    {
-      "after": "layout adaptive stage forced step avg swaps min …",
-      "then": "layout (видов строк: 4)",
+      "after": "layout adaptive stage forced step * avg swaps …",
+      "then": "layout short parallel pairs * workers * partitions …",
       "support": 4,
       "confidence": 0.5,
-      "lift": 7.7
+      "lift": 8.6
     },
     {
-      "after": "layout adaptive stage forced step avg swaps min …",
+      "after": "layout adaptive stage forced step * avg swaps …",
       "then": "layout similarity threshold cache reset reason adaptive lambda …",
       "support": 4,
       "confidence": 0.5,
-      "lift": 139.4
+      "lift": 151.6
     }
   ],
   "precursors": [
@@ -5428,39 +5918,81 @@
       "occurrences": 10,
       "precursors": [
         {
-          "type": "layout similarity threshold lambda threshold eta eta mode …",
-          "lift": 250.4,
+          "type": "layout similarity threshold lambda threshold * eta * …",
+          "lift": 272.3,
           "times": 5
         },
         {
           "type": "layout energy long kernel kernel distance radius min …",
-          "lift": 250.4,
+          "lift": 272.3,
           "times": 5
         },
         {
           "type": "layout energy distance long distance euclidean short distance …",
-          "lift": 250.4,
+          "lift": 272.3,
           "times": 5
         }
       ]
     },
     {
-      "event": "layout gpu error no module named (видов строк: 3)",
+      "event": "layout gpu pair energy unavailable error no module …",
       "occurrences": 5,
       "precursors": [
         {
-          "type": "layout distance eps distance eps вне статьи",
-          "lift": 500.8,
+          "type": "layout distance eps distance eps * вне статьи",
+          "lift": 544.6,
           "times": 5
         },
         {
-          "type": "layout codes code length ones min ones max …",
-          "lift": 500.8,
+          "type": "layout codes code length * ones min * …",
+          "lift": 544.6,
           "times": 5
         },
         {
-          "type": "layout gpu (видов строк: 2)",
-          "lift": 250.4,
+          "type": "layout gpu config use gpu true",
+          "lift": 544.6,
+          "times": 5
+        }
+      ]
+    },
+    {
+      "event": "layout gpu import failed error no module named …",
+      "occurrences": 5,
+      "precursors": [
+        {
+          "type": "layout gpu pair energy unavailable error no module …",
+          "lift": 544.6,
+          "times": 5
+        },
+        {
+          "type": "layout distance eps distance eps * вне статьи",
+          "lift": 544.6,
+          "times": 5
+        },
+        {
+          "type": "layout codes code length * ones min * …",
+          "lift": 544.6,
+          "times": 5
+        }
+      ]
+    },
+    {
+      "event": "layout gpu tensor unavailable error no module named …",
+      "occurrences": 5,
+      "precursors": [
+        {
+          "type": "layout gpu import failed error no module named …",
+          "lift": 544.6,
+          "times": 5
+        },
+        {
+          "type": "layout gpu pair energy unavailable error no module …",
+          "lift": 544.6,
+          "times": 5
+        },
+        {
+          "type": "layout distance eps distance eps * вне статьи",
+          "lift": 544.6,
           "times": 5
         }
       ]

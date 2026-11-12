@@ -463,6 +463,8 @@ python -m unittest discover -s tests -p "test*.py"
 нижние слои иерархии детекторов дают семейства событий, верхние — типы. По эталонным логам строится
 пространство, в целевых ищутся новые строки (§7.1.13.3), новые значения чисел (§4.2.1), инциденты
 и похожие на них окна эталона (§6.5, §2.2.5); по всем запускам — правила следования событий (§2.3.2).
+Формат лога знать не нужно: метки времени распознаются при разборе, заголовок строки (хост, процесс,
+уровень) и переменные слова находятся по статистике эталона.
 
 ```powershell
 $env:RERUN='off'
@@ -472,7 +474,9 @@ python log_insights.py
 Результаты: `log_insights.md` (отчёт), `log_insights.json`, карты `log_insights.png`,
 `log_insights.energy.png`, `log_insights.types.png`. Источники и параметры — константы `LOG_*`
 в `main.py`. Разбор идеи, отступления от статьи и результаты на логах DAMP —
-[docs/LOG_INSIGHTS.md](docs/LOG_INSIGHTS.md); тесты — `tests/test_log_insights.py`.
+[docs/LOG_INSIGHTS.md](docs/LOG_INSIGHTS.md); тесты — `tests/test_log_insights.py` и
+`tests/test_log_formats.py` (одни и те же события в пяти оформлениях строки; публичные логи loghub,
+если они лежат в `data/loghub/`).
 
 ## Кеш
 

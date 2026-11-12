@@ -62,6 +62,7 @@ from damp.article_refs import (
 from damp.encoding.bitarray import BitArray
 from damp.encoding.damp_encoder import EncoderCodeColorizer
 from damp.encoding.log_encoder import (
+    BackgroundWords,
     FragmentDictionary,
     LineCode,
     LineFragmenter,
@@ -70,6 +71,7 @@ from damp.encoding.log_encoder import (
     LogLineReader,
     NumericValueEncoder,
     TokenAlphabet,
+    VariableSlots,
 )
 from damp.layout.code_table import LayoutCodeTable
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig
@@ -85,6 +87,8 @@ from main import (
     LAYOUT_USE_GPU,
     LOG_ACTIVATION_DETECTOR_THRESHOLD,
     LOG_ACTIVATION_ENERGY_THRESHOLD,
+    LOG_BACKGROUND_MIN_LINES,
+    LOG_BACKGROUND_SHARE,
     LOG_CODE_BITS,
     LOG_DBSCAN_EPS,
     LOG_DBSCAN_MIN_SAMPLES,
@@ -154,6 +158,8 @@ from main import (
     LOG_TOKEN_BITS,
     LOG_TYPE_LAMBDA,
     LOG_TYPE_LAYER_LAMBDA,
+    LOG_VARIABLE_MIN_CONTEXT,
+    LOG_VARIABLE_MIN_VALUES,
     LOG_WINDOW_EMBEDDING_SATURATION_MAX,
     LOG_WINDOW_LINES,
     LOG_WINDOW_STRIDE,
@@ -324,8 +330,9 @@ class LayeredDetection:
 class LineReaction:
     """Реакция пространства на строку (§6.5, §7.1.11, §7.1.13.3).
 
-    embedding — код всех активных детекторов; type_code — детекторов верхних слоёв (кластеры и их части),
-    family_code — нижних слоёв (области и гиперкластеры), §7.1.10.
+    embedding — код детекторов, активных на всех кодах строки. type_code — отклик на код строки целиком,
+    детекторы верхних слоёв (кластеры и их части, §7.1.10). family_code — отклик на коды с акцентом на начало
+    строки (§7.1.4.5), детекторы нижних слоёв (области и гиперкластеры).
     """
 
     embedding: BitArray
@@ -658,8 +665,14 @@ class LogCodeSpace:
                 nearest_value, nearest = best[row], point
         exact = bool(best.size) and bool((best >= LOG_EXACT_SIMILARITY).all())
         status = STATUS_EXACT if exact else (STATUS_PARTIAL if active else STATUS_UNKNOWN)
-        fine = [item for item in active if item.detector.lambda_threshold >= LOG_TYPE_LAYER_LAMBDA]
-        coarse = [item for item in active if item.detector.lambda_threshold <= LOG_FAMILY_LAYER_LAMBDA]
+        fine = [
+            item for item in self._view_active(stimulus, "whole")
+            if item.detector.lambda_threshold >= LOG_TYPE_LAYER_LAMBDA
+        ]
+        coarse = [
+            item for item in self._view_active(stimulus, "head")
+            if item.detector.lambda_threshold <= LOG_FAMILY_LAYER_LAMBDA
+        ]
         result = LineReaction(
             embedding=self.coder.embedding_from_active(active),
             type_code=self.coder.embedding_from_active(fine),
@@ -685,6 +698,13 @@ class LogCodeSpace:
             },
         )
         return result
+
+    def _view_active(self, stimulus: int, view: str) -> list[ActivatedDetector]:
+        """Детекторы, активные на кодах одного взгляда на строку; у строки без таких кодов — на коде целой строки."""
+        codes = [item.code for item in self.stimulus_codes[stimulus] if item.view == view]
+        if not codes:
+            codes = [item.code for item in self.stimulus_codes[stimulus] if item.view == "whole"]
+        return self.detection.detect(codes)[1] if codes else []
 
     def window_embedding(self, stimuli: frozenset[int]) -> BitArray:
         """Эмбеддинг окна: детекция набора стимулов S — a_ji = max по s ∈ S (§6.5)."""
@@ -747,9 +767,9 @@ class EventTypes:
     """Типы и семейства событий: строки с близкими структурными кодами (§2.2.5, §7.1.10, §7.1.13).
 
     Центр очередного типа — самая частая строка без типа; в тип входят строки без типа, чей код типа
-    (детекторы верхних слоёв) похож на код центра не меньше LOG_TYPE_LAMBDA. Семейства строятся так же
-    по коду семейства (детекторы нижних слоёв: области и гиперкластеры) с порогом LOG_FAMILY_LAMBDA.
-    Строка без активных детекторов нужных слоёв образует свой тип и своё семейство.
+    (отклик на строку целиком, детекторы верхних слоёв) похож на код центра не меньше LOG_TYPE_LAMBDA.
+    Семейства строятся так же по коду семейства (отклик на начало строки, детекторы нижних слоёв) с порогом
+    LOG_FAMILY_LAMBDA. Строка без активных детекторов нужных слоёв образует свой тип и своё семейство.
     """
 
     def __init__(self, corpus: LogCorpus, space: LogCodeSpace) -> None:
@@ -1485,8 +1505,24 @@ class LogInsightsExperiment:
             slot_words=LOG_NUMBER_SLOT_WORDS,
         )
 
+    def read_lines(self) -> tuple[list[LogLine], list[LogLine]]:
+        """Строки эталонных и целевых логов после предобработки.
+
+        Фоновые слова и переменные места находятся по эталону и убираются из строк обоих наборов.
+        """
+        reference = self._reader.read_sources(self._reference)
+        target = self._reader.read_sources(self._target)
+        background = BackgroundWords(reference, share=LOG_BACKGROUND_SHARE, min_lines=LOG_BACKGROUND_MIN_LINES)
+        reference, target = background.clean(reference), background.clean(target)
+        variables = VariableSlots(
+            (line.units for line in reference),
+            min_values=LOG_VARIABLE_MIN_VALUES,
+            min_context=LOG_VARIABLE_MIN_CONTEXT,
+        )
+        return variables.clean(reference), variables.clean(target)
+
     def build_space(self) -> tuple[LogCorpus, LogCodeSpace]:
-        corpus = LogCorpus(self._reader.read_sources(self._reference), self._reader.read_sources(self._target))
+        corpus = LogCorpus(*self.read_lines())
         reference_stimuli = [corpus.stimuli[int(i)] for i in np.flatnonzero(corpus.reference_count > 0)]
         dictionary = FragmentDictionary(reference_stimuli, fragment_words_max=LOG_FRAGMENT_WORDS_MAX)
         encoder = LogLineEncoder(

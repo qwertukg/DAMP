@@ -14,6 +14,8 @@ import numpy as np  # noqa: E402
 
 from damp.encoding.bitarray import BitArray  # noqa: E402
 from damp.encoding.log_encoder import (  # noqa: E402
+    VALUE,
+    BackgroundWords,
     FragmentDictionary,
     LineFragmenter,
     LogLine,
@@ -21,6 +23,7 @@ from damp.encoding.log_encoder import (  # noqa: E402
     LogLineReader,
     NumericValueEncoder,
     TokenAlphabet,
+    VariableSlots,
 )
 from damp.logging import LOGGER  # noqa: E402
 import log_insights  # noqa: E402
@@ -36,6 +39,17 @@ def _reader(line_words_max: int = main.LOG_LINE_WORDS_MAX) -> LogLineReader:
         line_words_max=line_words_max,
         slot_words=main.LOG_NUMBER_SLOT_WORDS,
     )
+
+
+def _words(text: str, **options) -> tuple[str, ...]:
+    """Стимул строки: слова по порядку, на месте значений — заполнитель."""
+    units, numbers = _reader(**options).parse(text)
+    return LogLine(source="test", number=1, text=text, units=units, numbers=numbers).words
+
+
+def _units(*words: str) -> tuple[tuple[str, ...], ...]:
+    """Единицы строки из отдельных слов; заполнитель значения — пустая единица."""
+    return tuple(() if word == VALUE else (word,) for word in words)
 
 
 def _encoder(lines: list[tuple[str, ...]], *, saturation: dict | None = None) -> LogLineEncoder:
@@ -68,24 +82,83 @@ class ReaderTests(unittest.TestCase):
     """§7.1.3: строка делится на слова по небуквенным символам, слова — в нижний регистр, длина ограничена."""
 
     def test_words_are_split_lowercased_and_filtered_by_length(self) -> None:
-        words, _ = _reader().parse("Layout.Run_progress modeLong a x verylongwordthatexceedstwentychars ok")
-        self.assertEqual(words, ("layout", "run", "progress", "mode", "long", "ok"))
+        words = _words("Layout.Run_progress modeLong verylongwordthatexceedstwentychars ok")
+        self.assertEqual(words, ("layout", "run", "progress", "mode", "long", VALUE, "ok"))
 
-    def test_runs_with_digits_are_values_not_words(self) -> None:
-        words, _ = _reader().parse("request id=a0d8f41fba7a sha256 utf8 done")
-        self.assertEqual(words, ("request", "id", "done"))
+    def test_tokens_without_words_become_one_value_placeholder(self) -> None:
+        self.assertEqual(_words("request id=a0d8f41fba7a sha256 utf8 done"), ("request", "id", VALUE, "done"))
+        self.assertEqual(_words("42 took 3 5 ms 7"), ("took", VALUE, "ms"))
 
     def test_numbers_get_slots_and_timestamps_and_dotted_numbers_are_skipped(self) -> None:
-        _, numbers = _reader().parse("2026-11-12T07:12:05.754669Z energy=0.82 swap_ratio=1e-3 [5.9.1] at 10.0.0.5")
+        units, numbers = _reader().parse("2026-11-12T07:12:05.754669Z energy=0.82 swap_ratio=1e-3 [5.9.1] at 10.0.0.5")
         self.assertEqual(numbers, (("energy", 0.82), ("swap ratio", 0.001)))
+        self.assertEqual(units, (("energy",), (), ("swap", "ratio"), (), ("at",)))
 
-    def test_consecutive_numbers_share_a_continuation_slot(self) -> None:
-        _, numbers = _reader().parse("counts=[2, 3, 5]")
-        self.assertEqual([slot for slot, _ in numbers], ["counts", "counts …", "counts …"])
+    def test_number_with_a_short_unit_is_a_number(self) -> None:
+        _, numbers = _reader().parse("request took=35ms load=12% size 4.5MB")
+        self.assertEqual(numbers, (("request took", 35.0), ("load", 12.0), ("size", 4.5)))
+
+    def test_consecutive_numbers_get_numbered_slots(self) -> None:
+        _, numbers = _reader().parse("GET /index HTTP 200 2326 0.003")
+        self.assertEqual([slot for slot, _ in numbers], ["index http", "index http #1", "index http #2"])
+
+    def test_timestamps_of_common_formats_give_no_words(self) -> None:
+        for stamp in (
+            "Dec 10 06:55:46",
+            "[Sun Dec 04 04:47:44 2005]",
+            "2015-07-29 17:41:44,747",
+            "[10/Oct/2000:13:55:36 -0700]",
+            "12 November 2026 14:05:11",
+        ):
+            self.assertEqual(_words(f"{stamp} session opened"), ("session", "opened"), stamp)
+
+    def test_letters_of_any_alphabet_are_words(self) -> None:
+        self.assertEqual(_words("Қате: дерекқорға қосылу мүмкін емес"), ("қате", "дерекқорға", "қосылу", "мүмкін", "емес"))
+        self.assertEqual(_words("HTTPServer қайта іске қосылды"), ("http", "server", "қайта", "іске", "қосылды"))
 
     def test_line_is_truncated_to_words_max(self) -> None:
-        words, _ = _reader(line_words_max=3).parse("alpha beta gamma delta epsilon")
-        self.assertEqual(words, ("alpha", "beta", "gamma"))
+        self.assertEqual(_words("alpha beta gamma delta epsilon", line_words_max=3), ("alpha", "beta", "gamma"))
+
+
+class BackgroundAndVariableTests(unittest.TestCase):
+    """Заголовок и переменные места строки находятся по статистике эталона, без знания формата (вне статьи)."""
+
+    @staticmethod
+    def _line(*words: str) -> LogLine:
+        return LogLine(source="test", number=1, text=" ".join(words), units=_units(*words), numbers=())
+
+    def test_words_present_in_almost_every_line_are_dropped(self) -> None:
+        lines = [self._line("web", "sshd", "session", "opened")] * 30 + [self._line("web", "sshd", "disk", "full")] * 30
+        background = BackgroundWords(lines, share=0.9, min_lines=50)
+        self.assertEqual(background.words, frozenset({"web", "sshd"}))
+        self.assertEqual(background.clean(lines)[0].words, ("session", "opened"))
+        # Строка из одних фоновых слов остаётся как есть.
+        self.assertEqual(background.strip(_units("web", "sshd")), _units("web", "sshd"))
+
+    def test_background_is_not_searched_in_a_small_corpus(self) -> None:
+        lines = [self._line("web", "session", "opened")] * 10
+        self.assertEqual(BackgroundWords(lines, share=0.9, min_lines=50).words, frozenset())
+
+    def test_slot_with_many_values_in_the_same_context_is_masked(self) -> None:
+        lines = [_units("invalid", "user", name, "from") for name in ("admin", "guest", "oracle")]
+        lines += [_units("session", "opened"), _units("session", "closed"), _units("session", "expired")]
+        variables = VariableSlots(lines, min_values=3, min_context=2)
+        self.assertEqual(variables.mask(lines[0]), _units("invalid", "user", VALUE, "from"))
+        # Новое значение на известном переменном месте тоже заменяется.
+        self.assertEqual(variables.mask(_units("invalid", "user", "newbie", "from")), _units("invalid", "user", VALUE, "from"))
+        # В короткой строке окружения мало: слова остаются.
+        self.assertEqual(variables.mask(_units("session", "closed")), _units("session", "closed"))
+        self.assertEqual(variables.mask(_units("totally", "new", "line")), _units("totally", "new", "line"))
+
+    def test_word_is_masked_where_other_lines_have_a_value(self) -> None:
+        lines = [_units("failed", "password", "for", VALUE, "from"), _units("failed", "password", "for", "root", "from")]
+        variables = VariableSlots(lines, min_values=3, min_context=2)
+        self.assertEqual(variables.mask(lines[1]), lines[0])
+
+    def test_two_values_are_not_enough(self) -> None:
+        lines = [_units("mode", "long", "accepted", "swaps"), _units("mode", "short", "accepted", "swaps")]
+        variables = VariableSlots(lines, min_values=3, min_context=2)
+        self.assertEqual(variables.mask(lines[0]), lines[0])
 
 
 class DictionaryTests(unittest.TestCase):
@@ -173,6 +246,19 @@ class LineCodeTests(unittest.TestCase):
         budget = main.LOG_FRAGMENT_SATURATION[2][0]
         self.assertGreaterEqual(left.common(right), len(set(encoder._fragment_bits(shared, budget, "tail"))))
 
+    def test_value_placeholders_do_not_enter_the_code(self) -> None:
+        encoder = _encoder([("invalid", "user", "from")])
+        with_value = encoder.encode(("invalid", "user", VALUE, "from"))
+        without = encoder.encode(("invalid", "user", "from"))
+        self.assertEqual([item.code for item in with_value], [item.code for item in without])
+
+    def test_views_are_whole_line_head_and_tail(self) -> None:
+        encoder = _encoder([("alpha", "beta", "gamma")])
+        views = [item.view for item in encoder.encode(("alpha", "beta", "gamma"))]
+        self.assertEqual(views.count("whole"), 1)
+        self.assertIn("head", views)
+        self.assertIn("tail", views)
+
     def test_similar_lines_are_closer_than_unrelated_ones_and_codes_stay_sparse(self) -> None:
         lines = [
             ("layout", "run", "progress", "step", "mode", "long", "accepted", "swaps"),
@@ -210,7 +296,7 @@ class NumericTests(unittest.TestCase):
     def test_new_value_is_reported_and_known_value_is_not(self) -> None:
         def line(source: str, number: int, value: float) -> LogLine:
             return LogLine(source=source, number=number, text=f"job done elapsed={value}",
-                           words=("job", "done", "elapsed"), numbers=(("elapsed", value),))
+                           units=_units("job", "done", "elapsed"), numbers=(("elapsed", value),))
 
         reference = [line("ref.log", i + 1, 0.1 + 0.05 * (i % 17)) for i in range(40)]
         target = [line("new.log", 1, 0.3), line("new.log", 2, 5000.0)]
