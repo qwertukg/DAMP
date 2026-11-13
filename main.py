@@ -522,7 +522,8 @@ SECOND_LEVEL_FILE_PREFIX = "data/second"
 # Замеры 2026-11-13 (сглаженный режим, 2000 проверочных цифр, 1 ближайший сосед): 1000 цифр — 92.2–92.6 %
 # против 90.6 % у второго уровня над первой раскладкой; 5000 цифр — 96.0 % против 93.7 %.
 # Шаги вверх: радиус окна каждого шага в клетках сетки углопозиций (окнах Собеля). Один радиус — один
-# уровень кусков между углопозициями и картинкой; уровней всего — число радиусов + 2. Замеры (2000 и 5000
+# уровень кусков между углопозициями и картинкой. Нумерация: уровень 0 — углопозиции (первичный), уровни
+# 1… — куски, последний — картинки; уровней всего — число радиусов + 2. Замеры (2000 и 5000
 # цифр, все перекрытия): первый уровень кусков добавляет 0.4–1.7 пункта, второй (окно 1.5 над кусками
 # первого) отнимает 0.6–1.8 — его словарь не схлопывается и упирается в WINDOW_LEVEL_DICTIONARY_MAX.
 WINDOW_LEVEL_RADII = (2.5,)
@@ -557,7 +558,9 @@ WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST = 24
 WINDOW_LEVEL_OFFSET_RADIUS_MIN = 0.8   # самый узкий круг места в окне, клеток; самый широкий — радиус окна
 # Словарь образцов: порог слияния кодов кусков и предел числа образцов (точек карты форм).
 WINDOW_LEVEL_MERGE_SIMILARITY = 0.7
-WINDOW_LEVEL_DICTIONARY_MAX = 20000
+# Словарь первого уровня кусков (перекрытие 0.3): 7258 образцов на 2000 цифр, 9596 на 5000 — растёт медленно,
+# предел нужен только как защита от разбухания.
+WINDOW_LEVEL_DICTIONARY_MAX = 50000
 # Код картинки: круг на карте форм (радиусы в долях её стороны) × круг на картинке (радиусы в клетках).
 # Узкий круг карты форм важен: 0.33…0.1 даёт 90.0 % вместо 92.2 % (1000 цифр).
 WINDOW_LEVEL_SHAPE_RADIUS_MAX = 0.33
@@ -3782,7 +3785,7 @@ class DigitAtoms:
 class LevelElements:
     """Элементы уровня иерархии: у каждого — картинка, значение «что» и узел сетки картинки («где»).
 
-    На первом уровне элемент — углопозиция, «что» — её угол. На следующих элемент — кусок предыдущего уровня,
+    На уровне 0 элемент — углопозиция, «что» — её угол. На следующих элемент — кусок предыдущего уровня,
     «что» — его место на карте форм этого уровня, «где» — центр окна куска.
     """
 
@@ -3801,7 +3804,8 @@ class LevelElements:
 class MnistWindowLevelRunner:
     """Уровни «окно внимания» на MNIST (расширение статьи): «что» отдельно от «где», без первой раскладки.
 
-    1. Первый уровень — углопозиции цифр, тем же выделением, что у первой раскладки (угол, узел сетки окон).
+    1. Уровень 0 (первичный) — углопозиции цифр, тем же выделением, что у первой раскладки (угол, узел сетки
+       окон). Уровни 1… — куски, последний уровень — картинки.
     2. Шаг вверх (по одному на каждый радиус из WINDOW_LEVEL_RADII): по элементам уровня идёт круглое окно
        (AttentionWindows); кусок — элементы в окне, записанные от его центра. Код куска — детекторы-произведения
        «что элемента × его место в окне» (ConjunctionEncoder над детекторами двух Encoder), OR по элементам
@@ -3851,12 +3855,13 @@ class MnistWindowLevelRunner:
             WINDOW_LEVEL_PLACE_RADIUS_MIN / (high - low),
         )
         elements = self._atom_elements(atoms)
-        last = len(WINDOW_LEVEL_RADII) + 1
+        # Номера уровней: 0 — углопозиции (первичный), 1… — куски, последний — картинки.
+        last = len(WINDOW_LEVEL_RADII)
         segments: list[tuple[int, "np.ndarray", int]] = []
         if WINDOW_LEVEL_PICTURE_LEVELS == "all":
-            segments.append((1, *self._picture_segment(elements, place, atoms.pictures, 1)))
+            segments.append((0, *self._picture_segment(elements, place, atoms.pictures, 0)))
         field = 0.0
-        for number, radius in enumerate(WINDOW_LEVEL_RADII, start=2):
+        for number, radius in enumerate(WINDOW_LEVEL_RADII, start=1):
             field += float(radius)
             elements = self._next_level(elements, float(radius), atoms.labels, train.pictures, number, field)
             if WINDOW_LEVEL_PICTURE_LEVELS == "all" or number == last:
@@ -3874,14 +3879,18 @@ class MnistWindowLevelRunner:
                 "note": "код картинки склеен из кодов уровней: у каждого уровня свой сегмент (§2.2.3)",
             },
         )
+        # Проверка идёт до раскладки карты цифр: карта большого набора раскладывается долго, а на узнавание не влияет.
+        accuracy = None
+        if test is not None:
+            classifier = NearestCodeClassifier(
+                picture_codes[: train.pictures], train.labels, picture_length, use_gpu=ACTIVATION_USE_GPU
+            )
+            accuracy = classifier.accuracy(
+                picture_codes[train.pictures :], test.labels, neighbours=WINDOW_LEVEL_NEIGHBOURS
+            )
         if WINDOW_LEVEL_PICTURE_MAP:
             self._picture_map(picture_codes[: train.pictures], train.labels, picture_length, last + 1)
-        if test is None:
-            return None
-        classifier = NearestCodeClassifier(
-            picture_codes[: train.pictures], train.labels, picture_length, use_gpu=ACTIVATION_USE_GPU
-        )
-        return classifier.accuracy(picture_codes[train.pictures :], test.labels, neighbours=WINDOW_LEVEL_NEIGHBOURS)
+        return accuracy
 
     def _atoms(self, *, train: bool, count: int) -> DigitAtoms:
         """Углопозиции первых count цифр набора, у которых они есть."""
@@ -3956,7 +3965,7 @@ class MnistWindowLevelRunner:
 
     @staticmethod
     def _atom_elements(atoms: DigitAtoms) -> LevelElements:
-        """Первый уровень: элемент — углопозиция, «что» — её направление (детекторы угла, §4.4)."""
+        """Уровень 0: элемент — углопозиция, «что» — её направление (детекторы угла, §4.4)."""
         angles, angle_index = np.unique(atoms.angle, return_inverse=True)
         what = Encoder(
             ClosedDimension(
