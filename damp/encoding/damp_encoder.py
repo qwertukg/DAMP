@@ -723,6 +723,26 @@ class Encoder:
         """Бит кода каждого детектора (по self.detectors): один случайный бит полосы его слоя (§4.2.1)."""
         return self._detector_bits
 
+    def active_detectors(self, dimension: int | str, values: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Активные детекторы координаты для набора её значений (§4.1): пары (номер значения, номер детектора).
+
+        Номера детекторов — по self.detectors. Значение двумерной координаты — пара (y, x) (§4.3). Нужна
+        кодерам, которые строят свой код из тех же детекторов (например, из пар детекторов двух координат).
+        """
+        if isinstance(dimension, str):
+            titles = [dim.title for dim in self.dimensions]
+            if dimension not in titles:
+                raise KeyError(f"unknown dimension title: {dimension}")
+            position = titles.index(dimension)
+        else:
+            position = int(dimension)
+        dim = self.dimensions[position]
+        first = sum(len(group) for group in self._detectors_by_dimension[:position])
+        rows, local = self._indices[position].active_pairs(
+            self._normalize_values(dim, np.asarray(values, dtype=np.float64))
+        )
+        return np.asarray(rows, dtype=np.int64), first + np.asarray(local, dtype=np.int64)
+
     # ------------------------------------------------------------------ geometry
     def _build_layer_detectors(
         self,

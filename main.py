@@ -58,6 +58,11 @@ from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding, Mnis
 from damp.article_refs import MAPPING_CONTINUITY
 from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, ThresholdActivation
 from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
+from damp.activation.nearest_point import NearestPointActivation
+from damp.decode.nearest_codes import NearestCodeClassifier
+from damp.encoding.attention_window import AttentionWindows, WindowPieces
+from damp.encoding.conjunction import ConjunctionEncoder
+from damp.layout.code_dictionary import CodeDictionary, LeaderDictionary, PairwiseSimilarity
 
 LOG_INTERVAL_DEFAULT = 1
 LOG_INTERVAL_INIT = 1
@@ -510,6 +515,52 @@ SECOND_LEVEL_EVALUATE_LIMIT = 200
 # = 0.35 веса всех соседей почти равны: 100 цифр — 44 % на 50 тестовых картинках при 78 % у ближайшего соседа.
 SECOND_LEVEL_DECODER_TEMPERATURE = 0.02
 SECOND_LEVEL_FILE_PREFIX = "data/second"
+
+# --- Уровень «окно внимания» (расширение статьи): кусок в координатах своего окна, «что» отдельно от «где».
+# Замеры 2026-11-13 (сглаженный режим, 2000 проверочных цифр, 1 ближайший сосед): 1000 цифр — 92.2–92.6 %
+# против 90.6 % у второго уровня над первой раскладкой; 5000 цифр — 96.0 % против 93.7 %.
+# Окно: радиус в клетках сетки углопозиций (окнах Собеля) и шаг центров. Шаг 2 теряет 6 пунктов (86.1 %):
+# карта форм складывается только при плотной выборке (окно в каждой клетке).
+WINDOW_LEVEL_RADIUS = 2.5
+WINDOW_LEVEL_STRIDE = 1
+# Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
+WINDOW_LEVEL_LAYERS = 5
+WINDOW_LEVEL_OVERLAP = 0.6
+# Код куска: детектор направления × круг места внутри окна.
+WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST = 4
+WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST = 24
+WINDOW_LEVEL_OFFSET_RADIUS_MIN = 0.8   # самый узкий круг места в окне, клеток; самый широкий — радиус окна
+# Словарь образцов: порог слияния кодов кусков и предел числа образцов (точек карты форм).
+WINDOW_LEVEL_MERGE_SIMILARITY = 0.7
+WINDOW_LEVEL_DICTIONARY_MAX = 20000
+# Код картинки: круг на карте форм (радиусы в долях её стороны) × круг на картинке (радиусы в клетках).
+# Узкий круг карты форм важен: 0.33…0.1 даёт 90.0 % вместо 92.2 % (1000 цифр).
+WINDOW_LEVEL_SHAPE_RADIUS_MAX = 0.33
+WINDOW_LEVEL_SHAPE_RADIUS_MIN = 0.03
+WINDOW_LEVEL_PLACE_RADIUS_MAX = 12.0
+WINDOW_LEVEL_PLACE_RADIUS_MIN = 2.0
+# Плоскость мест окон на картинке: сетка углопозиций 0…23 и поле под центры окон, вышедших за её край.
+WINDOW_LEVEL_PLACE_MIN = -4.0
+WINDOW_LEVEL_PLACE_MAX = 28.0
+# True — детекторы-произведения из любых двух слоёв (код картинки вчетверо длиннее, +1 пункт на 1000 цифрах).
+WINDOW_LEVEL_CROSS_LAYERS = False
+# Длины кодов подбираются под среднюю плотность (§6.6): по первым кускам и первым картинкам.
+WINDOW_LEVEL_TARGET_DENSITY = 0.25
+WINDOW_LEVEL_CODE_LENGTH_MIN = 64
+WINDOW_LEVEL_CODE_LENGTH_MAX = 262144
+WINDOW_LEVEL_CALIBRATION_PIECES = 20000
+WINDOW_LEVEL_CALIBRATION_PICTURES = 200
+# Длина собственного кода вспомогательных кодеров координат: от них берутся только детекторы, биты не нужны.
+WINDOW_LEVEL_AXIS_CODE_LENGTH = 256
+WINDOW_LEVEL_RANDOM_SEED = ENCODER_RANDOM_SEED
+# Пороги λ раскладок уровня — теми же квантилями попарных сходств, что у второго уровня (§7.1.7).
+WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE = SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE
+WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE = SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE
+# True — коды обучающих картинок раскладываются в карту цифр (как у второго уровня).
+WINDOW_LEVEL_PICTURE_MAP = True
+WINDOW_LEVEL_EVALUATE_LIMIT = 2000
+WINDOW_LEVEL_NEIGHBOURS = (1, 5)
+WINDOW_LEVEL_FILE_PREFIX = "data/window"
 
 # --- Второй уровень, вариант «код на углопозицию» (§4.3, §6.2; расширение статьи; эксперимент).
 # Каждая точка первой раскладки получает код своего места на карте: стимул точки зажигает точки с тем же
@@ -3659,6 +3710,294 @@ class MnistSecondLevelRunner:
 
 
 @dataclass(frozen=True)
+class DigitAtoms:
+    """Углопозиции набора цифр одним массивом: картинка, угол и узел сетки окон каждой углопозиции (§4.4, §4.6)."""
+
+    picture: "np.ndarray"  # номер картинки каждой углопозиции
+    angle: "np.ndarray"
+    y: "np.ndarray"  # узел сетки окон Собеля
+    x: "np.ndarray"
+    labels: "np.ndarray"  # метка каждой картинки
+
+    @property
+    def pictures(self) -> int:
+        return int(self.labels.shape[0])
+
+    def joined(self, other: "DigitAtoms | None") -> "DigitAtoms":
+        """Этот набор и следом за ним other (номера его картинок сдвигаются)."""
+        if other is None:
+            return self
+        return DigitAtoms(
+            picture=np.concatenate([self.picture, other.picture + self.pictures]),
+            angle=np.concatenate([self.angle, other.angle]),
+            y=np.concatenate([self.y, other.y]),
+            x=np.concatenate([self.x, other.x]),
+            labels=np.concatenate([self.labels, other.labels]),
+        )
+
+
+class MnistWindowLevelRunner:
+    """Уровень «окно внимания» на MNIST (расширение статьи): «что» отдельно от «где», без первой раскладки.
+
+    1. Углопозиции цифр — тем же выделением, что у первой раскладки (угол, узел сетки окон).
+    2. По картинке идёт круглое окно (AttentionWindows): кусок — углопозиции в окне, записанные от его центра.
+    3. Код куска — детекторы-произведения «направление × место в окне» (ConjunctionEncoder над детекторами
+       двух кодеров Encoder), OR по углопозициям куска (§2.2.1); длина — под плотность 25 % (§6.6).
+    4. Коды кусков обучающих картинок сливаются к образцу (LeaderDictionary), образцы раскладываются тем же
+       Layout — карта форм; каждый кусок получает место на ней (NearestPointActivation, §6.1).
+    5. Код картинки — детекторы-произведения «круг на карте форм × круг на картинке» по всем её кускам.
+    6. Коды картинок раскладываются в карту цифр; проверка — нечёткий поиск по кодам обучающих (§2.2.5).
+    """
+
+    def __init__(
+        self,
+        *,
+        count: int,
+        evaluate_limit: int = WINDOW_LEVEL_EVALUATE_LIMIT,
+        split: str = "test",
+    ) -> None:
+        if count <= 0:
+            raise ValueError("count must be positive")
+        if evaluate_limit < 0:
+            raise ValueError("evaluate_limit must be non-negative")
+        self.count = int(count)
+        self._evaluate_limit = int(evaluate_limit)
+        self._split = split
+        # От первичного конвейера нужны выделение углопозиций и раскраска раскладок; сама первая раскладка — нет.
+        self._primary = MnistLayoutRunner(count=count, layout_only=True)
+
+    def run(self) -> dict[int, float] | None:
+        """Весь путь уровня; возвращает точность нечёткого поиска по числу соседей (None — проверка отключена)."""
+        train = self._atoms(train=True, count=self.count)
+        test = self._atoms(train=self._split == "train", count=self._evaluate_limit) if self._evaluate_limit else None
+        atoms = train.joined(test)
+        pieces = AttentionWindows(radius=WINDOW_LEVEL_RADIUS, stride=WINDOW_LEVEL_STRIDE).pieces(
+            atoms.picture, atoms.y, atoms.x
+        )
+        piece_codes, piece_length = self._piece_codes(atoms, pieces)
+        train_rows = np.flatnonzero(pieces.picture < train.pictures)
+        dictionary = LeaderDictionary(
+            similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY,
+            max_size=WINDOW_LEVEL_DICTIONARY_MAX,
+            use_gpu=ACTIVATION_USE_GPU,
+        ).select(piece_codes[train_rows], piece_length)
+        shapes = self._shape_map(dictionary, atoms.labels[pieces.picture[train_rows[dictionary.rows]]])
+        places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name="shapes").place(
+            piece_codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
+        )
+        picture_codes, picture_length = self._picture_codes(shapes, pieces, places.cells, atoms.pictures)
+        if WINDOW_LEVEL_PICTURE_MAP:
+            self._picture_map(picture_codes[: train.pictures], train.labels, picture_length)
+        if test is None:
+            return None
+        classifier = NearestCodeClassifier(
+            picture_codes[: train.pictures], train.labels, picture_length, use_gpu=ACTIVATION_USE_GPU
+        )
+        return classifier.accuracy(picture_codes[train.pictures :], test.labels, neighbours=WINDOW_LEVEL_NEIGHBOURS)
+
+    def _atoms(self, *, train: bool, count: int) -> DigitAtoms:
+        """Углопозиции первых count цифр набора, у которых они есть."""
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        dataset = MNIST(root="./data", train=train, download=True, transform=transforms.ToTensor())
+        rows: list["np.ndarray"] = []
+        labels: list[int] = []
+        for image, label in dataset:
+            if len(labels) >= count:
+                break
+            found = self._primary.extractor.extract(image.squeeze(0).numpy(), label=int(label)).get(int(label), [])
+            if not found:
+                continue
+            values = np.asarray(found, dtype=np.float64)  # (угол, x, y)
+            rows.append(np.column_stack([np.full(values.shape[0], len(labels), dtype=np.float64), values]))
+            labels.append(int(label))
+        if not rows:
+            raise ValueError("no digits with angle-positions")
+        data = np.concatenate(rows)
+        atoms = DigitAtoms(
+            picture=data[:, 0].astype(np.int64),
+            angle=data[:, 1],
+            y=np.rint(data[:, 3]).astype(np.int64),
+            x=np.rint(data[:, 2]).astype(np.int64),
+            labels=np.asarray(labels, dtype=np.int64),
+        )
+        LOGGER.event(
+            "window_level.atoms",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "split": "train" if train else "test",
+                "pictures": atoms.pictures,
+                "atoms": int(atoms.picture.shape[0]),
+                "atoms_per_picture": float(atoms.picture.shape[0]) / atoms.pictures,
+            },
+        )
+        return atoms
+
+    @staticmethod
+    def _plane_encoder(title: str, size, widest_radius: float, narrowest_radius: float) -> Encoder:
+        """Кодер двумерной координаты уровня (§4.3): от него берутся детекторы-круги и их слои."""
+        return Encoder(
+            PlaneDimension(
+                title,
+                size,
+                plane_detector_layers(
+                    layers_count=WINDOW_LEVEL_LAYERS,
+                    widest_radius=widest_radius,
+                    narrowest_radius=narrowest_radius,
+                    overlap=WINDOW_LEVEL_OVERLAP,
+                ),
+                code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+                layer_bands=False,
+            ),
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            layer_phase=ENCODER_LAYER_PHASE,
+        )
+
+    @staticmethod
+    def _fit_and_encode(
+        encoder: ConjunctionEncoder,
+        what_values: "np.ndarray",
+        what_index: "np.ndarray",
+        where_values: "np.ndarray",
+        where_index: "np.ndarray",
+        groups: "np.ndarray",
+        group_count: int,
+        sample_groups: int,
+    ) -> "np.ndarray":
+        encoder.fit_length(
+            what_values,
+            what_index,
+            where_values,
+            where_index,
+            groups,
+            sample_groups=sample_groups,
+            target_density=WINDOW_LEVEL_TARGET_DENSITY,
+            min_length=WINDOW_LEVEL_CODE_LENGTH_MIN,
+            max_length=WINDOW_LEVEL_CODE_LENGTH_MAX,
+        )
+        return encoder.encode_sets(what_values, what_index, where_values, where_index, groups, group_count)
+
+    def _piece_codes(self, atoms: DigitAtoms, pieces: WindowPieces) -> tuple["np.ndarray", int]:
+        """Коды кусков: «направление углопозиции × её место в окне», OR по углопозициям куска (§2.2.1)."""
+        angles, angle_index = np.unique(atoms.angle, return_inverse=True)
+        what = Encoder(
+            ClosedDimension(
+                "Angle",
+                (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
+                geometric_detector_layers(
+                    layers_count=WINDOW_LEVEL_LAYERS,
+                    widest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST,
+                    narrowest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST,
+                    overlap=WINDOW_LEVEL_OVERLAP,
+                ),
+                code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+            ),
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            layer_phase=ENCODER_LAYER_PHASE,
+        )
+        radius = WINDOW_LEVEL_RADIUS
+        where = self._plane_encoder(
+            "Offset",
+            ((-radius, radius), (-radius, radius)),
+            0.5,
+            WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * radius),
+        )
+        encoder = ConjunctionEncoder(what, where, random_seed=WINDOW_LEVEL_RANDOM_SEED, name="piece")
+        packed = self._fit_and_encode(
+            encoder,
+            angles,
+            angle_index.reshape(-1)[pieces.element],
+            pieces.offsets,
+            pieces.offset,
+            pieces.piece,
+            pieces.count,
+            WINDOW_LEVEL_CALIBRATION_PIECES,
+        )
+        return packed, encoder.code_length
+
+    @staticmethod
+    def _lambda_schedule(bits: "np.ndarray", name: str) -> LayoutLambdaSchedule:
+        """Пороги λ раскладки кодов — квантилями их попарных сходств (§7.1.7)."""
+        quantiles = (WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE, WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE)
+        start, maximum = PairwiseSimilarity(seed=WINDOW_LEVEL_RANDOM_SEED).quantiles(bits, quantiles, name=name)
+        return LayoutLambdaSchedule.from_quantiles(
+            start, maximum, start_quantile=quantiles[0], maximum_quantile=quantiles[1]
+        )
+
+    def _layout_bits(self, bits: "np.ndarray", labels: "np.ndarray", name: str) -> Layout:
+        """Раскладка кодов тем же Layout и с той же настройкой, что первая; цвет точки — класс цифры."""
+        table = LayoutCodeTable.from_bits(
+            bits,
+            hues=(labels * SECOND_LEVEL_CLASS_HUE_STEP).tolist(),
+            labels=[int(label) for label in labels],
+        ).grouped_by_hue()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        return _layout_from_codes(
+            table, tuner.tune(table.count), self._primary.colorizer, lambda_schedule=self._lambda_schedule(bits, name)
+        )
+
+    def _export(self, layout: Layout, name: str) -> None:
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        stem = f"{WINDOW_LEVEL_FILE_PREFIX}-{name}-{self.count}-{suffix}"
+        layout.save_json(f"{stem}-{LAYOUT_CACHE_TAG}.json")
+        MnistLayoutRunner._save_layout_images(
+            layout,
+            image_path=f"{stem}.png",
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
+        )
+
+    def _shape_map(self, dictionary: CodeDictionary, labels: "np.ndarray") -> Layout:
+        """Карта форм: раскладка образцов словаря; подпись точки — цифра, где образец встретился первым."""
+        layout = self._layout_bits(dictionary.bits(), labels, "shapes")
+        self._export(layout, "shapes")
+        return layout
+
+    def _picture_codes(
+        self, shapes: Layout, pieces: WindowPieces, cells: "np.ndarray", pictures: int
+    ) -> tuple["np.ndarray", int]:
+        """Коды картинок: «место куска на карте форм × место окна на картинке», OR по кускам картинки."""
+        what = self._plane_encoder(
+            "Shape",
+            ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
+            WINDOW_LEVEL_SHAPE_RADIUS_MAX,
+            WINDOW_LEVEL_SHAPE_RADIUS_MIN,
+        )
+        low, high = WINDOW_LEVEL_PLACE_MIN, WINDOW_LEVEL_PLACE_MAX
+        where = self._plane_encoder(
+            "Place",
+            ((low, high), (low, high)),
+            WINDOW_LEVEL_PLACE_RADIUS_MAX / (high - low),
+            WINDOW_LEVEL_PLACE_RADIUS_MIN / (high - low),
+        )
+        shape_cells, shape_index = np.unique(cells, axis=0, return_inverse=True)
+        spots, spot_index = np.unique(pieces.centre, axis=0, return_inverse=True)
+        encoder = ConjunctionEncoder(
+            what, where, random_seed=WINDOW_LEVEL_RANDOM_SEED, cross_layers=WINDOW_LEVEL_CROSS_LAYERS, name="picture"
+        )
+        packed = self._fit_and_encode(
+            encoder,
+            shape_cells,
+            shape_index.reshape(-1),
+            spots,
+            spot_index.reshape(-1),
+            pieces.picture,
+            pictures,
+            WINDOW_LEVEL_CALIBRATION_PICTURES,
+        )
+        return packed, encoder.code_length
+
+    def _picture_map(self, packed: "np.ndarray", labels: "np.ndarray", code_length: int) -> None:
+        """Карта цифр: раскладка кодов обучающих картинок; собрались ли классы рядом (§5.13.2)."""
+        layout = self._layout_bits(np.unpackbits(packed, axis=1, count=code_length), labels, "pictures")
+        self._export(layout, "pictures")
+        LabelMapQuality().measure(layout)
+
+
+@dataclass(frozen=True)
 class SecondLevelPointReport:
     """Итог варианта «код на углопозицию»: коды второго уровня и сравнение первой и второй карт."""
 
@@ -3967,6 +4306,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="число картинок проверки нечётким поиском; 0 — без проверки",
     )
     second_parser.add_argument("--split", choices=["train", "test"], default="test")
+    window_parser = subparsers.add_parser(
+        "window",
+        help="уровень «окно внимания»: куски в координатах окна, карта форм, коды картинок и проверка",
+    )
+    window_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
+    window_parser.add_argument(
+        "--limit",
+        type=int,
+        default=WINDOW_LEVEL_EVALUATE_LIMIT,
+        help="число картинок проверки нечётким поиском; 0 — без проверки",
+    )
+    window_parser.add_argument("--split", choices=["train", "test"], default="test")
     _add_second_points_parser(subparsers)
     return parser
 
@@ -4035,6 +4386,12 @@ def main() -> None:
         second_accuracy = second_runner.run()
         if second_accuracy is not None:
             print(f"second level: dataset={args.split} samples={args.limit} accuracy={second_accuracy:.4f}")
+        return
+    if command == "window":
+        window_accuracy = MnistWindowLevelRunner(count=args.count, evaluate_limit=args.limit, split=args.split).run()
+        if window_accuracy is not None:
+            report = " ".join(f"accuracy@{k}={value:.4f}" for k, value in window_accuracy.items())
+            print(f"window level: dataset={args.split} samples={args.limit} {report}")
         return
     if command == "second-points":
         MnistSecondLevelPointRunner(
