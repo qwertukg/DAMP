@@ -522,16 +522,20 @@ SECOND_LEVEL_FILE_PREFIX = "data/second"
 # Замеры 2026-11-13 (сглаженный режим, 2000 проверочных цифр, 1 ближайший сосед): 1000 цифр — 92.2–92.6 %
 # против 90.6 % у второго уровня над первой раскладкой; 5000 цифр — 96.0 % против 93.7 %.
 # Шаги вверх: радиус окна каждого шага в клетках сетки углопозиций (окнах Собеля). Один радиус — один
-# уровень кусков между углопозициями и картинкой; уровней всего — число радиусов + 2. Второе окно смотрит
-# на куски первого, поэтому поле зрения кусков — 2.5 и 4 клетки. Замеры на 5000 цифрах: (2.5,) с кодом
-# картинки от этого уровня — 95.9 %, 135 с; (2.5, 1.5) с кодом от всех уровней — 95.4 %, 281 с.
-WINDOW_LEVEL_RADII = (2.5, 1.5)
+# уровень кусков между углопозициями и картинкой; уровней всего — число радиусов + 2. Замеры (2000 и 5000
+# цифр, все перекрытия): первый уровень кусков добавляет 0.4–1.7 пункта, второй (окно 1.5 над кусками
+# первого) отнимает 0.6–1.8 — его словарь не схлопывается и упирается в WINDOW_LEVEL_DICTIONARY_MAX.
+WINDOW_LEVEL_RADII = (2.5,)
 # Шаг центров окна. Шаг 2 теряет 6 пунктов (86.1 %): карта форм складывается только при плотной выборке
 # (окно в каждой клетке).
 WINDOW_LEVEL_STRIDE = 1
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
+# Замеры на 2000 цифрах при перекрытии 0.3: 3 слоя — 93.0 %, 5 — 95.0 %, 7 — 93.95 %, 10 — 93.75 %.
+# Перекрытие задаёт число сработавших кругов: точку накрывает π / (4·(1 − перекрытие)²) кругов слоя — 4.9
+# при 0.6 и 1.6 при 0.3 (ниже 0.29 круги уже не закрывают плоскость). На 5000 цифрах код картинки при 0.3
+# в 8 раз короче, чем при 0.6, а узнавание ниже на 0.3–0.8 пункта (95.65 % против 95.95 % при плотности 25 %).
 WINDOW_LEVEL_LAYERS = 5
-WINDOW_LEVEL_OVERLAP = 0.6
+WINDOW_LEVEL_OVERLAP = 0.3
 # Слои двумерных детекторов (место в окне, место на карте форм, место на картинке). True — каждый следующий
 # слой вдвое мельче предыдущего, начиная с WINDOW_LEVEL_PLANE_DETECTORS_WIDEST кругов по стороне: 2×2, 4×4,
 # 8×8, 16×16, 32×32; решётки слоёв совпадают, сработавшие круги вложены друг в друга. False — радиусы от
@@ -545,7 +549,7 @@ WINDOW_LEVEL_HALVING_LAYERS = False
 # False — срабатывают все круги, в которые попала точка (§4.1). Замер на 5000 цифрах (окна 2.5 и 1.5, код
 # от всех уровней): все круги — 95.4 %, код картинки 94.6 тыс. бит (зажжено около 24 тыс.); только вложенные —
 # 91.0 %, код 13.4 тыс. бит (зажжено около 3.4 тыс.), словарь первого уровня кусков 730 образцов вместо 3576.
-WINDOW_LEVEL_NESTED_CIRCLES = True
+WINDOW_LEVEL_NESTED_CIRCLES = False
 WINDOW_LEVEL_PLANE_DETECTORS_WIDEST = 2
 # Код куска: детектор направления × круг места внутри окна.
 WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST = 4
@@ -571,6 +575,10 @@ WINDOW_LEVEL_PICTURE_LEVELS = "all"
 WINDOW_LEVEL_CROSS_LAYERS = False
 # Длины кодов подбираются под среднюю плотность (§6.6): по первым кускам и первым картинкам.
 WINDOW_LEVEL_TARGET_DENSITY = 0.25
+# Плотность кода картинки задаётся отдельно от кода куска. На 5000 цифрах (перекрытие 0.3): 25 % — 5088 бит,
+# 95.65 %; 40 % — 2872 бита, 95.55 %; 50 % — 2112 бит, 95.0 %. При перекрытии 0.6 и плотности 40 % —
+# 23.9 тыс. бит и 96.4 % (максимум качества из замеренного).
+WINDOW_LEVEL_PICTURE_DENSITY = 0.4
 WINDOW_LEVEL_CODE_LENGTH_MIN = 64
 WINDOW_LEVEL_CODE_LENGTH_MAX = 262144
 WINDOW_LEVEL_CALIBRATION_PIECES = 20000
@@ -3984,6 +3992,7 @@ class MnistWindowLevelRunner:
         groups: "np.ndarray",
         group_count: int,
         sample_groups: int,
+        target_density: float,
     ) -> "np.ndarray":
         encoder.fit_length(
             what_values,
@@ -3992,7 +4001,7 @@ class MnistWindowLevelRunner:
             where_index,
             groups,
             sample_groups=sample_groups,
-            target_density=WINDOW_LEVEL_TARGET_DENSITY,
+            target_density=target_density,
             min_length=WINDOW_LEVEL_CODE_LENGTH_MIN,
             max_length=WINDOW_LEVEL_CODE_LENGTH_MAX,
         )
@@ -4036,6 +4045,7 @@ class MnistWindowLevelRunner:
             pieces.piece,
             pieces.count,
             WINDOW_LEVEL_CALIBRATION_PIECES,
+            WINDOW_LEVEL_TARGET_DENSITY,
         )
         train_rows = np.flatnonzero(pieces.picture < train_pictures)
         dictionary = LeaderDictionary(
@@ -4091,6 +4101,7 @@ class MnistWindowLevelRunner:
             elements.picture,
             pictures,
             WINDOW_LEVEL_CALIBRATION_PICTURES,
+            WINDOW_LEVEL_PICTURE_DENSITY,
         )
         return packed, encoder.code_length
 
