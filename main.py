@@ -4405,6 +4405,12 @@ class MnistWindowLevelRunner:
         atoms, starts = self._drawn, self._atom_starts
         # Сколько клеток от центра помещается в ячейке рисунка: поле зрения и поле вокруг него.
         reach = window.field + 1.0 if window.square else math.ceil(window.field) + 1
+        # Поле зрения шире картинки: кусок рисуется в рамке всей картинки, а не вокруг своего центра, иначе
+        # рисунок занимает малую долю ячейки.
+        whole = reach > WINDOW_LEVEL_GRID / 2.0 + 1.0
+        if whole:
+            reach = WINDOW_LEVEL_GRID / 2.0 + 1.0
+        middle = (WINDOW_LEVEL_GRID - 1) / 2.0
 
         def paint(canvas, draw, sample: int, left: int, top: int, size: int) -> None:  # noqa: ANN001
             unit = size / (2.0 * reach)
@@ -4416,6 +4422,8 @@ class MnistWindowLevelRunner:
                 if not window.sees(dy, dx):
                     continue
                 angle = math.radians(float(atoms.angle[index]))
+                if whole:
+                    dy, dx = atoms.y[index] - middle, atoms.x[index] - middle
                 px, py = left + size / 2.0 + dx * unit, top + size / 2.0 + dy * unit
                 ux, uy = math.cos(angle) * unit * 0.45, math.sin(angle) * unit * 0.45
                 draw.line(
