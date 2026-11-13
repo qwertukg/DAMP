@@ -61,6 +61,7 @@ from damp.article_refs import CONCATENATION, MAPPING_CONTINUITY
 from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, ThresholdActivation
 from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
 from damp.activation.nearest_point import NearestPointActivation
+from damp.activation.hierarchy_detection import DetectedCodes, HierarchyDetection
 from damp.decode.nearest_codes import NearestCodeClassifier
 from damp.encoding.attention_window import AttentionWindows, BlockWindows, DetectorWindows, WindowPieces
 from damp.encoding.conjunction import ConjunctionEncoder
@@ -564,6 +565,31 @@ WINDOW_LEVEL_DETECTOR_MARGIN: float | None = None
 # каждая углопозиция: размер пространства уровня равен числу кусков и задаётся только размером кругов.
 WINDOW_LEVEL_DICTIONARY_KINDS = ("leaders", "all")
 WINDOW_LEVEL_DICTIONARY = "leaders"
+# Чем читается карта уровня. "lattice" — геометрический способ: кусок зажигает одну точку карты с самым похожим
+# кодом, место точки читает решётка кругов заданных размеров (§4.3). "hierarchy" — способ статьи: кусок зажигает
+# все точки карты со сходством не ниже порога λ_a (§6.1), карту читают самоорганизующиеся детекторы, построенные
+# по её кластерам (§6.4), детектор срабатывает по энергии зажжённых точек своего поля (§6.5).
+WINDOW_LEVEL_MAP_DETECTOR_KINDS = ("lattice", "hierarchy")
+WINDOW_LEVEL_MAP_DETECTORS = "hierarchy"
+# Слои иерархии над картой уровня (§7.1.10): пороги λ_d по возрастанию; радиус активации и минимум точек
+# кластера каждого слоя — из ACTIVATION_DETECTOR_LAYER_SPECS. Пороги лежат ниже порога слияния образцов
+# WINDOW_LEVEL_MERGE_SIMILARITY = 0.7: образцы карты похожи друг на друга меньше него, и на порогах от 0.7
+# кластеров нет — иерархия не строится. None — WINDOW_LEVEL_HIERARCHY_LAYERS порогов равными шагами от порога,
+# с которого карта начинала раскладываться, до порога, на котором закончила (0.48…0.60 на 1000 цифрах).
+WINDOW_LEVEL_HIERARCHY_LAYERS = 5
+WINDOW_LEVEL_HIERARCHY_THRESHOLDS: tuple[float, ...] | None = (0.52, 0.56, 0.60, 0.64, 0.68)
+# Порог срабатывания детектора μ_d над картой уровня (§6.5): доля собственной энергии детектора.
+WINDOW_LEVEL_HIERARCHY_DETECTOR_THRESHOLD = ACTIVATION_DETECTOR_THRESHOLD
+# Порог активации карты кодом куска λ_a (§6.1); None — порог нижнего слоя иерархии, как в §7.1.11.
+# Замер 2026-11-13 (1000 цифр, 2000 проверочных, слои 0.52…0.68; решётка кругов на тех же данных — 92.90 %):
+# λ_a = 0.52 (нижний слой) — 85.25 %, кусок зажигает 338 точек карты из 2579 и 114 детекторов из 580;
+# 0.55 — 88.20 %; 0.60 — 92.30 % (75 точек, 28 детекторов, код 10 096 бит); 0.65 — 92.10 % (22 точки,
+# 7.6 детектора, код 5400 бит). Код куска похож на многие образцы сразу, и с порогом нижнего слоя ответ
+# карты размывается: порог активации нужен выше, чтобы кусок зажигал 1–3 % карты.
+# На 10 000 проверочных: решётка — 94.99 % (код 8808 бит), иерархия с λ_a = 0.60 — 94.25 % (10 096 бит),
+# с λ_a = 0.65 — 94.52 % (5400 бит). Два уровня кусков (2000 проверочных, λ_a = 0.60): решётка 92.70 %,
+# иерархия 91.10 %.
+WINDOW_LEVEL_HIERARCHY_ACTIVATION_LAMBDA: float | None = 0.65
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
 # Замеры на 2000 цифрах при перекрытии 0.3: 3 слоя — 93.0 %, 5 — 95.0 %, 7 — 93.95 %, 10 — 93.75 %.
 # Перекрытие задаёт число сработавших кругов: точку накрывает π / (4·(1 − перекрытие)²) кругов слоя — 4.9
@@ -4209,7 +4235,7 @@ class MnistWindowLevelRunner:
             where,
             random_seed=WINDOW_LEVEL_RANDOM_SEED,
             # Слоёв «что» и слоёв кругов внутри широкого разное число: пары берутся из любых двух слоёв.
-            cross_layers=thrown,
+            cross_layers=thrown or self._layers_differ(elements.what, where),
             nested=WINDOW_LEVEL_NESTED_CIRCLES,
             name=f"piece-{number}",
         )
@@ -4257,27 +4283,102 @@ class MnistWindowLevelRunner:
         shapes = self._layout_bits(dictionary.bits(), labels[pieces.picture[train_rows[dictionary.rows]]], name)
         self._export(shapes, name)
         self._shape_glyphs(shapes, dictionary, pieces, train_rows, number, window)
-        places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name=name).place(
-            codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
-        )
-        cells, cell_index = np.unique(places.cells, axis=0, return_inverse=True)
         lattice = isinstance(window.windows, AttentionWindows)
-        what = self._plane_encoder(
-            f"Shape{number}",
-            ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
-            WINDOW_LEVEL_SHAPE_RADIUS_MAX,
-            WINDOW_LEVEL_SHAPE_RADIUS_MIN,
-        )
+        if WINDOW_LEVEL_MAP_DETECTORS not in WINDOW_LEVEL_MAP_DETECTOR_KINDS:
+            raise ValueError(f"WINDOW_LEVEL_MAP_DETECTORS must be one of {WINDOW_LEVEL_MAP_DETECTOR_KINDS}")
+        if WINDOW_LEVEL_MAP_DETECTORS == "hierarchy":
+            what_values, what_index, what = self._hierarchy_what(shapes, dictionary, codes, number)
+        else:
+            places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name=name).place(
+                codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
+            )
+            what_values, what_index = np.unique(places.cells, axis=0, return_inverse=True)
+            what_index = what_index.reshape(-1)
+            what = self._plane_encoder(
+                f"Shape{number}",
+                ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
+                WINDOW_LEVEL_SHAPE_RADIUS_MAX,
+                WINDOW_LEVEL_SHAPE_RADIUS_MIN,
+            )
         return LevelElements(
             picture=pieces.picture,
-            what_values=cells,
-            what_index=cell_index.reshape(-1),
+            what_values=what_values,
+            what_index=what_index,
             # Центр блока и центр наброшенного круга нецелые и нужны точными: по ним собираются куски следующего
             # уровня. Центры круглых окон с шагом стоят в узлах сетки.
             y=np.rint(pieces.centre[:, 0]).astype(np.int64) if lattice else pieces.centre[:, 0],
             x=np.rint(pieces.centre[:, 1]).astype(np.int64) if lattice else pieces.centre[:, 1],
             what=what,
         )
+
+    def _hierarchy_what(
+        self, shapes: Layout, dictionary: CodeDictionary, codes: "np.ndarray", number: int
+    ) -> tuple["np.ndarray", "np.ndarray", DetectedCodes]:
+        """«Что» кусков по способу статьи: иерархия детекторов над картой уровня и детекторы, сработавшие на код.
+
+        Возвращает значения «что» (номера различных кодов кусков), номер значения у каждого куска и источник
+        детекторов для кода следующего уровня.
+        """
+        name = f"shapes{number}"
+        energies = shapes.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
+        quantiles = (WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE, WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE)
+        low, high = PairwiseSimilarity(seed=WINDOW_LEVEL_RANDOM_SEED).quantiles(
+            dictionary.bits(), quantiles, name=f"{name}-hierarchy"
+        )
+        thresholds = np.linspace(low, max(low, high), WINDOW_LEVEL_HIERARCHY_LAYERS)
+        if WINDOW_LEVEL_HIERARCHY_THRESHOLDS is not None:
+            thresholds = np.asarray(sorted(WINDOW_LEVEL_HIERARCHY_THRESHOLDS), dtype=np.float64)
+        extent = max(1, min(shapes.width, shapes.height))
+        specs = ACTIVATION_DETECTOR_LAYER_SPECS
+        configs = []
+        for layer, threshold in enumerate(thresholds):
+            # Радиус активации и минимум точек — у слоя той же относительной глубины из настроек первой раскладки.
+            _, radius_factor, min_points = specs[min(len(specs) - 1, layer * len(specs) // len(thresholds))]
+            configs.append(
+                DetectorLayerConfig(
+                    lambda_threshold=float(threshold),
+                    activation_radius=max(ACTIVATION_DETECTOR_RADIUS_MIN, int(round(extent * float(radius_factor)))),
+                    min_points=int(min_points),
+                )
+            )
+        detectors = DetectorHierarchyBuilder(
+            layout=shapes,
+            energies=energies,
+            layer_configs=tuple(configs),
+            radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
+            output_bits=ACTIVATION_OUTPUT_BITS,
+            energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
+            eta=ACTIVATION_ETA,
+            attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
+            seed=ACTIVATION_DETECTOR_SEED,
+            clusterer=DbscanClusterer(eps=ACTIVATION_DBSCAN_EPS, min_samples=ACTIVATION_DBSCAN_MIN_SAMPLES),
+        ).build()
+        detection = HierarchyDetection(
+            shapes,
+            detectors,
+            energies,
+            similarity=LAYOUT_SIMILARITY,
+            lambda_threshold=float(
+                thresholds[0] if WINDOW_LEVEL_HIERARCHY_ACTIVATION_LAMBDA is None else WINDOW_LEVEL_HIERARCHY_ACTIVATION_LAMBDA
+            ),
+            eta=ACTIVATION_ETA,
+            energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
+            detector_threshold=WINDOW_LEVEL_HIERARCHY_DETECTOR_THRESHOLD,
+            use_gpu=ACTIVATION_USE_GPU,
+            name=name,
+        )
+        # Одинаковые коды зажигают одни и те же детекторы: считаем только для различных.
+        packed = np.ascontiguousarray(codes)
+        view = packed.view(np.dtype((np.void, packed.shape[1]))).reshape(-1)
+        _, first, inverse = np.unique(view, return_index=True, return_inverse=True)
+        rows, found = detection.active(packed[first])
+        what = DetectedCodes(f"Shape{number}", rows, found, detection.layer_index, int(first.shape[0]))
+        return np.arange(first.shape[0], dtype=np.float64), inverse.reshape(-1), what
+
+    @staticmethod
+    def _layers_differ(what, where) -> bool:  # noqa: ANN001
+        """Разное ли число слоёв у двух источников детекторов: тогда пары берутся из любых двух слоёв."""
+        return int(what.detector_layer_indices().max()) != int(where.detector_layer_indices().max())
 
     def _picture_segment(
         self, elements: LevelElements, place: Encoder, pictures: int, number: int
@@ -4290,7 +4391,7 @@ class MnistWindowLevelRunner:
             elements.what,
             place,
             random_seed=WINDOW_LEVEL_RANDOM_SEED,
-            cross_layers=WINDOW_LEVEL_CROSS_LAYERS,
+            cross_layers=WINDOW_LEVEL_CROSS_LAYERS or self._layers_differ(elements.what, place),
             nested=WINDOW_LEVEL_NESTED_CIRCLES,
             name=f"picture-{number}",
         )
@@ -4421,16 +4522,27 @@ class MnistWindowLevelRunner:
                 dy, dx = atoms.y[index] - centre_y, atoms.x[index] - centre_x
                 if not window.sees(dy, dx):
                     continue
-                angle = math.radians(float(atoms.angle[index]))
+                # Угол углопозиции — направление перепада яркости, оно поперёк линии цифры. Отрезок рисуется
+                # вдоль края (поворот на 90°) стрелкой: так глаз видит саму линию.
+                along = math.radians(float(atoms.angle[index]) + 90.0)
                 if whole:
                     dy, dx = atoms.y[index] - middle, atoms.x[index] - middle
                 px, py = left + size / 2.0 + dx * unit, top + size / 2.0 + dy * unit
-                ux, uy = math.cos(angle) * unit * 0.45, math.sin(angle) * unit * 0.45
-                draw.line(
-                    (px - ux, py - uy, px + ux, py + uy),
-                    fill=self._hue_colour(float(atoms.angle[index])),
-                    width=2 if unit >= 5 else 1,
-                )
+                half = unit * 0.45
+                # Угол отсчитан с осью Y вверх (ядро Собеля по Y — верх минус низ), на картинке ось Y вниз:
+                # вертикальная составляющая берётся с обратным знаком.
+                ux, uy = math.cos(along) * half, -math.sin(along) * half
+                colour = self._hue_colour(float(atoms.angle[index]))
+                width = 2 if unit >= 5 else 1
+                draw.line((px - ux, py - uy, px + ux, py + uy), fill=colour, width=width)
+                if half >= 4:  # наконечник различим только на достаточно длинной стрелке
+                    for turn in (150.0, -150.0):
+                        side = along + math.radians(turn)
+                        draw.line(
+                            (px + ux + math.cos(side) * half * 0.7, py + uy - math.sin(side) * half * 0.7, px + ux, py + uy),
+                            fill=colour,
+                            width=width,
+                        )
 
         glyphs = LayoutGlyphMap(shapes, dictionary.packed)
         glyphs.save(
