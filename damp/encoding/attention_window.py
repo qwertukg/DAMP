@@ -13,6 +13,7 @@ import math
 import numpy as np
 
 from damp.article_refs import OUTSIDE_ARTICLE
+from damp.encoding.damp_encoder import Encoder
 from damp.logging import LOGGER
 
 
@@ -176,6 +177,81 @@ class BlockWindows:
                 "elements_per_piece": float(picture.shape[0]) / max(1, pieces.count),
                 "note": "окна-блоки без перекрытия: элемент входит ровно в один кусок, кусков × элементов в куске "
                 "= элементов картинки (в статье окна нет)",
+            },
+        )
+        return pieces
+
+
+class DetectorWindows:
+    """Окна — сработавшие детекторы-круги, наброшенные на плоскость картинки (расширение статьи; круги — §4.3).
+
+    Картинка заранее не режется. Слой перекрывающихся кругов покрывает плоскость картинки, и кусок — элементы
+    картинки внутри одного сработавшего круга. Элемент входит во все круги, в которые попал (§4.1), поэтому
+    соседние куски имеют общие элементы (§4.4.1: соседние окна дают общие биты).
+    """
+
+    square = False  # окно круглое
+
+    def __init__(self, *, plane: Encoder) -> None:
+        circles = plane.detectors
+        if not circles:
+            raise ValueError("plane encoder has no detectors")
+        self._plane = plane
+        self._centre = np.asarray([(circle.center_y, circle.center_x) for circle in circles], dtype=np.float64)
+        self.extent = float(max(circle.radius for circle in circles))  # радиус круга в клетках
+
+    def pieces(self, picture: "np.ndarray", y: "np.ndarray", x: "np.ndarray") -> WindowPieces:
+        """Куски всех картинок: picture, y, x — номер картинки и координаты каждого элемента."""
+        picture = np.asarray(picture, dtype=np.int64)
+        position = np.stack([np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)], axis=1)
+        if picture.ndim != 1 or position.shape[0] != picture.shape[0]:
+            raise ValueError("picture, y and x must be one-dimensional arrays of the same length")
+        if picture.size == 0:
+            raise ValueError("no elements")
+        values, inverse = np.unique(position, axis=0, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        rows, ids = self._plane.active_detectors(0, values)
+        order = np.argsort(rows, kind="stable")
+        rows, ids = rows[order], ids[order]
+        # Круги каждого места раздаются всем элементам, стоящим в этом месте.
+        counts = np.bincount(rows, minlength=values.shape[0])
+        starts = np.concatenate([[0], np.cumsum(counts)[:-1]])
+        per_element = counts[inverse]
+        element = np.repeat(np.arange(picture.shape[0], dtype=np.int64), per_element)
+        within = np.arange(element.shape[0]) - np.repeat(np.cumsum(per_element) - per_element, per_element)
+        circle = ids[np.repeat(starts[inverse], per_element) + within]
+        total = self._centre.shape[0]
+        keys = picture[element] * total + circle
+        order = np.argsort(keys, kind="stable")
+        keys, element = keys[order], element[order]
+        piece_keys, piece = np.unique(keys, return_inverse=True)
+        piece = piece.reshape(-1).astype(np.int64)
+        centre = self._centre[piece_keys % total]
+        offsets, offset = np.unique(np.round(position[element] - centre[piece], 6), axis=0, return_inverse=True)
+        pieces = WindowPieces(
+            offsets=offsets.astype(np.float64),
+            picture=piece_keys // total,
+            centre=centre,
+            piece=piece,
+            element=element,
+            offset=offset.reshape(-1).astype(np.int64),
+        )
+        pictures = int(np.unique(picture).shape[0])
+        LOGGER.event(
+            "attention_window.detectors",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "radius": self.extent,
+                "circles": int(total),
+                "offsets": int(offsets.shape[0]),
+                "pictures": pictures,
+                "elements": int(picture.shape[0]),
+                "pieces": pieces.count,
+                "pieces_per_picture": pieces.count / max(1, pictures),
+                "elements_per_piece": float(element.shape[0]) / max(1, pieces.count),
+                "circles_per_element": float(element.shape[0]) / max(1, picture.shape[0]),
+                "note": "окна — сработавшие круги наброшенного слоя детекторов: кусок — элементы картинки внутри "
+                "одного круга, элемент входит во все круги, в которые попал (в статье окна нет)",
             },
         )
         return pieces

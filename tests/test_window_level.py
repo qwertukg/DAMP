@@ -9,10 +9,11 @@ os.environ.setdefault("RERUN", "off")
 import numpy as np  # noqa: E402
 
 from damp.decode.nearest_codes import NearestCodeClassifier  # noqa: E402
-from damp.encoding.attention_window import AttentionWindows, BlockWindows  # noqa: E402
+from damp.encoding.attention_window import AttentionWindows, BlockWindows, DetectorWindows  # noqa: E402
 from damp.encoding.conjunction import ConjunctionEncoder  # noqa: E402
 from damp.encoding.damp_encoder import (  # noqa: E402
     ClosedDimension,
+    Detectors,
     Encoder,
     PlaneDimension,
     geometric_detector_layers,
@@ -251,6 +252,39 @@ class BlockWindowsTest(unittest.TestCase):
         self.assertEqual(large.centre.tolist(), [[2.5, 2.5], [8.5, 8.5]])
         self.assertEqual(large.piece.tolist(), [0, 0, 1])
         self.assertEqual(sorted(large.offsets.tolist()), [[-1.5, -1.5], [1.5, 1.5]])
+
+
+class DetectorWindowsTest(unittest.TestCase):
+    @staticmethod
+    def _windows() -> DetectorWindows:
+        plane = Encoder(
+            PlaneDimension("Window", ((0.0, 24.0), (0.0, 24.0)), (Detectors(count=6, overlap=0.3),), code_length=64, layer_bands=False),
+            random_seed=1,
+        )
+        return DetectorWindows(plane=plane)
+
+    def test_piece_is_the_elements_inside_one_fired_circle(self) -> None:
+        rng = np.random.default_rng(2)
+        picture = np.sort(rng.integers(0, 3, 150))
+        y, x = rng.integers(0, 24, 150).astype(np.float64), rng.integers(0, 24, 150).astype(np.float64)
+        windows = self._windows()
+        pieces = windows.pieces(picture, y, x)
+        # Каждый элемент попал хотя бы в один круг, и его смещение от центра круга не больше радиуса.
+        self.assertEqual(sorted(set(pieces.element.tolist())), list(range(150)))
+        shift = pieces.offsets[pieces.offset]
+        self.assertTrue(np.all(np.hypot(shift[:, 0], shift[:, 1]) <= windows.extent + 1e-6))
+        centre = pieces.centre[pieces.piece]
+        self.assertTrue(np.allclose(centre[:, 0] + shift[:, 0], y[pieces.element]))
+        self.assertTrue(np.allclose(centre[:, 1] + shift[:, 1], x[pieces.element]))
+        self.assertTrue(np.array_equal(pieces.picture[pieces.piece], picture[pieces.element]))
+        # Круги перекрываются: вхождений больше, чем элементов.
+        self.assertGreater(pieces.element.shape[0], 150)
+
+    def test_pictures_do_not_share_pieces(self) -> None:
+        y, x = np.asarray([5.0, 5.0]), np.asarray([5.0, 5.0])
+        pieces = self._windows().pieces(np.asarray([0, 1]), y, x)
+        self.assertEqual(pieces.count % 2, 0)
+        self.assertEqual(set(pieces.picture.tolist()), {0, 1})
 
 
 class LeaderDictionaryTest(unittest.TestCase):

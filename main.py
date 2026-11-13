@@ -38,6 +38,7 @@ from damp.activation.plane_detection import (
 from damp.MnistSobelAngleMap import MnistSobelAngleMap, UpscaledSobel
 from damp.encoding.damp_encoder import (
     ClosedDimension,
+    Detectors,
     Encoder,
     EncoderCodeColorizer,
     OpenedDimension,
@@ -61,7 +62,7 @@ from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, Thre
 from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
 from damp.activation.nearest_point import NearestPointActivation
 from damp.decode.nearest_codes import NearestCodeClassifier
-from damp.encoding.attention_window import AttentionWindows, BlockWindows, WindowPieces
+from damp.encoding.attention_window import AttentionWindows, BlockWindows, DetectorWindows, WindowPieces
 from damp.encoding.conjunction import ConjunctionEncoder
 from damp.layout.code_dictionary import CodeDictionary, LeaderDictionary, PairwiseSimilarity
 from damp.layout.glyph_map import LayoutGlyphMap
@@ -537,12 +538,23 @@ WINDOW_LEVEL_STRIDES: tuple[int, ...] | None = None
 # перекрываются, и кусков на картинку с уровнем становится больше (277, 367, 463 на 1000 цифрах).
 # "blocks" — квадратные блоки со сторонами WINDOW_LEVEL_BLOCK_SIDES, без перекрытия: углопозиция входит ровно
 # в один кусок уровня, и на любом уровне кусков картинки × углопозиций в куске = углопозиций картинки.
-WINDOW_LEVEL_WINDOW_KINDS = ("round", "blocks")
+# "detectors" — картинка заранее не режется: на её плоскость набрасывается слой перекрывающихся кругов-детекторов
+# (§4.3), и кусок — элементы картинки внутри одного сработавшего круга; элемент входит во все круги, в которые
+# попал. Место элемента внутри широкого круга кодируют слои кругов вдвое и вчетверо меньше.
+WINDOW_LEVEL_WINDOW_KINDS = ("round", "blocks", "detectors")
 WINDOW_LEVEL_WINDOWS = "round"
 # Стороны блоков по уровням, в клетках сетки 24×24 (24 = 3·2·2·2), каждый уровень собирает 2×2 блока
 # предыдущего. 1000 цифр, в среднем на картинку: уровень 0 — 88.3 углопозиции; блок 3 — 23.3 куска по 3.8
 # углопозиции; блок 6 — 9.4 по 9.4; блок 12 — 4.0 по 22.3; картинка — 1 кусок из 88.3.
 WINDOW_LEVEL_BLOCK_SIDES = (3, 6, 12)
+# Диаметр широкого круга по уровням, в клетках сетки. Толщина линии цифры — около 2 клеток (медиана расстояния
+# между противоположными краями линии по углопозициям 1000 цифр — 2.0, среднее 2.46; шаг самих углопозиций —
+# 1 клетка). Первый уровень — круг с толщину линии, каждый следующий вдвое шире.
+WINDOW_LEVEL_DETECTOR_DIAMETERS = (2.0, 4.0, 8.0, 16.0)
+# Перекрытие широких кругов и кругов внутри них.
+WINDOW_LEVEL_DETECTOR_OVERLAP = 0.3
+# Слоёв кругов внутри широкого: каждый вдвое меньше предыдущего (половина и четверть диаметра широкого).
+WINDOW_LEVEL_DETECTOR_INNER_LAYERS = 2
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
 # Замеры на 2000 цифрах при перекрытии 0.3: 3 слоя — 93.0 %, 5 — 95.0 %, 7 — 93.95 %, 10 — 93.75 %.
 # Перекрытие задаёт число сработавших кругов: точку накрывает π / (4·(1 − перекрытие)²) кругов слоя — 4.9
@@ -3965,6 +3977,30 @@ class MnistWindowLevelRunner:
             ]
         result: list[LevelWindow] = []
         field = 0.0
+        if WINDOW_LEVEL_WINDOWS == "detectors":
+            margin = MnistWindowLevelRunner._place_margin()
+            low, high = -margin, float(WINDOW_LEVEL_GRID) + margin
+            for number, diameter in enumerate(WINDOW_LEVEL_DETECTOR_DIAMETERS, start=1):
+                # Круг диаметра d при перекрытии o: шаг решётки d·(1 − o), кругов по стороне — сторона / шаг (§4.2).
+                per_side = max(1, int(round((high - low) / (float(diameter) * (1.0 - WINDOW_LEVEL_DETECTOR_OVERLAP)))))
+                plane = Encoder(
+                    PlaneDimension(
+                        f"Window{number}",
+                        ((low, high), (low, high)),
+                        (Detectors(count=per_side, overlap=WINDOW_LEVEL_DETECTOR_OVERLAP),),
+                        code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+                        layer_bands=False,
+                    ),
+                    random_seed=WINDOW_LEVEL_RANDOM_SEED,
+                    layer_phase=ENCODER_LAYER_PHASE,
+                )
+                windows = DetectorWindows(plane=plane)
+                # Поле зрения куска — радиус его круга и поле зрения элементов, попавших в круг.
+                field += windows.extent
+                result.append(
+                    LevelWindow(windows, field, f"круг диаметром {2.0 * windows.extent:.3g} клетки, поле зрения {field:.3g}")
+                )
+            return result
         strides = WINDOW_LEVEL_STRIDES or (WINDOW_LEVEL_STRIDE,) * len(WINDOW_LEVEL_RADII)
         if len(strides) != len(WINDOW_LEVEL_RADII):
             raise ValueError("WINDOW_LEVEL_STRIDES must have one stride per radius")
@@ -3983,6 +4019,8 @@ class MnistWindowLevelRunner:
         """Поле вокруг сетки картинки под центры окон: круглые окна выходят за край, блоки — нет."""
         if WINDOW_LEVEL_WINDOWS == "blocks":
             return 1.0
+        if WINDOW_LEVEL_WINDOWS == "detectors":
+            return float(math.ceil(sum(WINDOW_LEVEL_DETECTOR_DIAMETERS) / 2.0) + 1)
         return float(math.ceil(sum(WINDOW_LEVEL_RADII)) + 1)
 
     def _atoms(self, *, train: bool, count: int) -> DigitAtoms:
@@ -4120,16 +4158,37 @@ class MnistWindowLevelRunner:
         """Шаг вверх: куски уровня в окнах window, их коды, словарь образцов, карта форм и места кусков."""
         pieces = window.windows.pieces(elements.picture, elements.y, elements.x)
         extent = window.extent
-        where = self._plane_encoder(
-            f"Offset{number}",
-            ((-extent, extent), (-extent, extent)),
-            0.5,
-            WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * extent),
-        )
+        thrown = isinstance(window.windows, DetectorWindows)
+        if thrown:
+            # Внутри широкого круга — слои кругов вдвое и вчетверо меньше: 2 / (1 − o) кругов по его диаметру.
+            where = Encoder(
+                PlaneDimension(
+                    f"Offset{number}",
+                    ((-extent, extent), (-extent, extent)),
+                    halving_detector_layers(
+                        layers_count=WINDOW_LEVEL_DETECTOR_INNER_LAYERS,
+                        widest_detectors=max(2, int(round(2.0 / (1.0 - WINDOW_LEVEL_DETECTOR_OVERLAP)))),
+                        overlap=WINDOW_LEVEL_DETECTOR_OVERLAP,
+                    ),
+                    code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+                    layer_bands=False,
+                ),
+                random_seed=WINDOW_LEVEL_RANDOM_SEED,
+                layer_phase=ENCODER_LAYER_PHASE,
+            )
+        else:
+            where = self._plane_encoder(
+                f"Offset{number}",
+                ((-extent, extent), (-extent, extent)),
+                0.5,
+                WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * extent),
+            )
         encoder = ConjunctionEncoder(
             elements.what,
             where,
             random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            # Слоёв «что» и слоёв кругов внутри широкого разное число: пары берутся из любых двух слоёв.
+            cross_layers=thrown,
             nested=WINDOW_LEVEL_NESTED_CIRCLES,
             name=f"piece-{number}",
         )
@@ -4159,6 +4218,7 @@ class MnistWindowLevelRunner:
             codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
         )
         cells, cell_index = np.unique(places.cells, axis=0, return_inverse=True)
+        lattice = isinstance(window.windows, AttentionWindows)
         what = self._plane_encoder(
             f"Shape{number}",
             ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
@@ -4169,9 +4229,10 @@ class MnistWindowLevelRunner:
             picture=pieces.picture,
             what_values=cells,
             what_index=cell_index.reshape(-1),
-            # Центр блока бывает полуцелым и нужен точным: по нему блоки следующего уровня собирают куски.
-            y=pieces.centre[:, 0] if window.square else np.rint(pieces.centre[:, 0]).astype(np.int64),
-            x=pieces.centre[:, 1] if window.square else np.rint(pieces.centre[:, 1]).astype(np.int64),
+            # Центр блока и центр наброшенного круга нецелые и нужны точными: по ним собираются куски следующего
+            # уровня. Центры круглых окон с шагом стоят в узлах сетки.
+            y=np.rint(pieces.centre[:, 0]).astype(np.int64) if lattice else pieces.centre[:, 0],
+            x=np.rint(pieces.centre[:, 1]).astype(np.int64) if lattice else pieces.centre[:, 1],
             what=what,
         )
 
