@@ -42,6 +42,7 @@ class HierarchyDetection:
         eta: float | None,
         energy_threshold: float,
         detector_threshold: float,
+        activate_best: bool = False,
         use_gpu: bool = True,
         name: str = "layout",
     ) -> None:
@@ -68,6 +69,9 @@ class HierarchyDetection:
         self._lambda = float(lambda_threshold)
         self._eta = None if eta is None else float(eta)
         self._detector_threshold = float(detector_threshold)
+        # Самая похожая точка зажигается всегда, даже если её сходство ниже λ_a: код без единой зажжённой точки
+        # не оставил бы следа на карте (расширение статьи).
+        self._activate_best = bool(activate_best)
         self._name = str(name)
         self._points = self._to_device(np.ascontiguousarray(table.packed))
         self._ones = self._points.sum(dim=1)
@@ -99,6 +103,7 @@ class HierarchyDetection:
                 "eta": 0.0 if self._eta is None else self._eta,
                 "energy_threshold": float(energy_threshold),
                 "detector_threshold": self._detector_threshold,
+                "activate_best": self._activate_best,
                 "note": "детекторы упорядочены по слоям: слой 0 — самый низкий порог λ_d (самые широкие области)",
             },
         )
@@ -128,6 +133,9 @@ class HierarchyDetection:
                     activation = torch.where(similarity >= self._lambda, similarity, torch.zeros_like(similarity))
                 else:
                     activation = similarity / (1.0 + torch.exp(-self._eta * (similarity - self._lambda)))
+                if self._activate_best:
+                    best = similarity.max(dim=1, keepdim=True).values
+                    activation = torch.maximum(activation, torch.where(similarity >= best, similarity, torch.zeros_like(similarity)))
                 lit += int((activation > 0).sum().item())
                 level = ((activation * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
                 found = torch.nonzero(level >= self._detector_threshold)

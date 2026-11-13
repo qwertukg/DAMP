@@ -52,6 +52,17 @@ class HierarchyDetectionTest(unittest.TestCase):
             self.assertEqual(mine, expected, f"stimulus {number}")
         self.assertEqual(found[rows == 3].size, 0)  # непохожий код ничего не зажигает
 
+    def test_best_point_lights_even_below_the_threshold(self) -> None:
+        layout = _clustered_layout()
+        detectors = self._detectors()
+        energies = [1.0] * 32
+        settings = {"similarity": "cosine", "eta": None, "energy_threshold": 0.12, "detector_threshold": 0.05, "use_gpu": False}
+        far = np.packbits(np.asarray([list(BitArray.from_indices(64, [0, 1, 2, 3, 50, 51, 52, 53]))], dtype=np.uint8), axis=1)
+        strict = HierarchyDetection(layout, detectors, energies, lambda_threshold=0.9, **settings)
+        self.assertEqual(strict.active(far)[1].size, 0)  # сходство с любой точкой ниже 0.9: ничего не зажглось
+        lenient = HierarchyDetection(layout, detectors, energies, lambda_threshold=0.9, activate_best=True, **settings)
+        self.assertGreater(lenient.active(far)[1].size, 0)  # самая похожая точка зажжена и подняла детектор
+
     def test_detected_codes_return_the_detectors_of_requested_codes(self) -> None:
         rows = np.asarray([2, 0, 2, 0, 0])
         detectors = np.asarray([5, 1, 3, 4, 0])
