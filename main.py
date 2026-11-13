@@ -555,6 +555,15 @@ WINDOW_LEVEL_DETECTOR_DIAMETERS = (2.0, 4.0, 8.0, 16.0)
 WINDOW_LEVEL_DETECTOR_OVERLAP = 0.3
 # Слоёв кругов внутри широкого: каждый вдвое меньше предыдущего (половина и четверть диаметра широкого).
 WINDOW_LEVEL_DETECTOR_INNER_LAYERS = 2
+# Поле вокруг сетки картинки для плоскости наброшенных кругов, в клетках; None — половина суммы диаметров + 1.
+# Центры кругов лежат внутри плоскости, поэтому при заданном поле число кругов по стороне зависит только от
+# диаметра своего уровня, и размер пространства уровня можно подбирать независимо от остальных уровней.
+WINDOW_LEVEL_DETECTOR_MARGIN: float | None = None
+# Что становится точками карты уровня. "leaders" — образцы: похожие коды кусков сливаются к образцу
+# (WINDOW_LEVEL_MERGE_SIMILARITY). "all" — каждый кусок обучающих картинок, как на уровне 0 точкой становится
+# каждая углопозиция: размер пространства уровня равен числу кусков и задаётся только размером кругов.
+WINDOW_LEVEL_DICTIONARY_KINDS = ("leaders", "all")
+WINDOW_LEVEL_DICTIONARY = "leaders"
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
 # Замеры на 2000 цифрах при перекрытии 0.3: 3 слоя — 93.0 %, 5 — 95.0 %, 7 — 93.95 %, 10 — 93.75 %.
 # Перекрытие задаёт число сработавших кругов: точку накрывает π / (4·(1 − перекрытие)²) кругов слоя — 4.9
@@ -4020,6 +4029,8 @@ class MnistWindowLevelRunner:
         if WINDOW_LEVEL_WINDOWS == "blocks":
             return 1.0
         if WINDOW_LEVEL_WINDOWS == "detectors":
+            if WINDOW_LEVEL_DETECTOR_MARGIN is not None:
+                return float(WINDOW_LEVEL_DETECTOR_MARGIN)
             return float(math.ceil(sum(WINDOW_LEVEL_DETECTOR_DIAMETERS) / 2.0) + 1)
         return float(math.ceil(sum(WINDOW_LEVEL_RADII)) + 1)
 
@@ -4204,11 +4215,33 @@ class MnistWindowLevelRunner:
             WINDOW_LEVEL_TARGET_DENSITY,
         )
         train_rows = np.flatnonzero(pieces.picture < train_pictures)
-        dictionary = LeaderDictionary(
-            similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY,
-            max_size=WINDOW_LEVEL_DICTIONARY_MAX,
-            use_gpu=ACTIVATION_USE_GPU,
-        ).select(codes[train_rows], encoder.code_length)
+        if WINDOW_LEVEL_DICTIONARY not in WINDOW_LEVEL_DICTIONARY_KINDS:
+            raise ValueError(f"WINDOW_LEVEL_DICTIONARY must be one of {WINDOW_LEVEL_DICTIONARY_KINDS}")
+        if WINDOW_LEVEL_DICTIONARY == "all":
+            taught = np.ascontiguousarray(codes[train_rows])
+            dictionary = CodeDictionary(
+                packed=taught,
+                rows=np.arange(train_rows.shape[0], dtype=np.int64),
+                code_length=encoder.code_length,
+                distinct=int(np.unique(taught.view(np.dtype((np.void, taught.shape[1]))).reshape(-1)).shape[0]),
+            )
+            LOGGER.event(
+                "window_level.space",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "level": number,
+                    "points": dictionary.count,
+                    "distinct": dictionary.distinct,
+                    "note": "точкой карты уровня становится каждый кусок обучающих картинок: размер пространства "
+                    "уровня равен числу кусков",
+                },
+            )
+        else:
+            dictionary = LeaderDictionary(
+                similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY,
+                max_size=WINDOW_LEVEL_DICTIONARY_MAX,
+                use_gpu=ACTIVATION_USE_GPU,
+            ).select(codes[train_rows], encoder.code_length)
         name = f"shapes{number}"
         # Подпись точки карты форм — цифра, где образец встретился первым.
         shapes = self._layout_bits(dictionary.bits(), labels[pieces.picture[train_rows[dictionary.rows]]], name)
