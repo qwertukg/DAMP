@@ -530,6 +530,9 @@ WINDOW_LEVEL_RADII = (2.5,)
 # Шаг центров окна. Шаг 2 теряет 6 пунктов (86.1 %): карта форм складывается только при плотной выборке
 # (окно в каждой клетке).
 WINDOW_LEVEL_STRIDE = 1
+# Шаг центров окна по уровням (для круглых окон); None — WINDOW_LEVEL_STRIDE на всех уровнях. Шаг, растущий
+# с уровнем, уменьшает число кусков на картинку; шаг уровня должен быть кратен шагу предыдущего.
+WINDOW_LEVEL_STRIDES: tuple[int, ...] | None = None
 # Вид окон уровней кусков. "round" — круглые окна радиусов WINDOW_LEVEL_RADII с шагом WINDOW_LEVEL_STRIDE: окна
 # перекрываются, и кусков на картинку с уровнем становится больше (277, 367, 463 на 1000 цифрах).
 # "blocks" — квадратные блоки со сторонами WINDOW_LEVEL_BLOCK_SIDES, без перекрытия: углопозиция входит ровно
@@ -3962,12 +3965,15 @@ class MnistWindowLevelRunner:
             ]
         result: list[LevelWindow] = []
         field = 0.0
-        for radius in WINDOW_LEVEL_RADII:
+        strides = WINDOW_LEVEL_STRIDES or (WINDOW_LEVEL_STRIDE,) * len(WINDOW_LEVEL_RADII)
+        if len(strides) != len(WINDOW_LEVEL_RADII):
+            raise ValueError("WINDOW_LEVEL_STRIDES must have one stride per radius")
+        for radius, stride in zip(WINDOW_LEVEL_RADII, strides):
             # Поле зрения круглого окна — сумма радиусов окон всех шагов до него.
             field += float(radius)
             result.append(
                 LevelWindow(
-                    AttentionWindows(radius=float(radius), stride=WINDOW_LEVEL_STRIDE), field, f"поле зрения {field:g} клетки"
+                    AttentionWindows(radius=float(radius), stride=int(stride)), field, f"поле зрения {field:g} клетки"
                 )
             )
         return result
