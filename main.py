@@ -61,7 +61,7 @@ from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, Thre
 from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
 from damp.activation.nearest_point import NearestPointActivation
 from damp.decode.nearest_codes import NearestCodeClassifier
-from damp.encoding.attention_window import AttentionWindows, WindowPieces
+from damp.encoding.attention_window import AttentionWindows, BlockWindows, WindowPieces
 from damp.encoding.conjunction import ConjunctionEncoder
 from damp.layout.code_dictionary import CodeDictionary, LeaderDictionary, PairwiseSimilarity
 from damp.layout.glyph_map import LayoutGlyphMap
@@ -530,6 +530,16 @@ WINDOW_LEVEL_RADII = (2.5,)
 # Шаг центров окна. Шаг 2 теряет 6 пунктов (86.1 %): карта форм складывается только при плотной выборке
 # (окно в каждой клетке).
 WINDOW_LEVEL_STRIDE = 1
+# Вид окон уровней кусков. "round" — круглые окна радиусов WINDOW_LEVEL_RADII с шагом WINDOW_LEVEL_STRIDE: окна
+# перекрываются, и кусков на картинку с уровнем становится больше (277, 367, 463 на 1000 цифрах).
+# "blocks" — квадратные блоки со сторонами WINDOW_LEVEL_BLOCK_SIDES, без перекрытия: углопозиция входит ровно
+# в один кусок уровня, и на любом уровне кусков картинки × углопозиций в куске = углопозиций картинки.
+WINDOW_LEVEL_WINDOW_KINDS = ("round", "blocks")
+WINDOW_LEVEL_WINDOWS = "round"
+# Стороны блоков по уровням, в клетках сетки 24×24 (24 = 3·2·2·2), каждый уровень собирает 2×2 блока
+# предыдущего. 1000 цифр, в среднем на картинку: уровень 0 — 88.3 углопозиции; блок 3 — 23.3 куска по 3.8
+# углопозиции; блок 6 — 9.4 по 9.4; блок 12 — 4.0 по 22.3; картинка — 1 кусок из 88.3.
+WINDOW_LEVEL_BLOCK_SIDES = (3, 6, 12)
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
 # Замеры на 2000 цифрах при перекрытии 0.3: 3 слоя — 93.0 %, 5 — 95.0 %, 7 — 93.95 %, 10 — 93.75 %.
 # Перекрытие задаёт число сработавших кругов: точку накрывает π / (4·(1 − перекрытие)²) кругов слоя — 4.9
@@ -3816,13 +3826,37 @@ class LevelElements:
     picture: "np.ndarray"  # номер картинки каждого элемента
     what_values: "np.ndarray"  # различные значения «что»: углы или ячейки карты форм (y, x)
     what_index: "np.ndarray"  # номер значения «что» у каждого элемента
-    y: "np.ndarray"  # узел сетки картинки
+    y: "np.ndarray"  # место на сетке картинки: узел (круглые окна) либо центр блока (окна-блоки)
     x: "np.ndarray"
     what: Encoder  # кодер координаты «что»: его детекторы читают значения этого уровня
 
     @property
     def count(self) -> int:
         return int(self.picture.shape[0])
+
+
+@dataclass(frozen=True)
+class LevelWindow:
+    """Окно одного уровня кусков: чем режется картинка и какое поле зрения у куска этого уровня."""
+
+    windows: "AttentionWindows | BlockWindows"
+    field: float  # поле зрения куска на картинке от его центра: радиус круга либо половина стороны квадрата
+    title: str  # как назвать окно в подписях
+
+    @property
+    def square(self) -> bool:
+        return bool(self.windows.square)
+
+    @property
+    def extent(self) -> float:
+        """Половина размера окна в клетках: плоскость смещений «где в окне» — (−extent, extent)²."""
+        return float(self.windows.extent)
+
+    def sees(self, dy: float, dx: float) -> bool:
+        """Попадает ли углопозиция со смещением (dy, dx) от центра куска в его поле зрения."""
+        if self.square:
+            return abs(dy) <= self.field + 1e-9 and abs(dx) <= self.field + 1e-9
+        return dy * dy + dx * dx <= self.field * self.field
 
 
 class MnistWindowLevelRunner:
@@ -3870,7 +3904,8 @@ class MnistWindowLevelRunner:
         self._drawn = atoms
         self._atom_starts = np.searchsorted(atoms.picture, np.arange(atoms.pictures + 1))
         # Плоскость мест на картинке: сетка углопозиций и поле под центры окон, вышедших за её край.
-        margin = float(math.ceil(sum(WINDOW_LEVEL_RADII)) + 1)
+        windows = self._level_windows()
+        margin = self._place_margin()
         low, high = -margin, float(WINDOW_LEVEL_GRID) + margin
         place = self._plane_encoder(
             "Place",
@@ -3880,14 +3915,12 @@ class MnistWindowLevelRunner:
         )
         elements = self._atom_elements(atoms)
         # Номера уровней: 0 — углопозиции (первичный), 1… — куски, последний — картинки.
-        last = len(WINDOW_LEVEL_RADII)
+        last = len(windows)
         segments: list[tuple[int, "np.ndarray", int]] = []
         if WINDOW_LEVEL_PICTURE_LEVELS == "all":
             segments.append((0, *self._picture_segment(elements, place, atoms.pictures, 0)))
-        field = 0.0
-        for number, radius in enumerate(WINDOW_LEVEL_RADII, start=1):
-            field += float(radius)
-            elements = self._next_level(elements, float(radius), atoms.labels, train.pictures, number, field)
+        for number, window in enumerate(windows, start=1):
+            elements = self._next_level(elements, window, atoms.labels, train.pictures, number)
             if WINDOW_LEVEL_PICTURE_LEVELS == "all" or number == last:
                 segments.append((number, *self._picture_segment(elements, place, atoms.pictures, number)))
         picture_codes = np.concatenate([packed for _, packed, _ in segments], axis=1)
@@ -3915,6 +3948,36 @@ class MnistWindowLevelRunner:
         if WINDOW_LEVEL_PICTURE_MAP:
             self._picture_map(picture_codes[: train.pictures], train.labels, picture_length, last + 1)
         return accuracy
+
+    @staticmethod
+    def _level_windows() -> list[LevelWindow]:
+        """Окна уровней кусков по константам WINDOW_LEVEL_WINDOWS: круглые с шагом либо блоки без перекрытия."""
+        if WINDOW_LEVEL_WINDOWS not in WINDOW_LEVEL_WINDOW_KINDS:
+            raise ValueError(f"WINDOW_LEVEL_WINDOWS must be one of {WINDOW_LEVEL_WINDOW_KINDS}")
+        if WINDOW_LEVEL_WINDOWS == "blocks":
+            # Поле зрения блока — его же клетки: углопозиции не дальше (side − 1)/2 от центра по каждой оси.
+            return [
+                LevelWindow(BlockWindows(side=int(side)), (int(side) - 1) / 2.0, f"блок {int(side)}×{int(side)} клеток")
+                for side in WINDOW_LEVEL_BLOCK_SIDES
+            ]
+        result: list[LevelWindow] = []
+        field = 0.0
+        for radius in WINDOW_LEVEL_RADII:
+            # Поле зрения круглого окна — сумма радиусов окон всех шагов до него.
+            field += float(radius)
+            result.append(
+                LevelWindow(
+                    AttentionWindows(radius=float(radius), stride=WINDOW_LEVEL_STRIDE), field, f"поле зрения {field:g} клетки"
+                )
+            )
+        return result
+
+    @staticmethod
+    def _place_margin() -> float:
+        """Поле вокруг сетки картинки под центры окон: круглые окна выходят за край, блоки — нет."""
+        if WINDOW_LEVEL_WINDOWS == "blocks":
+            return 1.0
+        return float(math.ceil(sum(WINDOW_LEVEL_RADII)) + 1)
 
     def _atoms(self, *, train: bool, count: int) -> DigitAtoms:
         """Углопозиции первых count цифр набора, у которых они есть."""
@@ -4043,24 +4106,19 @@ class MnistWindowLevelRunner:
     def _next_level(
         self,
         elements: LevelElements,
-        radius: float,
+        window: LevelWindow,
         labels: "np.ndarray",
         train_pictures: int,
         number: int,
-        field: float,
     ) -> LevelElements:
-        """Шаг вверх: куски уровня в окне радиуса radius, их коды, словарь образцов, карта форм и места кусков.
-
-        field — поле зрения куска этого уровня на картинке: сумма радиусов окон всех шагов до него.
-        """
-        pieces = AttentionWindows(radius=radius, stride=WINDOW_LEVEL_STRIDE).pieces(
-            elements.picture, elements.y, elements.x
-        )
+        """Шаг вверх: куски уровня в окнах window, их коды, словарь образцов, карта форм и места кусков."""
+        pieces = window.windows.pieces(elements.picture, elements.y, elements.x)
+        extent = window.extent
         where = self._plane_encoder(
             f"Offset{number}",
-            ((-radius, radius), (-radius, radius)),
+            ((-extent, extent), (-extent, extent)),
             0.5,
-            WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * radius),
+            WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * extent),
         )
         encoder = ConjunctionEncoder(
             elements.what,
@@ -4090,7 +4148,7 @@ class MnistWindowLevelRunner:
         # Подпись точки карты форм — цифра, где образец встретился первым.
         shapes = self._layout_bits(dictionary.bits(), labels[pieces.picture[train_rows[dictionary.rows]]], name)
         self._export(shapes, name)
-        self._shape_glyphs(shapes, dictionary, pieces, train_rows, number, field)
+        self._shape_glyphs(shapes, dictionary, pieces, train_rows, number, window)
         places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name=name).place(
             codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
         )
@@ -4105,8 +4163,9 @@ class MnistWindowLevelRunner:
             picture=pieces.picture,
             what_values=cells,
             what_index=cell_index.reshape(-1),
-            y=np.rint(pieces.centre[:, 0]).astype(np.int64),
-            x=np.rint(pieces.centre[:, 1]).astype(np.int64),
+            # Центр блока бывает полуцелым и нужен точным: по нему блоки следующего уровня собирают куски.
+            y=pieces.centre[:, 0] if window.square else np.rint(pieces.centre[:, 0]).astype(np.int64),
+            x=pieces.centre[:, 1] if window.square else np.rint(pieces.centre[:, 1]).astype(np.int64),
             what=what,
         )
 
@@ -4228,13 +4287,14 @@ class MnistWindowLevelRunner:
         pieces: WindowPieces,
         train_rows: "np.ndarray",
         number: int,
-        field: float,
+        window: LevelWindow,
     ) -> None:
         """Карта форм рисунками: в ячейке образца — углопозиции картинки в его поле зрения, цвет — направление."""
         rows = train_rows[dictionary.rows]
         picture, centre = pieces.picture[rows], pieces.centre[rows]
         atoms, starts = self._drawn, self._atom_starts
-        reach = math.ceil(field) + 1
+        # Сколько клеток от центра помещается в ячейке рисунка: поле зрения и поле вокруг него.
+        reach = window.field + 1.0 if window.square else math.ceil(window.field) + 1
 
         def paint(canvas, draw, sample: int, left: int, top: int, size: int) -> None:  # noqa: ANN001
             unit = size / (2.0 * reach)
@@ -4243,7 +4303,7 @@ class MnistWindowLevelRunner:
             first, last = int(starts[picture[sample]]), int(starts[picture[sample] + 1])
             for index in range(first, last):
                 dy, dx = atoms.y[index] - centre_y, atoms.x[index] - centre_x
-                if dy * dy + dx * dx > field * field:
+                if not window.sees(dy, dx):
                     continue
                 angle = math.radians(float(atoms.angle[index]))
                 px, py = left + size / 2.0 + dx * unit, top + size / 2.0 + dy * unit
@@ -4259,7 +4319,7 @@ class MnistWindowLevelRunner:
             f"{WINDOW_LEVEL_FILE_PREFIX}-level{number}-shapes-{self.count}.glyphs.png",
             paint,
             tile=glyphs.tile_size(WINDOW_LEVEL_SHAPE_TILE),
-            title=f"Уровень {number} — куски: карта форм, {dictionary.count} образцов, поле зрения {field:g} клетки; "
+            title=f"Уровень {number} — куски: карта форм, {dictionary.count} образцов, {window.title}; "
             "отрезок — углопозиция, цвет — направление",
         )
 

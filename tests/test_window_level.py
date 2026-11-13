@@ -9,7 +9,7 @@ os.environ.setdefault("RERUN", "off")
 import numpy as np  # noqa: E402
 
 from damp.decode.nearest_codes import NearestCodeClassifier  # noqa: E402
-from damp.encoding.attention_window import AttentionWindows  # noqa: E402
+from damp.encoding.attention_window import AttentionWindows, BlockWindows  # noqa: E402
 from damp.encoding.conjunction import ConjunctionEncoder  # noqa: E402
 from damp.encoding.damp_encoder import (  # noqa: E402
     ClosedDimension,
@@ -225,6 +225,32 @@ class AttentionWindowsTest(unittest.TestCase):
         sparse = AttentionWindows(radius=1.5, stride=2).pieces(np.asarray([0, 1]), y, x)
         self.assertLess(sparse.count, dense.count)
         self.assertTrue(np.all(sparse.centre % 2 == 0))
+
+
+class BlockWindowsTest(unittest.TestCase):
+    def test_every_element_is_in_exactly_one_piece(self) -> None:
+        rng = np.random.default_rng(1)
+        picture = np.sort(rng.integers(0, 3, 200))
+        y, x = rng.integers(0, 24, 200), rng.integers(0, 24, 200)
+        pieces = BlockWindows(side=3).pieces(picture, y, x)
+        self.assertEqual(sorted(pieces.element.tolist()), list(range(200)))
+        self.assertTrue(np.all(np.diff(pieces.piece) >= 0))
+        # Элемент лежит в своём блоке: смещение от центра не больше (side − 1)/2 по каждой оси.
+        self.assertTrue(np.all(np.abs(pieces.offsets) <= 1.0))
+        centre = pieces.centre[pieces.piece]
+        shift = pieces.offsets[pieces.offset]
+        self.assertTrue(np.array_equal(centre[:, 0] + shift[:, 0], y[pieces.element].astype(np.float64)))
+        self.assertTrue(np.array_equal(centre[:, 1] + shift[:, 1], x[pieces.element].astype(np.float64)))
+        self.assertTrue(np.array_equal(pieces.picture[pieces.piece], picture[pieces.element]))
+
+    def test_larger_blocks_collect_whole_smaller_blocks(self) -> None:
+        y, x = np.asarray([0, 2, 3, 5, 6]), np.asarray([0, 2, 3, 5, 6])
+        small = BlockWindows(side=3).pieces(np.zeros(5, dtype=np.int64), y, x)
+        self.assertEqual(small.centre.tolist(), [[1.0, 1.0], [4.0, 4.0], [7.0, 7.0]])
+        large = BlockWindows(side=6).pieces(small.picture, small.centre[:, 0], small.centre[:, 1])
+        self.assertEqual(large.centre.tolist(), [[2.5, 2.5], [8.5, 8.5]])
+        self.assertEqual(large.piece.tolist(), [0, 0, 1])
+        self.assertEqual(sorted(large.offsets.tolist()), [[-1.5, -1.5], [1.5, 1.5]])
 
 
 class LeaderDictionaryTest(unittest.TestCase):
