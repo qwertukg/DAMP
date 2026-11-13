@@ -55,7 +55,7 @@ from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding, MnistDecoder, PredictionResult
 # Второй уровень, вариант «код на углопозицию».
-from damp.article_refs import MAPPING_CONTINUITY
+from damp.article_refs import CONCATENATION, MAPPING_CONTINUITY
 from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, ThresholdActivation
 from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
 from damp.activation.nearest_point import NearestPointActivation
@@ -63,6 +63,7 @@ from damp.decode.nearest_codes import NearestCodeClassifier
 from damp.encoding.attention_window import AttentionWindows, WindowPieces
 from damp.encoding.conjunction import ConjunctionEncoder
 from damp.layout.code_dictionary import CodeDictionary, LeaderDictionary, PairwiseSimilarity
+from damp.layout.glyph_map import LayoutGlyphMap
 
 LOG_INTERVAL_DEFAULT = 1
 LOG_INTERVAL_INIT = 1
@@ -519,9 +520,13 @@ SECOND_LEVEL_FILE_PREFIX = "data/second"
 # --- Уровень «окно внимания» (расширение статьи): кусок в координатах своего окна, «что» отдельно от «где».
 # Замеры 2026-11-13 (сглаженный режим, 2000 проверочных цифр, 1 ближайший сосед): 1000 цифр — 92.2–92.6 %
 # против 90.6 % у второго уровня над первой раскладкой; 5000 цифр — 96.0 % против 93.7 %.
-# Окно: радиус в клетках сетки углопозиций (окнах Собеля) и шаг центров. Шаг 2 теряет 6 пунктов (86.1 %):
-# карта форм складывается только при плотной выборке (окно в каждой клетке).
-WINDOW_LEVEL_RADIUS = 2.5
+# Шаги вверх: радиус окна каждого шага в клетках сетки углопозиций (окнах Собеля). Один радиус — один
+# уровень кусков между углопозициями и картинкой; уровней всего — число радиусов + 2. Второе окно смотрит
+# на куски первого, поэтому поле зрения кусков — 2.5 и 4 клетки. Замеры на 5000 цифрах: (2.5,) с кодом
+# картинки от этого уровня — 95.9 %, 135 с; (2.5, 1.5) с кодом от всех уровней — 95.4 %, 281 с.
+WINDOW_LEVEL_RADII = (2.5, 1.5)
+# Шаг центров окна. Шаг 2 теряет 6 пунктов (86.1 %): карта форм складывается только при плотной выборке
+# (окно в каждой клетке).
 WINDOW_LEVEL_STRIDE = 1
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
 WINDOW_LEVEL_LAYERS = 5
@@ -539,9 +544,13 @@ WINDOW_LEVEL_SHAPE_RADIUS_MAX = 0.33
 WINDOW_LEVEL_SHAPE_RADIUS_MIN = 0.03
 WINDOW_LEVEL_PLACE_RADIUS_MAX = 12.0
 WINDOW_LEVEL_PLACE_RADIUS_MIN = 2.0
-# Плоскость мест окон на картинке: сетка углопозиций 0…23 и поле под центры окон, вышедших за её край.
-WINDOW_LEVEL_PLACE_MIN = -4.0
-WINDOW_LEVEL_PLACE_MAX = 28.0
+# Сетка углопозиций: 28·8 // 9 = 24 окна Собеля по стороне (узлы 0…23). Плоскость мест на картинке шире
+# её на поле под центры окон, вышедших за край: ⌈сумма радиусов⌉ + 1 клетка с каждой стороны.
+WINDOW_LEVEL_GRID = 24
+# Из каких уровней собирается код картинки: "last" — только из верхнего уровня кусков, "all" — из всех
+# уровней, начиная с углопозиций; сегменты уровней склеиваются (§2.2.3).
+# На 1000 цифрах при трёх уровнях кусков (1.5, 1.5, 1.5): "last" — 87.7 %, "all" — 90.2 %.
+WINDOW_LEVEL_PICTURE_LEVELS = "all"
 # True — детекторы-произведения из любых двух слоёв (код картинки вчетверо длиннее, +1 пункт на 1000 цифрах).
 WINDOW_LEVEL_CROSS_LAYERS = False
 # Длины кодов подбираются под среднюю плотность (§6.6): по первым кускам и первым картинкам.
@@ -558,9 +567,16 @@ WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE = SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE
 WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE = SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE
 # True — коды обучающих картинок раскладываются в карту цифр (как у второго уровня).
 WINDOW_LEVEL_PICTURE_MAP = True
+# Сколько «картинок × бит» помещается в раскладку карты цифр на видеокарте 8 ГБ. Замеры: 5000 × 37 тыс. бит
+# раскладываются за минуту, 12 000 × 34 тыс. и 5000 × 57 тыс. — не помещаются в память. Если код длиннее,
+# карта цифр строится по случайной выборке его бит.
+WINDOW_LEVEL_PICTURE_MAP_CELLS = 180_000_000
 WINDOW_LEVEL_EVALUATE_LIMIT = 2000
 WINDOW_LEVEL_NEIGHBOURS = (1, 5)
 WINDOW_LEVEL_FILE_PREFIX = "data/window"
+# Размер ячейки на картах с рисунками стимулов, пикселей: кусок на карте форм и цифра на карте цифр.
+WINDOW_LEVEL_SHAPE_TILE = 40
+WINDOW_LEVEL_DIGIT_TILE = 28
 
 # --- Второй уровень, вариант «код на углопозицию» (§4.3, §6.2; расширение статьи; эксперимент).
 # Каждая точка первой раскладки получает код своего места на карте: стимул точки зажигает точки с тем же
@@ -3718,6 +3734,7 @@ class DigitAtoms:
     y: "np.ndarray"  # узел сетки окон Собеля
     x: "np.ndarray"
     labels: "np.ndarray"  # метка каждой картинки
+    images: "np.ndarray"  # сами картинки (N × 28 × 28, 0…255) — для рисунков карт
 
     @property
     def pictures(self) -> int:
@@ -3733,20 +3750,43 @@ class DigitAtoms:
             y=np.concatenate([self.y, other.y]),
             x=np.concatenate([self.x, other.x]),
             labels=np.concatenate([self.labels, other.labels]),
+            images=np.concatenate([self.images, other.images]),
         )
 
 
-class MnistWindowLevelRunner:
-    """Уровень «окно внимания» на MNIST (расширение статьи): «что» отдельно от «где», без первой раскладки.
+@dataclass(frozen=True)
+class LevelElements:
+    """Элементы уровня иерархии: у каждого — картинка, значение «что» и узел сетки картинки («где»).
 
-    1. Углопозиции цифр — тем же выделением, что у первой раскладки (угол, узел сетки окон).
-    2. По картинке идёт круглое окно (AttentionWindows): кусок — углопозиции в окне, записанные от его центра.
-    3. Код куска — детекторы-произведения «направление × место в окне» (ConjunctionEncoder над детекторами
-       двух кодеров Encoder), OR по углопозициям куска (§2.2.1); длина — под плотность 25 % (§6.6).
-    4. Коды кусков обучающих картинок сливаются к образцу (LeaderDictionary), образцы раскладываются тем же
-       Layout — карта форм; каждый кусок получает место на ней (NearestPointActivation, §6.1).
-    5. Код картинки — детекторы-произведения «круг на карте форм × круг на картинке» по всем её кускам.
-    6. Коды картинок раскладываются в карту цифр; проверка — нечёткий поиск по кодам обучающих (§2.2.5).
+    На первом уровне элемент — углопозиция, «что» — её угол. На следующих элемент — кусок предыдущего уровня,
+    «что» — его место на карте форм этого уровня, «где» — центр окна куска.
+    """
+
+    picture: "np.ndarray"  # номер картинки каждого элемента
+    what_values: "np.ndarray"  # различные значения «что»: углы или ячейки карты форм (y, x)
+    what_index: "np.ndarray"  # номер значения «что» у каждого элемента
+    y: "np.ndarray"  # узел сетки картинки
+    x: "np.ndarray"
+    what: Encoder  # кодер координаты «что»: его детекторы читают значения этого уровня
+
+    @property
+    def count(self) -> int:
+        return int(self.picture.shape[0])
+
+
+class MnistWindowLevelRunner:
+    """Уровни «окно внимания» на MNIST (расширение статьи): «что» отдельно от «где», без первой раскладки.
+
+    1. Первый уровень — углопозиции цифр, тем же выделением, что у первой раскладки (угол, узел сетки окон).
+    2. Шаг вверх (по одному на каждый радиус из WINDOW_LEVEL_RADII): по элементам уровня идёт круглое окно
+       (AttentionWindows); кусок — элементы в окне, записанные от его центра. Код куска — детекторы-произведения
+       «что элемента × его место в окне» (ConjunctionEncoder над детекторами двух Encoder), OR по элементам
+       куска (§2.2.1), длина под плотность 25 % (§6.6). Коды кусков обучающих картинок сливаются к образцу
+       (LeaderDictionary), образцы раскладываются тем же Layout — карта форм уровня; каждый кусок получает
+       место на ней (NearestPointActivation, §6.1) и становится элементом следующего уровня.
+    3. Последний уровень — картинка: её код собирается детекторами-произведениями «что элемента × его место на
+       картинке» по элементам уровней из WINDOW_LEVEL_PICTURE_LEVELS и склеивается из их кодов (§2.2.3).
+    4. Коды картинок раскладываются в карту цифр; проверка — нечёткий поиск по кодам обучающих (§2.2.5).
     """
 
     def __init__(
@@ -3760,6 +3800,10 @@ class MnistWindowLevelRunner:
             raise ValueError("count must be positive")
         if evaluate_limit < 0:
             raise ValueError("evaluate_limit must be non-negative")
+        if not WINDOW_LEVEL_RADII:
+            raise ValueError("WINDOW_LEVEL_RADII must name at least one window")
+        if WINDOW_LEVEL_PICTURE_LEVELS not in ("all", "last"):
+            raise ValueError("WINDOW_LEVEL_PICTURE_LEVELS must be 'all' or 'last'")
         self.count = int(count)
         self._evaluate_limit = int(evaluate_limit)
         self._split = split
@@ -3767,27 +3811,47 @@ class MnistWindowLevelRunner:
         self._primary = MnistLayoutRunner(count=count, layout_only=True)
 
     def run(self) -> dict[int, float] | None:
-        """Весь путь уровня; возвращает точность нечёткого поиска по числу соседей (None — проверка отключена)."""
+        """Весь путь уровней; возвращает точность нечёткого поиска по числу соседей (None — проверка отключена)."""
         train = self._atoms(train=True, count=self.count)
         test = self._atoms(train=self._split == "train", count=self._evaluate_limit) if self._evaluate_limit else None
         atoms = train.joined(test)
-        pieces = AttentionWindows(radius=WINDOW_LEVEL_RADIUS, stride=WINDOW_LEVEL_STRIDE).pieces(
-            atoms.picture, atoms.y, atoms.x
+        self._drawn = atoms
+        self._atom_starts = np.searchsorted(atoms.picture, np.arange(atoms.pictures + 1))
+        # Плоскость мест на картинке: сетка углопозиций и поле под центры окон, вышедших за её край.
+        margin = float(math.ceil(sum(WINDOW_LEVEL_RADII)) + 1)
+        low, high = -margin, float(WINDOW_LEVEL_GRID) + margin
+        place = self._plane_encoder(
+            "Place",
+            ((low, high), (low, high)),
+            WINDOW_LEVEL_PLACE_RADIUS_MAX / (high - low),
+            WINDOW_LEVEL_PLACE_RADIUS_MIN / (high - low),
         )
-        piece_codes, piece_length = self._piece_codes(atoms, pieces)
-        train_rows = np.flatnonzero(pieces.picture < train.pictures)
-        dictionary = LeaderDictionary(
-            similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY,
-            max_size=WINDOW_LEVEL_DICTIONARY_MAX,
-            use_gpu=ACTIVATION_USE_GPU,
-        ).select(piece_codes[train_rows], piece_length)
-        shapes = self._shape_map(dictionary, atoms.labels[pieces.picture[train_rows[dictionary.rows]]])
-        places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name="shapes").place(
-            piece_codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
+        elements = self._atom_elements(atoms)
+        last = len(WINDOW_LEVEL_RADII) + 1
+        segments: list[tuple[int, "np.ndarray", int]] = []
+        if WINDOW_LEVEL_PICTURE_LEVELS == "all":
+            segments.append((1, *self._picture_segment(elements, place, atoms.pictures, 1)))
+        field = 0.0
+        for number, radius in enumerate(WINDOW_LEVEL_RADII, start=2):
+            field += float(radius)
+            elements = self._next_level(elements, float(radius), atoms.labels, train.pictures, number, field)
+            if WINDOW_LEVEL_PICTURE_LEVELS == "all" or number == last:
+                segments.append((number, *self._picture_segment(elements, place, atoms.pictures, number)))
+        picture_codes = np.concatenate([packed for _, packed, _ in segments], axis=1)
+        picture_length = sum(length for _, _, length in segments)
+        LOGGER.event(
+            "window_level.picture_code",
+            section=CONCATENATION,
+            data={
+                "levels": [number for number, _, _ in segments],
+                "segment_lengths": [length for _, _, length in segments],
+                "code_length": picture_length,
+                "pictures": atoms.pictures,
+                "note": "код картинки склеен из кодов уровней: у каждого уровня свой сегмент (§2.2.3)",
+            },
         )
-        picture_codes, picture_length = self._picture_codes(shapes, pieces, places.cells, atoms.pictures)
         if WINDOW_LEVEL_PICTURE_MAP:
-            self._picture_map(picture_codes[: train.pictures], train.labels, picture_length)
+            self._picture_map(picture_codes[: train.pictures], train.labels, picture_length, last + 1)
         if test is None:
             return None
         classifier = NearestCodeClassifier(
@@ -3803,12 +3867,15 @@ class MnistWindowLevelRunner:
         dataset = MNIST(root="./data", train=train, download=True, transform=transforms.ToTensor())
         rows: list["np.ndarray"] = []
         labels: list[int] = []
+        images: list["np.ndarray"] = []
         for image, label in dataset:
             if len(labels) >= count:
                 break
-            found = self._primary.extractor.extract(image.squeeze(0).numpy(), label=int(label)).get(int(label), [])
+            pixels = image.squeeze(0).numpy()
+            found = self._primary.extractor.extract(pixels, label=int(label)).get(int(label), [])
             if not found:
                 continue
+            images.append((pixels * 255.0).astype(np.uint8))
             values = np.asarray(found, dtype=np.float64)  # (угол, x, y)
             rows.append(np.column_stack([np.full(values.shape[0], len(labels), dtype=np.float64), values]))
             labels.append(int(label))
@@ -3821,6 +3888,7 @@ class MnistWindowLevelRunner:
             y=np.rint(data[:, 3]).astype(np.int64),
             x=np.rint(data[:, 2]).astype(np.int64),
             labels=np.asarray(labels, dtype=np.int64),
+            images=np.stack(images),
         )
         LOGGER.event(
             "window_level.atoms",
@@ -3855,6 +3923,34 @@ class MnistWindowLevelRunner:
         )
 
     @staticmethod
+    def _atom_elements(atoms: DigitAtoms) -> LevelElements:
+        """Первый уровень: элемент — углопозиция, «что» — её направление (детекторы угла, §4.4)."""
+        angles, angle_index = np.unique(atoms.angle, return_inverse=True)
+        what = Encoder(
+            ClosedDimension(
+                "Angle",
+                (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
+                geometric_detector_layers(
+                    layers_count=WINDOW_LEVEL_LAYERS,
+                    widest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST,
+                    narrowest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST,
+                    overlap=WINDOW_LEVEL_OVERLAP,
+                ),
+                code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+            ),
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            layer_phase=ENCODER_LAYER_PHASE,
+        )
+        return LevelElements(
+            picture=atoms.picture,
+            what_values=angles,
+            what_index=angle_index.reshape(-1),
+            y=atoms.y,
+            x=atoms.x,
+            what=what,
+        )
+
+    @staticmethod
     def _fit_and_encode(
         encoder: ConjunctionEncoder,
         what_values: "np.ndarray",
@@ -3878,41 +3974,94 @@ class MnistWindowLevelRunner:
         )
         return encoder.encode_sets(what_values, what_index, where_values, where_index, groups, group_count)
 
-    def _piece_codes(self, atoms: DigitAtoms, pieces: WindowPieces) -> tuple["np.ndarray", int]:
-        """Коды кусков: «направление углопозиции × её место в окне», OR по углопозициям куска (§2.2.1)."""
-        angles, angle_index = np.unique(atoms.angle, return_inverse=True)
-        what = Encoder(
-            ClosedDimension(
-                "Angle",
-                (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
-                geometric_detector_layers(
-                    layers_count=WINDOW_LEVEL_LAYERS,
-                    widest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST,
-                    narrowest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST,
-                    overlap=WINDOW_LEVEL_OVERLAP,
-                ),
-                code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
-            ),
-            random_seed=WINDOW_LEVEL_RANDOM_SEED,
-            layer_phase=ENCODER_LAYER_PHASE,
+    def _next_level(
+        self,
+        elements: LevelElements,
+        radius: float,
+        labels: "np.ndarray",
+        train_pictures: int,
+        number: int,
+        field: float,
+    ) -> LevelElements:
+        """Шаг вверх: куски уровня в окне радиуса radius, их коды, словарь образцов, карта форм и места кусков.
+
+        field — поле зрения куска этого уровня на картинке: сумма радиусов окон всех шагов до него.
+        """
+        pieces = AttentionWindows(radius=radius, stride=WINDOW_LEVEL_STRIDE).pieces(
+            elements.picture, elements.y, elements.x
         )
-        radius = WINDOW_LEVEL_RADIUS
         where = self._plane_encoder(
-            "Offset",
+            f"Offset{number}",
             ((-radius, radius), (-radius, radius)),
             0.5,
             WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * radius),
         )
-        encoder = ConjunctionEncoder(what, where, random_seed=WINDOW_LEVEL_RANDOM_SEED, name="piece")
-        packed = self._fit_and_encode(
+        encoder = ConjunctionEncoder(
+            elements.what, where, random_seed=WINDOW_LEVEL_RANDOM_SEED, name=f"piece-{number}"
+        )
+        codes = self._fit_and_encode(
             encoder,
-            angles,
-            angle_index.reshape(-1)[pieces.element],
+            elements.what_values,
+            elements.what_index[pieces.element],
             pieces.offsets,
             pieces.offset,
             pieces.piece,
             pieces.count,
             WINDOW_LEVEL_CALIBRATION_PIECES,
+        )
+        train_rows = np.flatnonzero(pieces.picture < train_pictures)
+        dictionary = LeaderDictionary(
+            similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY,
+            max_size=WINDOW_LEVEL_DICTIONARY_MAX,
+            use_gpu=ACTIVATION_USE_GPU,
+        ).select(codes[train_rows], encoder.code_length)
+        name = f"shapes{number}"
+        # Подпись точки карты форм — цифра, где образец встретился первым.
+        shapes = self._layout_bits(dictionary.bits(), labels[pieces.picture[train_rows[dictionary.rows]]], name)
+        self._export(shapes, name)
+        self._shape_glyphs(shapes, dictionary, pieces, train_rows, number, field)
+        places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name=name).place(
+            codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
+        )
+        cells, cell_index = np.unique(places.cells, axis=0, return_inverse=True)
+        what = self._plane_encoder(
+            f"Shape{number}",
+            ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
+            WINDOW_LEVEL_SHAPE_RADIUS_MAX,
+            WINDOW_LEVEL_SHAPE_RADIUS_MIN,
+        )
+        return LevelElements(
+            picture=pieces.picture,
+            what_values=cells,
+            what_index=cell_index.reshape(-1),
+            y=np.rint(pieces.centre[:, 0]).astype(np.int64),
+            x=np.rint(pieces.centre[:, 1]).astype(np.int64),
+            what=what,
+        )
+
+    def _picture_segment(
+        self, elements: LevelElements, place: Encoder, pictures: int, number: int
+    ) -> tuple["np.ndarray", int]:
+        """Сегмент кода картинки от одного уровня: «что элемента × его место на картинке», OR по элементам."""
+        spots, spot_index = np.unique(
+            np.stack([elements.y, elements.x], axis=1).astype(np.float64), axis=0, return_inverse=True
+        )
+        encoder = ConjunctionEncoder(
+            elements.what,
+            place,
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            cross_layers=WINDOW_LEVEL_CROSS_LAYERS,
+            name=f"picture-{number}",
+        )
+        packed = self._fit_and_encode(
+            encoder,
+            elements.what_values,
+            elements.what_index,
+            spots,
+            spot_index.reshape(-1),
+            elements.picture,
+            pictures,
+            WINDOW_LEVEL_CALIBRATION_PICTURES,
         )
         return packed, encoder.code_length
 
@@ -3950,51 +4099,96 @@ class MnistWindowLevelRunner:
             energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
         )
 
-    def _shape_map(self, dictionary: CodeDictionary, labels: "np.ndarray") -> Layout:
-        """Карта форм: раскладка образцов словаря; подпись точки — цифра, где образец встретился первым."""
-        layout = self._layout_bits(dictionary.bits(), labels, "shapes")
-        self._export(layout, "shapes")
-        return layout
-
-    def _picture_codes(
-        self, shapes: Layout, pieces: WindowPieces, cells: "np.ndarray", pictures: int
-    ) -> tuple["np.ndarray", int]:
-        """Коды картинок: «место куска на карте форм × место окна на картинке», OR по кускам картинки."""
-        what = self._plane_encoder(
-            "Shape",
-            ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
-            WINDOW_LEVEL_SHAPE_RADIUS_MAX,
-            WINDOW_LEVEL_SHAPE_RADIUS_MIN,
-        )
-        low, high = WINDOW_LEVEL_PLACE_MIN, WINDOW_LEVEL_PLACE_MAX
-        where = self._plane_encoder(
-            "Place",
-            ((low, high), (low, high)),
-            WINDOW_LEVEL_PLACE_RADIUS_MAX / (high - low),
-            WINDOW_LEVEL_PLACE_RADIUS_MIN / (high - low),
-        )
-        shape_cells, shape_index = np.unique(cells, axis=0, return_inverse=True)
-        spots, spot_index = np.unique(pieces.centre, axis=0, return_inverse=True)
-        encoder = ConjunctionEncoder(
-            what, where, random_seed=WINDOW_LEVEL_RANDOM_SEED, cross_layers=WINDOW_LEVEL_CROSS_LAYERS, name="picture"
-        )
-        packed = self._fit_and_encode(
-            encoder,
-            shape_cells,
-            shape_index.reshape(-1),
-            spots,
-            spot_index.reshape(-1),
-            pieces.picture,
-            pictures,
-            WINDOW_LEVEL_CALIBRATION_PICTURES,
-        )
-        return packed, encoder.code_length
-
-    def _picture_map(self, packed: "np.ndarray", labels: "np.ndarray", code_length: int) -> None:
+    def _picture_map(self, packed: "np.ndarray", labels: "np.ndarray", code_length: int, number: int) -> None:
         """Карта цифр: раскладка кодов обучающих картинок; собрались ли классы рядом (§5.13.2)."""
-        layout = self._layout_bits(np.unpackbits(packed, axis=1, count=code_length), labels, "pictures")
+        bits = np.unpackbits(packed, axis=1, count=code_length)
+        limit = (WINDOW_LEVEL_PICTURE_MAP_CELLS // packed.shape[0]) // 8 * 8
+        if code_length > limit:
+            # Длинные коды многих картинок не помещаются в память раскладки: берётся случайная выборка бит.
+            # Плотность и ожидаемое сходство кодов при этом те же (§2.2.4), растёт только разброс сходства.
+            columns = np.sort(
+                np.random.default_rng(WINDOW_LEVEL_RANDOM_SEED).choice(code_length, size=limit, replace=False)
+            )
+            bits = np.ascontiguousarray(bits[:, columns])
+            LOGGER.event(
+                "window_level.picture_map.sample",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "pictures": int(packed.shape[0]),
+                    "code_length": int(code_length),
+                    "sampled_bits": int(limit),
+                    "note": "карта цифр раскладывается по случайной выборке бит кода картинки; проверка узнавания "
+                    "идёт по полным кодам",
+                },
+            )
+        layout = self._layout_bits(bits, labels, "pictures")
         self._export(layout, "pictures")
         LabelMapQuality().measure(layout)
+        images = self._drawn.images
+
+        def paint(canvas, draw, row: int, left: int, top: int, size: int) -> None:  # noqa: ANN001
+            from PIL import Image
+
+            colour = np.asarray(self._hue_colour(float(labels[row]) * SECOND_LEVEL_CLASS_HUE_STEP), dtype=np.float64)
+            tinted = (images[row][:, :, None].astype(np.float64) / 255.0 * colour[None, None, :]).astype(np.uint8)
+            canvas.paste(Image.fromarray(tinted).resize((size, size)), (left, top))
+
+        glyphs = LayoutGlyphMap(layout, LayoutCodeTable.pack_bits(bits))
+        glyphs.save(
+            f"{WINDOW_LEVEL_FILE_PREFIX}-level{number}-pictures-{self.count}.glyphs.png",
+            paint,
+            tile=glyphs.tile_size(WINDOW_LEVEL_DIGIT_TILE),
+            title=f"Уровень {number} — картинки: карта цифр, {packed.shape[0]} картинок, цвет — цифра",
+        )
+
+    @staticmethod
+    def _hue_colour(hue: float) -> tuple[int, int, int]:
+        import colorsys
+
+        red, green, blue = colorsys.hsv_to_rgb((hue % 360.0) / 360.0, 0.9, 1.0)
+        return int(red * 255), int(green * 255), int(blue * 255)
+
+    def _shape_glyphs(
+        self,
+        shapes: Layout,
+        dictionary: CodeDictionary,
+        pieces: WindowPieces,
+        train_rows: "np.ndarray",
+        number: int,
+        field: float,
+    ) -> None:
+        """Карта форм рисунками: в ячейке образца — углопозиции картинки в его поле зрения, цвет — направление."""
+        rows = train_rows[dictionary.rows]
+        picture, centre = pieces.picture[rows], pieces.centre[rows]
+        atoms, starts = self._drawn, self._atom_starts
+        reach = math.ceil(field) + 1
+
+        def paint(canvas, draw, sample: int, left: int, top: int, size: int) -> None:  # noqa: ANN001
+            unit = size / (2.0 * reach)
+            draw.rectangle((left, top, left + size - 1, top + size - 1), outline=(38, 38, 38))
+            centre_y, centre_x = centre[sample]
+            first, last = int(starts[picture[sample]]), int(starts[picture[sample] + 1])
+            for index in range(first, last):
+                dy, dx = atoms.y[index] - centre_y, atoms.x[index] - centre_x
+                if dy * dy + dx * dx > field * field:
+                    continue
+                angle = math.radians(float(atoms.angle[index]))
+                px, py = left + size / 2.0 + dx * unit, top + size / 2.0 + dy * unit
+                ux, uy = math.cos(angle) * unit * 0.45, math.sin(angle) * unit * 0.45
+                draw.line(
+                    (px - ux, py - uy, px + ux, py + uy),
+                    fill=self._hue_colour(float(atoms.angle[index])),
+                    width=2 if unit >= 5 else 1,
+                )
+
+        glyphs = LayoutGlyphMap(shapes, dictionary.packed)
+        glyphs.save(
+            f"{WINDOW_LEVEL_FILE_PREFIX}-level{number}-shapes-{self.count}.glyphs.png",
+            paint,
+            tile=glyphs.tile_size(WINDOW_LEVEL_SHAPE_TILE),
+            title=f"Уровень {number} — куски: карта форм, {dictionary.count} образцов, поле зрения {field:g} клетки; "
+            "отрезок — углопозиция, цвет — направление",
+        )
 
 
 @dataclass(frozen=True)
