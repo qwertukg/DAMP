@@ -41,6 +41,7 @@ class ConjunctionEncoder:
         *,
         random_seed: int,
         cross_layers: bool = False,
+        nested: bool = False,
         name: str = "conjunction",
     ) -> None:
         if len(what.dimensions) != 1 or len(where.dimensions) != 1:
@@ -48,6 +49,9 @@ class ConjunctionEncoder:
         self._what = what
         self._where = where
         self._seed = int(random_seed)
+        # True — у двумерных координат срабатывают только вложенные круги (Encoder.active_detectors, nested).
+        self._nested = bool(nested)
+        self._active = 0
         self._name = str(name)
         self._what_layers = self._layer_ranges(what)
         self._where_layers = self._layer_ranges(where)
@@ -71,6 +75,7 @@ class ConjunctionEncoder:
                 "where_layers": [count for _, count in self._where_layers],
                 "layer_pairs": len(self._pairs),
                 "cross_layers": bool(cross_layers),
+                "nested": self._nested,
                 "detectors": self._detectors,
                 "note": "детектор-произведение = детектор «что» × детектор «где»; один случайный бит на детектор "
                 "(как в §4.2.1); статья такого детектора не описывает",
@@ -106,12 +111,11 @@ class ConjunctionEncoder:
             for number, (a, b) in enumerate(self._pairs)
         ]
 
-    @staticmethod
-    def _padded(encoder: Encoder, ranges: Sequence[tuple[int, int]], values: "np.ndarray") -> list["np.ndarray"]:
+    def _padded(self, encoder: Encoder, ranges: Sequence[tuple[int, int]], values: "np.ndarray") -> list["np.ndarray"]:
         """Активные детекторы значений по слоям: (значения × k) номеров внутри слоя, −1 — пусто."""
         values = np.asarray(values, dtype=np.float64)
         count = values.shape[0]
-        rows, detectors = encoder.active_detectors(0, values)
+        rows, detectors = encoder.active_detectors(0, values, nested=self._nested)
         layer_of = encoder.detector_layer_indices()[detectors]
         result = []
         for layer, (first, _) in enumerate(ranges):
@@ -144,6 +148,7 @@ class ConjunctionEncoder:
         groups, what_index, where_index = groups[order], what_index[order], where_index[order]
         max_groups = max(1, self.BLOCK_BYTES // max(1, self._length))
         start, total = 0, groups.shape[0]
+        self._active = 0
         while start < total:
             stop = min(total, start + self.BLOCK_ELEMENTS)
             stop = min(stop, int(np.searchsorted(groups, groups[start] + max_groups, side="left")))
@@ -156,6 +161,7 @@ class ConjunctionEncoder:
             rows = np.repeat(groups[start:stop] - first, bits.shape[1])
             flat = bits.reshape(-1)
             keep = flat >= 0
+            self._active += int(np.count_nonzero(keep))
             dense[rows[keep], flat[keep]] = 1
             packed[first:last] = np.packbits(dense, axis=1)
             start = stop
@@ -249,6 +255,7 @@ class ConjunctionEncoder:
                 "sets": int(group_count),
                 "elements": int(groups.shape[0]),
                 "elements_per_set": float(groups.shape[0]) / max(1, int(group_count)),
+                "detectors_per_element": float(self._active) / max(1, int(groups.shape[0])),
                 "code_length": self._length,
                 "density": self._density(sample, self._length),
                 "note": "код набора — OR битов детекторов-произведений его элементов",

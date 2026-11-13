@@ -43,6 +43,7 @@ from damp.encoding.damp_encoder import (
     OpenedDimension,
     PlaneDimension,
     geometric_detector_layers,
+    halving_detector_layers,
     plane_detector_layers,
 )
 import numpy as np
@@ -531,6 +532,21 @@ WINDOW_LEVEL_STRIDE = 1
 # Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
 WINDOW_LEVEL_LAYERS = 5
 WINDOW_LEVEL_OVERLAP = 0.6
+# Слои двумерных детекторов (место в окне, место на карте форм, место на картинке). True — каждый следующий
+# слой вдвое мельче предыдущего, начиная с WINDOW_LEVEL_PLANE_DETECTORS_WIDEST кругов по стороне: 2×2, 4×4,
+# 8×8, 16×16, 32×32; решётки слоёв совпадают, сработавшие круги вложены друг в друга. False — радиусы от
+# самого широкого до самого узкого геометрическим рядом (константы *_RADIUS_* ниже). Срабатывают в обоих
+# случаях все круги, в которые попала точка (§4.1).
+# Замер на 2000 цифрах (все круги): прежние слои — 93.6 %, «вдвое» 5 слоёв — 90.9 %, 7 слоёв — 85.9 %: при
+# делении пополам от 2×2 круги места в окне уже с четвёртого слоя мельче одной клетки.
+WINDOW_LEVEL_HALVING_LAYERS = False
+# True — у двумерных детекторов срабатывают только вложенные круги: круг слоя срабатывает, если целиком
+# лежит внутри сработавшего круга ближайшего более широкого слоя (самый широкий слой срабатывает весь).
+# False — срабатывают все круги, в которые попала точка (§4.1). Замер на 5000 цифрах (окна 2.5 и 1.5, код
+# от всех уровней): все круги — 95.4 %, код картинки 94.6 тыс. бит (зажжено около 24 тыс.); только вложенные —
+# 91.0 %, код 13.4 тыс. бит (зажжено около 3.4 тыс.), словарь первого уровня кусков 730 образцов вместо 3576.
+WINDOW_LEVEL_NESTED_CIRCLES = True
+WINDOW_LEVEL_PLANE_DETECTORS_WIDEST = 2
 # Код куска: детектор направления × круг места внутри окна.
 WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST = 4
 WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST = 24
@@ -3905,16 +3921,24 @@ class MnistWindowLevelRunner:
     @staticmethod
     def _plane_encoder(title: str, size, widest_radius: float, narrowest_radius: float) -> Encoder:
         """Кодер двумерной координаты уровня (§4.3): от него берутся детекторы-круги и их слои."""
+        if WINDOW_LEVEL_HALVING_LAYERS:
+            layers = halving_detector_layers(
+                layers_count=WINDOW_LEVEL_LAYERS,
+                widest_detectors=WINDOW_LEVEL_PLANE_DETECTORS_WIDEST,
+                overlap=WINDOW_LEVEL_OVERLAP,
+            )
+        else:
+            layers = plane_detector_layers(
+                layers_count=WINDOW_LEVEL_LAYERS,
+                widest_radius=widest_radius,
+                narrowest_radius=narrowest_radius,
+                overlap=WINDOW_LEVEL_OVERLAP,
+            )
         return Encoder(
             PlaneDimension(
                 title,
                 size,
-                plane_detector_layers(
-                    layers_count=WINDOW_LEVEL_LAYERS,
-                    widest_radius=widest_radius,
-                    narrowest_radius=narrowest_radius,
-                    overlap=WINDOW_LEVEL_OVERLAP,
-                ),
+                layers,
                 code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
                 layer_bands=False,
             ),
@@ -3997,7 +4021,11 @@ class MnistWindowLevelRunner:
             WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * radius),
         )
         encoder = ConjunctionEncoder(
-            elements.what, where, random_seed=WINDOW_LEVEL_RANDOM_SEED, name=f"piece-{number}"
+            elements.what,
+            where,
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            nested=WINDOW_LEVEL_NESTED_CIRCLES,
+            name=f"piece-{number}",
         )
         codes = self._fit_and_encode(
             encoder,
@@ -4051,6 +4079,7 @@ class MnistWindowLevelRunner:
             place,
             random_seed=WINDOW_LEVEL_RANDOM_SEED,
             cross_layers=WINDOW_LEVEL_CROSS_LAYERS,
+            nested=WINDOW_LEVEL_NESTED_CIRCLES,
             name=f"picture-{number}",
         )
         packed = self._fit_and_encode(

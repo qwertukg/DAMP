@@ -16,6 +16,7 @@ from damp.encoding.damp_encoder import (  # noqa: E402
     Encoder,
     PlaneDimension,
     geometric_detector_layers,
+    halving_detector_layers,
     plane_detector_layers,
 )
 from damp.layout.code_dictionary import LeaderDictionary, PairwiseSimilarity  # noqa: E402
@@ -47,6 +48,78 @@ def _plane_encoder(layers: int = 3, side: float = 5.0) -> Encoder:
         ),
         random_seed=0,
     )
+
+
+class HalvingLayersTest(unittest.TestCase):
+    def test_counts_double(self) -> None:
+        layers = halving_detector_layers(layers_count=5, widest_detectors=2, overlap=0.6)
+        self.assertEqual([layer.count for layer in layers], [2, 4, 8, 16, 32])
+        self.assertTrue(all(layer.overlap == 0.6 for layer in layers))
+
+    def test_every_circle_lies_inside_a_circle_of_the_previous_layer(self) -> None:
+        """Решётки слоёв совпадают: круг слоя целиком внутри одного из кругов предыдущего слоя."""
+        encoder = Encoder(
+            PlaneDimension(
+                "Map",
+                ((0.0, 64.0), (0.0, 64.0)),
+                halving_detector_layers(layers_count=4, widest_detectors=2, overlap=0.6),
+                code_length=64,
+                layer_bands=False,
+            ),
+            random_seed=0,
+        )
+        by_layer: dict[int, list] = {}
+        for circle in encoder.detectors:
+            by_layer.setdefault(circle.layer_index, []).append(circle)
+        for layer in range(1, 4):
+            for circle in by_layer[layer]:
+                inside = any(
+                    np.hypot(circle.center_y - parent.center_y, circle.center_x - parent.center_x) + circle.radius
+                    <= parent.radius + 1e-9
+                    for parent in by_layer[layer - 1]
+                )
+                self.assertTrue(inside)
+
+
+class NestedCirclesTest(unittest.TestCase):
+    def test_nested_circles_lie_inside_a_kept_wider_circle(self) -> None:
+        encoder = _plane_encoder(layers=4, side=40.0)
+        values = np.asarray([[1.5, -7.0], [0.0, 0.0], [-12.25, 9.5]])
+        rows, everything = encoder.active_detectors(0, values)
+        nested_rows, nested = encoder.active_detectors(0, values, nested=True)
+        for row in range(values.shape[0]):
+            all_ids = set(everything[rows == row].tolist())
+            kept = [encoder.detectors[i] for i in nested[nested_rows == row]]
+            self.assertTrue({c.detector_index for c in kept} <= all_ids)
+            widest = min(c.layer_index for c in kept)
+            for circle in kept:
+                if circle.layer_index == widest:
+                    continue
+                self.assertTrue(
+                    any(
+                        np.hypot(circle.center_y - parent.center_y, circle.center_x - parent.center_x) + circle.radius
+                        <= parent.radius + 1e-9
+                        for parent in kept
+                        if parent.layer_index < circle.layer_index
+                    )
+                )
+
+    def test_halving_layers_keep_every_circle(self) -> None:
+        """При слоях «вдвое» решётки совпадают: вложены все круги, правило ничего не отбрасывает."""
+        encoder = Encoder(
+            PlaneDimension(
+                "Map",
+                ((0.0, 64.0), (0.0, 64.0)),
+                halving_detector_layers(layers_count=4, widest_detectors=2, overlap=0.6),
+                code_length=64,
+                layer_bands=False,
+            ),
+            random_seed=0,
+        )
+        values = np.asarray([[10.3, 50.1], [33.0, 31.9], [63.0, 2.0]])
+        _, everything = encoder.active_detectors(0, values)
+        _, nested = encoder.active_detectors(0, values, nested=True)
+        self.assertEqual(sorted(everything.tolist()), sorted(nested.tolist()))
 
 
 class EncoderActiveDetectorsTest(unittest.TestCase):

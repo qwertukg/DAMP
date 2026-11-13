@@ -115,6 +115,41 @@ def geometric_detector_layers(
     return tuple(Detectors(count, overlap) for count in counts)
 
 
+def halving_detector_layers(
+    *,
+    layers_count: int,
+    widest_detectors: int,
+    overlap: float,
+) -> tuple[Detectors, ...]:
+    """Слои, каждый вдвое мельче предыдущего: число детекторов по стороне удваивается (§4.2, §4.5).
+
+    Решётки таких слоёв совпадают: центры слоя лежат в серединах шагов, и шаг делится ровно пополам. Для
+    кругов двумерной координаты (§4.3) это значит, что каждый круг слоя целиком лежит внутри одного из кругов
+    предыдущего слоя (при перекрытии не меньше 1 − 1/√2 ≈ 0.3), то есть сработавшие круги разных слоёв
+    вложены друг в друга.
+    """
+    if layers_count < 1:
+        raise ValueError("at least one detector layer is required")
+    if widest_detectors <= 0:
+        raise ValueError("widest_detectors must be positive")
+    if not (0.0 <= overlap < 1.0):
+        raise ValueError("overlap must be in [0.0, 1.0)")
+    counts = [int(widest_detectors) * 2**layer for layer in range(layers_count)]
+    LOGGER.event(
+        "detectors.halving_layers",
+        section=SHORT_LONG_ORDER,
+        data={
+            "layers_count": layers_count,
+            "widest_detectors": int(widest_detectors),
+            "narrowest_detectors": counts[-1],
+            "overlap": overlap,
+            "counts": counts,
+            "note": "каждый слой вдвое мельче предыдущего: дальний порядок дают широкие слои, ближний — узкие",
+        },
+    )
+    return tuple(Detectors(count, overlap) for count in counts)
+
+
 def plane_detector_layers(
     *,
     layers_count: int,
@@ -723,11 +758,16 @@ class Encoder:
         """Бит кода каждого детектора (по self.detectors): один случайный бит полосы его слоя (§4.2.1)."""
         return self._detector_bits
 
-    def active_detectors(self, dimension: int | str, values: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+    def active_detectors(
+        self, dimension: int | str, values: "np.ndarray", *, nested: bool = False
+    ) -> tuple["np.ndarray", "np.ndarray"]:
         """Активные детекторы координаты для набора её значений (§4.1): пары (номер значения, номер детектора).
 
         Номера детекторов — по self.detectors. Значение двумерной координаты — пара (y, x) (§4.3). Нужна
         кодерам, которые строят свой код из тех же детекторов (например, из пар детекторов двух координат).
+        nested (вне статьи, только для двумерной координаты): из кругов, в которые попало значение, остаются
+        вложенные — круг слоя срабатывает, если целиком лежит внутри сработавшего круга ближайшего более
+        широкого слоя; круги самого широкого слоя срабатывают все.
         """
         if isinstance(dimension, str):
             titles = [dim.title for dim in self.dimensions]
@@ -741,7 +781,40 @@ class Encoder:
         rows, local = self._indices[position].active_pairs(
             self._normalize_values(dim, np.asarray(values, dtype=np.float64))
         )
-        return np.asarray(rows, dtype=np.int64), first + np.asarray(local, dtype=np.int64)
+        rows, local = np.asarray(rows, dtype=np.int64), np.asarray(local, dtype=np.int64)
+        if nested and isinstance(dim, PlaneDimension):
+            keep = self._nested_circles(position, rows, local)
+            rows, local = rows[keep], local[keep]
+        return rows, first + local
+
+    def _nested_circles(self, position: int, rows: "np.ndarray", local: "np.ndarray") -> "np.ndarray":
+        """Какие из активных кругов значения вложены в активный круг более широкого слоя (маска по парам)."""
+        circles = self._detectors_by_dimension[position]
+        centre_y = np.asarray([c.center_y for c in circles], dtype=np.float64)
+        centre_x = np.asarray([c.center_x for c in circles], dtype=np.float64)
+        radius = np.asarray([c.radius for c in circles], dtype=np.float64)
+        layer = np.asarray([c.layer_index for c in circles], dtype=np.int64)
+        keep = np.zeros(rows.shape[0], dtype=bool)
+        order = np.lexsort((layer[local], rows))
+        bounds = np.flatnonzero(np.diff(rows[order])) + 1
+        for group in np.split(order, bounds):
+            ids = local[group]
+            layers = layer[ids]
+            parents = None
+            for number in np.unique(layers):
+                mine = np.flatnonzero(layers == number)
+                if parents is None:
+                    inside = np.ones(mine.shape[0], dtype=bool)
+                else:
+                    distance = np.hypot(
+                        centre_y[ids[mine]][:, None] - centre_y[parents][None, :],
+                        centre_x[ids[mine]][:, None] - centre_x[parents][None, :],
+                    )
+                    inside = np.any(distance + radius[ids[mine]][:, None] <= radius[parents][None, :] + 1e-9, axis=1)
+                keep[group[mine[inside]]] = True
+                if np.any(inside):
+                    parents = ids[mine[inside]]
+        return keep
 
     # ------------------------------------------------------------------ geometry
     def _build_layer_detectors(
