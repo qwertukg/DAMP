@@ -558,9 +558,10 @@ WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST = 24
 WINDOW_LEVEL_OFFSET_RADIUS_MIN = 0.8   # самый узкий круг места в окне, клеток; самый широкий — радиус окна
 # Словарь образцов: порог слияния кодов кусков и предел числа образцов (точек карты форм).
 WINDOW_LEVEL_MERGE_SIMILARITY = 0.7
-# Словарь первого уровня кусков (перекрытие 0.3): 7258 образцов на 2000 цифр, 9596 на 5000 — растёт медленно,
-# предел нужен только как защита от разбухания.
-WINDOW_LEVEL_DICTIONARY_MAX = 50000
+# Словарь первого уровня кусков (перекрытие 0.3): 7258 образцов на 2000 цифр, 9596 на 5000 — растёт медленно.
+# Словари следующих уровней кусков схлопываются гораздо хуже: уровню 2 нужно 45 429 образцов на 1000 цифр и
+# 84 170 на 2000. Предел — только защита от разбухания; раскладка больше 100 000 образцов идёт от затравки.
+WINDOW_LEVEL_DICTIONARY_MAX = 1000000
 # Код картинки: круг на карте форм (радиусы в долях её стороны) × круг на картинке (радиусы в клетках).
 # Узкий круг карты форм важен: 0.33…0.1 даёт 90.0 % вместо 92.2 % (1000 цифр).
 WINDOW_LEVEL_SHAPE_RADIUS_MAX = 0.33
@@ -2609,7 +2610,8 @@ def _layout_from_codes(
     """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка.
 
     lambda_schedule — пороги сходства для кодов с другим распределением сходств (коды следующего уровня);
-    None — константы LAYOUT_*. Большая раскладка от затравки идёт только с порогами по умолчанию.
+    None — константы LAYOUT_*. Большая раскладка от затравки со своими порогами идёт только в режиме
+    сглаживания: затравка раскладывается с теми же порогами, доводка — дальней фазой с радиуса доводки.
     """
     seeded = (
         run_params.seed_points is not None
@@ -2617,11 +2619,23 @@ def _layout_from_codes(
         and codes.count > run_params.seed_points
     )
     if lambda_schedule is not None:
+        if seeded and not LAYOUT_SMOOTH_PINWHEELS:
+            raise ValueError("свои пороги сходства в большой раскладке от затравки поддержаны только в режиме сглаживания")
         if seeded:
-            raise ValueError("свои пороги сходства не поддержаны для большой раскладки от затравки")
-        layout = _new_layout(codes, run_params, colorizer, lambda_threshold=lambda_schedule.start)
+            layout, refine_radius, refine_steps = _seeded_layout(
+                codes, run_params, colorizer, lambda_schedule=lambda_schedule
+            )
+        else:
+            layout = _new_layout(codes, run_params, colorizer, lambda_threshold=lambda_schedule.start)
+            refine_radius = refine_steps = None
         _run_long_phase(
-            layout, run_params, step_offset=1, layout_path=layout_path, lambda_max=lambda_schedule.maximum
+            layout,
+            run_params,
+            step_offset=1,
+            layout_path=layout_path,
+            start_radius=refine_radius,
+            steps=refine_steps,
+            lambda_max=lambda_schedule.maximum,
         )
         _run_short_phase(
             layout,
@@ -2696,6 +2710,8 @@ def _seeded_layout(
     codes: LayoutCodeTable,
     run_params: TunedLayoutParams,
     colorizer: EncoderCodeColorizer | None,
+    *,
+    lambda_schedule: LayoutLambdaSchedule | None = None,
 ) -> tuple[Layout, int, int]:
     """Большая раскладка от затравки (вне статьи; ср. подмножество §5.9.4): раскладка, радиус и число шагов доводки.
 
@@ -2703,6 +2719,8 @@ def _seeded_layout(
     для своего числа точек); остальные точки ставятся возле самых похожих точек подмножества. Глобальный
     порядок готов — дальняя фаза большой раскладки начинается с радиуса в несколько блоков затравки и идёт
     по тому же геометрическому расписанию, что полная фаза (те же шаги на октаву радиуса, §7.1.7).
+    lambda_schedule — свои пороги сходства (коды следующего уровня): с ними раскладываются и затравка, и
+    большая раскладка.
     """
     placement = SeededPlacement(
         codes,
@@ -2715,7 +2733,7 @@ def _seeded_layout(
     ).tune(placement.seed_count)
     started = time.perf_counter()
     # Затравка раскладывается тем же путём: целиком либо, если она сама велика, от своей затравки (уровни).
-    seed_layout = _layout_from_codes(placement.seed_table(), seed_params, colorizer)
+    seed_layout = _layout_from_codes(placement.seed_table(), seed_params, colorizer, lambda_schedule=lambda_schedule)
     seed_cells = seed_layout.cells_array()
     seed_shape = (seed_layout.height, seed_layout.width)
     seed_lambda = seed_layout.lambda_threshold
@@ -2732,7 +2750,13 @@ def _seeded_layout(
         # Режим статьи: место точки в блоке родителя — по похожим на неё точкам затравки (sim ≥ λ затравки).
         neighbour_threshold=None if LAYOUT_SMOOTH_PINWHEELS else seed_lambda,
     )
-    layout = _new_layout(codes, run_params, colorizer, initial_cells=cells)
+    layout = _new_layout(
+        codes,
+        run_params,
+        colorizer,
+        initial_cells=cells,
+        lambda_threshold=None if lambda_schedule is None else lambda_schedule.start,
+    )
     if not LAYOUT_SMOOTH_PINWHEELS:
         # Порог λ большой раскладки продолжает расписание затравки (§7.1.7): её дальний порядок уже установлен.
         layout.set_similarity_params(lambda_threshold=seed_lambda)

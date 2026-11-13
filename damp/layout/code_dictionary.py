@@ -37,6 +37,9 @@ class LeaderDictionary:
     """Слияние кодов к образцу по косинусному сходству (расширение статьи; мера сходства — §2.2.4)."""
 
     BLOCK = 512
+    # Образцов в одной части банка. Банк растёт частями, и блок кодов сравнивается с ним по частям: память
+    # устройства определяется числом найденных образцов, а не пределом max_size.
+    BANK_PART = 65536
 
     def __init__(self, *, similarity_threshold: float, max_size: int, use_gpu: bool = True) -> None:
         if not 0.0 < similarity_threshold <= 1.0:
@@ -60,36 +63,51 @@ class LeaderDictionary:
         order = np.lexsort((first, -counts))
         first = first[order]
         device = torch.device("cuda" if self._use_gpu and torch.cuda.is_available() else "cpu")
-        bank = torch.zeros((self.max_size, code_length), dtype=torch.float32, device=device)
-        bank_ones = torch.ones(self.max_size, dtype=torch.float32, device=device)
+        part_size = min(self.BANK_PART, self.max_size)
+        banks: list["torch.Tensor"] = []  # части банка: (part_size, L) коды образцов
+        banks_ones: list["torch.Tensor"] = []  # число единиц в кодах образцов той же части
         chosen: list[int] = []
+        fresh = np.zeros(self.BLOCK, dtype=np.int64)
         for start in range(0, first.shape[0], self.BLOCK):
             if len(chosen) >= self.max_size:
                 break
             rows = first[start : start + self.BLOCK]
             block = torch.as_tensor(np.unpackbits(packed[rows], axis=1, count=code_length), device=device).to(torch.float32)
             ones = block.sum(dim=1)
-            if chosen:
-                cosine = (block @ bank[: len(chosen)].T) / torch.sqrt(
-                    torch.clamp(ones[:, None] * bank_ones[None, : len(chosen)], min=1.0)
+            # Наибольшее сходство кода блока с уже выбранными образцами — по частям банка.
+            best = torch.zeros(block.shape[0], dtype=torch.float32, device=device)
+            for part, (bank, bank_ones) in enumerate(zip(banks, banks_ones)):
+                used = min(part_size, len(chosen) - part * part_size)
+                cosine = (block @ bank[:used].T) / torch.sqrt(
+                    torch.clamp(ones[:, None] * bank_ones[None, :used], min=1.0)
                 )
-                free = (cosine.max(dim=1).values < self.similarity_threshold).cpu().numpy()
-            else:
-                free = np.ones(block.shape[0], dtype=bool)
+                best = torch.maximum(best, cosine.max(dim=1).values)
+            free = (best < self.similarity_threshold).cpu().numpy()
             inner = (
                 (block @ block.T) / torch.sqrt(torch.clamp(ones[:, None] * ones[None, :], min=1.0))
                 >= self.similarity_threshold
             ).cpu().numpy()
-            fresh: list[int] = []
+            taken = 0
             for row in np.flatnonzero(free):
-                if len(chosen) >= self.max_size:
+                if len(chosen) + taken >= self.max_size:
                     break
-                if any(inner[row, other] for other in fresh):
+                if taken and inner[row, fresh[:taken]].any():
                     continue
-                fresh.append(int(row))
-                bank[len(chosen)] = block[row]
-                bank_ones[len(chosen)] = ones[row]
-                chosen.append(int(rows[row]))
+                fresh[taken] = row
+                taken += 1
+            # Новые образцы блока дописываются в банк разом; часть банка заводится, когда прежняя заполнена.
+            written = 0
+            while written < taken:
+                part, offset = divmod(len(chosen), part_size)
+                if part == len(banks):
+                    banks.append(torch.zeros((part_size, code_length), dtype=torch.float32, device=device))
+                    banks_ones.append(torch.ones(part_size, dtype=torch.float32, device=device))
+                step = min(taken - written, part_size - offset)
+                picked = torch.as_tensor(fresh[written : written + step], device=device)
+                banks[part][offset : offset + step] = block[picked]
+                banks_ones[part][offset : offset + step] = ones[picked]
+                chosen.extend(int(rows[row]) for row in fresh[written : written + step])
+                written += step
         selected = np.asarray(chosen, dtype=np.int64)
         dictionary = CodeDictionary(
             packed=packed[selected], rows=selected, code_length=int(code_length), distinct=int(first.shape[0])

@@ -251,6 +251,23 @@ class LeaderDictionaryTest(unittest.TestCase):
         dictionary = LeaderDictionary(similarity_threshold=0.9, max_size=5, use_gpu=False).select(np.packbits(codes, axis=1), 32)
         self.assertEqual(dictionary.count, 5)
 
+    def test_bank_parts_do_not_change_the_dictionary(self) -> None:
+        rng = np.random.default_rng(3)
+        prototypes = (rng.random((40, 96)) < 0.25).astype(np.uint8)
+        codes = prototypes[rng.integers(0, 40, 600)].copy()
+        flips = rng.integers(0, 96, (600, 3))
+        codes[np.arange(600)[:, None], flips] ^= 1
+        packed = np.packbits(codes, axis=1)
+
+        class SmallParts(LeaderDictionary):
+            BLOCK = 16
+            BANK_PART = 7
+
+        whole = LeaderDictionary(similarity_threshold=0.7, max_size=500, use_gpu=False).select(packed, 96)
+        parts = SmallParts(similarity_threshold=0.7, max_size=500, use_gpu=False).select(packed, 96)
+        self.assertGreater(whole.count, 7)
+        self.assertEqual(sorted(whole.rows.tolist()), sorted(parts.rows.tolist()))
+
     def test_pairwise_quantiles_are_ordered(self) -> None:
         rng = np.random.default_rng(0)
         bits = (rng.random((60, 128)) < 0.25).astype(np.uint8)
