@@ -15,6 +15,7 @@ import numpy as np
 from damp.article_refs import (
     COLOR_ENCODING,
     CONCATENATION,
+    CONJUNCTION,
     CYCLIC_COORDS,
     INTEGER_ENCODING,
     LAID_OUT_STRUCTURE,
@@ -24,6 +25,7 @@ from damp.article_refs import (
     OUTSIDE_ARTICLE,
     SHORT_LONG_ORDER,
     SPARSE_BIT_VECTORS,
+    TWO_DIM_CODES,
     WIDE_DETECTORS,
 )
 from damp.encoding.bitarray import BitArray
@@ -113,8 +115,90 @@ def geometric_detector_layers(
     return tuple(Detectors(count, overlap) for count in counts)
 
 
+def halving_detector_layers(
+    *,
+    layers_count: int,
+    widest_detectors: int,
+    overlap: float,
+) -> tuple[Detectors, ...]:
+    """Слои, каждый вдвое мельче предыдущего: число детекторов по стороне удваивается (§4.2, §4.5).
+
+    Решётки таких слоёв совпадают: центры слоя лежат в серединах шагов, и шаг делится ровно пополам. Для
+    кругов двумерной координаты (§4.3) это значит, что каждый круг слоя целиком лежит внутри одного из кругов
+    предыдущего слоя (при перекрытии не меньше 1 − 1/√2 ≈ 0.3), то есть сработавшие круги разных слоёв
+    вложены друг в друга.
+    """
+    if layers_count < 1:
+        raise ValueError("at least one detector layer is required")
+    if widest_detectors <= 0:
+        raise ValueError("widest_detectors must be positive")
+    if not (0.0 <= overlap < 1.0):
+        raise ValueError("overlap must be in [0.0, 1.0)")
+    counts = [int(widest_detectors) * 2**layer for layer in range(layers_count)]
+    LOGGER.event(
+        "detectors.halving_layers",
+        section=SHORT_LONG_ORDER,
+        data={
+            "layers_count": layers_count,
+            "widest_detectors": int(widest_detectors),
+            "narrowest_detectors": counts[-1],
+            "overlap": overlap,
+            "counts": counts,
+            "note": "каждый слой вдвое мельче предыдущего: дальний порядок дают широкие слои, ближний — узкие",
+        },
+    )
+    return tuple(Detectors(count, overlap) for count in counts)
+
+
+def plane_detector_layers(
+    *,
+    layers_count: int,
+    widest_radius: float,
+    narrowest_radius: float,
+    overlap: float,
+) -> tuple[Detectors, ...]:
+    """Слои детекторов-кругов двумерной позиции (§4.3) по радиусам в долях стороны плоскости.
+
+    Радиус круга слоя из count детекторов по стороне — side / (2 · count · (1 − overlap)) (шаг решётки
+    side / count, диаметр step / (1 − overlap), как ширина одномерного детектора, §4.2). Отсюда число
+    детекторов по стороне для самого широкого и самого узкого слоя; между ними оно растёт геометрически
+    по тому же правилу, что у одномерных координат (geometric_detector_layers, §4.2, §4.5).
+    """
+    if not 0.0 < narrowest_radius < widest_radius:
+        raise ValueError("radii must satisfy 0 < narrowest_radius < widest_radius (fractions of the plane side)")
+    if not (0.0 <= overlap < 1.0):
+        raise ValueError("overlap must be in [0.0, 1.0)")
+    widest = max(1, int(math.floor(1.0 / (2.0 * widest_radius * (1.0 - overlap)) + 0.5)))
+    narrowest = int(math.floor(1.0 / (2.0 * narrowest_radius * (1.0 - overlap)) + 0.5))
+    narrowest = max(narrowest, widest + layers_count - 1)
+    LOGGER.event(
+        "detectors.plane_layers",
+        section=TWO_DIM_CODES,
+        data={
+            "layers_count": layers_count,
+            "widest_radius": widest_radius,
+            "narrowest_radius": narrowest_radius,
+            "overlap": overlap,
+            "widest_per_side": widest,
+            "narrowest_per_side": narrowest,
+            "widest_radius_actual": 1.0 / (2.0 * widest * (1.0 - overlap)),
+            "narrowest_radius_actual": 1.0 / (2.0 * narrowest * (1.0 - overlap)),
+            "note": "радиусы — доли стороны плоскости; число кругов по стороне = 1 / (2 · r · (1 − overlap))",
+        },
+    )
+    return geometric_detector_layers(
+        layers_count=layers_count,
+        widest_detectors=widest,
+        narrowest_detectors=narrowest,
+        overlap=overlap,
+    )
+
+
 class Dimension:
     """Одна координата стимула со своим сегментом кода (§2.2.3, §4.2)."""
+
+    # Сколько чисел задаёт значение координаты: 1 — точка на прямой, 2 — точка на плоскости (§4.3).
+    arity = 1
 
     def __init__(
         self,
@@ -186,6 +270,14 @@ class Dimension:
         length = base + (1 if layer_index >= extra_from else 0)
         return start, length
 
+    def expected_active_detectors(self, layer: Detectors) -> float:
+        """Сколько детекторов слоя в среднем активно для одного значения (§4.2.1): ≈ 1 / (1 − overlap)."""
+        return 1.0 / (1.0 - layer.overlap)
+
+    def signature_token(self) -> str:
+        """Часть отпечатка кодера: диапазон, вид и длина сегмента координаты."""
+        return f"{self.title}|{self.min_value}|{self.max_value}|{self.closed}|{self.code_length}|"
+
 
 class ClosedDimension(Dimension):
     """Циклическая координата: соседние значения через границу периода близки (§4.4)."""
@@ -230,6 +322,114 @@ class OpenedDimension(Dimension):
         )
 
 
+class PlaneDimension(Dimension):
+    """Двумерная позиция на плоскости (§4.3): детекторы — круги вместо отрезков.
+
+    Устроена как одномерная координата (§4.2): слои от самого широкого к самому узкому, перекрытие соседних
+    детекторов, цветовая полоса на слой и один случайный бит полосы на детектор (§3.2, §4.2.1). Слой из
+    count детекторов по стороне — квадратная решётка кругов с шагом side / count и диаметром
+    step / (1 − overlap), где side — большая сторона плоскости; круги стоят по центрам своих шагов, как
+    детекторы отрезка без детекторов за краями. Значение координаты — пара (y, x).
+    """
+
+    arity = 2
+    # Ниже этого перекрытия круги квадратной решётки не закрывают плоскость: между четырьмя соседями
+    # остаётся непокрытая область (радиус меньше половины диагонали шага).
+    FULL_COVERAGE_OVERLAP = 1.0 - 1.0 / math.sqrt(2.0)
+
+    def __init__(
+        self,
+        title: str,
+        size: Tuple[Tuple[float, float], Tuple[float, float]],
+        detector_layers: Sequence[Detectors],
+        *,
+        code_length: int,
+        layer_bands: bool = True,
+    ) -> None:
+        if len(size) != 2 or len(size[0]) != 2 or len(size[1]) != 2:
+            raise ValueError("size must be ((y_min, y_max), (x_min, x_max))")
+        # True — у каждого слоя своя цветовая полоса кода, как у одномерных координат (§3.2); False — бит круга
+        # случаен во всём коде: слои делят код поровну по числу активных кругов, а не по числу слоёв.
+        self.layer_bands = bool(layer_bands)
+        self.y_min, self.y_max = float(size[0][0]), float(size[0][1])
+        self.x_min, self.x_max = float(size[1][0]), float(size[1][1])
+        if self.y_max <= self.y_min or self.x_max <= self.x_min:
+            raise ValueError("size must be increasing ranges")
+        side = max(self.y_max - self.y_min, self.x_max - self.x_min)
+        super().__init__(
+            title=title,
+            size=(0.0, side),
+            detector_layers=detector_layers,
+            closed=False,
+            code_length=code_length,
+            edge_detectors=False,
+        )
+        geometry = [self.layer_geometry(layer) for layer in self.detector_layers]
+        LOGGER.event(
+            "dimension.plane",
+            section=TWO_DIM_CODES,
+            data={
+                "title": self.title,
+                "y_range": (self.y_min, self.y_max),
+                "x_range": (self.x_min, self.x_max),
+                "side": self.side,
+                "code_length": self.code_length,
+                "layer_bands": self.layer_bands,
+                "layers": len(self.detector_layers),
+                "radii": [radius for _, radius, _, _ in geometry],
+                "radii_of_side": [radius / self.side for _, radius, _, _ in geometry],
+                "circles": [rows * cols for _, _, rows, cols in geometry],
+                "note": "§4.3: детекторы двумерной позиции — круги на плоскости, всё пространство заполнено "
+                "детекторами всех слоёв",
+            },
+        )
+        sparse_layers = [
+            index for index, layer in enumerate(self.detector_layers) if layer.overlap < self.FULL_COVERAGE_OVERLAP
+        ]
+        if sparse_layers:
+            LOGGER.event(
+                "dimension.plane.coverage.warning",
+                section=TWO_DIM_CODES,
+                data={
+                    "title": self.title,
+                    "layers": sparse_layers,
+                    "min_overlap": self.FULL_COVERAGE_OVERLAP,
+                    "note": "круги слоя не закрывают плоскость: у части позиций в слое нет активного детектора",
+                },
+            )
+
+    @property
+    def side(self) -> float:
+        """Большая сторона плоскости: к ней отнесены шаг решётки и радиусы кругов."""
+        return self.period
+
+    def layer_band(self, layer_index: int) -> tuple[int, int]:
+        """Биты кода, из которых берётся случайный бит круга слоя: полоса слоя (§3.2) либо весь код."""
+        if self.layer_bands:
+            return super().layer_band(layer_index)
+        if not 0 <= layer_index < len(self.detector_layers):
+            raise ValueError("layer_index out of range")
+        return 0, self.code_length
+
+    def layer_geometry(self, layer: Detectors) -> tuple[float, float, int, int]:
+        """Шаг решётки, радиус круга и число кругов по вертикали и по горизонтали для слоя."""
+        step = self.side / layer.count
+        radius = step / (1.0 - layer.overlap) / 2.0
+        rows = max(1, int(math.ceil((self.y_max - self.y_min) / step - 1e-9)))
+        cols = max(1, int(math.ceil((self.x_max - self.x_min) / step - 1e-9)))
+        return step, radius, rows, cols
+
+    def expected_active_detectors(self, layer: Detectors) -> float:
+        """Сколько кругов слоя в среднем накрывает одну позицию: площадь круга к площади шага решётки."""
+        return math.pi / (4.0 * (1.0 - layer.overlap) ** 2)
+
+    def signature_token(self) -> str:
+        return (
+            f"{self.title}|plane|{self.y_min}|{self.y_max}|{self.x_min}|{self.x_max}|{self.code_length}|"
+            f"{self.layer_bands}|"
+        )
+
+
 @dataclass(frozen=True)
 class DetectorWindow:
     """Рецептивное поле одного широкого детектора и его случайный бит (§4.1, §4.2.1)."""
@@ -253,6 +453,33 @@ class DetectorWindow:
             diff = abs(value - self.center) % self.period
             return min(diff, self.period - diff) <= self.half_width
         return abs(value - self.center) <= self.half_width
+
+    def signature_token(self) -> str:
+        """Часть отпечатка кодера: поле детектора и его бит."""
+        return f"{self.center:.9f},{self.half_width:.9f},{self.bit};"
+
+
+@dataclass(frozen=True)
+class DetectorCircle:
+    """Рецептивное поле детектора двумерной позиции — круг на плоскости — и его случайный бит (§4.3, §4.2.1)."""
+
+    detector_index: int
+    dimension_index: int
+    layer_index: int
+    center_y: float
+    center_x: float
+    radius: float
+    bit: int
+    local_bit: int
+
+    def is_active(self, value: Sequence[float]) -> bool:
+        """Детектор активен, если позиция (y, x) лежит в его круге (§4.1, §4.3)."""
+        dy = float(value[0]) - self.center_y
+        dx = float(value[1]) - self.center_x
+        return dy * dy + dx * dx <= self.radius * self.radius
+
+    def signature_token(self) -> str:
+        return f"{self.center_y:.9f},{self.center_x:.9f},{self.radius:.9f},{self.bit};"
 
 
 @dataclass(frozen=True)
@@ -278,11 +505,92 @@ class _DimensionIndex:
             return (distance <= self.half_widths[None, :]) | (self.half_widths[None, :] >= self.period / 2.0)
         return np.abs(values - self.centers[None, :]) <= self.half_widths[None, :]
 
+    def active_pairs(self, values: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Пары (номер значения, номер активного детектора координаты) для набора значений (§4.1)."""
+        return np.nonzero(self.active_mask(values))
+
     def active_detector_bits(self, value: float) -> "np.ndarray":
         """Биты всех активных детекторов (с повторами: несколько детекторов могут делить бит)."""
         return self.bits[self.active_mask(np.asarray([value]))[0]]
 
     def active_bits(self, value: float) -> tuple["np.ndarray", "np.ndarray"]:
+        unique, hits = np.unique(self.active_detector_bits(value), return_counts=True)
+        return unique, hits
+
+
+@dataclass(frozen=True)
+class _PlaneLayer:
+    """Один слой кругов двумерной позиции: квадратная решётка центров (§4.3)."""
+
+    first: int  # номер первого круга слоя среди детекторов координаты
+    rows: int
+    cols: int
+    step: float
+    radius: float
+    origin_y: float  # центр круга (0, 0)
+    origin_x: float
+
+
+@dataclass(frozen=True)
+class _PlaneIndex:
+    """Векторизованные параметры детекторов-кругов двумерной позиции (§4.3)."""
+
+    offset: int
+    code_length: int
+    y_min: float
+    y_max: float
+    x_min: float
+    x_max: float
+    layers: tuple[_PlaneLayer, ...]
+    centers_y: "np.ndarray"
+    centers_x: "np.ndarray"
+    radii: "np.ndarray"
+    bits: "np.ndarray"
+
+    def active_mask(self, values: "np.ndarray") -> "np.ndarray":
+        """Маска (позиции × круги) полным перебором: круг активен, если позиция лежит в нём (§4.1, §4.3).
+
+        Стоит k × D сравнений; для наборов позиций используется active_pairs, дающая те же пары.
+        """
+        values = np.asarray(values, dtype=np.float64).reshape(-1, 2)
+        dy = values[:, 0][:, None] - self.centers_y[None, :]
+        dx = values[:, 1][:, None] - self.centers_x[None, :]
+        return dy * dy + dx * dx <= (self.radii * self.radii)[None, :]
+
+    def active_pairs(self, values: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Пары (номер позиции, номер активного круга координаты) для набора позиций (§4.3).
+
+        Центры слоя стоят на решётке, поэтому круги, способные накрыть позицию, — это окно решётки вокруг её
+        ячейки шага: проверяются только они, стоимость не зависит от числа кругов слоя.
+        """
+        values = np.asarray(values, dtype=np.float64).reshape(-1, 2)
+        if values.shape[0] == 0:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+        y = values[:, 0]
+        x = values[:, 1]
+        row_parts: list[np.ndarray] = []
+        detector_parts: list[np.ndarray] = []
+        for layer in self.layers:
+            reach = int(math.ceil(layer.radius / layer.step))
+            offsets = np.arange(-reach, reach + 1, dtype=np.int64)
+            ii = np.floor((y - layer.origin_y) / layer.step).astype(np.int64)[:, None] + offsets[None, :]
+            jj = np.floor((x - layer.origin_x) / layer.step).astype(np.int64)[:, None] + offsets[None, :]
+            dy = y[:, None] - (layer.origin_y + ii * layer.step)
+            dx = x[:, None] - (layer.origin_x + jj * layer.step)
+            inside = (dy * dy)[:, :, None] + (dx * dx)[:, None, :] <= layer.radius * layer.radius
+            inside &= ((ii >= 0) & (ii < layer.rows))[:, :, None]
+            inside &= ((jj >= 0) & (jj < layer.cols))[:, None, :]
+            point_ids, row_ids, col_ids = np.nonzero(inside)
+            row_parts.append(point_ids.astype(np.int64))
+            detector_parts.append(layer.first + ii[point_ids, row_ids] * layer.cols + jj[point_ids, col_ids])
+        return np.concatenate(row_parts), np.concatenate(detector_parts)
+
+    def active_detector_bits(self, value: Sequence[float]) -> "np.ndarray":
+        """Биты всех активных кругов (с повторами: несколько кругов могут делить бит)."""
+        _, detector_ids = self.active_pairs(np.asarray([value], dtype=np.float64))
+        return self.bits[detector_ids]
+
+    def active_bits(self, value: Sequence[float]) -> tuple["np.ndarray", "np.ndarray"]:
         unique, hits = np.unique(self.active_detector_bits(value), return_counts=True)
         return unique, hits
 
@@ -317,41 +625,74 @@ class Encoder:
         self.log_every = int(log_every) if log_every is not None else 0
         self._log_counter = 0
         self._layer_phase = bool(layer_phase)
-        self.detectors: List[DetectorWindow] = []
-        self._detectors_by_dimension: List[List[DetectorWindow]] = []
+        self.detectors: List[DetectorWindow | DetectorCircle] = []
+        self._detectors_by_dimension: List[List[DetectorWindow | DetectorCircle]] = []
         self._segments: list[tuple[int, int]] = []
-        self._indices: list[_DimensionIndex] = []
+        self._indices: list[_DimensionIndex | _PlaneIndex] = []
+        # Число чисел одного стимула: одномерная координата берёт одно, двумерная позиция (§4.3) — пару (y, x).
+        self._value_columns = sum(dim.arity for dim in self.dimensions)
         offset = 0
         for dim_index, dim in enumerate(self.dimensions):
-            detectors_for_dim: List[DetectorWindow] = []
+            detectors_for_dim: List[DetectorWindow | DetectorCircle] = []
+            plane_layers: list[_PlaneLayer] = []
             for layer_index, layer in enumerate(dim.detector_layers):
-                windows = self._build_layer_detectors(
-                    dim=dim,
-                    dim_index=dim_index,
-                    layer_index=layer_index,
-                    layer=layer,
-                    start_index=len(self.detectors) + len(detectors_for_dim),
-                    offset=offset,
-                )
+                start_index = len(self.detectors) + len(detectors_for_dim)
+                if isinstance(dim, PlaneDimension):
+                    windows, plane_layer = self._build_plane_layer_detectors(
+                        dim=dim,
+                        dim_index=dim_index,
+                        layer_index=layer_index,
+                        layer=layer,
+                        start_index=start_index,
+                        first=len(detectors_for_dim),
+                        offset=offset,
+                    )
+                    plane_layers.append(plane_layer)
+                else:
+                    windows = self._build_layer_detectors(
+                        dim=dim,
+                        dim_index=dim_index,
+                        layer_index=layer_index,
+                        layer=layer,
+                        start_index=start_index,
+                        offset=offset,
+                    )
                 detectors_for_dim.extend(windows)
             self.detectors.extend(detectors_for_dim)
             self._detectors_by_dimension.append(detectors_for_dim)
             self._segments.append((offset, dim.code_length))
-            self._indices.append(
-                _DimensionIndex(
-                    offset=offset,
-                    code_length=dim.code_length,
-                    closed=dim.closed,
-                    period=dim.period,
-                    min_value=dim.min_value,
-                    max_value=dim.max_value,
-                    centers=np.asarray([w.center for w in detectors_for_dim], dtype=np.float64),
-                    half_widths=np.asarray(
-                        [w.half_width for w in detectors_for_dim], dtype=np.float64
-                    ),
-                    bits=np.asarray([w.bit for w in detectors_for_dim], dtype=np.int64),
+            if isinstance(dim, PlaneDimension):
+                self._indices.append(
+                    _PlaneIndex(
+                        offset=offset,
+                        code_length=dim.code_length,
+                        y_min=dim.y_min,
+                        y_max=dim.y_max,
+                        x_min=dim.x_min,
+                        x_max=dim.x_max,
+                        layers=tuple(plane_layers),
+                        centers_y=np.asarray([w.center_y for w in detectors_for_dim], dtype=np.float64),
+                        centers_x=np.asarray([w.center_x for w in detectors_for_dim], dtype=np.float64),
+                        radii=np.asarray([w.radius for w in detectors_for_dim], dtype=np.float64),
+                        bits=np.asarray([w.bit for w in detectors_for_dim], dtype=np.int64),
+                    )
                 )
-            )
+            else:
+                self._indices.append(
+                    _DimensionIndex(
+                        offset=offset,
+                        code_length=dim.code_length,
+                        closed=dim.closed,
+                        period=dim.period,
+                        min_value=dim.min_value,
+                        max_value=dim.max_value,
+                        centers=np.asarray([w.center for w in detectors_for_dim], dtype=np.float64),
+                        half_widths=np.asarray(
+                            [w.half_width for w in detectors_for_dim], dtype=np.float64
+                        ),
+                        bits=np.asarray([w.bit for w in detectors_for_dim], dtype=np.int64),
+                    )
+                )
             self._log_dimension_bits(dim_index, dim, detectors_for_dim)
             if not self.shared_code:
                 offset += dim.code_length
@@ -405,6 +746,75 @@ class Encoder:
             section=WIDE_DETECTORS,
             data={"detectors": len(self.detectors)},
         )
+        # Слой каждого детектора (номер слоя — цвет его бита, §3.2): для разбора кода набора по слоям.
+        self._detector_layers = np.asarray([w.layer_index for w in self.detectors], dtype=np.int64)
+        self._detector_bits = np.asarray([w.bit for w in self.detectors], dtype=np.int64)
+
+    def detector_layer_indices(self) -> "np.ndarray":
+        """Номер слоя каждого детектора (по self.detectors): 0 — самый широкий слой (§4.2, §4.5)."""
+        return self._detector_layers
+
+    def detector_bits(self) -> "np.ndarray":
+        """Бит кода каждого детектора (по self.detectors): один случайный бит полосы его слоя (§4.2.1)."""
+        return self._detector_bits
+
+    def active_detectors(
+        self, dimension: int | str, values: "np.ndarray", *, nested: bool = False
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Активные детекторы координаты для набора её значений (§4.1): пары (номер значения, номер детектора).
+
+        Номера детекторов — по self.detectors. Значение двумерной координаты — пара (y, x) (§4.3). Нужна
+        кодерам, которые строят свой код из тех же детекторов (например, из пар детекторов двух координат).
+        nested (вне статьи, только для двумерной координаты): из кругов, в которые попало значение, остаются
+        вложенные — круг слоя срабатывает, если целиком лежит внутри сработавшего круга ближайшего более
+        широкого слоя; круги самого широкого слоя срабатывают все.
+        """
+        if isinstance(dimension, str):
+            titles = [dim.title for dim in self.dimensions]
+            if dimension not in titles:
+                raise KeyError(f"unknown dimension title: {dimension}")
+            position = titles.index(dimension)
+        else:
+            position = int(dimension)
+        dim = self.dimensions[position]
+        first = sum(len(group) for group in self._detectors_by_dimension[:position])
+        rows, local = self._indices[position].active_pairs(
+            self._normalize_values(dim, np.asarray(values, dtype=np.float64))
+        )
+        rows, local = np.asarray(rows, dtype=np.int64), np.asarray(local, dtype=np.int64)
+        if nested and isinstance(dim, PlaneDimension):
+            keep = self._nested_circles(position, rows, local)
+            rows, local = rows[keep], local[keep]
+        return rows, first + local
+
+    def _nested_circles(self, position: int, rows: "np.ndarray", local: "np.ndarray") -> "np.ndarray":
+        """Какие из активных кругов значения вложены в активный круг более широкого слоя (маска по парам)."""
+        circles = self._detectors_by_dimension[position]
+        centre_y = np.asarray([c.center_y for c in circles], dtype=np.float64)
+        centre_x = np.asarray([c.center_x for c in circles], dtype=np.float64)
+        radius = np.asarray([c.radius for c in circles], dtype=np.float64)
+        layer = np.asarray([c.layer_index for c in circles], dtype=np.int64)
+        keep = np.zeros(rows.shape[0], dtype=bool)
+        order = np.lexsort((layer[local], rows))
+        bounds = np.flatnonzero(np.diff(rows[order])) + 1
+        for group in np.split(order, bounds):
+            ids = local[group]
+            layers = layer[ids]
+            parents = None
+            for number in np.unique(layers):
+                mine = np.flatnonzero(layers == number)
+                if parents is None:
+                    inside = np.ones(mine.shape[0], dtype=bool)
+                else:
+                    distance = np.hypot(
+                        centre_y[ids[mine]][:, None] - centre_y[parents][None, :],
+                        centre_x[ids[mine]][:, None] - centre_x[parents][None, :],
+                    )
+                    inside = np.any(distance + radius[ids[mine]][:, None] <= radius[parents][None, :] + 1e-9, axis=1)
+                keep[group[mine[inside]]] = True
+                if np.any(inside):
+                    parents = ids[mine[inside]]
+        return keep
 
     # ------------------------------------------------------------------ geometry
     def _build_layer_detectors(
@@ -479,15 +889,8 @@ class Encoder:
             },
         )
         windows: List[DetectorWindow] = []
-        # Один случайный бит на детектор (§4.2.1): биты полосы выдаются случайной перестановкой, поэтому
-        # детекторы слоя не совпадают, пока их не больше длины полосы; дальше перестановка повторяется
-        # и совпадения далёких детекторов допускаются (коллизии §4.2.1).
-        bit_pool: list[int] = []
-        for position, center in enumerate(centers):
-            if not bit_pool:
-                bit_pool = list(range(band_start, band_start + band_length))
-                self._rng.shuffle(bit_pool)
-            local_bit = bit_pool.pop()
+        local_bits = self._draw_band_bits(len(centers), band_start, band_length)
+        for position, (center, local_bit) in enumerate(zip(centers, local_bits)):
             windows.append(
                 DetectorWindow(
                     detector_index=start_index + position,
@@ -504,6 +907,99 @@ class Encoder:
                 )
             )
         return windows
+
+    def _draw_band_bits(self, count: int, band_start: int, band_length: int) -> list[int]:
+        """Один случайный бит полосы на каждый из count детекторов слоя (§4.2.1).
+
+        Биты полосы выдаются случайной перестановкой, поэтому детекторы слоя не совпадают, пока их не больше
+        длины полосы; дальше перестановка повторяется и совпадения далёких детекторов допускаются
+        (коллизии §4.2.1).
+        """
+        bits: list[int] = []
+        bit_pool: list[int] = []
+        for _ in range(count):
+            if not bit_pool:
+                bit_pool = list(range(band_start, band_start + band_length))
+                self._rng.shuffle(bit_pool)
+            bits.append(bit_pool.pop())
+        return bits
+
+    def _build_plane_layer_detectors(
+        self,
+        *,
+        dim: PlaneDimension,
+        dim_index: int,
+        layer_index: int,
+        layer: Detectors,
+        start_index: int,
+        first: int,
+        offset: int,
+    ) -> tuple[List[DetectorCircle], _PlaneLayer]:
+        """Слой кругов двумерной позиции (§4.3): решётка центров, цветовая полоса и случайные биты слоя."""
+        step, radius, rows, cols = dim.layer_geometry(layer)
+        origin_y = dim.y_min + 0.5 * step
+        origin_x = dim.x_min + 0.5 * step
+        LOGGER.event(
+            "encoder.layer",
+            section=TWO_DIM_CODES,
+            data={
+                "dimension": dim.title,
+                "dimension_index": dim_index,
+                "layer_index": layer_index,
+                "count": layer.count,
+                "detectors": rows * cols,
+                "rows": rows,
+                "cols": cols,
+                "overlap": layer.overlap,
+                "width": 2.0 * radius,
+                "radius": radius,
+                "radius_of_side": radius / dim.side,
+                "step": step,
+                "expected_active": dim.expected_active_detectors(layer),
+                "closed": False,
+            },
+        )
+        band_start, band_length = dim.layer_band(layer_index)
+        LOGGER.event(
+            "encoder.colour_band",
+            section=COLOR_ENCODING,
+            data={
+                "dimension": dim.title,
+                "layer_index": layer_index,
+                "colour_rank": layer_index,
+                "band_start": band_start,
+                "band_length": band_length,
+                "detectors": rows * cols,
+                "note": "§3.2: цвет бита — важность; широкий слой — красные младшие биты, "
+                "узкий — фиолетовые старшие (§4.4.2, §5.14); бит детектора случаен внутри полосы (§4.2.1)",
+            },
+        )
+        circles: List[DetectorCircle] = []
+        local_bits = self._draw_band_bits(rows * cols, band_start, band_length)
+        for position, local_bit in enumerate(local_bits):
+            row, col = divmod(position, cols)
+            circles.append(
+                DetectorCircle(
+                    detector_index=start_index + position,
+                    dimension_index=dim_index,
+                    layer_index=layer_index,
+                    center_y=origin_y + row * step,
+                    center_x=origin_x + col * step,
+                    radius=radius,
+                    bit=offset + local_bit,
+                    local_bit=local_bit,
+                )
+            )
+        plane_layer = _PlaneLayer(
+            first=first,
+            rows=rows,
+            cols=cols,
+            step=step,
+            radius=radius,
+            origin_y=origin_y,
+            origin_x=origin_x,
+        )
+        return circles, plane_layer
 
     def _log_dimension_bits(
         self,
@@ -539,7 +1035,7 @@ class Encoder:
         expected_bits = 0.0
         for layer_index, layer in enumerate(dim.detector_layers):
             _, band_length = dim.layer_band(layer_index)
-            active_detectors = 1.0 / (1.0 - layer.overlap)
+            active_detectors = dim.expected_active_detectors(layer)
             expected_bits += band_length * (1.0 - (1.0 - 1.0 / band_length) ** active_detectors)
         return expected_bits / dim.code_length
 
@@ -550,7 +1046,7 @@ class Encoder:
         for (offset, _), dim in zip(self._segments, self.dimensions):
             for layer_index, layer in enumerate(dim.detector_layers):
                 start, length = dim.layer_band(layer_index)
-                active_detectors = 1.0 / (1.0 - layer.overlap)
+                active_detectors = dim.expected_active_detectors(layer)
                 unset[offset + start: offset + start + length] *= (1.0 - 1.0 / length) ** active_detectors
         return float(1.0 - unset.mean())
 
@@ -560,13 +1056,11 @@ class Encoder:
         digest = hashlib.sha256()
         digest.update(f"shared={self.shared_code}|".encode())
         for dim in self.dimensions:
-            digest.update(
-                f"{dim.title}|{dim.min_value}|{dim.max_value}|{dim.closed}|{dim.code_length}|".encode()
-            )
+            digest.update(dim.signature_token().encode())
             for layer in dim.detector_layers:
                 digest.update(f"{layer.count}:{layer.overlap};".encode())
         for window in self.detectors:
-            digest.update(f"{window.center:.9f},{window.half_width:.9f},{window.bit};".encode())
+            digest.update(window.signature_token().encode())
         return digest.hexdigest()
 
     def segment(self, dimension: int | str) -> tuple[int, int]:
@@ -600,7 +1094,15 @@ class Encoder:
         """
         index = dimension if isinstance(dimension, int) else [d.title for d in self.dimensions].index(dimension)
         dim = self.dimensions[index]
-        span = dim.period if dim.closed else dim.max_value - dim.min_value
+        # Двумерная позиция (§4.3): профиль берётся вдоль горизонтали через середину плоскости.
+        plane = isinstance(dim, PlaneDimension)
+        if plane:
+            span = dim.x_max - dim.x_min
+            line_min = dim.x_min
+            line_y = (dim.y_min + dim.y_max) / 2.0
+        else:
+            span = dim.period if dim.closed else dim.max_value - dim.min_value
+            line_min = dim.min_value
         if step is not None:
             # Шаг сетки стимулов: профиль считается на тех же расстояниях, что встречаются в данных.
             if step <= 0.0:
@@ -609,14 +1111,14 @@ class Encoder:
         if samples < 3:
             raise ValueError("samples must be at least 3")
         if dim.closed:
-            grid = [dim.min_value + span * k / samples for k in range(samples)]
+            grid = [line_min + span * k / samples for k in range(samples)]
         else:
-            grid = [dim.min_value + span * k / (samples - 1) for k in range(samples)]
+            grid = [line_min + span * k / (samples - 1) for k in range(samples)]
         codes = []
         for value in grid:
             # Сравниваются только биты детекторов этой координаты: биты остальных координат
             # постоянны и лишь поднимают пол сходства, скрывая плоский хвост профиля (и в общем коде тоже).
-            codes.append(set(self.dimension_bits(index, value)))
+            codes.append(set(self.dimension_bits(index, (line_y, value) if plane else value)))
         step = span / samples if dim.closed else span / (samples - 1)
         buckets: dict[int, list[float]] = {}
         for i in range(len(grid)):
@@ -693,17 +1195,22 @@ class Encoder:
         их биты суммируются в общую матрицу — это OR кодов координат (§2.2.1) с подсчётом коллизий (§4.2.1).
         """
         matrix = np.asarray(rows, dtype=np.float64)
-        if matrix.ndim != 2 or matrix.shape[1] != len(self.dimensions):
+        if matrix.ndim != 2 or matrix.shape[1] != self._value_columns:
             raise ValueError("number of values must match number of dimensions")
         count = matrix.shape[0]
         normalized = np.empty_like(matrix)
         flat_hits: list[np.ndarray] = []
-        for column, (dim, index) in enumerate(zip(self.dimensions, self._indices)):
-            normalized[:, column] = self._normalize_values(dim, matrix[:, column])
+        column = 0
+        for dim, index in zip(self.dimensions, self._indices):
+            # Одномерная координата — один столбец значений, двумерная позиция (§4.3) — два: (y, x).
+            width = dim.arity
+            values = matrix[:, column] if width == 1 else matrix[:, column : column + width]
+            values = self._normalize_values(dim, values)
+            normalized[:, column : column + width] = values.reshape(count, width)
+            column += width
             if count == 0:
                 continue
-            mask = index.active_mask(normalized[:, column])
-            row_ids, detector_ids = np.nonzero(mask)
+            row_ids, detector_ids = index.active_pairs(values)
             flat_hits.append(row_ids.astype(np.int64) * self.code_length + index.bits[detector_ids])
         if count == 0:
             return normalized, np.zeros((0, self.code_length), dtype=np.int32)
@@ -714,6 +1221,22 @@ class Encoder:
     @staticmethod
     def _normalize_values(dim: "Dimension", values: "np.ndarray") -> "np.ndarray":
         values = np.asarray(values, dtype=np.float64)
+        if isinstance(dim, PlaneDimension):
+            # Двумерная позиция (§4.3): пары (y, x) должны лежать на плоскости координаты.
+            values = values.reshape(-1, 2)
+            outside = (
+                (values[:, 0] < dim.y_min)
+                | (values[:, 0] > dim.y_max)
+                | (values[:, 1] < dim.x_min)
+                | (values[:, 1] > dim.x_max)
+            )
+            if np.any(outside):
+                y, x = (float(v) for v in values[outside][0])
+                raise ValueError(
+                    f"position ({y}, {x}) is outside the plane "
+                    f"[{dim.y_min}, {dim.y_max}] × [{dim.x_min}, {dim.x_max}]"
+                )
+            return values
         if dim.closed:
             return ((values - dim.min_value) % dim.period) + dim.min_value
         outside = (values < dim.min_value) | (values > dim.max_value)
@@ -744,7 +1267,12 @@ class Encoder:
         """Биты, которые ставят детекторы одной координаты при данном значении (её собственный код)."""
         index = dimension if isinstance(dimension, int) else [d.title for d in self.dimensions].index(dimension)
         dim = self.dimensions[index]
-        bits, _ = self._indices[index].active_bits(self._normalize_value(dim, value))
+        if isinstance(dim, PlaneDimension):
+            # Значение двумерной позиции (§4.3) — пара (y, x).
+            position = self._normalize_values(dim, np.asarray([value], dtype=np.float64))[0]
+            bits, _ = self._indices[index].active_bits(position)
+        else:
+            bits, _ = self._indices[index].active_bits(self._normalize_value(dim, value))
         return tuple(int(bit) for bit in bits)
 
     def encode(
@@ -797,6 +1325,51 @@ class Encoder:
             rows, log_image=log_image, log_label=log_label, log_measurements=log_measurements
         )
         return bit_matrix
+
+    def encode_set(self, rows: Sequence[Sequence[float]]) -> tuple["np.ndarray", "np.ndarray"]:
+        """Код набора стимулов: OR их кодов (§2.2.1) — биты кода и номера активных детекторов.
+
+        Детектор активен для набора, если он активен хотя бы для одного его стимула (§4.1). Биты те же, что
+        у побитового OR строк encode_matrix, но матрица «стимулы × биты» не строится: стоимость определяется
+        числом активных детекторов, а не длиной кода. Номера детекторов — по self.detectors, по возрастанию.
+        """
+        matrix = np.asarray(rows, dtype=np.float64)
+        if matrix.ndim != 2 or matrix.shape[1] != self._value_columns:
+            raise ValueError("number of values must match number of dimensions")
+        count = matrix.shape[0]
+        bits = np.zeros(self.code_length, dtype=np.uint8)
+        hits = np.zeros(self.code_length, dtype=np.int64)
+        active_parts: list[np.ndarray] = []
+        column = 0
+        first = 0
+        for dim, index, detectors in zip(self.dimensions, self._indices, self._detectors_by_dimension):
+            width = dim.arity
+            values = matrix[:, column] if width == 1 else matrix[:, column : column + width]
+            column += width
+            if count:
+                _, detector_ids = index.active_pairs(self._normalize_values(dim, values))
+                local = np.unique(detector_ids)
+                np.add.at(hits, index.bits[local], 1)
+                active_parts.append(first + local)
+            first += len(detectors)
+        bits[hits > 0] = 1
+        active = np.concatenate(active_parts) if active_parts else np.zeros(0, dtype=np.int64)
+        active_bits = int(np.count_nonzero(bits))
+        LOGGER.event(
+            "encoder.encode.set",
+            section=CONJUNCTION,
+            data={
+                "stimuli": count,
+                "active_detectors": int(active.size),
+                "code_length": self.code_length,
+                "active_bits": active_bits,
+                "density": active_bits / self.code_length,
+                # Бит, который поставили несколько активных детекторов, — паразитный (§4.2.1).
+                "shared_bits": int(np.count_nonzero(hits > 1)),
+                "note": "OR кодов стимулов набора (§2.2.1): детектор активен, если активен хотя бы для одного стимула",
+            },
+        )
+        return bits, active
 
     def _encode_rows(
         self,

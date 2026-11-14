@@ -191,6 +191,10 @@ class LayoutPayloadBuilder:
         self._eta = eta
         self._metadata: Dict[str, object] = dict(metadata or {})
 
+    def add_metadata(self, values: Mapping[str, object]) -> None:
+        """Дополнить заголовок файла раскладки своими ключами (до записи файла)."""
+        self._metadata.update(values)
+
     def __len__(self) -> int:
         return self._count
 

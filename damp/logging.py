@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import sys
 from typing import Any, Callable, Mapping, Sequence
@@ -57,6 +58,10 @@ class RerunViewerBlueprint:
     SWAP_RATIO = "/layout/swap_ratio"
     AVERAGE_ENERGY = "/layout/energy/long"
     TEXT_LOG = f"/{LOG_PATH}"
+    # Детекторы-круги над раскладкой (PlaneDetectorSpace): зажжённые точки и активные круги.
+    PLANE_DETECTION = "/plane_detection"
+    PLANE_DETECTION_MAP = "plane_detection/map"
+    PLANE_DETECTION_CIRCLES = "plane_detection/circles"
 
     @classmethod
     def build(cls):
@@ -78,6 +83,7 @@ class RerunViewerBlueprint:
             rrb.Spatial2DView(name="Активация", origin="/activation/map"),
             rrb.Spatial2DView(name="Энергия точек", origin="/activation/energy"),
             rrb.Spatial2DView(name="Детекторы кодера", origin="/encoder/detectors"),
+            rrb.Spatial2DView(name="Детекторы-круги над раскладкой (§4.3)", origin=cls.PLANE_DETECTION),
         )
         charts = rrb.Vertical(
             rrb.TimeSeriesView(name="Доля обменов (§5.6)", origin=cls.SWAP_RATIO),
@@ -202,6 +208,16 @@ class DampLogger:
     def mute(self) -> None:
         """Выключает журнал этого процесса: ни консоли, ни rerun (для рабочих процессов)."""
         self._muted = True
+
+    @contextmanager
+    def quiet(self):
+        """Временно выключает журнал: для пробных построений, записи которых повторяли бы записи итогового."""
+        previous = self._muted
+        self._muted = True
+        try:
+            yield
+        finally:
+            self._muted = previous
 
     def use_blueprint(self, builder: Callable[[], Any]) -> None:
         """Своя раскладка панелей окна для отдельного скрипта; по умолчанию — ход раскладки DAMP.

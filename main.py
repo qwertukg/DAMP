@@ -27,13 +27,25 @@ from damp.activation import (
     OutputCodeSize,
     reassign_output_bits,
 )
+from damp.activation.plane_detection import (
+    BestMatchActivation,
+    LabelMapQuality,
+    PlaneCodeSizer,
+    PlaneDetection,
+    PlaneDetectorSpace,
+    StimulusSetCodes,
+)
 from damp.MnistSobelAngleMap import MnistSobelAngleMap, UpscaledSobel
 from damp.encoding.damp_encoder import (
     ClosedDimension,
+    Detectors,
     Encoder,
     EncoderCodeColorizer,
     OpenedDimension,
+    PlaneDimension,
     geometric_detector_layers,
+    halving_detector_layers,
+    plane_detector_layers,
 )
 import numpy as np
 
@@ -44,6 +56,17 @@ from damp.layout.seeded import SeededPlacement
 from damp.encoding.bitarray import BitArray
 from damp.logging import LOGGER
 from damp.decode import DecoderConfig, EmbeddingDatabase, LabeledEmbedding, MnistDecoder, PredictionResult
+# Второй уровень, вариант «код на углопозицию».
+from damp.article_refs import CONCATENATION, MAPPING_CONTINUITY
+from damp.activation.point_codes import LayoutPointCodes, PointCodeSummary, ThresholdActivation
+from damp.layout.map_comparison import MapContinuity, MapCorrespondence, MapEnergy, StimulusMapMeter
+from damp.activation.nearest_point import NearestPointActivation
+from damp.activation.hierarchy_detection import DetectedCodes, HierarchyDetection
+from damp.decode.nearest_codes import NearestCodeClassifier
+from damp.encoding.attention_window import AttentionWindows, BlockWindows, DetectorWindows, WindowPieces
+from damp.encoding.conjunction import ConjunctionEncoder
+from damp.layout.code_dictionary import CodeDictionary, LeaderDictionary, PairwiseSimilarity
+from damp.layout.glyph_map import LayoutGlyphMap
 
 LOG_INTERVAL_DEFAULT = 1
 LOG_INTERVAL_INIT = 1
@@ -73,6 +96,8 @@ LOG_INTERVAL_ACTIVATION_DETECTOR_LAYER = 1
 LOG_INTERVAL_ACTIVATION_SAMPLE = 100
 LOG_INTERVAL_ACTIVATION_VISUAL = 100
 LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE = 1
+LOG_INTERVAL_SECOND_LEVEL_IMAGE = 100
+LOG_INTERVAL_SECOND_LEVEL_VISUAL = 25
 
 EMBEDDINGS_JSON_KEY = "embeddings"
 EMBEDDINGS_VERSION_KEY = "embeddings_version"
@@ -85,6 +110,10 @@ ENCODER_SIGNATURE_KEY = "encoder_signature"
 # они собраны окнами 4×4 по среднему градиенту окна; кеш с другими значениями не подхватывается.
 PATCH_SIZE_KEY = "patch_size"
 STIMULUS_MODE_KEY = "stimulus_mode"
+# Радиус выбора пар ближней фазы, с которым раскладка была запланирована (по нему же назван файл). Кеш сверяется
+# по нему: итоговый радиус большой раскладки режима статьи меньше планового, и сверка по итоговому отвергала
+# готовую раскладку. В файлах без этого ключа сверяется итоговый радиус, как раньше.
+PLANNED_PAIR_RADIUS_KEY = "planned_pair_radius"
 LAYOUT_CACHE_LEGACY_STIMULUS = {PATCH_SIZE_KEY: 4, STIMULUS_MODE_KEY: "window"}
 PIPELINE_CHECKPOINT_SUFFIX = ".checkpoint.json"
 PIPELINE_CHECKPOINT_VERSION = 3
@@ -425,6 +454,291 @@ DECODER_DATASET_LIMIT = 64
 DECODER_DEFAULT_COUNT = 1000
 DECODER_CALIBRATION_TEMPERATURES = (0.25, 0.35, 0.5, 0.75, 1.0)
 
+# --- Второй уровень: детекторы-круги над первой раскладкой (§4.3, §6.2, §6.5, §6.6; расширение статьи).
+# Раскладка заполняется кругами всех слоёв равномерно, как детекторы двумерной позиции (§4.3), а не по
+# кластерам раскладки (§6.4). Слои от самого широкого к самому узкому, перекрытие соседей и один случайный
+# бит на детектор — как у координат стимула (§4.2); радиус круга задаётся долей стороны карты, между
+# самым широким и самым узким слоем число кругов по стороне растёт геометрически (§4.2, §4.5).
+# Стимулы набора (все углопозиции одной картинки) зажигают самые похожие точки первой раскладки, зажжённая
+# точка активирует круги, в поле которых лежит. Код набора — вектор фиксированной длины: каждому кругу
+# назначен один случайный бит цветовой полосы его слоя, активный круг зажигает свой бит (§4.2.1). Коды
+# наборов раскладываются тем же Layout (§6.2, §6.6).
+# Длина кода не задаётся, а подбирается (§6.6, шаг 3: размер выходного слоя — по среднему числу активных
+# детекторов): наименьшая, при которой средняя плотность кодов первых SECOND_LEVEL_CALIBRATION_SAMPLES
+# картинок не выше SECOND_LEVEL_TARGET_DENSITY (§2: 25 %). Поиск идёт между SECOND_LEVEL_CODE_LENGTH_MIN
+# и SECOND_LEVEL_CODE_LENGTH_MAX.
+# Плотность подобрана вместе с длиной кода (1000 цифр, сглаживание, 2000 тестовых картинок, ближайший сосед):
+# 50 % (1 256 бит) — 87.5 %, 40 % — 89.1 %, 30 % — 89.7 %, 25 % (2 960 бит) — 90.7 %, 10 % (7 848 бит) — 90.3 %,
+# 2 % (40 464 бита) — 90.1 %, 0.5 % (162 720 бит) — 90.4 %; с 10 слоями и перекрытием 0.9 (в 26 раз больше
+# кругов) при 524 288 битах — 90.2 %. Длиннее точность не растёт, плотнее 25 % — падает.
+SECOND_LEVEL_TARGET_DENSITY = 0.25
+SECOND_LEVEL_CALIBRATION_SAMPLES = 100
+SECOND_LEVEL_CODE_LENGTH_MIN = 256
+SECOND_LEVEL_CODE_LENGTH_MAX = 262144
+# Параметры кругов подобраны перебором (ближайший сосед по косинусу кодов картинок, 2000 тестовых картинок,
+# плотность кода 25 %; разброс оценки ±0.6 %). Чувствителен только самый узкий радиус; остальное лежит на плато.
+#  - Самый узкий радиус, доля стороны (5 слоёв, перекрытие 0.7; в скобках — радиус в ячейках):
+#      100 цифр, карта 115, сглаживание:  0.015 — 73.7 %, 0.02 — 74.2 %, 0.03 (3.4) — 75.0 %, 0.045 — 73.2 %, 0.07 — 66.4 %;
+#      100 цифр, режим статьи:            0.015 — 74.3 %, 0.02 — 74.0 %, 0.03 — 75.3 %, 0.045 — 72.4 %, 0.07 — 65.0 %;
+#      1000 цифр, карта 364, сглаживание: 0.015 — 89.9 %, 0.02 — 89.5 %, 0.03 (10.9) — 90.1 %, 0.045 — 87.1 %, 0.07 — 77.3 %;
+#      2000 цифр, карта 514, режим статьи: 0.015 — 92.1 %, 0.02 — 92.1 %, 0.03 (15.4) — 92.4 %, 0.045 — 90.9 %, 0.07 — 81.1 %.
+#    Лучший радиус в долях стороны один и тот же (0.02–0.03) при любом размере карты и в обоих режимах первой
+#    раскладки, то есть в ячейках он растёт вместе с картой; поэтому радиус задаётся долей стороны. Уже 0.01
+#    круги различают отдельные углопозиции и хуже обобщают, шире 0.045 сливают разные.
+#  - Самый широкий радиус (1000 цифр): 0.15 — 90.4 %, 0.33 — 90.1 %, 0.6 — 90.6 %: не влияет. Картинка зажигает
+#    все широкие круги; при 0.33 самый широкий слой не накрывает всю карту, и проверка дальнего порядка кодов
+#    позиций (§4.5) пишет предупреждение.
+#  - Слои и перекрытие (1000 цифр, радиусы 0.33 … 0.025): 3, 5, 7, 10 слоёв × перекрытие 0.5, 0.6, 0.7, 0.8 —
+#    все 16 вариантов дают 88.4–90.7 %, а длина кода меняется от 1 208 до 22 280 бит. 5 слоёв и перекрытие 0.6 —
+#    90.7 % при 2 960 битах; 10 слоёв и 0.7 (как у X и Y стимула) — 90.1 % при 9 672 битах.
+SECOND_LEVEL_LAYERS = 5
+SECOND_LEVEL_OVERLAP = 0.6
+# False — случайный бит круга берётся из всего кода; True — из цветовой полосы его слоя, как у одномерных
+# координат (§3.2). Картинка активирует в узких слоях сотни кругов, в широких — единицы, а полосы слоёв равны:
+# при плотности кода 25 % полосы пяти широких слоёв заполнены на 1–11 %, полосы трёх узких — на 48–63 %,
+# и круги узких слоёв, которые и различают картинки, сливаются. 2000 обучающих цифр, 1000 тестовых,
+# ближайший сосед, плотность 25 %, 10 слоёв, радиусы 0.85 … 0.02: с полосами — 89.6 %, без полос — 93.7 %.
+SECOND_LEVEL_LAYER_BANDS = False
+SECOND_LEVEL_RADIUS_MAX = 0.33
+SECOND_LEVEL_RADIUS_MIN = 0.025
+SECOND_LEVEL_RANDOM_SEED = ENCODER_RANDOM_SEED
+# Стимул зажигает точки с наибольшим сходством, если оно не ниже λ_a (§6.1); порог тот же, что у активации §6.5.
+SECOND_LEVEL_ACTIVATION_LAMBDA = ACTIVATION_LAMBDA_THRESHOLD
+# Подпись и цвет точки второй раскладки — класс цифры: hue = класс · шаг (10 классов на круге 360°).
+SECOND_LEVEL_CLASS_HUE_STEP = 36.0
+# Порог сходства второй раскладки (§5.4, §7.1.7). Сходства кодов картинок лежат в другом диапазоне, чем
+# у первичных кодов (100 цифр: 0.36…0.58 против порога λ = 0.65), поэтому λ задаётся долей похожих пар,
+# как у первичных кодов: LAYOUT_LAMBDA_THRESHOLD = 0.65 — квантиль 0.82 их попарных сходств (18 % пар
+# похожи), LAYOUT_ADAPTIVE_LAMBDA_MAX = 0.8 — квантиль 0.982 (1.8 % пар; замер на 100 цифрах, 8 693 точки).
+SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE = 0.82
+SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE = 0.982
+# Число тестовых картинок проверки нечётким поиском по кодам второго уровня (§2.2.5).
+SECOND_LEVEL_EVALUATE_LIMIT = 200
+# Температура голосования соседей в нечётком поиске по кодам второго уровня. Сходства кодов картинок
+# различаются на сотые (диапазон 0.36…0.58 против 0…1 у прежних эмбеддингов), и при DECODER_SOFTMAX_TEMPERATURE
+# = 0.35 веса всех соседей почти равны: 100 цифр — 44 % на 50 тестовых картинках при 78 % у ближайшего соседа.
+SECOND_LEVEL_DECODER_TEMPERATURE = 0.02
+SECOND_LEVEL_FILE_PREFIX = "data/second"
+
+# --- Уровень «окно внимания» (расширение статьи): кусок в координатах своего окна, «что» отдельно от «где».
+# Замеры 2026-11-13 (сглаженный режим, 2000 проверочных цифр, 1 ближайший сосед): 1000 цифр — 92.2–92.6 %
+# против 90.6 % у второго уровня над первой раскладкой; 5000 цифр — 96.0 % против 93.7 %.
+# Шаги вверх: радиус окна каждого шага в клетках сетки углопозиций (окнах Собеля). Один радиус — один
+# уровень кусков между углопозициями и картинкой. Нумерация: уровень 0 — углопозиции (первичный), уровни
+# 1… — куски, последний — картинки; уровней всего — число радиусов + 2. Замеры (2000 и 5000
+# цифр, все перекрытия): первый уровень кусков добавляет 0.4–1.7 пункта, второй (окно 1.5 над кусками
+# первого) отнимает 0.6–1.8 — его словарь не схлопывается и упирается в WINDOW_LEVEL_DICTIONARY_MAX.
+WINDOW_LEVEL_RADII = (2.5,)
+# Шаг центров окна. Шаг 2 теряет 6 пунктов (86.1 %): карта форм складывается только при плотной выборке
+# (окно в каждой клетке).
+WINDOW_LEVEL_STRIDE = 1
+# Шаг центров окна по уровням (для круглых окон); None — WINDOW_LEVEL_STRIDE на всех уровнях. Шаг, растущий
+# с уровнем, уменьшает число кусков на картинку; шаг уровня должен быть кратен шагу предыдущего.
+WINDOW_LEVEL_STRIDES: tuple[int, ...] | None = None
+# Вид окон уровней кусков. "round" — круглые окна радиусов WINDOW_LEVEL_RADII с шагом WINDOW_LEVEL_STRIDE: окна
+# перекрываются, и кусков на картинку с уровнем становится больше (277, 367, 463 на 1000 цифрах).
+# "blocks" — квадратные блоки со сторонами WINDOW_LEVEL_BLOCK_SIDES, без перекрытия: углопозиция входит ровно
+# в один кусок уровня, и на любом уровне кусков картинки × углопозиций в куске = углопозиций картинки.
+# "detectors" — картинка заранее не режется: на её плоскость набрасывается слой перекрывающихся кругов-детекторов
+# (§4.3), и кусок — элементы картинки внутри одного сработавшего круга; элемент входит во все круги, в которые
+# попал. Место элемента внутри широкого круга кодируют слои кругов вдвое и вчетверо меньше.
+WINDOW_LEVEL_WINDOW_KINDS = ("round", "blocks", "detectors")
+WINDOW_LEVEL_WINDOWS = "round"
+# Стороны блоков по уровням, в клетках сетки 24×24 (24 = 3·2·2·2), каждый уровень собирает 2×2 блока
+# предыдущего. 1000 цифр, в среднем на картинку: уровень 0 — 88.3 углопозиции; блок 3 — 23.3 куска по 3.8
+# углопозиции; блок 6 — 9.4 по 9.4; блок 12 — 4.0 по 22.3; картинка — 1 кусок из 88.3.
+WINDOW_LEVEL_BLOCK_SIDES = (3, 6, 12)
+# Диаметр широкого круга по уровням, в клетках сетки. Толщина линии цифры — около 2 клеток (медиана расстояния
+# между противоположными краями линии по углопозициям 1000 цифр — 2.0, среднее 2.46; шаг самих углопозиций —
+# 1 клетка). Первый уровень — круг с толщину линии, каждый следующий вдвое шире.
+WINDOW_LEVEL_DETECTOR_DIAMETERS = (2.0, 4.0, 8.0, 16.0)
+# Перекрытие широких кругов и кругов внутри них.
+WINDOW_LEVEL_DETECTOR_OVERLAP = 0.3
+# Слоёв кругов внутри широкого: каждый вдвое меньше предыдущего (половина и четверть диаметра широкого).
+WINDOW_LEVEL_DETECTOR_INNER_LAYERS = 2
+# Поле вокруг сетки картинки для плоскости наброшенных кругов, в клетках; None — половина суммы диаметров + 1.
+# Центры кругов лежат внутри плоскости, поэтому при заданном поле число кругов по стороне зависит только от
+# диаметра своего уровня, и размер пространства уровня можно подбирать независимо от остальных уровней.
+WINDOW_LEVEL_DETECTOR_MARGIN: float | None = None
+# Что становится точками карты уровня. "leaders" — образцы: похожие коды кусков сливаются к образцу
+# (WINDOW_LEVEL_MERGE_SIMILARITY). "all" — каждый кусок обучающих картинок, как на уровне 0 точкой становится
+# каждая углопозиция: размер пространства уровня равен числу кусков и задаётся только размером кругов.
+WINDOW_LEVEL_DICTIONARY_KINDS = ("leaders", "all")
+WINDOW_LEVEL_DICTIONARY = "leaders"
+# Чем читается карта уровня. "lattice" — геометрический способ: кусок зажигает одну точку карты с самым похожим
+# кодом, место точки читает решётка кругов заданных размеров (§4.3). "hierarchy" — способ статьи: кусок зажигает
+# все точки карты со сходством не ниже порога λ_a (§6.1), карту читают самоорганизующиеся детекторы, построенные
+# по её кластерам (§6.4), детектор срабатывает по энергии зажжённых точек своего поля (§6.5).
+WINDOW_LEVEL_MAP_DETECTOR_KINDS = ("lattice", "hierarchy")
+WINDOW_LEVEL_MAP_DETECTORS = "hierarchy"
+# Слои иерархии над картой уровня (§7.1.10): пороги λ_d по возрастанию; радиус активации и минимум точек
+# кластера каждого слоя — из ACTIVATION_DETECTOR_LAYER_SPECS. Пороги лежат ниже порога слияния образцов
+# WINDOW_LEVEL_MERGE_SIMILARITY = 0.7: образцы карты похожи друг на друга меньше него, и на порогах от 0.7
+# кластеров нет — иерархия не строится. None — WINDOW_LEVEL_HIERARCHY_LAYERS порогов равными шагами от порога,
+# с которого карта начинала раскладываться, до порога, на котором закончила (0.48…0.60 на 1000 цифрах).
+WINDOW_LEVEL_HIERARCHY_LAYERS = 5
+WINDOW_LEVEL_HIERARCHY_THRESHOLDS: tuple[float, ...] | None = (0.52, 0.56, 0.60, 0.64, 0.68)
+# Порог срабатывания детектора μ_d над картой уровня (§6.5): доля собственной энергии детектора.
+# При единичной активации (высокий λ_a) в поле детектора зажжена одна точка, и её энергии хватает только на
+# малую долю собственной энергии детектора: порог 0.5 первой раскладки здесь не срабатывает почти никогда.
+WINDOW_LEVEL_HIERARCHY_DETECTOR_THRESHOLD = 0.05
+# True — самая похожая точка карты зажигается всегда, даже если её сходство ниже λ_a (расширение статьи):
+# при высоком пороге половина кусков иначе не зажигает ничего.
+WINDOW_LEVEL_HIERARCHY_ACTIVATE_BEST = True
+# Порог активации карты кодом куска λ_a (§6.1); None — порог нижнего слоя иерархии, как в §7.1.11.
+# Замер 2026-11-13 (1000 цифр, 2000 проверочных, слои 0.52…0.68; решётка кругов на тех же данных — 92.90 %):
+# λ_a = 0.52 (нижний слой) — 85.25 %, кусок зажигает 338 точек карты из 2579 и 114 детекторов из 580;
+# 0.55 — 88.20 %; 0.60 — 92.30 % (75 точек, 28 детекторов, код 10 096 бит); 0.65 — 92.10 % (22 точки,
+# 7.6 детектора, код 5400 бит). Код куска похож на многие образцы сразу, и с порогом нижнего слоя ответ
+# карты размывается: порог активации нужен выше, чтобы кусок зажигал 1–3 % карты.
+# На 10 000 проверочных: решётка — 94.99 % (код 8808 бит), иерархия с λ_a = 0.60 — 94.25 % (10 096 бит),
+# с λ_a = 0.65 — 94.52 % (5400 бит). Два уровня кусков (2000 проверочных, λ_a = 0.60): решётка 92.70 %,
+# иерархия 91.10 %.
+# Единичная активация (замер 2026-11-13, 1000 обучающих цифр, 10 000 проверочных; решётка — 94.99 % при 8808
+# битах): сходство куска с лучшим образцом в среднем 0.82, со вторым 0.75, фон 0.34, поэтому при λ_a = 0.8 кусок
+# зажигает одну точку или ни одной. С правилом «самая похожая точка зажигается всегда» и μ_d = 0.05:
+# λ_a = 0.80 — 95.00 % при 4648 битах (стоит), 0.90 — 94.92 % при 4576; без правила λ_a = 0.70, μ_d = 0.10 —
+# 95.19 % при 8016 битах. Прежние λ_a = 0.65, μ_d = 0.5 — 94.52 % при 5400 битах.
+WINDOW_LEVEL_HIERARCHY_ACTIVATION_LAMBDA: float | None = 0.80
+# Слои и перекрытие детекторов уровня (и для кода куска, и для кода картинки).
+# Замеры на 2000 цифрах при перекрытии 0.3: 3 слоя — 93.0 %, 5 — 95.0 %, 7 — 93.95 %, 10 — 93.75 %.
+# Перекрытие задаёт число сработавших кругов: точку накрывает π / (4·(1 − перекрытие)²) кругов слоя — 4.9
+# при 0.6 и 1.6 при 0.3 (ниже 0.29 круги уже не закрывают плоскость). На 5000 цифрах код картинки при 0.3
+# в 8 раз короче, чем при 0.6, а узнавание ниже на 0.3–0.8 пункта (95.65 % против 95.95 % при плотности 25 %).
+# Замер 2026-11-13 (1000 обучающих цифр, 10 000 проверочных, самый узкий круг места 2 клетки): перекрытие
+# 0.3 — 93.56 % при коде 2944 бита, 0.5 — 94.23 % при 10 080, 0.6 — 94.32 % при 22 896, 0.7 — 94.11 % при
+# 66 496. Выше 0.5 качество не растёт, а код длиннее вдвое на каждый шаг; с кругом места 3 клетки: 0.3 —
+# 93.98 % (2704 бита), 0.5 — 94.99 % (8808 бит), 0.6 — 95.06 % (20 320 бит).
+WINDOW_LEVEL_LAYERS = 5
+WINDOW_LEVEL_OVERLAP = 0.5
+# Слои двумерных детекторов (место в окне, место на карте форм, место на картинке). True — каждый следующий
+# слой вдвое мельче предыдущего, начиная с WINDOW_LEVEL_PLANE_DETECTORS_WIDEST кругов по стороне: 2×2, 4×4,
+# 8×8, 16×16, 32×32; решётки слоёв совпадают, сработавшие круги вложены друг в друга. False — радиусы от
+# самого широкого до самого узкого геометрическим рядом (константы *_RADIUS_* ниже). Срабатывают в обоих
+# случаях все круги, в которые попала точка (§4.1).
+# Замер на 2000 цифрах (все круги): прежние слои — 93.6 %, «вдвое» 5 слоёв — 90.9 %, 7 слоёв — 85.9 %: при
+# делении пополам от 2×2 круги места в окне уже с четвёртого слоя мельче одной клетки.
+WINDOW_LEVEL_HALVING_LAYERS = False
+# True — у двумерных детекторов срабатывают только вложенные круги: круг слоя срабатывает, если целиком
+# лежит внутри сработавшего круга ближайшего более широкого слоя (самый широкий слой срабатывает весь).
+# False — срабатывают все круги, в которые попала точка (§4.1). Замер на 5000 цифрах (окна 2.5 и 1.5, код
+# от всех уровней): все круги — 95.4 %, код картинки 94.6 тыс. бит (зажжено около 24 тыс.); только вложенные —
+# 91.0 %, код 13.4 тыс. бит (зажжено около 3.4 тыс.), словарь первого уровня кусков 730 образцов вместо 3576.
+WINDOW_LEVEL_NESTED_CIRCLES = False
+WINDOW_LEVEL_PLANE_DETECTORS_WIDEST = 2
+# Код куска: детектор направления × круг места внутри окна.
+WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST = 4
+WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST = 24
+WINDOW_LEVEL_OFFSET_RADIUS_MIN = 0.8   # самый узкий круг места в окне, клеток; самый широкий — радиус окна
+# Словарь образцов: порог слияния кодов кусков и предел числа образцов (точек карты форм).
+# Замер 2026-11-13 (1000 цифр, 10 000 проверочных, перекрытие 0.6): порог 0.6 — 93.98 % (399 образцов),
+# 0.7 — 94.32 % (2068), 0.8 — 94.57 % (16 645), 0.9 — 94.61 % (101 545 образцов, в 8 раз дольше). 0.8 даёт
+# +0.2 пункта ценой словаря в 8 раз больше — на больших наборах это часы, поэтому оставлено 0.7.
+WINDOW_LEVEL_MERGE_SIMILARITY = 0.7
+# Словарь первого уровня кусков (перекрытие 0.3): 7258 образцов на 2000 цифр, 9596 на 5000 — растёт медленно.
+# Словари следующих уровней кусков схлопываются гораздо хуже: уровню 2 нужно 45 429 образцов на 1000 цифр и
+# 84 170 на 2000. Предел — только защита от разбухания; раскладка больше 100 000 образцов идёт от затравки.
+WINDOW_LEVEL_DICTIONARY_MAX = 1000000
+# Код картинки: круг на карте форм (радиусы в долях её стороны) × круг на картинке (радиусы в клетках).
+# Узкий круг карты форм важен: 0.33…0.1 даёт 90.0 % вместо 92.2 % (1000 цифр).
+WINDOW_LEVEL_SHAPE_RADIUS_MAX = 0.33
+WINDOW_LEVEL_SHAPE_RADIUS_MIN = 0.03
+# Самый узкий круг места на картинке задаёт допуск на сдвиг и деформацию цифры. Замер 2026-11-13 (1000
+# обучающих цифр, 10 000 проверочных, перекрытие 0.6): 1.5 клетки — 93.57 %, 2 — 94.32 %, 3 — 95.06 %,
+# 4 — 95.07 %, 5 — 95.20 %, 6 — 95.09 %. С 3 клеток плато; код картинки при этом короче, чем при 2.
+WINDOW_LEVEL_PLACE_RADIUS_MAX = 12.0
+WINDOW_LEVEL_PLACE_RADIUS_MIN = 3.0
+# Сетка углопозиций: 28·8 // 9 = 24 окна Собеля по стороне (узлы 0…23). Плоскость мест на картинке шире
+# её на поле под центры окон, вышедших за край: ⌈сумма радиусов⌉ + 1 клетка с каждой стороны.
+WINDOW_LEVEL_GRID = 24
+# Из каких уровней собирается код картинки: "last" — только из верхнего уровня кусков, "all" — из всех
+# уровней, начиная с углопозиций; сегменты уровней склеиваются (§2.2.3).
+# На 1000 цифрах при трёх уровнях кусков (1.5, 1.5, 1.5): "last" — 87.7 %, "all" — 90.2 %.
+WINDOW_LEVEL_PICTURE_LEVELS = "all"
+# True — детекторы-произведения из любых двух слоёв (код картинки вчетверо длиннее, +1 пункт на 1000 цифрах).
+WINDOW_LEVEL_CROSS_LAYERS = False
+# Длины кодов подбираются под среднюю плотность (§6.6): по первым кускам и первым картинкам.
+WINDOW_LEVEL_TARGET_DENSITY = 0.25
+# Плотность кода картинки задаётся отдельно от кода куска. На 5000 цифрах (перекрытие 0.3): 25 % — 5088 бит,
+# 95.65 %; 40 % — 2872 бита, 95.55 %; 50 % — 2112 бит, 95.0 %. При перекрытии 0.6 и плотности 40 % —
+# 23.9 тыс. бит и 96.4 % (максимум качества из замеренного).
+WINDOW_LEVEL_PICTURE_DENSITY = 0.4
+WINDOW_LEVEL_CODE_LENGTH_MIN = 64
+WINDOW_LEVEL_CODE_LENGTH_MAX = 262144
+WINDOW_LEVEL_CALIBRATION_PIECES = 20000
+WINDOW_LEVEL_CALIBRATION_PICTURES = 200
+# Длина собственного кода вспомогательных кодеров координат: от них берутся только детекторы, биты не нужны.
+WINDOW_LEVEL_AXIS_CODE_LENGTH = 256
+WINDOW_LEVEL_RANDOM_SEED = ENCODER_RANDOM_SEED
+# Пороги λ раскладок уровня — теми же квантилями попарных сходств, что у второго уровня (§7.1.7).
+WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE = SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE
+WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE = SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE
+# True — коды обучающих картинок раскладываются в карту цифр (как у второго уровня).
+WINDOW_LEVEL_PICTURE_MAP = True
+# Сколько «картинок × бит» помещается в раскладку карты цифр на видеокарте 8 ГБ. Замеры: 5000 × 37 тыс. бит
+# раскладываются за минуту, 12 000 × 34 тыс. и 5000 × 57 тыс. — не помещаются в память. Если код длиннее,
+# карта цифр строится по случайной выборке его бит.
+WINDOW_LEVEL_PICTURE_MAP_CELLS = 180_000_000
+WINDOW_LEVEL_EVALUATE_LIMIT = 2000
+WINDOW_LEVEL_NEIGHBOURS = (1, 5)
+WINDOW_LEVEL_FILE_PREFIX = "data/window"
+# Размер ячейки на картах с рисунками стимулов, пикселей: кусок на карте форм и цифра на карте цифр.
+WINDOW_LEVEL_SHAPE_TILE = 40
+WINDOW_LEVEL_DIGIT_TILE = 28
+
+# --- Второй уровень, вариант «код на углопозицию» (§4.3, §6.2; расширение статьи; эксперимент).
+# Каждая точка первой раскладки получает код своего места на карте: стимул точки зажигает точки с тем же
+# кодом, зажжённые точки активируют детекторы-круги (§4.3). Кодов столько же, сколько точек первой раскладки;
+# они несут только топологию карты и раскладываются тем же Layout. Точка второй раскладки сохраняет угол и
+# подпись исходной точки, поэтому две карты сравниваются точка в точку (StimulusMapMeter).
+# Код фиксированной длины: каждому кругу назначен один случайный бит цветовой полосы своего слоя (§3.2,
+# §4.2.1), активный круг зажигает свой бит, биты не отбираются и не отбрасываются (colour merge не применяется).
+# Длина кода подобрана под среднюю плотность 25 % (§2) на карте 100 цифр (8693 точки): одну позицию накрывает
+# ≈ π / (4 · (1 − overlap)²) кругов слоя, всего ≈ 390 кругов. На карте 300 цифр кодов, стоящих в нескольких
+# местах, больше, и средняя плотность выше (26 %).
+# Число слоёв и перекрытие — такие, чтобы проверка дальнего порядка (Encoder.long_range_order, §4.5, §5.13.1)
+# проходила устойчиво: при 10 слоях и перекрытии 0.7 (≈ 80 единиц в коде) случайные совпадения бит дают разброс
+# сходства пары ±0.04, и проверка проходит через раз (5 из 12 значений seed на карте 115 × 115); здесь —
+# 12 из 12 на карте 115 × 115 и 11 из 12 на карте 199 × 199.
+SECOND_LEVEL_POINT_CODE_LENGTH = 1428
+SECOND_LEVEL_POINT_LAYERS = 12
+SECOND_LEVEL_POINT_OVERLAP = 0.85
+# Самый широкий слой — доля стороны карты (как SECOND_LEVEL_RADIUS_MAX: круг накрывает всю карту, §4.5).
+SECOND_LEVEL_POINT_RADIUS_MAX = 0.85
+# Самый узкий слой — в ячейках карты, а не в долях стороны: код места должен различать соседние ячейки
+# при любом размере карты.
+SECOND_LEVEL_POINT_RADIUS_MIN_CELLS = 1.4
+SECOND_LEVEL_POINT_RANDOM_SEED = ENCODER_RANDOM_SEED
+# Правило зажигания точек стимулом точки (ключ --activation команды second-points).
+# "best" — только точки с самым похожим (тем же) кодом: правило, выбранное для второго уровня. Код точки —
+# код её места; кодер — SECOND_LEVEL_POINT_*.
+# "threshold" — все точки со сходством не ниже SECOND_LEVEL_POINT_ACTIVATION_LAMBDA, как активация §6.1, §6.5:
+# отход от выбранного правила. Код точки — код набора мест всех похожих на неё кодов; кодер —
+# SECOND_LEVEL_POINT_THRESHOLD_*.
+SECOND_LEVEL_POINT_ACTIVATION = "best"
+SECOND_LEVEL_POINT_ACTIVATION_RULES = ("best", "threshold")
+SECOND_LEVEL_POINT_ACTIVATION_LAMBDA = ACTIVATION_LAMBDA_THRESHOLD
+# Кодер правила "threshold". При λ_a = 0.7 стимул точки зажигает ≈ 9 % карты (в среднем 820 точек из 8693 на
+# 100 цифрах), как набор углопозиций картинки, поэтому слои и перекрытие — как у координат X, Y стимула, а самый
+# узкий круг задан долей стороны карты (набор занимает долю карты, а не число ячеек). Длина кода — под среднюю
+# плотность 25 % на карте 100 цифр (≈ 4500 активных кругов на код); на карте 300 цифр зажжённые точки
+# разбросаны по большему числу областей и средняя плотность выше (28 %).
+SECOND_LEVEL_POINT_THRESHOLD_CODE_LENGTH = 12160
+SECOND_LEVEL_POINT_THRESHOLD_LAYERS = MNIST_POSITION_LAYERS
+SECOND_LEVEL_POINT_THRESHOLD_OVERLAP = MNIST_POSITION_OVERLAP
+SECOND_LEVEL_POINT_THRESHOLD_RADIUS_MIN = 0.012
+# Сравнение первой и второй карт (§5.13.2): «стенка» — соседние ячейки, стимулы которых различаются по углу
+# больше чем на 30° или по позиции окна больше чем на 3 окна; разрыв — соседи, стоявшие на другой карте
+# дальше стольких ячеек.
+SECOND_LEVEL_POINT_ANGLE_JUMP = 30.0
+SECOND_LEVEL_POINT_POSITION_JUMP = 3.0
+SECOND_LEVEL_POINT_TEAR_DISTANCE = 10.0
+SECOND_LEVEL_POINT_FILE_PREFIX = "data/second-points"
+# Суффиксы карт «место точки на первой карте» (цветовой круг): вторая карта и первая карта как легенда.
+SECOND_LEVEL_POINT_SOURCE_IMAGE_SUFFIX = ".source.png"
+SECOND_LEVEL_POINT_SOURCE_LEGEND_SUFFIX = ".source-first.png"
+LOG_INTERVAL_SECOND_LEVEL_POINT = 1000
+
 # §5.10: пары шага считаются спекулятивно по старым позициям; это не влияет на результат, пока обменов
 # за шаг много меньше числа точек. В режиме статьи число пар за шаг (а значит, и обменов) ограничено
 # долей LAYOUT_PAIRS_POINT_FRACTION от числа точек в обеих фазах; None — без ограничения (режим сглаживания,
@@ -480,8 +794,9 @@ LAYOUT_SEED_SHORT_RADIUS_FACTOR = 4.0
 # с отсечкой 0.65 — 0.853, без отсечки — 0.887 (при прежней расстановке ровно в блок родителя: 0.875 и 0.888).
 LAYOUT_SEED_SHORT_SIMILARITY_CUTOFF = 0.0
 # Файл раскладки больше этого размера как кеш не читается (вне статьи): чтение строит по объекту на точку,
-# и на миллионах точек они не помещаются в память — раскладка считается заново. 256 МБ — около 380 тыс. точек.
-LAYOUT_CACHE_MAX_FILE_BYTES = 256 * 1024 * 1024
+# и на миллионах точек они не помещаются в память — раскладка считается заново. 512 МБ — около 750 тыс. точек.
+# 5000 цифр (442 тыс. точек, файл 300 МБ) читаются из кеша за 38 с против 2–3.5 минут расчёта раскладки.
+LAYOUT_CACHE_MAX_FILE_BYTES = 512 * 1024 * 1024
 #  - шаг дальней фазы идёт целиком на устройстве (LAYOUT_DEVICE_STEP): выбор пар, энергии, отбор и применение
 #    обменов — те же действия, что на хосте, но случайные числа берёт генератор устройства. На миллионе пар
 #    за шаг массивы numpy на хосте занимали половину времени шага.
@@ -741,7 +1056,20 @@ LOG_INTERVALS = {
     "activation.map.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.energy.visual": LOG_INTERVAL_ACTIVATION_VISUAL,
     "activation.embedding.save": LOG_INTERVAL_ACTIVATION_EMBEDDING_SAVE,
+    # Второй уровень: события на каждую картинку — раз в столько картинок.
+    "encoder.encode.set": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.activation": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.detect": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.code": LOG_INTERVAL_SECOND_LEVEL_IMAGE,
+    "plane_detection.visual": LOG_INTERVAL_SECOND_LEVEL_VISUAL,
 }
+
+# Второй уровень, вариант «код на углопозицию»: событие на каждую точку — раз в столько точек.
+LOG_INTERVALS.update(
+    {
+        "point_codes.activation": LOG_INTERVAL_SECOND_LEVEL_POINT,
+    }
+)
 
 LAYOUT_CACHE_PATTERNS = (
     f"data/layout-{{count}}-*-{LAYOUT_CACHE_TAG}.json",
@@ -821,6 +1149,57 @@ class TunedLayoutParams:
     device_step: bool = False
     # True — шаг ближней фазы большой раскладки режима статьи выполняется целиком на устройстве.
     device_short_step: bool = False
+
+
+@dataclass(frozen=True)
+class LayoutLambdaSchedule:
+    """Пороги сходства раскладки (§5.4, §7.1.7) для кодов со своим распределением сходств.
+
+    start — порог λ в начале раскладки, он же порог ранней отсечки пар ближней фазы (§5.9.1); maximum —
+    предел роста λ ступенями (§7.1.7). Константы LAYOUT_LAMBDA_THRESHOLD и LAYOUT_ADAPTIVE_LAMBDA_MAX подобраны
+    для первичных кодов; у кодов следующего уровня сходства лежат в другом диапазоне, и пороги для них
+    берутся квантилями попарных сходств — той же долей похожих пар, что у первичных кодов.
+    """
+
+    start: float
+    maximum: float
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.start <= self.maximum <= 1.0:
+            raise ValueError("lambda schedule must satisfy 0 <= start <= maximum <= 1")
+
+    @property
+    def short_cutoff(self) -> float:
+        """Порог ранней отсечки пар ближней фазы (§5.9.1): совпадает с начальным λ."""
+        return self.start
+
+    @classmethod
+    def from_quantiles(
+        cls,
+        start: float,
+        maximum: float,
+        *,
+        start_quantile: float,
+        maximum_quantile: float,
+    ) -> "LayoutLambdaSchedule":
+        """Пороги по квантилям попарных сходств кодов: start и maximum — значения этих квантилей."""
+        schedule = cls(start=float(start), maximum=max(float(start), float(maximum)))
+        LOGGER.event(
+            "layout.lambda_schedule",
+            section=LAYOUT_PARAMETERS,
+            data={
+                "lambda_threshold": schedule.start,
+                "lambda_max": schedule.maximum,
+                "start_quantile": start_quantile,
+                "maximum_quantile": maximum_quantile,
+                "primary_lambda_threshold": LAYOUT_LAMBDA_THRESHOLD,
+                "primary_lambda_max": LAYOUT_ADAPTIVE_LAMBDA_MAX,
+                "note": "§7.1.7: параметры раскладки зависят от задачи; пороги взяты квантилями попарных сходств "
+                "кодов — та же доля похожих пар, что дают первичным кодам LAYOUT_LAMBDA_THRESHOLD и "
+                "LAYOUT_ADAPTIVE_LAMBDA_MAX",
+            },
+        )
+        return schedule
 
 
 @dataclass(frozen=True)
@@ -1600,7 +1979,13 @@ class LayoutCacheFile:
             )
             return None
         expected_pair_radius = _expected_pair_radius(total_points, run_params)
-        if pair_radius_saved is not None and pair_radius_saved != expected_pair_radius:
+        planned_pair_radius = data.get(PLANNED_PAIR_RADIUS_KEY)
+        if planned_pair_radius is not None:
+            # Раскладка считалась с этим плановым радиусом; итоговый радиус может быть меньше (большая
+            # раскладка режима статьи заканчивается на своём радиусе), на пригодность кеша он не влияет.
+            if int(planned_pair_radius) != expected_pair_radius:
+                return None
+        elif pair_radius_saved is not None and pair_radius_saved != expected_pair_radius:
             return None
         if not points_payload:
             return None
@@ -1728,6 +2113,126 @@ def _build_colorizer() -> EncoderCodeColorizer:
         min_hue=LAYOUT_PSEUDO_COLOR_MIN_HUE,
         max_hue=LAYOUT_PSEUDO_COLOR_MAX_HUE,
     )
+
+
+def _build_plane_encoder(layout: Layout, code_length: int, *, check_order: bool = True) -> Encoder:
+    """Кодер двумерной позиции на карте раскладки (§4.3): круги всех слоёв заполняют её сетку ячеек.
+
+    code_length — длина кода; check_order — проверить дальний порядок кодов позиций (§4.5).
+    """
+    layers = plane_detector_layers(
+        layers_count=SECOND_LEVEL_LAYERS,
+        widest_radius=SECOND_LEVEL_RADIUS_MAX,
+        narrowest_radius=SECOND_LEVEL_RADIUS_MIN,
+        overlap=SECOND_LEVEL_OVERLAP,
+    )
+    encoder = Encoder(
+        PlaneDimension(
+            "Map",
+            PlaneDetectorSpace.plane_size(layout),
+            layers,
+            code_length=int(code_length),
+            layer_bands=SECOND_LEVEL_LAYER_BANDS,
+        ),
+        random_seed=SECOND_LEVEL_RANDOM_SEED,
+        layer_phase=ENCODER_LAYER_PHASE,
+    )
+    if check_order:
+        # §4.5, §5.13.1: сходство кодов позиций должно убывать с расстоянием на карте на всём её протяжении;
+        # Encoder.long_range_order сам логирует профиль и предупреждение.
+        encoder.long_range_order("Map")
+    return encoder
+
+
+def _build_plane_detection(layout: Layout, calibration: Sequence["np.ndarray"]) -> PlaneDetection:
+    """Детекторы-круги над раскладкой и зажигание её точек стимулами: код набора стимулов (§4.3, §6.2, §6.5).
+
+    calibration — упакованные коды стимулов калибровочных наборов (картинок): по ним подбирается длина кода
+    с заданной средней плотностью (§6.6, шаг 3).
+    """
+    activation = BestMatchActivation(
+        layout.code_table,
+        similarity=LAYOUT_SIMILARITY,
+        lambda_threshold=SECOND_LEVEL_ACTIVATION_LAMBDA,
+        use_gpu=ACTIVATION_USE_GPU,
+    )
+    code_length = PlaneCodeSizer(
+        target_density=SECOND_LEVEL_TARGET_DENSITY,
+        min_length=SECOND_LEVEL_CODE_LENGTH_MIN,
+        max_length=SECOND_LEVEL_CODE_LENGTH_MAX,
+    ).fit(
+        layout,
+        activation,
+        calibration,
+        lambda length: _build_plane_encoder(layout, length, check_order=False),
+    )
+    return PlaneDetection(activation, PlaneDetectorSpace(layout, _build_plane_encoder(layout, code_length)))
+
+
+def _build_point_plane_encoder(layout: Layout, activation: str | None = None) -> Encoder:
+    """Кодер двумерной позиции на карте раскладки (§4.3) для варианта «код на углопозицию».
+
+    activation — правило зажигания (None — SECOND_LEVEL_POINT_ACTIVATION): "best" — код одного места,
+    "threshold" — код набора мест (SECOND_LEVEL_POINT_THRESHOLD_*).
+    """
+    rule = SECOND_LEVEL_POINT_ACTIVATION if activation is None else activation
+    if rule == "best":
+        side = float(max(layout.height, layout.width))
+        code_length = SECOND_LEVEL_POINT_CODE_LENGTH
+        layers = plane_detector_layers(
+            layers_count=SECOND_LEVEL_POINT_LAYERS,
+            widest_radius=SECOND_LEVEL_POINT_RADIUS_MAX,
+            narrowest_radius=SECOND_LEVEL_POINT_RADIUS_MIN_CELLS / side,
+            overlap=SECOND_LEVEL_POINT_OVERLAP,
+        )
+    elif rule == "threshold":
+        code_length = SECOND_LEVEL_POINT_THRESHOLD_CODE_LENGTH
+        layers = plane_detector_layers(
+            layers_count=SECOND_LEVEL_POINT_THRESHOLD_LAYERS,
+            widest_radius=SECOND_LEVEL_POINT_RADIUS_MAX,
+            narrowest_radius=SECOND_LEVEL_POINT_THRESHOLD_RADIUS_MIN,
+            overlap=SECOND_LEVEL_POINT_THRESHOLD_OVERLAP,
+        )
+    else:
+        raise ValueError(f"activation rule must be one of {SECOND_LEVEL_POINT_ACTIVATION_RULES}")
+    encoder = Encoder(
+        PlaneDimension(
+            "Map",
+            PlaneDetectorSpace.plane_size(layout),
+            layers,
+            code_length=code_length,
+        ),
+        random_seed=SECOND_LEVEL_POINT_RANDOM_SEED,
+        layer_phase=ENCODER_LAYER_PHASE,
+    )
+    # §4.5, §5.13.1: Encoder.long_range_order сам логирует профиль и предупреждение.
+    encoder.long_range_order("Map")
+    return encoder
+
+
+def _build_point_plane_detection(layout: Layout, activation: str | None = None) -> PlaneDetection:
+    """Детекторы-круги над раскладкой и правило зажигания для кода одной точки (§4.3, §6.1, §6.5).
+
+    activation — правило зажигания; None — SECOND_LEVEL_POINT_ACTIVATION.
+
+    "best" — стимул точки зажигает точки с тем же кодом: код точки — код её места.
+    "threshold" — стимул точки зажигает все точки со сходством не ниже λ_a (§6.5): код точки — код набора мест.
+    Код — биты активных кругов (OR, §2.2.1) без отбора: colour merge не применяется, плотность задаёт длина кода.
+    """
+    rule = SECOND_LEVEL_POINT_ACTIVATION if activation is None else activation
+    if rule not in SECOND_LEVEL_POINT_ACTIVATION_RULES:
+        raise ValueError(f"activation rule must be one of {SECOND_LEVEL_POINT_ACTIVATION_RULES}")
+    activation_class: type[BestMatchActivation] | type[ThresholdActivation] = (
+        BestMatchActivation if rule == "best" else ThresholdActivation
+    )
+    space = PlaneDetectorSpace(layout, _build_point_plane_encoder(layout, rule))
+    lighting = activation_class(
+        layout.code_table,
+        similarity=LAYOUT_SIMILARITY,
+        lambda_threshold=SECOND_LEVEL_POINT_ACTIVATION_LAMBDA,
+        use_gpu=ACTIVATION_USE_GPU,
+    )
+    return PlaneDetection(lighting, space)
 
 
 def _build_extractor(
@@ -2180,13 +2685,46 @@ def _layout_from_codes(
     colorizer: EncoderCodeColorizer | None,
     *,
     layout_path: str | None = None,
+    lambda_schedule: LayoutLambdaSchedule | None = None,
 ) -> Layout:
-    """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка."""
+    """Раскладка кодов: дальняя и ближняя фазы (§5.5) либо большая раскладка от затравки и её доводка.
+
+    lambda_schedule — пороги сходства для кодов с другим распределением сходств (коды следующего уровня);
+    None — константы LAYOUT_*. Большая раскладка от затравки со своими порогами идёт только в режиме
+    сглаживания: затравка раскладывается с теми же порогами, доводка — дальней фазой с радиуса доводки.
+    """
     seeded = (
         run_params.seed_points is not None
         and isinstance(codes, LayoutCodeTable)
         and codes.count > run_params.seed_points
     )
+    if lambda_schedule is not None:
+        if seeded and not LAYOUT_SMOOTH_PINWHEELS:
+            raise ValueError("свои пороги сходства в большой раскладке от затравки поддержаны только в режиме сглаживания")
+        if seeded:
+            layout, refine_radius, refine_steps = _seeded_layout(
+                codes, run_params, colorizer, lambda_schedule=lambda_schedule
+            )
+        else:
+            layout = _new_layout(codes, run_params, colorizer, lambda_threshold=lambda_schedule.start)
+            refine_radius = refine_steps = None
+        _run_long_phase(
+            layout,
+            run_params,
+            step_offset=1,
+            layout_path=layout_path,
+            start_radius=refine_radius,
+            steps=refine_steps,
+            lambda_max=lambda_schedule.maximum,
+        )
+        _run_short_phase(
+            layout,
+            run_params,
+            step_offset=1 + layout.last_steps,
+            similarity_cutoff=lambda_schedule.short_cutoff,
+            lambda_max=lambda_schedule.maximum,
+        )
+        return layout
     if seeded:
         layout, refine_radius, refine_steps = _seeded_layout(codes, run_params, colorizer)
     else:
@@ -2216,13 +2754,15 @@ def _new_layout(
     colorizer: EncoderCodeColorizer | None,
     *,
     initial_cells: "np.ndarray | None" = None,
+    lambda_threshold: float | None = None,
 ) -> Layout:
-    """Раскладка с параметрами конвейера; initial_cells — начальная расстановка вместо случайной (§5.2)."""
+    """Раскладка с параметрами конвейера; initial_cells — начальная расстановка вместо случайной (§5.2),
+    lambda_threshold — порог сходства λ (§5.4) вместо LAYOUT_LAMBDA_THRESHOLD."""
     return Layout(
         codes,
         empty_ratio=LAYOUT_EMPTY_RATIO,
         similarity=LAYOUT_SIMILARITY,
-        lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
+        lambda_threshold=LAYOUT_LAMBDA_THRESHOLD if lambda_threshold is None else float(lambda_threshold),
         eta=LAYOUT_ETA,
         seed=LAYOUT_RANDOM_SEED,
         use_gpu=LAYOUT_USE_GPU,
@@ -2250,6 +2790,8 @@ def _seeded_layout(
     codes: LayoutCodeTable,
     run_params: TunedLayoutParams,
     colorizer: EncoderCodeColorizer | None,
+    *,
+    lambda_schedule: LayoutLambdaSchedule | None = None,
 ) -> tuple[Layout, int, int]:
     """Большая раскладка от затравки (вне статьи; ср. подмножество §5.9.4): раскладка, радиус и число шагов доводки.
 
@@ -2257,6 +2799,8 @@ def _seeded_layout(
     для своего числа точек); остальные точки ставятся возле самых похожих точек подмножества. Глобальный
     порядок готов — дальняя фаза большой раскладки начинается с радиуса в несколько блоков затравки и идёт
     по тому же геометрическому расписанию, что полная фаза (те же шаги на октаву радиуса, §7.1.7).
+    lambda_schedule — свои пороги сходства (коды следующего уровня): с ними раскладываются и затравка, и
+    большая раскладка.
     """
     placement = SeededPlacement(
         codes,
@@ -2269,7 +2813,7 @@ def _seeded_layout(
     ).tune(placement.seed_count)
     started = time.perf_counter()
     # Затравка раскладывается тем же путём: целиком либо, если она сама велика, от своей затравки (уровни).
-    seed_layout = _layout_from_codes(placement.seed_table(), seed_params, colorizer)
+    seed_layout = _layout_from_codes(placement.seed_table(), seed_params, colorizer, lambda_schedule=lambda_schedule)
     seed_cells = seed_layout.cells_array()
     seed_shape = (seed_layout.height, seed_layout.width)
     seed_lambda = seed_layout.lambda_threshold
@@ -2286,7 +2830,13 @@ def _seeded_layout(
         # Режим статьи: место точки в блоке родителя — по похожим на неё точкам затравки (sim ≥ λ затравки).
         neighbour_threshold=None if LAYOUT_SMOOTH_PINWHEELS else seed_lambda,
     )
-    layout = _new_layout(codes, run_params, colorizer, initial_cells=cells)
+    layout = _new_layout(
+        codes,
+        run_params,
+        colorizer,
+        initial_cells=cells,
+        lambda_threshold=None if lambda_schedule is None else lambda_schedule.start,
+    )
     if not LAYOUT_SMOOTH_PINWHEELS:
         # Порог λ большой раскладки продолжает расписание затравки (§7.1.7): её дальний порядок уже установлен.
         layout.set_similarity_params(lambda_threshold=seed_lambda)
@@ -2336,8 +2886,10 @@ def _run_long_phase(
     layout_path: str | None,
     start_radius: int | None = None,
     steps: int | None = None,
+    lambda_max: float | None = None,
 ) -> None:
-    """Дальняя фаза раскладки (§5.5.1, §7.1.7); start_radius и steps — начало и длина расписания доводки."""
+    """Дальняя фаза раскладки (§5.5.1, §7.1.7); start_radius и steps — начало и длина расписания доводки,
+    lambda_max — предел роста λ вместо LAYOUT_ADAPTIVE_LAMBDA_MAX."""
     long_radius_start = max(
         LAYOUT_ADAPTIVE_RADIUS_MIN,
         int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR),
@@ -2349,7 +2901,7 @@ def _run_long_phase(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
-        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX if lambda_max is None else float(lambda_max),
         radius_schedule=LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
         radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
         swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
@@ -2382,9 +2934,11 @@ def _run_short_phase(
     step_offset: int,
     start_radius: int | None = None,
     similarity_cutoff: float | None = None,
+    lambda_max: float | None = None,
 ) -> None:
     """Ближняя фаза раскладки (§5.5.2, §7.1.7); start_radius — начальный радиус выбора пар доводки от затравки,
-    similarity_cutoff — порог ранней отсечки пар (§5.9.1) вместо LAYOUT_SHORT_SIMILARITY_CUTOFF."""
+    similarity_cutoff — порог ранней отсечки пар (§5.9.1) вместо LAYOUT_SHORT_SIMILARITY_CUTOFF,
+    lambda_max — предел роста λ вместо LAYOUT_ADAPTIVE_LAMBDA_MAX."""
     short_radius_max = int(layout.width * LAYOUT_ADAPTIVE_RADIUS_START_FACTOR)
     short_radius_base = int(
         max(
@@ -2403,7 +2957,7 @@ def _run_short_phase(
         end_radius=LAYOUT_ADAPTIVE_RADIUS_MIN,
         swap_ratio_trigger=LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=LAYOUT_ADAPTIVE_LAMBDA_STEP,
-        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX,
+        lambda_max=LAYOUT_ADAPTIVE_LAMBDA_MAX if lambda_max is None else float(lambda_max),
         radius_schedule=LAYOUT_SHORT_ADAPTIVE_RADIUS_SCHEDULE,
         radius_factor=LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
         swap_window=LAYOUT_ADAPTIVE_SWAP_WINDOW,
@@ -2733,7 +3287,12 @@ class MnistLayoutRunner:
             embeddings=embeddings,
         )
 
-    def run(self) -> None:
+    def digit_codes(self, count: int) -> list[DigitCodes]:
+        """Первые count цифр обучающего набора с их углопозициями и кодами — из общего кеша кодов."""
+        return self._code_cache(self._build_dataset()).take_nonempty(count)
+
+    def run(self) -> Layout:
+        """Конвейер MNIST: раскладка, затем (без --layout-only) активация и эмбеддинги; возвращает раскладку."""
         if self._reuse_cache:
             cached_layout = self._try_load_cached_layout()
         else:
@@ -2774,6 +3333,7 @@ class MnistLayoutRunner:
             tuned_params = self._tune_layout(total_codes)
             expected_pair_radius = _expected_pair_radius(total_codes, tuned_params)
             layout_path = _layout_json_path(self.count, expected_pair_radius)
+            payload.add_metadata({PLANNED_PAIR_RADIUS_KEY: expected_pair_radius})
             # Файл больше LAYOUT_CACHE_MAX_FILE_BYTES как кеш не читается: до раскладки пишется только заголовок.
             payload.save_base(layout_path, max_points_bytes=LAYOUT_CACHE_MAX_FILE_BYTES)
             if not self._reuse_cache:
@@ -2829,7 +3389,7 @@ class MnistLayoutRunner:
                 stages=stages,
                 embeddings=checkpoint_embeddings,
             )
-            return
+            return layout
         try:
             cached_embeddings = self._embedding_store.load(layout_path)
         except FileNotFoundError:
@@ -2874,6 +3434,7 @@ class MnistLayoutRunner:
             stages=stages,
             embeddings=embeddings,
         )
+        return layout
 
 
 
@@ -3172,6 +3733,1092 @@ class MnistDecodeRunner:
         return best_temp, best_acc
 
 
+class MnistSecondLevelRunner:
+    """Второй уровень на MNIST (§6.2, §6.6; расширение статьи): код картинки и раскладка кодов картинок.
+
+    1. Первая раскладка углопозиций — обычным конвейером (MnistLayoutRunner, только раскладка).
+    2. Над ней строятся детекторы-круги (§4.3); все углопозиции картинки зажигают самые похожие точки
+       раскладки, зажжённая точка активирует круги, в поле которых лежит, активный круг зажигает свой бит
+       кода картинки (PlaneDetection). Длина кода подобрана под плотность 25 % (PlaneCodeSizer, §6.6).
+    3. Коды картинок раскладываются тем же Layout: точка второй раскладки — картинка, цвет — класс цифры.
+    4. Проверка: нечёткий поиск тестовых картинок по базе кодов обучающих (§2.2.5), тем же декодером.
+    """
+
+    def __init__(
+        self,
+        *,
+        count: int,
+        reuse_cache: bool = True,
+        evaluate_limit: int = SECOND_LEVEL_EVALUATE_LIMIT,
+        split: str = "test",
+    ) -> None:
+        if evaluate_limit < 0:
+            raise ValueError("evaluate_limit must be non-negative")
+        self.count = int(count)
+        self._evaluate_limit = int(evaluate_limit)
+        self._split = split
+        self._primary = MnistLayoutRunner(count=count, reuse_cache=reuse_cache, layout_only=True)
+
+    def run(self) -> float | None:
+        """Весь путь второго уровня; возвращает точность нечёткого поиска (None — проверка отключена)."""
+        primary_layout = self._primary.run()
+        digits = self._primary.digit_codes(self.count)
+        detection = _build_plane_detection(
+            primary_layout, [item.packed for item in digits[:SECOND_LEVEL_CALIBRATION_SAMPLES]]
+        )
+        codes = self._encode_digits(detection, digits)
+        summary = codes.log_summary(
+            detection.space,
+            similarity=LAYOUT_SIMILARITY,
+            seed=SECOND_LEVEL_RANDOM_SEED,
+            quantiles=(SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE, SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE),
+        )
+        schedule = LayoutLambdaSchedule.from_quantiles(
+            summary[codes.quantile_key(SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE)],
+            summary[codes.quantile_key(SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE)],
+            start_quantile=SECOND_LEVEL_LAYOUT_LAMBDA_QUANTILE,
+            maximum_quantile=SECOND_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE,
+        )
+        second_layout = self._layout_codes(codes, schedule)
+        self._export(second_layout)
+        if self._evaluate_limit == 0:
+            return None
+        return self._evaluate(detection, codes)
+
+    @staticmethod
+    def _encode_digits(detection: PlaneDetection, digits: Sequence[DigitCodes]) -> StimulusSetCodes:
+        """Коды второго уровня обучающих картинок: набор стимулов — все углопозиции одной цифры."""
+        codes = StimulusSetCodes(detection.code_length)
+        for item in digits:
+            codes.add(item.label, detection.encode_packed(item.packed, label=item.label))
+        return codes
+
+    def _layout_codes(self, codes: StimulusSetCodes, schedule: LayoutLambdaSchedule) -> Layout:
+        """Раскладка кодов картинок тем же алгоритмом и с той же настройкой, что первая (§6.2, §6.6);
+        отличается только порог сходства λ — он взят по распределению сходств самих кодов (§7.1.7)."""
+        table = codes.table(hue_step=SECOND_LEVEL_CLASS_HUE_STEP).grouped_by_hue()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        return _layout_from_codes(
+            table, tuner.tune(table.count), self._primary.colorizer, lambda_schedule=schedule
+        )
+
+    def _export(self, layout: Layout) -> None:
+        """JSON и карты второй раскладки: псевдоцвета кода, раскраска по классу цифры, яркость по энергии."""
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        stem = f"{SECOND_LEVEL_FILE_PREFIX}-{self.count}-{suffix}"
+        layout.save_json(f"{stem}-{LAYOUT_CACHE_TAG}.json")
+        MnistLayoutRunner._save_layout_images(
+            layout,
+            image_path=f"{stem}.png",
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
+        )
+        # Собрала ли раскладка картинки одного класса рядом (класс в раскладке не участвует).
+        LabelMapQuality().measure(layout)
+
+    def _evaluate(self, detection: PlaneDetection, codes: StimulusSetCodes) -> float:
+        """Нечёткий поиск (§2.2.5): класс тестовой картинки — по самым похожим кодам обучающих картинок."""
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        database = EmbeddingDatabase(
+            [
+                LabeledEmbedding(label=label, embedding=embedding)
+                for label, embedding in zip(codes.labels, codes.embeddings())
+            ],
+            DecoderConfig(
+                similarity=DECODER_SIMILARITY,
+                temperature=SECOND_LEVEL_DECODER_TEMPERATURE,
+                min_confidence=DECODER_MIN_CONFIDENCE,
+                expected_classes=DECODER_EXPECTED_CLASSES,
+                knn_top_k=DECODER_KNN_TOP_K,
+                top_k_per_class=DECODER_TOP_K_PER_CLASS,
+                min_similarity=DECODER_MIN_SIMILARITY,
+            ),
+        )
+        decoder = MnistDecoder(
+            encoder=self._primary.encoder,
+            extractor=self._primary.extractor,
+            activation_engine=detection,
+            embedding_db=database,
+        )
+        dataset = MNIST(root="./data", train=self._split == "train", download=True, transform=transforms.ToTensor())
+        images: list["np.ndarray"] = []
+        labels: list[int] = []
+        for index, (image, label) in enumerate(dataset):
+            if index >= self._evaluate_limit:
+                break
+            images.append(image.squeeze(0).numpy())
+            labels.append(int(label))
+        _, accuracy = decoder.predict_batch(images, labels=labels)
+        return 0.0 if accuracy is None else float(accuracy)
+
+
+@dataclass(frozen=True)
+class DigitAtoms:
+    """Углопозиции набора цифр одним массивом: картинка, угол и узел сетки окон каждой углопозиции (§4.4, §4.6)."""
+
+    picture: "np.ndarray"  # номер картинки каждой углопозиции
+    angle: "np.ndarray"
+    y: "np.ndarray"  # узел сетки окон Собеля
+    x: "np.ndarray"
+    labels: "np.ndarray"  # метка каждой картинки
+    images: "np.ndarray"  # сами картинки (N × 28 × 28, 0…255) — для рисунков карт
+
+    @property
+    def pictures(self) -> int:
+        return int(self.labels.shape[0])
+
+    def joined(self, other: "DigitAtoms | None") -> "DigitAtoms":
+        """Этот набор и следом за ним other (номера его картинок сдвигаются)."""
+        if other is None:
+            return self
+        return DigitAtoms(
+            picture=np.concatenate([self.picture, other.picture + self.pictures]),
+            angle=np.concatenate([self.angle, other.angle]),
+            y=np.concatenate([self.y, other.y]),
+            x=np.concatenate([self.x, other.x]),
+            labels=np.concatenate([self.labels, other.labels]),
+            images=np.concatenate([self.images, other.images]),
+        )
+
+
+@dataclass(frozen=True)
+class LevelElements:
+    """Элементы уровня иерархии: у каждого — картинка, значение «что» и узел сетки картинки («где»).
+
+    На уровне 0 элемент — углопозиция, «что» — её угол. На следующих элемент — кусок предыдущего уровня,
+    «что» — его место на карте форм этого уровня, «где» — центр окна куска.
+    """
+
+    picture: "np.ndarray"  # номер картинки каждого элемента
+    what_values: "np.ndarray"  # различные значения «что»: углы или ячейки карты форм (y, x)
+    what_index: "np.ndarray"  # номер значения «что» у каждого элемента
+    y: "np.ndarray"  # место на сетке картинки: узел (круглые окна) либо центр блока (окна-блоки)
+    x: "np.ndarray"
+    what: Encoder  # кодер координаты «что»: его детекторы читают значения этого уровня
+
+    @property
+    def count(self) -> int:
+        return int(self.picture.shape[0])
+
+
+@dataclass(frozen=True)
+class LevelWindow:
+    """Окно одного уровня кусков: чем режется картинка и какое поле зрения у куска этого уровня."""
+
+    windows: "AttentionWindows | BlockWindows"
+    field: float  # поле зрения куска на картинке от его центра: радиус круга либо половина стороны квадрата
+    title: str  # как назвать окно в подписях
+
+    @property
+    def square(self) -> bool:
+        return bool(self.windows.square)
+
+    @property
+    def extent(self) -> float:
+        """Половина размера окна в клетках: плоскость смещений «где в окне» — (−extent, extent)²."""
+        return float(self.windows.extent)
+
+    def sees(self, dy: float, dx: float) -> bool:
+        """Попадает ли углопозиция со смещением (dy, dx) от центра куска в его поле зрения."""
+        if self.square:
+            return abs(dy) <= self.field + 1e-9 and abs(dx) <= self.field + 1e-9
+        return dy * dy + dx * dx <= self.field * self.field
+
+
+class MnistWindowLevelRunner:
+    """Уровни «окно внимания» на MNIST (расширение статьи): «что» отдельно от «где», без первой раскладки.
+
+    1. Уровень 0 (первичный) — углопозиции цифр, тем же выделением, что у первой раскладки (угол, узел сетки
+       окон). Уровни 1… — куски, последний уровень — картинки.
+    2. Шаг вверх (по одному на каждый радиус из WINDOW_LEVEL_RADII): по элементам уровня идёт круглое окно
+       (AttentionWindows); кусок — элементы в окне, записанные от его центра. Код куска — детекторы-произведения
+       «что элемента × его место в окне» (ConjunctionEncoder над детекторами двух Encoder), OR по элементам
+       куска (§2.2.1), длина под плотность 25 % (§6.6). Коды кусков обучающих картинок сливаются к образцу
+       (LeaderDictionary), образцы раскладываются тем же Layout — карта форм уровня; каждый кусок получает
+       место на ней (NearestPointActivation, §6.1) и становится элементом следующего уровня.
+    3. Последний уровень — картинка: её код собирается детекторами-произведениями «что элемента × его место на
+       картинке» по элементам уровней из WINDOW_LEVEL_PICTURE_LEVELS и склеивается из их кодов (§2.2.3).
+    4. Коды картинок раскладываются в карту цифр; проверка — нечёткий поиск по кодам обучающих (§2.2.5).
+    """
+
+    def __init__(
+        self,
+        *,
+        count: int,
+        evaluate_limit: int = WINDOW_LEVEL_EVALUATE_LIMIT,
+        split: str = "test",
+    ) -> None:
+        if count <= 0:
+            raise ValueError("count must be positive")
+        if evaluate_limit < 0:
+            raise ValueError("evaluate_limit must be non-negative")
+        if not WINDOW_LEVEL_RADII:
+            raise ValueError("WINDOW_LEVEL_RADII must name at least one window")
+        if WINDOW_LEVEL_PICTURE_LEVELS not in ("all", "last"):
+            raise ValueError("WINDOW_LEVEL_PICTURE_LEVELS must be 'all' or 'last'")
+        self.count = int(count)
+        self._evaluate_limit = int(evaluate_limit)
+        self._split = split
+        # От первичного конвейера нужны выделение углопозиций и раскраска раскладок; сама первая раскладка — нет.
+        self._primary = MnistLayoutRunner(count=count, layout_only=True)
+
+    def run(self) -> dict[int, float] | None:
+        """Весь путь уровней; возвращает точность нечёткого поиска по числу соседей (None — проверка отключена)."""
+        train = self._atoms(train=True, count=self.count)
+        test = self._atoms(train=self._split == "train", count=self._evaluate_limit) if self._evaluate_limit else None
+        atoms = train.joined(test)
+        self._drawn = atoms
+        self._atom_starts = np.searchsorted(atoms.picture, np.arange(atoms.pictures + 1))
+        # Плоскость мест на картинке: сетка углопозиций и поле под центры окон, вышедших за её край.
+        windows = self._level_windows()
+        margin = self._place_margin()
+        low, high = -margin, float(WINDOW_LEVEL_GRID) + margin
+        place = self._plane_encoder(
+            "Place",
+            ((low, high), (low, high)),
+            WINDOW_LEVEL_PLACE_RADIUS_MAX / (high - low),
+            WINDOW_LEVEL_PLACE_RADIUS_MIN / (high - low),
+        )
+        elements = self._atom_elements(atoms)
+        # Номера уровней: 0 — углопозиции (первичный), 1… — куски, последний — картинки.
+        last = len(windows)
+        segments: list[tuple[int, "np.ndarray", int]] = []
+        if WINDOW_LEVEL_PICTURE_LEVELS == "all":
+            segments.append((0, *self._picture_segment(elements, place, atoms.pictures, 0)))
+        for number, window in enumerate(windows, start=1):
+            elements = self._next_level(elements, window, atoms.labels, train.pictures, number)
+            if WINDOW_LEVEL_PICTURE_LEVELS == "all" or number == last:
+                segments.append((number, *self._picture_segment(elements, place, atoms.pictures, number)))
+        picture_codes = np.concatenate([packed for _, packed, _ in segments], axis=1)
+        picture_length = sum(length for _, _, length in segments)
+        LOGGER.event(
+            "window_level.picture_code",
+            section=CONCATENATION,
+            data={
+                "levels": [number for number, _, _ in segments],
+                "segment_lengths": [length for _, _, length in segments],
+                "code_length": picture_length,
+                "pictures": atoms.pictures,
+                "note": "код картинки склеен из кодов уровней: у каждого уровня свой сегмент (§2.2.3)",
+            },
+        )
+        # Проверка идёт до раскладки карты цифр: карта большого набора раскладывается долго, а на узнавание не влияет.
+        accuracy = None
+        if test is not None:
+            classifier = NearestCodeClassifier(
+                picture_codes[: train.pictures], train.labels, picture_length, use_gpu=ACTIVATION_USE_GPU
+            )
+            accuracy = classifier.accuracy(
+                picture_codes[train.pictures :], test.labels, neighbours=WINDOW_LEVEL_NEIGHBOURS
+            )
+        if WINDOW_LEVEL_PICTURE_MAP:
+            self._picture_map(picture_codes[: train.pictures], train.labels, picture_length, last + 1)
+        return accuracy
+
+    @staticmethod
+    def _level_windows() -> list[LevelWindow]:
+        """Окна уровней кусков по константам WINDOW_LEVEL_WINDOWS: круглые с шагом либо блоки без перекрытия."""
+        if WINDOW_LEVEL_WINDOWS not in WINDOW_LEVEL_WINDOW_KINDS:
+            raise ValueError(f"WINDOW_LEVEL_WINDOWS must be one of {WINDOW_LEVEL_WINDOW_KINDS}")
+        if WINDOW_LEVEL_WINDOWS == "blocks":
+            # Поле зрения блока — его же клетки: углопозиции не дальше (side − 1)/2 от центра по каждой оси.
+            return [
+                LevelWindow(BlockWindows(side=int(side)), (int(side) - 1) / 2.0, f"блок {int(side)}×{int(side)} клеток")
+                for side in WINDOW_LEVEL_BLOCK_SIDES
+            ]
+        result: list[LevelWindow] = []
+        field = 0.0
+        if WINDOW_LEVEL_WINDOWS == "detectors":
+            margin = MnistWindowLevelRunner._place_margin()
+            low, high = -margin, float(WINDOW_LEVEL_GRID) + margin
+            for number, diameter in enumerate(WINDOW_LEVEL_DETECTOR_DIAMETERS, start=1):
+                # Круг диаметра d при перекрытии o: шаг решётки d·(1 − o), кругов по стороне — сторона / шаг (§4.2).
+                per_side = max(1, int(round((high - low) / (float(diameter) * (1.0 - WINDOW_LEVEL_DETECTOR_OVERLAP)))))
+                plane = Encoder(
+                    PlaneDimension(
+                        f"Window{number}",
+                        ((low, high), (low, high)),
+                        (Detectors(count=per_side, overlap=WINDOW_LEVEL_DETECTOR_OVERLAP),),
+                        code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+                        layer_bands=False,
+                    ),
+                    random_seed=WINDOW_LEVEL_RANDOM_SEED,
+                    layer_phase=ENCODER_LAYER_PHASE,
+                )
+                windows = DetectorWindows(plane=plane)
+                # Поле зрения куска — радиус его круга и поле зрения элементов, попавших в круг.
+                field += windows.extent
+                result.append(
+                    LevelWindow(windows, field, f"круг диаметром {2.0 * windows.extent:.3g} клетки, поле зрения {field:.3g}")
+                )
+            return result
+        strides = WINDOW_LEVEL_STRIDES or (WINDOW_LEVEL_STRIDE,) * len(WINDOW_LEVEL_RADII)
+        if len(strides) != len(WINDOW_LEVEL_RADII):
+            raise ValueError("WINDOW_LEVEL_STRIDES must have one stride per radius")
+        for radius, stride in zip(WINDOW_LEVEL_RADII, strides):
+            # Поле зрения круглого окна — сумма радиусов окон всех шагов до него.
+            field += float(radius)
+            result.append(
+                LevelWindow(
+                    AttentionWindows(radius=float(radius), stride=int(stride)), field, f"поле зрения {field:g} клетки"
+                )
+            )
+        return result
+
+    @staticmethod
+    def _place_margin() -> float:
+        """Поле вокруг сетки картинки под центры окон: круглые окна выходят за край, блоки — нет."""
+        if WINDOW_LEVEL_WINDOWS == "blocks":
+            return 1.0
+        if WINDOW_LEVEL_WINDOWS == "detectors":
+            if WINDOW_LEVEL_DETECTOR_MARGIN is not None:
+                return float(WINDOW_LEVEL_DETECTOR_MARGIN)
+            return float(math.ceil(sum(WINDOW_LEVEL_DETECTOR_DIAMETERS) / 2.0) + 1)
+        return float(math.ceil(sum(WINDOW_LEVEL_RADII)) + 1)
+
+    def _atoms(self, *, train: bool, count: int) -> DigitAtoms:
+        """Углопозиции первых count цифр набора, у которых они есть."""
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        dataset = MNIST(root="./data", train=train, download=True, transform=transforms.ToTensor())
+        rows: list["np.ndarray"] = []
+        labels: list[int] = []
+        images: list["np.ndarray"] = []
+        for image, label in dataset:
+            if len(labels) >= count:
+                break
+            pixels = image.squeeze(0).numpy()
+            found = self._primary.extractor.extract(pixels, label=int(label)).get(int(label), [])
+            if not found:
+                continue
+            images.append((pixels * 255.0).astype(np.uint8))
+            values = np.asarray(found, dtype=np.float64)  # (угол, x, y)
+            rows.append(np.column_stack([np.full(values.shape[0], len(labels), dtype=np.float64), values]))
+            labels.append(int(label))
+        if not rows:
+            raise ValueError("no digits with angle-positions")
+        data = np.concatenate(rows)
+        atoms = DigitAtoms(
+            picture=data[:, 0].astype(np.int64),
+            angle=data[:, 1],
+            y=np.rint(data[:, 3]).astype(np.int64),
+            x=np.rint(data[:, 2]).astype(np.int64),
+            labels=np.asarray(labels, dtype=np.int64),
+            images=np.stack(images),
+        )
+        LOGGER.event(
+            "window_level.atoms",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "split": "train" if train else "test",
+                "pictures": atoms.pictures,
+                "atoms": int(atoms.picture.shape[0]),
+                "atoms_per_picture": float(atoms.picture.shape[0]) / atoms.pictures,
+            },
+        )
+        return atoms
+
+    @staticmethod
+    def _plane_encoder(title: str, size, widest_radius: float, narrowest_radius: float) -> Encoder:
+        """Кодер двумерной координаты уровня (§4.3): от него берутся детекторы-круги и их слои."""
+        if WINDOW_LEVEL_HALVING_LAYERS:
+            layers = halving_detector_layers(
+                layers_count=WINDOW_LEVEL_LAYERS,
+                widest_detectors=WINDOW_LEVEL_PLANE_DETECTORS_WIDEST,
+                overlap=WINDOW_LEVEL_OVERLAP,
+            )
+        else:
+            layers = plane_detector_layers(
+                layers_count=WINDOW_LEVEL_LAYERS,
+                widest_radius=widest_radius,
+                narrowest_radius=narrowest_radius,
+                overlap=WINDOW_LEVEL_OVERLAP,
+            )
+        return Encoder(
+            PlaneDimension(
+                title,
+                size,
+                layers,
+                code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+                layer_bands=False,
+            ),
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            layer_phase=ENCODER_LAYER_PHASE,
+        )
+
+    @staticmethod
+    def _atom_elements(atoms: DigitAtoms) -> LevelElements:
+        """Уровень 0: элемент — углопозиция, «что» — её направление (детекторы угла, §4.4)."""
+        angles, angle_index = np.unique(atoms.angle, return_inverse=True)
+        what = Encoder(
+            ClosedDimension(
+                "Angle",
+                (MNIST_ANGLE_MIN, MNIST_ANGLE_MAX),
+                geometric_detector_layers(
+                    layers_count=WINDOW_LEVEL_LAYERS,
+                    widest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_WIDEST,
+                    narrowest_detectors=WINDOW_LEVEL_ANGLE_DETECTORS_NARROWEST,
+                    overlap=WINDOW_LEVEL_OVERLAP,
+                ),
+                code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+            ),
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            layer_phase=ENCODER_LAYER_PHASE,
+        )
+        return LevelElements(
+            picture=atoms.picture,
+            what_values=angles,
+            what_index=angle_index.reshape(-1),
+            y=atoms.y,
+            x=atoms.x,
+            what=what,
+        )
+
+    @staticmethod
+    def _fit_and_encode(
+        encoder: ConjunctionEncoder,
+        what_values: "np.ndarray",
+        what_index: "np.ndarray",
+        where_values: "np.ndarray",
+        where_index: "np.ndarray",
+        groups: "np.ndarray",
+        group_count: int,
+        sample_groups: int,
+        target_density: float,
+    ) -> "np.ndarray":
+        encoder.fit_length(
+            what_values,
+            what_index,
+            where_values,
+            where_index,
+            groups,
+            sample_groups=sample_groups,
+            target_density=target_density,
+            min_length=WINDOW_LEVEL_CODE_LENGTH_MIN,
+            max_length=WINDOW_LEVEL_CODE_LENGTH_MAX,
+        )
+        return encoder.encode_sets(what_values, what_index, where_values, where_index, groups, group_count)
+
+    def _next_level(
+        self,
+        elements: LevelElements,
+        window: LevelWindow,
+        labels: "np.ndarray",
+        train_pictures: int,
+        number: int,
+    ) -> LevelElements:
+        """Шаг вверх: куски уровня в окнах window, их коды, словарь образцов, карта форм и места кусков."""
+        pieces = window.windows.pieces(elements.picture, elements.y, elements.x)
+        extent = window.extent
+        thrown = isinstance(window.windows, DetectorWindows)
+        if thrown:
+            # Внутри широкого круга — слои кругов вдвое и вчетверо меньше: 2 / (1 − o) кругов по его диаметру.
+            where = Encoder(
+                PlaneDimension(
+                    f"Offset{number}",
+                    ((-extent, extent), (-extent, extent)),
+                    halving_detector_layers(
+                        layers_count=WINDOW_LEVEL_DETECTOR_INNER_LAYERS,
+                        widest_detectors=max(2, int(round(2.0 / (1.0 - WINDOW_LEVEL_DETECTOR_OVERLAP)))),
+                        overlap=WINDOW_LEVEL_DETECTOR_OVERLAP,
+                    ),
+                    code_length=WINDOW_LEVEL_AXIS_CODE_LENGTH,
+                    layer_bands=False,
+                ),
+                random_seed=WINDOW_LEVEL_RANDOM_SEED,
+                layer_phase=ENCODER_LAYER_PHASE,
+            )
+        else:
+            where = self._plane_encoder(
+                f"Offset{number}",
+                ((-extent, extent), (-extent, extent)),
+                0.5,
+                WINDOW_LEVEL_OFFSET_RADIUS_MIN / (2.0 * extent),
+            )
+        encoder = ConjunctionEncoder(
+            elements.what,
+            where,
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            # Слоёв «что» и слоёв кругов внутри широкого разное число: пары берутся из любых двух слоёв.
+            cross_layers=thrown or self._layers_differ(elements.what, where),
+            nested=WINDOW_LEVEL_NESTED_CIRCLES,
+            name=f"piece-{number}",
+        )
+        codes = self._fit_and_encode(
+            encoder,
+            elements.what_values,
+            elements.what_index[pieces.element],
+            pieces.offsets,
+            pieces.offset,
+            pieces.piece,
+            pieces.count,
+            WINDOW_LEVEL_CALIBRATION_PIECES,
+            WINDOW_LEVEL_TARGET_DENSITY,
+        )
+        train_rows = np.flatnonzero(pieces.picture < train_pictures)
+        if WINDOW_LEVEL_DICTIONARY not in WINDOW_LEVEL_DICTIONARY_KINDS:
+            raise ValueError(f"WINDOW_LEVEL_DICTIONARY must be one of {WINDOW_LEVEL_DICTIONARY_KINDS}")
+        if WINDOW_LEVEL_DICTIONARY == "all":
+            taught = np.ascontiguousarray(codes[train_rows])
+            dictionary = CodeDictionary(
+                packed=taught,
+                rows=np.arange(train_rows.shape[0], dtype=np.int64),
+                code_length=encoder.code_length,
+                distinct=int(np.unique(taught.view(np.dtype((np.void, taught.shape[1]))).reshape(-1)).shape[0]),
+            )
+            LOGGER.event(
+                "window_level.space",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "level": number,
+                    "points": dictionary.count,
+                    "distinct": dictionary.distinct,
+                    "note": "точкой карты уровня становится каждый кусок обучающих картинок: размер пространства "
+                    "уровня равен числу кусков",
+                },
+            )
+        else:
+            dictionary = LeaderDictionary(
+                similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY,
+                max_size=WINDOW_LEVEL_DICTIONARY_MAX,
+                use_gpu=ACTIVATION_USE_GPU,
+            ).select(codes[train_rows], encoder.code_length)
+        name = f"shapes{number}"
+        # Подпись точки карты форм — цифра, где образец встретился первым.
+        shapes = self._layout_bits(dictionary.bits(), labels[pieces.picture[train_rows[dictionary.rows]]], name)
+        self._export(shapes, name)
+        self._shape_glyphs(shapes, dictionary, pieces, train_rows, number, window)
+        lattice = isinstance(window.windows, AttentionWindows)
+        if WINDOW_LEVEL_MAP_DETECTORS not in WINDOW_LEVEL_MAP_DETECTOR_KINDS:
+            raise ValueError(f"WINDOW_LEVEL_MAP_DETECTORS must be one of {WINDOW_LEVEL_MAP_DETECTOR_KINDS}")
+        if WINDOW_LEVEL_MAP_DETECTORS == "hierarchy":
+            what_values, what_index, what = self._hierarchy_what(shapes, dictionary, codes, number)
+        else:
+            places = NearestPointActivation(shapes, use_gpu=ACTIVATION_USE_GPU, name=name).place(
+                codes, similarity_threshold=WINDOW_LEVEL_MERGE_SIMILARITY
+            )
+            what_values, what_index = np.unique(places.cells, axis=0, return_inverse=True)
+            what_index = what_index.reshape(-1)
+            what = self._plane_encoder(
+                f"Shape{number}",
+                ((0.0, float(shapes.height)), (0.0, float(shapes.width))),
+                WINDOW_LEVEL_SHAPE_RADIUS_MAX,
+                WINDOW_LEVEL_SHAPE_RADIUS_MIN,
+            )
+        return LevelElements(
+            picture=pieces.picture,
+            what_values=what_values,
+            what_index=what_index,
+            # Центр блока и центр наброшенного круга нецелые и нужны точными: по ним собираются куски следующего
+            # уровня. Центры круглых окон с шагом стоят в узлах сетки.
+            y=np.rint(pieces.centre[:, 0]).astype(np.int64) if lattice else pieces.centre[:, 0],
+            x=np.rint(pieces.centre[:, 1]).astype(np.int64) if lattice else pieces.centre[:, 1],
+            what=what,
+        )
+
+    def _hierarchy_what(
+        self, shapes: Layout, dictionary: CodeDictionary, codes: "np.ndarray", number: int
+    ) -> tuple["np.ndarray", "np.ndarray", DetectedCodes]:
+        """«Что» кусков по способу статьи: иерархия детекторов над картой уровня и детекторы, сработавшие на код.
+
+        Возвращает значения «что» (номера различных кодов кусков), номер значения у каждого куска и источник
+        детекторов для кода следующего уровня.
+        """
+        name = f"shapes{number}"
+        energies = shapes.point_energies(ACTIVATION_POINT_ENERGY_RADIUS)
+        quantiles = (WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE, WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE)
+        low, high = PairwiseSimilarity(seed=WINDOW_LEVEL_RANDOM_SEED).quantiles(
+            dictionary.bits(), quantiles, name=f"{name}-hierarchy"
+        )
+        thresholds = np.linspace(low, max(low, high), WINDOW_LEVEL_HIERARCHY_LAYERS)
+        if WINDOW_LEVEL_HIERARCHY_THRESHOLDS is not None:
+            thresholds = np.asarray(sorted(WINDOW_LEVEL_HIERARCHY_THRESHOLDS), dtype=np.float64)
+        extent = max(1, min(shapes.width, shapes.height))
+        specs = ACTIVATION_DETECTOR_LAYER_SPECS
+        configs = []
+        for layer, threshold in enumerate(thresholds):
+            # Радиус активации и минимум точек — у слоя той же относительной глубины из настроек первой раскладки.
+            _, radius_factor, min_points = specs[min(len(specs) - 1, layer * len(specs) // len(thresholds))]
+            configs.append(
+                DetectorLayerConfig(
+                    lambda_threshold=float(threshold),
+                    activation_radius=max(ACTIVATION_DETECTOR_RADIUS_MIN, int(round(extent * float(radius_factor)))),
+                    min_points=int(min_points),
+                )
+            )
+        detectors = DetectorHierarchyBuilder(
+            layout=shapes,
+            energies=energies,
+            layer_configs=tuple(configs),
+            radius_min=ACTIVATION_DETECTOR_RADIUS_MIN,
+            output_bits=ACTIVATION_OUTPUT_BITS,
+            energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
+            eta=ACTIVATION_ETA,
+            attempts_without_change=ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
+            seed=ACTIVATION_DETECTOR_SEED,
+            clusterer=DbscanClusterer(eps=ACTIVATION_DBSCAN_EPS, min_samples=ACTIVATION_DBSCAN_MIN_SAMPLES),
+        ).build()
+        detection = HierarchyDetection(
+            shapes,
+            detectors,
+            energies,
+            similarity=LAYOUT_SIMILARITY,
+            lambda_threshold=float(
+                thresholds[0] if WINDOW_LEVEL_HIERARCHY_ACTIVATION_LAMBDA is None else WINDOW_LEVEL_HIERARCHY_ACTIVATION_LAMBDA
+            ),
+            eta=ACTIVATION_ETA,
+            energy_threshold=ACTIVATION_ENERGY_THRESHOLD,
+            detector_threshold=WINDOW_LEVEL_HIERARCHY_DETECTOR_THRESHOLD,
+            activate_best=WINDOW_LEVEL_HIERARCHY_ACTIVATE_BEST,
+            use_gpu=ACTIVATION_USE_GPU,
+            name=name,
+        )
+        # Одинаковые коды зажигают одни и те же детекторы: считаем только для различных.
+        packed = np.ascontiguousarray(codes)
+        view = packed.view(np.dtype((np.void, packed.shape[1]))).reshape(-1)
+        _, first, inverse = np.unique(view, return_index=True, return_inverse=True)
+        rows, found = detection.active(packed[first])
+        what = DetectedCodes(f"Shape{number}", rows, found, detection.layer_index, int(first.shape[0]))
+        return np.arange(first.shape[0], dtype=np.float64), inverse.reshape(-1), what
+
+    @staticmethod
+    def _layers_differ(what, where) -> bool:  # noqa: ANN001
+        """Разное ли число слоёв у двух источников детекторов: тогда пары берутся из любых двух слоёв."""
+        return int(what.detector_layer_indices().max()) != int(where.detector_layer_indices().max())
+
+    def _picture_segment(
+        self, elements: LevelElements, place: Encoder, pictures: int, number: int
+    ) -> tuple["np.ndarray", int]:
+        """Сегмент кода картинки от одного уровня: «что элемента × его место на картинке», OR по элементам."""
+        spots, spot_index = np.unique(
+            np.stack([elements.y, elements.x], axis=1).astype(np.float64), axis=0, return_inverse=True
+        )
+        encoder = ConjunctionEncoder(
+            elements.what,
+            place,
+            random_seed=WINDOW_LEVEL_RANDOM_SEED,
+            cross_layers=WINDOW_LEVEL_CROSS_LAYERS or self._layers_differ(elements.what, place),
+            nested=WINDOW_LEVEL_NESTED_CIRCLES,
+            name=f"picture-{number}",
+        )
+        packed = self._fit_and_encode(
+            encoder,
+            elements.what_values,
+            elements.what_index,
+            spots,
+            spot_index.reshape(-1),
+            elements.picture,
+            pictures,
+            WINDOW_LEVEL_CALIBRATION_PICTURES,
+            WINDOW_LEVEL_PICTURE_DENSITY,
+        )
+        return packed, encoder.code_length
+
+    @staticmethod
+    def _lambda_schedule(bits: "np.ndarray", name: str) -> LayoutLambdaSchedule:
+        """Пороги λ раскладки кодов — квантилями их попарных сходств (§7.1.7)."""
+        quantiles = (WINDOW_LEVEL_LAYOUT_LAMBDA_QUANTILE, WINDOW_LEVEL_LAYOUT_LAMBDA_MAX_QUANTILE)
+        start, maximum = PairwiseSimilarity(seed=WINDOW_LEVEL_RANDOM_SEED).quantiles(bits, quantiles, name=name)
+        return LayoutLambdaSchedule.from_quantiles(
+            start, maximum, start_quantile=quantiles[0], maximum_quantile=quantiles[1]
+        )
+
+    def _layout_bits(self, bits: "np.ndarray", labels: "np.ndarray", name: str) -> Layout:
+        """Раскладка кодов тем же Layout и с той же настройкой, что первая; цвет точки — класс цифры."""
+        table = LayoutCodeTable.from_bits(
+            bits,
+            hues=(labels * SECOND_LEVEL_CLASS_HUE_STEP).tolist(),
+            labels=[int(label) for label in labels],
+        ).grouped_by_hue()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        return _layout_from_codes(
+            table, tuner.tune(table.count), self._primary.colorizer, lambda_schedule=self._lambda_schedule(bits, name)
+        )
+
+    def _export(self, layout: Layout, name: str) -> None:
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        stem = f"{WINDOW_LEVEL_FILE_PREFIX}-{name}-{self.count}-{suffix}"
+        layout.save_json(f"{stem}-{LAYOUT_CACHE_TAG}.json")
+        MnistLayoutRunner._save_layout_images(
+            layout,
+            image_path=f"{stem}.png",
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
+        )
+
+    def _picture_map(self, packed: "np.ndarray", labels: "np.ndarray", code_length: int, number: int) -> None:
+        """Карта цифр: раскладка кодов обучающих картинок; собрались ли классы рядом (§5.13.2)."""
+        bits = np.unpackbits(packed, axis=1, count=code_length)
+        limit = (WINDOW_LEVEL_PICTURE_MAP_CELLS // packed.shape[0]) // 8 * 8
+        if code_length > limit:
+            # Длинные коды многих картинок не помещаются в память раскладки: берётся случайная выборка бит.
+            # Плотность и ожидаемое сходство кодов при этом те же (§2.2.4), растёт только разброс сходства.
+            columns = np.sort(
+                np.random.default_rng(WINDOW_LEVEL_RANDOM_SEED).choice(code_length, size=limit, replace=False)
+            )
+            bits = np.ascontiguousarray(bits[:, columns])
+            LOGGER.event(
+                "window_level.picture_map.sample",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "pictures": int(packed.shape[0]),
+                    "code_length": int(code_length),
+                    "sampled_bits": int(limit),
+                    "note": "карта цифр раскладывается по случайной выборке бит кода картинки; проверка узнавания "
+                    "идёт по полным кодам",
+                },
+            )
+        layout = self._layout_bits(bits, labels, "pictures")
+        self._export(layout, "pictures")
+        LabelMapQuality().measure(layout)
+        images = self._drawn.images
+
+        def paint(canvas, draw, row: int, left: int, top: int, size: int) -> None:  # noqa: ANN001
+            from PIL import Image
+
+            colour = np.asarray(self._hue_colour(float(labels[row]) * SECOND_LEVEL_CLASS_HUE_STEP), dtype=np.float64)
+            tinted = (images[row][:, :, None].astype(np.float64) / 255.0 * colour[None, None, :]).astype(np.uint8)
+            canvas.paste(Image.fromarray(tinted).resize((size, size)), (left, top))
+
+        glyphs = LayoutGlyphMap(layout, LayoutCodeTable.pack_bits(bits))
+        glyphs.save(
+            f"{WINDOW_LEVEL_FILE_PREFIX}-level{number}-pictures-{self.count}.glyphs.png",
+            paint,
+            tile=glyphs.tile_size(WINDOW_LEVEL_DIGIT_TILE),
+            title=f"Уровень {number} — картинки: карта цифр, {packed.shape[0]} картинок, цвет — цифра",
+        )
+
+    @staticmethod
+    def _hue_colour(hue: float) -> tuple[int, int, int]:
+        import colorsys
+
+        red, green, blue = colorsys.hsv_to_rgb((hue % 360.0) / 360.0, 0.9, 1.0)
+        return int(red * 255), int(green * 255), int(blue * 255)
+
+    def _shape_glyphs(
+        self,
+        shapes: Layout,
+        dictionary: CodeDictionary,
+        pieces: WindowPieces,
+        train_rows: "np.ndarray",
+        number: int,
+        window: LevelWindow,
+    ) -> None:
+        """Карта форм рисунками: в ячейке образца — углопозиции картинки в его поле зрения, цвет — направление."""
+        rows = train_rows[dictionary.rows]
+        picture, centre = pieces.picture[rows], pieces.centre[rows]
+        atoms, starts = self._drawn, self._atom_starts
+        # Сколько клеток от центра помещается в ячейке рисунка: поле зрения и поле вокруг него.
+        reach = window.field + 1.0 if window.square else math.ceil(window.field) + 1
+        # Поле зрения шире картинки: кусок рисуется в рамке всей картинки, а не вокруг своего центра, иначе
+        # рисунок занимает малую долю ячейки.
+        whole = reach > WINDOW_LEVEL_GRID / 2.0 + 1.0
+        if whole:
+            reach = WINDOW_LEVEL_GRID / 2.0 + 1.0
+        middle = (WINDOW_LEVEL_GRID - 1) / 2.0
+
+        def paint(canvas, draw, sample: int, left: int, top: int, size: int) -> None:  # noqa: ANN001
+            unit = size / (2.0 * reach)
+            draw.rectangle((left, top, left + size - 1, top + size - 1), outline=(38, 38, 38))
+            centre_y, centre_x = centre[sample]
+            first, last = int(starts[picture[sample]]), int(starts[picture[sample] + 1])
+            for index in range(first, last):
+                dy, dx = atoms.y[index] - centre_y, atoms.x[index] - centre_x
+                if not window.sees(dy, dx):
+                    continue
+                # Угол углопозиции — направление перепада яркости, оно поперёк линии цифры. Отрезок рисуется
+                # вдоль края (поворот на 90°) стрелкой: так глаз видит саму линию.
+                along = math.radians(float(atoms.angle[index]) + 90.0)
+                if whole:
+                    dy, dx = atoms.y[index] - middle, atoms.x[index] - middle
+                px, py = left + size / 2.0 + dx * unit, top + size / 2.0 + dy * unit
+                half = unit * 0.45
+                # Угол отсчитан с осью Y вверх (ядро Собеля по Y — верх минус низ), на картинке ось Y вниз:
+                # вертикальная составляющая берётся с обратным знаком.
+                ux, uy = math.cos(along) * half, -math.sin(along) * half
+                colour = self._hue_colour(float(atoms.angle[index]))
+                width = 2 if unit >= 5 else 1
+                draw.line((px - ux, py - uy, px + ux, py + uy), fill=colour, width=width)
+                if half >= 4:  # наконечник различим только на достаточно длинной стрелке
+                    for turn in (150.0, -150.0):
+                        side = along + math.radians(turn)
+                        draw.line(
+                            (px + ux + math.cos(side) * half * 0.7, py + uy - math.sin(side) * half * 0.7, px + ux, py + uy),
+                            fill=colour,
+                            width=width,
+                        )
+
+        glyphs = LayoutGlyphMap(shapes, dictionary.packed)
+        glyphs.save(
+            f"{WINDOW_LEVEL_FILE_PREFIX}-level{number}-shapes-{self.count}.glyphs.png",
+            paint,
+            tile=glyphs.tile_size(WINDOW_LEVEL_SHAPE_TILE),
+            title=f"Уровень {number} — куски: карта форм, {dictionary.count} образцов, {window.title}; "
+            "отрезок — углопозиция, цвет — направление",
+        )
+
+
+@dataclass(frozen=True)
+class SecondLevelPointReport:
+    """Итог варианта «код на углопозицию»: коды второго уровня и сравнение первой и второй карт."""
+
+    codes: PointCodeSummary
+    first: MapContinuity  # первая карта
+    second: MapContinuity  # вторая карта (те же углопозиции на новых местах)
+    first_energy: MapEnergy  # исходные коды на местах первой раскладки
+    second_energy: MapEnergy  # исходные коды на местах второй раскладки
+    place_energy: float  # Ē второй раскладки на её собственных кодах (кодах мест)
+    correspondence: MapCorrespondence
+    image_path: str
+
+
+class MnistSecondLevelPointRunner:
+    """Второй уровень на MNIST, вариант «код на углопозицию» (§4.3, §6.2; расширение статьи; эксперимент).
+
+    1. Первая раскладка углопозиций — обычным конвейером (MnistLayoutRunner, только раскладка).
+    2. Каждая её точка получает код второго уровня (LayoutPointCodes): стимул точки зажигает точки первой
+       раскладки, зажжённые точки активируют детекторы-круги (§4.3). Правило "best" — зажигаются точки с тем
+       же кодом, код точки — код её места; правило "threshold" — все точки со сходством ≥ λ_a (§6.5), код
+       точки — код набора мест всех похожих на неё кодов.
+    3. Эти коды раскладываются тем же Layout с той же настройкой. Точка второй раскладки — та же углопозиция
+       (тот же угол и подпись), поэтому карты сравниваются точка в точку.
+    4. Сравнение карт (StimulusMapMeter): стенки по углу и позиции окна (§5.13.2), качество Ē исходных кодов
+       на новых местах (§5.8), соответствие расстановок.
+    """
+
+    def __init__(self, *, count: int, reuse_cache: bool = True, activation: str | None = None) -> None:
+        self.count = int(count)
+        self._activation = SECOND_LEVEL_POINT_ACTIVATION if activation is None else activation
+        if self._activation not in SECOND_LEVEL_POINT_ACTIVATION_RULES:
+            raise ValueError(f"activation rule must be one of {SECOND_LEVEL_POINT_ACTIVATION_RULES}")
+        self._primary = MnistLayoutRunner(count=count, reuse_cache=reuse_cache, layout_only=True)
+        self._params: TunedLayoutParams | None = None
+
+    def run(self) -> SecondLevelPointReport:
+        """Первая раскладка, коды мест её точек, вторая раскладка и сравнение двух карт."""
+        first = self._primary.run()
+        detection = _build_point_plane_detection(first, self._activation)
+        codes = LayoutPointCodes(detection, first.code_table)
+        summary = codes.log_summary(
+            first.cells_array(),
+            similarity=LAYOUT_SIMILARITY,
+            lambda_threshold=LAYOUT_LAMBDA_THRESHOLD,
+            seed=SECOND_LEVEL_POINT_RANDOM_SEED,
+        )
+        # Память устройства первой раскладки нужна второй; дальше от первой берутся только ячейки и коды.
+        first.release_device()
+        second = self._layout_codes(codes)
+        image_path = self._export(second)
+        return self._compare(first, second, summary, image_path)
+
+    def _layout_codes(self, codes: LayoutPointCodes) -> Layout:
+        """Раскладка кодов мест тем же алгоритмом и с той же настройкой, что первая (§6.2, §6.6).
+
+        Порядок точек таблицы не меняется: i-я точка второй раскладки — i-я точка первой.
+        """
+        table = codes.table()
+        tuner = LayoutParameterTuner(
+            empty_ratio=LAYOUT_EMPTY_RATIO,
+            start_radius_factor=LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
+        )
+        self._params = tuner.tune(table.count)
+        return _layout_from_codes(table, self._params, self._primary.colorizer)
+
+    def _export(self, layout: Layout) -> str:
+        """JSON и карты второй раскладки: псевдоцвета кода места, раскраска по углу стимула, яркость по энергии."""
+        suffix = "auto" if layout.pair_radius is None else str(layout.pair_radius)
+        # Файлы правила "best" — без пометки; у другого правила его имя входит в имя файла.
+        rule = "" if self._activation == "best" else f"-{self._activation}"
+        stem = f"{SECOND_LEVEL_POINT_FILE_PREFIX}{rule}-{self.count}-{suffix}"
+        layout.save_json(f"{stem}-{LAYOUT_CACHE_TAG}.json")
+        image_path = f"{stem}.png"
+        MnistLayoutRunner._save_layout_images(
+            layout,
+            image_path=image_path,
+            energies=layout.point_energies(ACTIVATION_POINT_ENERGY_RADIUS),
+        )
+        return image_path
+
+    def _stimulus_positions(self, table: LayoutCodeTable) -> "np.ndarray":
+        """Позиция окна (X, Y) стимула каждой точки раскладки — только для сравнения карт (вне статьи).
+
+        Таблица кодов хранит угол стимула (hue), но не окно. Углопозиции цифр набора извлекаются заново тем же
+        экстрактором и кодируются тем же кодером; окно точки находится по её коду.
+        """
+        from torchvision import transforms
+        from torchvision.datasets import MNIST
+
+        dataset = MNIST(root="./data", train=True, download=True, transform=transforms.ToTensor())
+        encoder = self._primary.encoder
+        extractor = self._primary.extractor
+        windows: dict[bytes, tuple[float, float]] = {}
+        ambiguous = 0
+        for index, (image, digit) in enumerate(dataset):
+            if index >= self.count:
+                break
+            measurements = extractor.extract(image.squeeze(0).numpy(), int(digit))[int(digit)]
+            if not measurements:
+                continue
+            packed = LayoutCodeTable.pack_bits(
+                encoder.encode_matrix([(float(a), float(x), float(y)) for a, x, y in measurements])
+            )
+            for row, (_, x, y) in enumerate(measurements):
+                window = (float(x), float(y))
+                if windows.setdefault(packed[row].tobytes(), window) != window:
+                    ambiguous += 1
+        positions = np.zeros((table.count, 2), dtype=np.float64)
+        source = table.packed
+        for index in range(table.count):
+            window = windows.get(source[index].tobytes())
+            if window is None:
+                raise ValueError("a layout point has no stimulus among the first digits of the dataset")
+            positions[index] = window
+        LOGGER.event(
+            "second_level.points.stimulus_positions",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "points": table.count,
+                "codes": len(windows),
+                "ambiguous": ambiguous,
+                "note": "окно (X, Y) стимула точки найдено по её коду; ambiguous — стимулы с тем же кодом, "
+                "но другим окном (берётся первое)",
+            },
+        )
+        return positions
+
+    def _source_energy(
+        self, meter: StimulusMapMeter, table: LayoutCodeTable, cells: "np.ndarray", name: str
+    ) -> MapEnergy:
+        """Качество Ē (§5.8) исходных кодов точек, расставленных по ячейкам cells."""
+        if self._params is None:
+            raise ValueError("the second layout must be built first")
+        layout = _new_layout(table, self._params, self._primary.colorizer, initial_cells=cells)
+        try:
+            return meter.energy(layout, LAYOUT_ENERGY_RADIUS, name=name)
+        finally:
+            layout.release_device()
+
+    def _save_source_images(
+        self,
+        meter: StimulusMapMeter,
+        first_cells: "np.ndarray",
+        second_cells: "np.ndarray",
+        shape: tuple[int, int],
+        image_path: str,
+    ) -> None:
+        """Карты «место точки на первой карте»: вторая карта и первая как легенда (цветовой круг)."""
+        from PIL import Image
+
+        stem = os.path.splitext(image_path)[0]
+        source_path = stem + SECOND_LEVEL_POINT_SOURCE_IMAGE_SUFFIX
+        legend_path = stem + SECOND_LEVEL_POINT_SOURCE_LEGEND_SUFFIX
+        Image.fromarray(meter.source_position_image(first_cells, second_cells, shape, name="second")).save(source_path)
+        Image.fromarray(meter.source_position_image(first_cells, first_cells, shape, name="first")).save(legend_path)
+        LOGGER.event(
+            "second_level.points.visual.save",
+            section=OUTSIDE_ARTICLE,
+            data={"source_image": source_path, "legend_image": legend_path},
+        )
+
+    def _compare(
+        self,
+        first: Layout,
+        second: Layout,
+        summary: PointCodeSummary,
+        image_path: str,
+    ) -> SecondLevelPointReport:
+        """Сравнение первой и второй карт по стимулам соседей, качеству исходных кодов и соответствию мест."""
+        table = first.code_table
+        shape = (first.height, first.width)
+        if (second.height, second.width) != shape:
+            raise ValueError("the second layout must have the grid of the first one")
+        first_cells = first.cells_array()
+        second_cells = second.cells_array()
+        place_energy = second.average_local_energy(LAYOUT_ENERGY_RADIUS)
+        second.release_device()
+        meter = StimulusMapMeter(
+            table,
+            angle_period=LAYOUT_COMPONENT_PERIOD,
+            angle_jump=SECOND_LEVEL_POINT_ANGLE_JUMP,
+            similarity=LAYOUT_SIMILARITY,
+            similarity_floor=LAYOUT_LAMBDA_THRESHOLD,
+            positions=self._stimulus_positions(table),
+            position_jump=SECOND_LEVEL_POINT_POSITION_JUMP,
+            tear_distance=SECOND_LEVEL_POINT_TEAR_DISTANCE,
+        )
+        first_map = meter.continuity(first_cells, shape, name="first")
+        second_map = meter.continuity(second_cells, shape, name="second")
+        first_energy = self._source_energy(meter, table, first_cells, "first")
+        second_energy = self._source_energy(meter, table, second_cells, "second")
+        correspondence = meter.correspondence(first_cells, second_cells, shape)
+        self._save_source_images(meter, first_cells, second_cells, shape, image_path)
+        LOGGER.event(
+            "second_level.points.summary",
+            section=MAPPING_CONTINUITY,
+            data={
+                "count": self.count,
+                "points": table.count,
+                "activation": self._activation,
+                "code_density": summary.density_mean,
+                "codes_ordered": summary.ordered,
+                "wall_ratio_first": first_map.wall_ratio,
+                "wall_ratio_second": second_map.wall_ratio,
+                "angle_jump_ratio_first": first_map.angle_jump_ratio,
+                "angle_jump_ratio_second": second_map.angle_jump_ratio,
+                "low_similarity_ratio_first": first_map.low_similarity_ratio,
+                "low_similarity_ratio_second": second_map.low_similarity_ratio,
+                "energy_first": first_energy.average,
+                "energy_second": second_energy.average,
+                "energy_mean_first": first_energy.mean,
+                "energy_mean_second": second_energy.mean,
+                "kept_neighbours_ratio": correspondence.kept_neighbours_ratio,
+                "fit_explained": correspondence.fit_explained,
+                "image": image_path,
+                "note": "первая карта против второй (те же углопозиции на местах второй раскладки): стенки по "
+                "стимулам соседей (§5.13.2) и качество Ē исходных кодов (§5.8)",
+            },
+        )
+        return SecondLevelPointReport(
+            codes=summary,
+            first=first_map,
+            second=second_map,
+            first_energy=first_energy,
+            second_energy=second_energy,
+            place_energy=float(place_energy),
+            correspondence=correspondence,
+            image_path=image_path,
+        )
+
+
+def _add_second_points_parser(subparsers) -> None:  # noqa: ANN001
+    """Команда варианта «код на углопозицию»."""
+    parser = subparsers.add_parser(
+        "second-points",
+        help="второй уровень, код на углопозицию: код места каждой точки первой раскладки, раскладка этих "
+        "кодов и сравнение двух карт",
+    )
+    parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="игнорировать готовую первую раскладку в data/ и посчитать её заново",
+    )
+    parser.add_argument(
+        "--activation",
+        choices=SECOND_LEVEL_POINT_ACTIVATION_RULES,
+        default=SECOND_LEVEL_POINT_ACTIVATION,
+        help="правило зажигания: best — точки с тем же кодом (код места точки); threshold — все точки со "
+        "сходством не ниже порога активации (§6.5)",
+    )
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="DAMP MNIST demo")
     subparsers = parser.add_subparsers(dest="command")
@@ -3210,6 +4857,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     evaluate_parser.add_argument("--limit", type=int, default=DECODER_DATASET_LIMIT)
     evaluate_parser.add_argument("--split", choices=["train", "test"], default="test")
     evaluate_parser.add_argument("--temperature", type=float, default=None)
+    second_parser = subparsers.add_parser(
+        "second",
+        help="второй уровень: коды картинок из детекторов-кругов над первой раскладкой, их раскладка и проверка",
+    )
+    second_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
+    second_parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="игнорировать готовую первую раскладку в data/ и посчитать её заново",
+    )
+    second_parser.add_argument(
+        "--limit",
+        type=int,
+        default=SECOND_LEVEL_EVALUATE_LIMIT,
+        help="число картинок проверки нечётким поиском; 0 — без проверки",
+    )
+    second_parser.add_argument("--split", choices=["train", "test"], default="test")
+    window_parser = subparsers.add_parser(
+        "window",
+        help="уровень «окно внимания»: куски в координатах окна, карта форм, коды картинок и проверка",
+    )
+    window_parser.add_argument("--count", type=int, default=DECODER_DEFAULT_COUNT)
+    window_parser.add_argument(
+        "--limit",
+        type=int,
+        default=WINDOW_LEVEL_EVALUATE_LIMIT,
+        help="число картинок проверки нечётким поиском; 0 — без проверки",
+    )
+    window_parser.add_argument("--split", choices=["train", "test"], default="test")
+    _add_second_points_parser(subparsers)
     return parser
 
 
@@ -3266,6 +4943,28 @@ def main() -> None:
             log_first=False,
         )
         print(f"dataset={args.split} samples={args.limit} accuracy={accuracy:.4f}")
+        return
+    if command == "second":
+        second_runner = MnistSecondLevelRunner(
+            count=args.count,
+            reuse_cache=not args.rebuild,
+            evaluate_limit=args.limit,
+            split=args.split,
+        )
+        second_accuracy = second_runner.run()
+        if second_accuracy is not None:
+            print(f"second level: dataset={args.split} samples={args.limit} accuracy={second_accuracy:.4f}")
+        return
+    if command == "window":
+        window_accuracy = MnistWindowLevelRunner(count=args.count, evaluate_limit=args.limit, split=args.split).run()
+        if window_accuracy is not None:
+            report = " ".join(f"accuracy@{k}={value:.4f}" for k, value in window_accuracy.items())
+            print(f"window level: dataset={args.split} samples={args.limit} {report}")
+        return
+    if command == "second-points":
+        MnistSecondLevelPointRunner(
+            count=args.count, reuse_cache=not args.rebuild, activation=args.activation
+        ).run()
         return
     parser.error(f"unknown command {command}")
 
