@@ -29,7 +29,8 @@ from damp.encoding.damp_encoder import (  # noqa: E402
 from damp.layout.damp_layout import Layout  # noqa: E402
 from damp.layout.payload import LayoutEncodedCode  # noqa: E402
 from damp.logging import LOGGER  # noqa: E402
-import main  # noqa: E402
+from damp.encoding import mnist_codes  # noqa: E402
+from damp import settings  # noqa: E402
 
 LOGGER.configure_intervals({}, default_interval=10**9)
 
@@ -106,15 +107,26 @@ class EncoderInvariantTests(unittest.TestCase):
         angle = ClosedDimension("Angle", (0.0, 360.0), angle_layers, code_length=48)
         x = OpenedDimension("X", (0.0, 6.0), x_layers, code_length=48)
         encoder = Encoder(angle, x, random_seed=0, shared_code=True)
-        view = DetectorLayerView(encoder, min_hue=0.0, max_hue=300.0, inactive_alpha=0.3, dpi=40, width_inches=8.0)
+        from damp.figures.style import figure_style
+
+        view = DetectorLayerView(
+            encoder,
+            style=figure_style(),
+            min_hue=0.0,
+            max_hue=300.0,
+            inactive_alpha=0.3,
+            panel=160,
+            code_columns=16,
+            code_cell=8,
+        )
         image = view.render((10.0, 3.0))
         self.assertEqual(image.ndim, 3)
         self.assertEqual(image.shape[2], 3)
         self.assertGreater(int(image.std()), 0)
-        self.assertEqual(view._layer_lanes(angle, 0), 2, "перекрытие 0.4: точку накрывают два соседних детектора")
-        self.assertEqual(view._layer_lanes(x, 2), 5, "перекрытие 0.8: точку накрывают пять соседних детекторов")
+        self.assertEqual(view.layer_lanes(0, 0), 2, "перекрытие 0.4: точку накрывают два соседних детектора")
+        self.assertEqual(view.layer_lanes(1, 2), 5, "перекрытие 0.8: точку накрывают пять соседних детекторов")
         wrapped = next(w for w in encoder.detectors if w.dimension_index == 0 and w.center - w.half_width < 0.0)
-        segments = view._field_segments(wrapped, angle)
+        segments = view.field_segments(wrapped, angle)
         self.assertEqual(len(segments), 2, "поле у границы периода рисуется двумя кусками")
         self.assertAlmostEqual(sum(end - start for start, end in segments), 2.0 * wrapped.half_width)
 
@@ -337,7 +349,7 @@ class LayoutInvariantTests(unittest.TestCase):
         self.assertEqual(component[0], component[1])
 
     def test_default_empty_ratio_matches_space_filling_margin(self) -> None:
-        self.assertEqual(main.LAYOUT_EMPTY_RATIO, 0.15)
+        self.assertEqual(settings.LAYOUT_EMPTY_RATIO, 0.15)
         layout = Layout(
             {float(i): [BitArray.from_indices(8, [i % 8])] for i in range(20)},
             empty_ratio=0.15,
@@ -530,30 +542,24 @@ class LayoutInvariantTests(unittest.TestCase):
 
     def test_main_layout_threshold_is_enabled(self) -> None:
         # §5.4: η = 0 выключает порог; η = None — жёсткий порог η = ∞ (§7.1.7).
-        self.assertTrue(main.LAYOUT_ETA is None or main.LAYOUT_ETA > 0.0)
-        self.assertGreater(main.LAYOUT_LAMBDA_THRESHOLD, 0.0)
+        self.assertTrue(settings.LAYOUT_ETA is None or settings.LAYOUT_ETA > 0.0)
+        self.assertGreater(settings.LAYOUT_LAMBDA_THRESHOLD, 0.0)
 
     def test_smoothing_flag_switches_long_phase_between_extension_and_article(self) -> None:
-        """LAYOUT_SMOOTH_PINWHEELS = False возвращает дальнюю фазу §5.5.1, §5.6, §7.1.7."""
+        """LAYOUT_SMOOTH_PINWHEELS = false возвращает дальнюю фазу §5.5.1, §5.6, §7.1.7."""
         import re
-        import sys
         import types
 
-        source = Path(main.__file__).read_text(encoding="utf-8")
-        pattern = re.compile(r"^LAYOUT_SMOOTH_PINWHEELS = (True|False)$", re.MULTILINE)
+        source = Path(settings.CONFIG_PATH).read_text(encoding="utf-8")
+        pattern = re.compile(r"^LAYOUT_SMOOTH_PINWHEELS = (true|false)$", re.MULTILINE)
         self.assertEqual(len(pattern.findall(source)), 1)
 
-        def load(flag: bool) -> types.ModuleType:
-            name = f"main_smooth_{flag}"
-            module = types.ModuleType(name)
-            module.__file__ = main.__file__
-            sys.modules[name] = module  # dataclass ищет модуль класса в sys.modules
-            try:
-                exec(compile(pattern.sub(f"LAYOUT_SMOOTH_PINWHEELS = {flag}", source), main.__file__, "exec"),
-                     module.__dict__)
-            finally:
-                del sys.modules[name]
-            return module
+        def load(flag: bool) -> types.SimpleNamespace:
+            # Тот же файл настроек с другим режимом: значения { smooth, article } берутся по флагу.
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "config.toml"
+                path.write_text(pattern.sub(f"LAYOUT_SMOOTH_PINWHEELS = {str(flag).lower()}", source), encoding="utf-8")
+                return types.SimpleNamespace(**settings._load(path))
 
         article = load(False)
         self.assertEqual(article.LAYOUT_LONG_KERNEL, "distance")
@@ -810,38 +816,38 @@ class PinwheelConfigurationTests(unittest.TestCase):
     """§2.2.3, §4.4: по 360 углов в каждой позиции кодируются как стимулы MNIST."""
 
     def test_pinwheel_encoder_matches_mnist_segments_and_detector_assignment(self) -> None:
-        from pinwheel_test import PinwheelEncoderFactory
+        from damp.layout.pinwheel import PinwheelEncoderFactory
 
-        self.assertEqual(main.PINWHEEL_ANGLE_COUNT, 360)
+        self.assertEqual(settings.PINWHEEL_ANGLE_COUNT, 360)
         encoder = PinwheelEncoderFactory.create()
-        reference = main._build_encoder()
+        reference = mnist_codes._build_encoder()
         self.assertEqual(encoder.signature, reference.signature)
         self.assertEqual([dim.title for dim in encoder.dimensions], ["Angle", "X", "Y"])
-        if main.ENCODER_SHARED_CODE:
-            self.assertEqual(encoder.code_length, main.ENCODER_SHARED_CODE_LENGTH)
+        if settings.ENCODER_SHARED_CODE:
+            self.assertEqual(encoder.code_length, settings.ENCODER_SHARED_CODE_LENGTH)
         else:
-            self.assertEqual(encoder.code_length, main.MNIST_ANGLE_CODE_LENGTH + 2 * main.MNIST_POSITION_CODE_LENGTH)
+            self.assertEqual(encoder.code_length, settings.MNIST_ANGLE_CODE_LENGTH + 2 * settings.MNIST_POSITION_CODE_LENGTH)
         for dimension in ("Angle", "X", "Y"):
             self.assertEqual(encoder.segment(dimension), reference.segment(dimension))
 
     def test_all_angles_use_every_position_and_exact_mnist_codes(self) -> None:
-        from pinwheel_test import PinwheelExperiment
+        from damp.layout.pinwheel import PinwheelExperiment
 
         experiment = PinwheelExperiment()
-        reference = main._build_encoder()
+        reference = mnist_codes._build_encoder()
         codes = experiment.encode_codes()
         self.assertEqual(sorted(codes), [float(angle) for angle in range(360)])
-        positions = len(main.PINWHEEL_POSITIONS)
+        positions = len(settings.PINWHEEL_POSITIONS)
         self.assertGreaterEqual(positions, 2)
-        self.assertEqual(len(set(main.PINWHEEL_POSITIONS)), positions)
+        self.assertEqual(len(set(settings.PINWHEEL_POSITIONS)), positions)
         self.assertEqual(sum(len(bucket) for bucket in codes.values()), 360 * positions)
         position_segments = {
             position: {dimension: set() for dimension in ("X", "Y")}
-            for position in main.PINWHEEL_POSITIONS
+            for position in settings.PINWHEEL_POSITIONS
         }
         for angle, bucket in codes.items():
-            self.assertEqual(len(bucket), len(main.PINWHEEL_POSITIONS))
-            for (x, y), entry in zip(main.PINWHEEL_POSITIONS, bucket):
+            self.assertEqual(len(bucket), len(settings.PINWHEEL_POSITIONS))
+            for (x, y), entry in zip(settings.PINWHEEL_POSITIONS, bucket):
                 _, expected = reference.encode(angle, x, y)
                 self.assertEqual(entry.code, expected, f"код ({angle}, {x}, {y}) отличается от MNIST")
                 active = set(entry.code.active_indices())
@@ -857,7 +863,7 @@ class PinwheelConfigurationTests(unittest.TestCase):
         self.assertNotEqual(codes[0.0][0].code, codes[0.0][1].code)
 
     def test_export_replaces_codes_and_labels_from_previous_experiment(self) -> None:
-        from pinwheel_test import PinwheelExperiment
+        from damp.layout.pinwheel import PinwheelExperiment
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "layout.json"
@@ -878,7 +884,7 @@ class PinwheelConfigurationTests(unittest.TestCase):
             payload = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(
                 payload["stimulus_positions"],
-                [{"x": x, "y": y} for x, y in main.PINWHEEL_POSITIONS],
+                [{"x": x, "y": y} for x, y in settings.PINWHEEL_POSITIONS],
             )
             expected = [(angle, entry) for angle, bucket in codes.items() for entry in bucket]
             self.assertEqual(payload["points"], len(expected))

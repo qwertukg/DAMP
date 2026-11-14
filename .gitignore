@@ -1,3 +1,20 @@
-**/__pycache__
-codes.json
+# Данные, кеши и журналы создают прогоны; MNIST torchvision скачивает сам в data/MNIST.
 data/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Системные файлы и редакторы
+.DS_Store
+Thumbs.db
+.idea/
+
+# Сгенерированная справка API (python client/apidocs.py)
+docs/api/

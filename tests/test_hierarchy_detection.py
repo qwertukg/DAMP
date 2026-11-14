@@ -1,17 +1,19 @@
 """Пакетное детектирование иерархией детекторов (§6.5) совпадает с ActivationEngine на одном стимуле."""
+
 from __future__ import annotations
 
 import os
 import sys
 import unittest
 
+
 os.environ.setdefault("RERUN", "off")
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "system"))
 
 import numpy as np  # noqa: E402
 
 from damp.activation import ActivationEngine, Detector  # noqa: E402
-from damp.activation.hierarchy_detection import DetectedCodes, HierarchyDetection  # noqa: E402
+from damp.activation.hierarchy_detection import HierarchyDetection  # noqa: E402
 from damp.encoding.bitarray import BitArray  # noqa: E402
 from tests.test_article_invariants import _clustered_layout  # noqa: E402
 
@@ -62,17 +64,6 @@ class HierarchyDetectionTest(unittest.TestCase):
         self.assertEqual(strict.active(far)[1].size, 0)  # сходство с любой точкой ниже 0.9: ничего не зажглось
         lenient = HierarchyDetection(layout, detectors, energies, lambda_threshold=0.9, activate_best=True, **settings)
         self.assertGreater(lenient.active(far)[1].size, 0)  # самая похожая точка зажжена и подняла детектор
-
-    def test_detected_codes_return_the_detectors_of_requested_codes(self) -> None:
-        rows = np.asarray([2, 0, 2, 0, 0])
-        detectors = np.asarray([5, 1, 3, 4, 0])
-        what = DetectedCodes("Shape", rows, detectors, np.asarray([0, 0, 0, 1, 1, 1]), count=3)
-        self.assertEqual(what.dimensions[0].title, "Shape")
-        asked, found = what.active_detectors(0, np.asarray([2.0, 1.0, 0.0]))
-        self.assertEqual(sorted(found[asked == 0].tolist()), [3, 5])
-        self.assertEqual(found[asked == 1].size, 0)
-        self.assertEqual(sorted(found[asked == 2].tolist()), [0, 1, 4])
-        self.assertEqual(what.detector_layer_indices().tolist(), [0, 0, 0, 1, 1, 1])
 
 
 if __name__ == "__main__":

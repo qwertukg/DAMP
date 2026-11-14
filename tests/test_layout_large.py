@@ -18,7 +18,10 @@ os.environ.setdefault("RERUN", "off")
 
 import numpy as np  # noqa: E402
 
-import main  # noqa: E402
+from damp.encoding import mnist_codes  # noqa: E402
+from damp.layout import mnist_layout  # noqa: E402
+from damp import settings  # noqa: E402
+from damp.stimuli import mnist as mnist_stimuli  # noqa: E402
 from damp.encoding.bitarray import BitArray  # noqa: E402
 from damp.encoding.damp_encoder import EncoderCodeColorizer  # noqa: E402
 from damp.layout.code_table import LayoutCodeTable  # noqa: E402
@@ -524,14 +527,14 @@ class SeededPlacementTests(unittest.TestCase):
         """_run_layout от затравки: все точки расставлены, порядок соседей не хуже затравки."""
         records = _records(2400, 44)
         table = _builder(records).code_table()
-        params = main.LayoutParameterTuner().tune(table.count)
+        params = mnist_layout.LayoutParameterTuner().tune(table.count)
         import dataclasses
 
         params = dataclasses.replace(
             params, seed_points=600, long_steps=300, short_steps=20, enforce_pair_radius=True,
             neighbourhood_sample_side=12,
         )
-        layout = main._run_layout(table, params, count=0, total_codes=table.count, use_cache=False)
+        layout = mnist_layout._run_layout(table, params, count=0, total_codes=table.count, use_cache=False)
         cells = layout.cells_array()
         self.assertEqual(len({(int(y), int(x)) for y, x in cells}), table.count)
         grid = np.full((layout.height, layout.width), -1, dtype=np.int64)
@@ -670,37 +673,37 @@ class TunerTests(unittest.TestCase):
     """§7.1.7: настройка до границы числа точек прежняя; выше — режим больших раскладок (сглаживание)."""
 
     def test_regime_boundary(self) -> None:
-        tuner = main.LayoutParameterTuner()
-        small = tuner.tune(main.LAYOUT_LONG_FULL_SPACE_MAX_POINTS)
+        tuner = mnist_layout.LayoutParameterTuner()
+        small = tuner.tune(settings.LAYOUT_LONG_FULL_SPACE_MAX_POINTS)
         self.assertIsNone(small.neighbourhood_sample_side)
         self.assertIsNone(small.long_subset_size)
-        self.assertLessEqual(small.long_pairs_per_step, main.LAYOUT_TUNE_LONG_PAIRS_MAX)
-        self.assertLessEqual(small.short_pairs_per_step, main.LAYOUT_TUNE_SHORT_PAIRS_MAX)
+        self.assertLessEqual(small.long_pairs_per_step, settings.LAYOUT_TUNE_LONG_PAIRS_MAX)
+        self.assertLessEqual(small.short_pairs_per_step, settings.LAYOUT_TUNE_SHORT_PAIRS_MAX)
         large = tuner.tune(1_000_000)
-        if not main.LAYOUT_SMOOTH_PINWHEELS:
+        if not settings.LAYOUT_SMOOTH_PINWHEELS:
             self.assertIsNone(large.neighbourhood_sample_side)
             return
-        self.assertEqual(large.neighbourhood_sample_side, main.LAYOUT_NEIGHBOURHOOD_SAMPLE_SIDE)
+        self.assertEqual(large.neighbourhood_sample_side, settings.LAYOUT_NEIGHBOURHOOD_SAMPLE_SIDE)
         self.assertTrue(large.enforce_pair_radius)
         self.assertFalse(small.enforce_pair_radius)
         self.assertIsNone(small.seed_points)
-        self.assertEqual(large.seed_points, main.LAYOUT_SEED_POINTS)
-        if main.LAYOUT_SEED_POINTS is None:
-            self.assertEqual(large.long_subset_size, main.LAYOUT_TUNE_LARGE_LONG_SUBSET)
+        self.assertEqual(large.seed_points, settings.LAYOUT_SEED_POINTS)
+        if settings.LAYOUT_SEED_POINTS is None:
+            self.assertEqual(large.long_subset_size, settings.LAYOUT_TUNE_LARGE_LONG_SUBSET)
         else:
             # Глобальный порядок — из раскладки затравки: подмножество B дальней фазе не нужно.
             self.assertIsNone(large.long_subset_size)
-        self.assertEqual(large.long_pairs_per_step, int(1_000_000 * main.LAYOUT_TUNE_LARGE_LONG_PAIR_FACTOR))
-        self.assertEqual(large.short_pairs_per_step, int(1_000_000 * main.LAYOUT_TUNE_LARGE_SHORT_PAIR_FACTOR))
-        self.assertLessEqual(large.short_local_radius, main.LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
-        self.assertLessEqual(large.short_energy_radius, main.LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX)
+        self.assertEqual(large.long_pairs_per_step, int(1_000_000 * settings.LAYOUT_TUNE_LARGE_LONG_PAIR_FACTOR))
+        self.assertEqual(large.short_pairs_per_step, int(1_000_000 * settings.LAYOUT_TUNE_LARGE_SHORT_PAIR_FACTOR))
+        self.assertLessEqual(large.short_local_radius, settings.LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
+        self.assertLessEqual(large.short_energy_radius, settings.LAYOUT_TUNE_LARGE_SHORT_ENERGY_RADIUS_MAX)
 
 
 class EncodingTests(unittest.TestCase):
     """§4.6: коды матрицей бит и коды рабочего процесса — те же, что объектами в основном процессе."""
 
     def test_encode_matrix_equals_encode_batch(self) -> None:
-        encoder = main._build_encoder()
+        encoder = mnist_codes._build_encoder()
         rows = [(float(angle), float(x), float(y)) for angle, x, y in ((10.0, 3.0, 4.0), (200.5, 20.0, 11.0), (359.0, 0.0, 27.0))]
         bits = encoder.encode_matrix(rows)
         batch = encoder.encode_batch(rows)
@@ -709,22 +712,22 @@ class EncodingTests(unittest.TestCase):
             self.assertEqual((row + 48).tobytes().decode("ascii"), code.to01())
 
     def test_worker_codes_equal_main_process_codes(self) -> None:
-        encoder = main._build_encoder()
-        extractor = main._build_extractor()
+        encoder = mnist_codes._build_encoder()
+        extractor = mnist_stimuli._build_extractor()
         rng = np.random.default_rng(5)
         image = np.zeros((28, 28), dtype=np.float32)
         image[6:22, 9:12] = 1.0
         image[6:9, 9:20] = 1.0
         image += rng.random((28, 28), dtype=np.float32) * 0.01
-        direct = main.StimulusCodeCache.encode_digit(encoder, extractor, image, 7)
+        direct = mnist_codes.StimulusCodeCache.encode_digit(encoder, extractor, image, 7)
         # Кодер и извлечение рабочего процесса заданы заранее: журнал этого процесса не выключается.
-        main.DigitEncodingWorker._encoder = main._build_encoder()
-        main.DigitEncodingWorker._extractor = main._build_extractor()
+        mnist_codes.DigitEncodingWorker._encoder = mnist_codes._build_encoder()
+        mnist_codes.DigitEncodingWorker._extractor = mnist_stimuli._build_extractor()
         try:
-            label, angles, packed = main.DigitEncodingWorker.encode([(image, 7)])[0]
+            label, angles, packed = mnist_codes.DigitEncodingWorker.encode([(image, 7)])[0]
         finally:
-            main.DigitEncodingWorker._encoder = None
-            main.DigitEncodingWorker._extractor = None
+            mnist_codes.DigitEncodingWorker._encoder = None
+            mnist_codes.DigitEncodingWorker._extractor = None
         self.assertGreater(direct.count, 0)
         self.assertEqual((label, angles), (direct.label, direct.angles))
         self.assertTrue(np.array_equal(packed, direct.packed))

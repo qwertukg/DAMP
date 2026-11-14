@@ -16,7 +16,10 @@ os.environ.setdefault("RERUN", "off")
 
 import numpy as np  # noqa: E402
 
-import main  # noqa: E402
+from damp.encoding import mnist_codes  # noqa: E402
+from damp.layout import mnist_layout  # noqa: E402
+from damp import settings  # noqa: E402
+from damp.stimuli import mnist as mnist_stimuli  # noqa: E402
 from damp.layout.damp_layout import AdaptiveLayoutConfig, Layout, ShortLayoutOptimConfig  # noqa: E402
 from damp.layout.seeded import SeededPlacement  # noqa: E402
 from damp.layout.window_energy_kernel import WindowEnergyKernel  # noqa: E402
@@ -523,20 +526,20 @@ class EncodedCodesFileTests(unittest.TestCase):
             return iter(self._items)
 
     def test_cached_codes_equal_encoded_codes(self) -> None:
-        encoder = main._build_encoder()
-        extractor = main._build_extractor()
+        encoder = mnist_codes._build_encoder()
+        extractor = mnist_stimuli._build_extractor()
         digits = self._Digits(40)
         with tempfile.TemporaryDirectory() as directory, mock.patch.multiple(
-            main, ENCODING_CODES_CACHE_MIN_DIGITS=10, ENCODING_PARALLEL_MIN_DIGITS=10**9
+            settings, ENCODING_CODES_CACHE_MIN_DIGITS=10, ENCODING_PARALLEL_MIN_DIGITS=10**9
         ):
-            store = main.EncodedCodesFile(directory, encoder=encoder, split="train", label=None)
-            first = main.StimulusCodeCache(digits, encoder, extractor, label=None, store=store)
+            store = mnist_codes.EncodedCodesFile(directory, encoder=encoder, split="train", label=None)
+            first = mnist_codes.StimulusCodeCache(digits, encoder, extractor, label=None, store=store)
             encoded = first.take(30)
             self.assertTrue(os.path.exists(store.path))
             self.assertGreater(sum(item.count for item in encoded), 0)
             # Повторный запуск: коды берутся из файла, набор не кодируется.
-            second = main.StimulusCodeCache(digits, encoder, extractor, label=None, store=store)
-            with mock.patch.object(main.StimulusCodeCache, "encode_digit", side_effect=AssertionError("encoded")):
+            second = mnist_codes.StimulusCodeCache(digits, encoder, extractor, label=None, store=store)
+            with mock.patch.object(mnist_codes.StimulusCodeCache, "encode_digit", side_effect=AssertionError("encoded")):
                 cached = second.take(30)
             self.assertEqual(len(cached), len(encoded))
             for left, right in zip(encoded, cached):
@@ -546,24 +549,24 @@ class EncodedCodesFileTests(unittest.TestCase):
                 self.assertEqual(left.code_length, right.code_length)
             # Следующие цифры набора кодируются после взятых из файла — те же, что без файла.
             more = second.take(40)
-            plain = main.StimulusCodeCache(digits, encoder, extractor, label=None).take(40)
+            plain = mnist_codes.StimulusCodeCache(digits, encoder, extractor, label=None).take(40)
             self.assertEqual(len(more), 40)
             for left, right in zip(plain, more):
                 self.assertEqual(left.label, right.label)
                 self.assertEqual(left.angles, right.angles)
                 self.assertTrue(np.array_equal(left.packed, right.packed))
             # Файл дополнен до 40 цифр; меньший запрос берёт начало файла.
-            third = main.StimulusCodeCache(digits, encoder, extractor, label=None, store=store)
-            with mock.patch.object(main.StimulusCodeCache, "encode_digit", side_effect=AssertionError("encoded")):
+            third = mnist_codes.StimulusCodeCache(digits, encoder, extractor, label=None, store=store)
+            with mock.patch.object(mnist_codes.StimulusCodeCache, "encode_digit", side_effect=AssertionError("encoded")):
                 self.assertEqual(len(third.take(35)), 35)
             # Другая константа кодирования — другой отпечаток: прежний файл не подходит.
-            with mock.patch.object(main, "MNIST_GRAD_THRESHOLD", main.MNIST_GRAD_THRESHOLD * 2.0):
-                other = main.EncodedCodesFile(directory, encoder=encoder, split="train", label=None)
+            with mock.patch.object(settings, "MNIST_GRAD_THRESHOLD", settings.MNIST_GRAD_THRESHOLD * 2.0):
+                other = mnist_codes.EncodedCodesFile(directory, encoder=encoder, split="train", label=None)
             self.assertNotEqual(other.path, store.path)
             self.assertIsNone(other.load(10))
             # Малый набор файл не читает и не пишет.
-            small_store = main.EncodedCodesFile(directory, encoder=encoder, split="test", label=None)
-            main.StimulusCodeCache(digits, encoder, extractor, label=None, store=small_store).take(5)
+            small_store = mnist_codes.EncodedCodesFile(directory, encoder=encoder, split="test", label=None)
+            mnist_codes.StimulusCodeCache(digits, encoder, extractor, label=None, store=small_store).take(5)
             self.assertFalse(os.path.exists(small_store.path))
 
 
@@ -573,49 +576,49 @@ class ArticleLargeTunerTests(unittest.TestCase):
     _ARTICLE = dict(LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_PAIRS_POINT_FRACTION=0.1)
 
     def test_article_large_layout_parameters(self) -> None:
-        with mock.patch.multiple(main, **self._ARTICLE):
-            tuner = main.LayoutParameterTuner()
-            small = tuner.tune(main.LAYOUT_LONG_FULL_SPACE_MAX_POINTS)
+        with mock.patch.multiple(settings, **self._ARTICLE):
+            tuner = mnist_layout.LayoutParameterTuner()
+            small = tuner.tune(settings.LAYOUT_LONG_FULL_SPACE_MAX_POINTS)
             large = tuner.tune(1_000_000)
         self.assertIsNone(small.seed_points)
         self.assertFalse(small.device_short_step)
         self.assertIsNone(small.neighbourhood_radius_min)
-        self.assertEqual(large.seed_points, main.LAYOUT_SEED_POINTS)
+        self.assertEqual(large.seed_points, settings.LAYOUT_SEED_POINTS)
         self.assertTrue(large.device_short_step)
         self.assertFalse(large.device_step)
         self.assertTrue(large.enforce_pair_radius)
         self.assertIsNone(large.long_subset_size)
         self.assertIsNone(large.neighbourhood_sample_side)
-        self.assertEqual(large.neighbourhood_radius_min, main.LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN)
+        self.assertEqual(large.neighbourhood_radius_min, settings.LAYOUT_TUNE_LARGE_SHORT_NEIGHBOURHOOD_MIN)
         # §5.10: пар за шаг — не больше доли точек.
         self.assertEqual(large.short_pairs_per_step, 100_000)
-        self.assertLessEqual(large.short_local_radius, main.LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
+        self.assertLessEqual(large.short_local_radius, settings.LAYOUT_TUNE_LARGE_SHORT_RADIUS_MAX)
 
     def test_smooth_large_layout_parameters_keep_device_long_step(self) -> None:
-        with mock.patch.multiple(main, LAYOUT_SMOOTH_PINWHEELS=True, LAYOUT_PAIRS_POINT_FRACTION=None):
-            large = main.LayoutParameterTuner().tune(1_000_000)
+        with mock.patch.multiple(settings, LAYOUT_SMOOTH_PINWHEELS=True, LAYOUT_PAIRS_POINT_FRACTION=None):
+            large = mnist_layout.LayoutParameterTuner().tune(1_000_000)
         self.assertFalse(large.device_short_step)
         self.assertIsNone(large.neighbourhood_radius_min)
-        self.assertEqual(large.device_step, bool(main.LAYOUT_DEVICE_STEP))
+        self.assertEqual(large.device_step, bool(settings.LAYOUT_DEVICE_STEP))
 
     def test_seed_levels(self) -> None:
         seed = 30000
-        with mock.patch.multiple(main, LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_SEED_LEVEL_RATIO_MAX=32):
+        with mock.patch.multiple(settings, LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_SEED_LEVEL_RATIO_MAX=32):
             # До 32 точек на точку затравки — один уровень.
-            self.assertEqual(main._seed_level_points(882_607, seed), seed)
-            self.assertEqual(main._seed_level_points(seed * 32, seed), seed)
-        with mock.patch.multiple(main, LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_SEED_LEVEL_RATIO_MAX=16):
+            self.assertEqual(mnist_layout._seed_level_points(882_607, seed), seed)
+            self.assertEqual(mnist_layout._seed_level_points(seed * 32, seed), seed)
+        with mock.patch.multiple(settings, LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_SEED_LEVEL_RATIO_MAX=16):
             # 29 точек на точку затравки при пределе 16 — два уровня по √29.
-            middle = main._seed_level_points(882_607, seed)
+            middle = mnist_layout._seed_level_points(882_607, seed)
             self.assertAlmostEqual(882_607 / middle, middle / seed, delta=0.01 * middle / seed)
-        with mock.patch.multiple(main, LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_SEED_LEVEL_RATIO_MAX=32):
+        with mock.patch.multiple(settings, LAYOUT_SMOOTH_PINWHEELS=False, LAYOUT_SEED_LEVEL_RATIO_MAX=32):
             # 5.3 млн точек: два уровня с равным отношением √177 ≈ 13.3.
-            middle = main._seed_level_points(5_302_618, seed)
+            middle = mnist_layout._seed_level_points(5_302_618, seed)
             self.assertAlmostEqual(5_302_618 / middle, middle / seed, delta=0.01 * middle / seed)
-            self.assertEqual(main._seed_level_points(middle, seed), seed)
-            self.assertEqual(main._seed_level_points(seed - 1, seed), seed)
-        with mock.patch.multiple(main, LAYOUT_SMOOTH_PINWHEELS=True):
-            self.assertEqual(main._seed_level_points(5_302_618, seed), seed)
+            self.assertEqual(mnist_layout._seed_level_points(middle, seed), seed)
+            self.assertEqual(mnist_layout._seed_level_points(seed - 1, seed), seed)
+        with mock.patch.multiple(settings, LAYOUT_SMOOTH_PINWHEELS=True):
+            self.assertEqual(mnist_layout._seed_level_points(5_302_618, seed), seed)
 
     def test_seeded_article_pipeline(self) -> None:
         """Раскладка от затравки в режиме статьи: два уровня, точки расставлены, соседи — из одной группы."""
@@ -628,29 +631,29 @@ class ArticleLargeTunerTests(unittest.TestCase):
             LAYOUT_ADAPTIVE_RADIUS_START_FACTOR=0.5, LAYOUT_LAMBDA_THRESHOLD=0.6,
             LAYOUT_LONG_FULL_SPACE_MAX_POINTS=1500, LAYOUT_SEED_POINTS=600, LAYOUT_SEED_LEVEL_RATIO_MAX=4,
         )
-        with mock.patch.multiple(main, **article):
+        with mock.patch.multiple(settings, **article):
             import dataclasses
 
-            original_tune = main.LayoutParameterTuner.tune
+            original_tune = mnist_layout.LayoutParameterTuner.tune
 
             def short_tune(self, total_points):  # noqa: ANN001, ANN202
                 params = original_tune(self, total_points)
                 return dataclasses.replace(params, long_steps=400, short_steps=150)
 
             cutoffs: list[tuple[int, float | None]] = []
-            original_short = main._run_short_phase
+            original_short = mnist_layout._run_short_phase
 
             def recorded_short(layout, run_params, **options):  # noqa: ANN001, ANN003, ANN202
                 cutoffs.append((layout.point_count, options.get("similarity_cutoff")))
                 return original_short(layout, run_params, **options)
 
-            with mock.patch.object(main.LayoutParameterTuner, "tune", short_tune):
-                with mock.patch.object(main, "_run_short_phase", recorded_short):
-                    params = main.LayoutParameterTuner().tune(table.count)
+            with mock.patch.object(mnist_layout.LayoutParameterTuner, "tune", short_tune):
+                with mock.patch.object(mnist_layout, "_run_short_phase", recorded_short):
+                    params = mnist_layout.LayoutParameterTuner().tune(table.count)
                     self.assertEqual(params.seed_points, 600)
                     # 9000 / 600 = 15 при пределе 4 точки на родителя: уровни 600 → 2324 → 9000.
-                    self.assertGreater(main._seed_level_points(table.count, 600), 600)
-                    layout = main._run_layout(table, params, count=0, total_codes=table.count, use_cache=False)
+                    self.assertGreater(mnist_layout._seed_level_points(table.count, 600), 600)
+                    layout = mnist_layout._run_layout(table, params, count=0, total_codes=table.count, use_cache=False)
         # §5.9.1: затравка раскладывается с ранней отсечкой пар, уровни выше неё — без отсечки (дальней фазы
         # на них нет, и разводить непохожие точки должна ближняя фаза).
         self.assertEqual([cutoff for _, cutoff in cutoffs], [None, 0.0, 0.0])

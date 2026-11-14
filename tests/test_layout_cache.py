@@ -12,7 +12,8 @@ import numpy as np  # noqa: E402
 
 from damp.layout.payload import LayoutPayloadBuilder  # noqa: E402
 from damp.logging import LOGGER  # noqa: E402
-import main  # noqa: E402
+from damp.layout import mnist_layout  # noqa: E402
+from damp import settings  # noqa: E402
 
 LOGGER.configure_intervals({}, default_interval=10**9)
 
@@ -22,8 +23,8 @@ CODE_LENGTH = 96
 
 class LayoutCacheRadiusTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.params = main.LayoutParameterTuner().tune(POINTS)
-        self.expected = main._expected_pair_radius(POINTS, self.params)
+        self.params = mnist_layout.LayoutParameterTuner().tune(POINTS)
+        self.expected = mnist_layout._expected_pair_radius(POINTS, self.params)
 
     def _saved(self, directory: str, *, planned: int | None, final: int) -> str:
         rng = np.random.default_rng(4)
@@ -33,23 +34,23 @@ class LayoutCacheRadiusTests(unittest.TestCase):
         payload = LayoutPayloadBuilder(similarity=None, lambda_threshold=None, eta=None, metadata={})
         payload.add_packed(label=1, hues=[0.0] * POINTS, packed=np.packbits(bits, axis=1), code_length=CODE_LENGTH)
         if planned is not None:
-            payload.add_metadata({main.PLANNED_PAIR_RADIUS_KEY: planned})
+            payload.add_metadata({settings.PLANNED_PAIR_RADIUS_KEY: planned})
         path = os.path.join(directory, "layout.json")
         payload.save_base(path)
-        layout = main._new_layout(payload.code_table(), self.params, None)
+        layout = mnist_layout._new_layout(payload.code_table(), self.params, None)
         layout.pair_radius = final
         layout.save_json(path)
         return path
 
     def _load(self, path: str):
-        return main.LayoutCacheFile.load(path, self.params, expected_code_length=CODE_LENGTH)
+        return mnist_layout.LayoutCacheFile.load(path, self.params, expected_code_length=CODE_LENGTH)
 
     def test_layout_planned_with_expected_radius_is_reused_whatever_its_final_radius(self) -> None:
         # Большая раскладка режима статьи заканчивается на радиусе меньше планового.
         with tempfile.TemporaryDirectory() as directory:
             path = self._saved(directory, planned=self.expected, final=max(1, self.expected - 1) + 5)
             with open(path, "r", encoding="utf-8") as fp:
-                self.assertEqual(json.load(fp)[main.PLANNED_PAIR_RADIUS_KEY], self.expected)
+                self.assertEqual(json.load(fp)[settings.PLANNED_PAIR_RADIUS_KEY], self.expected)
             layout = self._load(path)
             self.assertIsNotNone(layout)
             self.assertEqual(layout.point_count, POINTS)
