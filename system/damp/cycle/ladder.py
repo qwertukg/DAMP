@@ -28,8 +28,9 @@ from damp.environment import GPU_ENVIRONMENT, configure_logging
 from damp.layout.code_dictionary import CodeDictionary
 from damp.layout.damp_layout import Layout
 from damp.layout.glyph_map import LayoutGlyphMap
+from damp.layout.level_memory import LevelMemory
 from damp.logging import LOGGER
-from damp.stimuli.digits import DigitAtoms, DigitGroups, MnistDigits
+from damp.stimuli.digits import DigitAtoms, DigitGroups, ExampleDigit, MnistDigits
 
 _FROM_SETTINGS = object()  # значение по умолчанию берётся из настроек в момент вызова
 
@@ -54,6 +55,11 @@ class LadderLevelReport:
     detail_code_length: int
     detail_bits: float
     distinct_details: int
+    energy_mean: float  # качество раскладки Ē карты уровня (§5.8): средняя нормированная энергия точек
+    code_resolution: float  # окон обучающих картинок на один различный код детали (§5.13.2.5, «resolution per code»)
+    code_largest: int  # самый большой набор окон обучающих картинок с одним кодом детали (§5.13.2.5, «largest cluster size»)
+    detail_empty: float  # доля обучающих окон с пустой деталью: ни один детектор не сработал
+    detail_full: float  # доля обучающих окон, у которых сработавших детекторов не меньше σ (код упёрся в предел, §7.1.8.1)
     same_label: float  # доля пар соседних точек карты одного класса
     same_label_random: float
     alone: dict[int, float] | None  # узнавание по отклику картинки на этом уровне (число срабатываний детекторов)
@@ -97,17 +103,43 @@ class MnistLadderRunner:
         shifts: Sequence[tuple[int, int]] | None = None,
         file_prefix: str | None = None,
         observer: LadderObserver | None = None,
+        train_start: int = 0,
+        validation: int = 0,
+        pixel_shift: tuple[int, int] | None = None,
+        pixel_pictures: int = 0,
+        train_numbers: Sequence[int] | None = None,
+        validation_numbers: Sequence[int] | None = None,
+        test_numbers: Sequence[int] | None = None,
+        keep_levels: bool = False,
     ) -> None:
         evaluate_limit = settings.LADDER_EVALUATE_LIMIT if evaluate_limit is None else evaluate_limit
         if count <= 0:
             raise ValueError("count must be positive")
         if evaluate_limit < 0:
             raise ValueError("evaluate_limit must be non-negative")
+        # Явные номера MNIST групп (стенд bench: случайная выборка из пулов); число картинок группы — их число.
+        self._numbers = {
+            "train": None if train_numbers is None else tuple(int(n) for n in train_numbers),
+            "validation": None if validation_numbers is None else tuple(int(n) for n in validation_numbers),
+            "test": None if test_numbers is None else tuple(int(n) for n in test_numbers),
+        }
+        if self._numbers["train"] is not None and len(self._numbers["train"]) != int(count):
+            raise ValueError("count must equal the number of train_numbers")
+        if self._numbers["validation"] is not None:
+            validation = len(self._numbers["validation"])
+        if self._numbers["test"] is not None:
+            evaluate_limit = len(self._numbers["test"])
         configure_logging()
         GPU_ENVIRONMENT.apply()
         self.count = int(count)
         self._evaluate_limit = int(evaluate_limit)
         self._split = split
+        # Протокол данных (вне статьи): обучающие с train_start, отложенные validation для выбора настроек, сдвиг
+        # отложенных на пиксели для мерки устойчивости к деформации.
+        self._train_start = int(train_start)
+        self._validation = int(validation)
+        self._pixel_shift = None if pixel_shift is None else (int(pixel_shift[0]), int(pixel_shift[1]))
+        self._pixel_pictures = int(pixel_pictures)
         # Префикс файлов прогона: карты, рисунки окон и поля зрения пишутся под ним.
         self.FILE_PREFIX = str(settings.LADDER_FILE_PREFIX if file_prefix is None else file_prefix)
         limit = settings.LADDER_MAP_MAX_POINTS if map_max_points is _FROM_SETTINGS else map_max_points
@@ -126,6 +158,19 @@ class MnistLadderRunner:
         self._digits = MnistDigits()
         self.reports: list[LadderLevelReport] = []
         self.top_accuracy: dict[int, float] | None = None
+        # Итоги для стенда: группы картинок, детали верхнего уровня и отклики уровней (после run).
+        self.groups: DigitGroups | None = None
+        self.top_details: LadderElements | None = None
+        # Срабатывания детекторов верхнего уровня по окнам (§7.1.12: уровни активности — тоже эмбеддинг).
+        self.top_firing: dict | None = None
+        self.level_responses: list["np.ndarray"] = []
+        # Самый сильный уровень активации каждого детектора по окнам картинки, единичной длины, — по уровням (§9.3).
+        self.level_peaks: list["np.ndarray"] = []
+        self.example: int | None = None
+        # keep_levels — сохранить уровни после обучения (TrainedLevel): по ним идёт новая картинка (дашборд). На счёт
+        # прогона не влияет; карта и детекторы уровня остаются в памяти, видеокарта под ними освобождается как обычно.
+        self._keep_levels = bool(keep_levels)
+        self.levels: list = []  # TrainedLevel по уровням (при keep_levels)
 
     def run(self) -> dict[int, float] | None:
         """Вся лестница; возвращает узнавание по склейке кодов картинки от всех уровней (None — без проверки)."""
@@ -155,9 +200,20 @@ class MnistLadderRunner:
             split=self._split,
             shifts=self._shifts,
             shift_pictures=settings.LADDER_SHIFT_PICTURES,
+            train_start=self._train_start,
+            validation=self._validation,
+            pixel_shift=self._pixel_shift,
+            pixel_pictures=self._pixel_pictures,
+            train_numbers=self._numbers["train"],
+            validation_numbers=self._numbers["validation"],
+            test_numbers=self._numbers["test"],
+            train_views=settings.LADDER_TRAIN_VIEWS,
         )
         self._groups = groups
+        self.groups = groups
         atoms = groups.atoms
+        # Пример для рисунков и Rerun — одна обучающая картинка цифры-примера на весь прогон (вне статьи).
+        self.example = ExampleDigit.choose(groups)
         sticks = StickCoder()
         self._observer.stage(0, 2)
         elements = sticks.encode(atoms)
@@ -171,13 +227,19 @@ class MnistLadderRunner:
                 stick_angle=atoms.angle,
                 ranges={str(key): value for key, value in groups.ranges.items() if isinstance(key, str)},
                 angle_encoder=sticks.encoder,
+                example=self.example,
+                example_index=int(atoms.index[self.example]),
             )
         )
         self.reports = []
         responses: list["np.ndarray"] = []
+        self.level_responses = responses
+        self.level_peaks = []
+        self.levels = []
         elements, reached = self._ladder(elements, responses)
         if reached is None:
             raise RuntimeError("лестница не построила ни одного уровня")
+        self.top_details = elements
         self._class_map(elements, groups.labels, reached)
         self._log_summary()
         self._observer.finish(self.reports, self.top_accuracy)
@@ -282,7 +344,7 @@ class MnistLadderRunner:
         recognition = LevelRecognition(groups.labels, groups.ranges["train"])
         reached: LadderField | None = None
         circles: list[tuple[int, float, float, float]] = []  # окна картинки для рисунка: уровень, центр, радиус
-        figure = self._figure_picture(atoms)
+        figure = int(self.example)
         # Рисунок: окна всех уровней вокруг одного места — углопозиции, ближайшей к середине цифры.
         first_stick, last_stick = groups.sticks(figure)
         middle = (float(atoms.y[first_stick:last_stick].mean()), float(atoms.x[first_stick:last_stick].mean()))
@@ -351,9 +413,17 @@ class MnistLadderRunner:
             self._export(layout, memory.name, memory.energies)
             self._keyhole_glyphs(layout, dictionary, pieces, memory.rows, field, extent)
         rows, columns, levels = level.firing.rows, level.firing.columns, level.firing.levels
+        # Для стенда: уровни активации детекторов по окнам; последний записанный уровень — верхний (§7.1.12).
+        self.top_firing = {
+            "rows": rows, "columns": columns, "levels": levels, "detectors": int(found.built),
+            "picture": np.asarray(pieces.picture),
+            # Господство классов в детекторах (§8.2) — по точкам карты, то есть по обучающим окнам.
+            "dominance": found.dominance(int(labels.max()) + 1) if settings.BENCH_DOMINANCE else None,
+        }
         strength = level.strength
         response, peak = LevelRecognition.responses(pieces.picture, rows, columns, levels, pictures, found.built)
         responses.append(response)
+        self.level_peaks.append(peak)
         codes = level.codes
         result = level.elements
         what, what_index = result.what_packed, result.what_index
@@ -362,16 +432,20 @@ class MnistLadderRunner:
         shifted: dict[tuple[int, int], float] = {}
         same_response: dict[tuple[int, int], float] = {}
         ranges = groups.ranges
-        if "test" in ranges:
-            alone = recognition.by_response(response, ranges["test"])
-            strongest = recognition.by_response(peak, ranges["test"])
+        # Метки уровня — по проверочным; нет их, но есть отложенные (стенд) — по отложенным.
+        checked = "test" if "test" in ranges else "validation" if "validation" in ranges else None
+        if checked is not None:
+            alone = recognition.by_response(response, ranges[checked])
+            strongest = recognition.by_response(peak, ranges[checked])
             # Склейка откликов уровней 1…number: у каждого уровня свой сегмент единичной длины (§2.2.3).
-            glued = recognition.by_response(np.concatenate(responses, axis=1), ranges["test"])
-            first = ranges["test"][0]
-            moved = min(int(settings.LADDER_SHIFT_PICTURES), ranges["test"][1] - first)
+            glued = recognition.by_response(np.concatenate(responses, axis=1), ranges[checked])
+            first = ranges[checked][0]
+            moved = min(int(settings.LADDER_SHIFT_PICTURES), ranges[checked][1] - first)
             if self._shifts and moved:
                 unshifted = recognition.by_response(response, (first, first + moved))[min(settings.LADDER_NEIGHBOURS)]
             for shift in self._shifts:
+                if tuple(shift) not in ranges:
+                    continue  # сдвиги — проверочных картинок; без них (стенд на отложенных) сдвигов нет
                 begin, end = ranges[tuple(shift)]
                 shifted[tuple(shift)] = recognition.by_response(response, (begin, end))[min(settings.LADDER_NEIGHBOURS)]
                 # Отклики единичной длины: их скалярное произведение — косинус; два пустых отклика совпадают.
@@ -390,6 +464,7 @@ class MnistLadderRunner:
             )
         )
         quality = memory.quality
+        measures = self._detail_measures(level, memory)
         report = LadderLevelReport(
             number=number,
             field_height=field.height,
@@ -408,6 +483,7 @@ class MnistLadderRunner:
             detail_code_length=level.detail_length,
             detail_bits=float(packed_ones(what)[what_index].mean()),
             distinct_details=int(what.shape[0]),
+            **measures,
             same_label=quality["same_label"],
             same_label_random=quality["same_label_random"],
             alone=alone,
@@ -450,6 +526,17 @@ class MnistLadderRunner:
                 "detail_code_length": report.detail_code_length,
                 "detail_bits": report.detail_bits,
                 "distinct_details": report.distinct_details,
+                "energy_mean": report.energy_mean,
+                "energy_radius": int(settings.ACTIVATION_POINT_ENERGY_RADIUS),
+                "code_resolution": report.code_resolution,
+                "code_largest": report.code_largest,
+                "detail_empty": report.detail_empty,
+                "detail_full": report.detail_full,
+                "level_normalisation": settings.LADDER_LEVEL_NORMALISATION or "none",
+                "level_normalisation_note": "способ нормировки уровней активации - доработка автора проекта "
+                "(вне статьи): §7.1.12 и §9.3 требуют лишь значений в [0, 1]",
+                "code_measures_note": "code_resolution и code_largest - мера §5.13.2.5, перенесённая с кодов точек "
+                "карты на коды деталей (вне статьи); пустой код деталей не считается, их доля - detail_empty",
                 "same_label": report.same_label,
                 "same_label_random": report.same_label_random,
                 "accuracy_alone": {str(k): v for k, v in (alone or {}).items()},
@@ -465,8 +552,39 @@ class MnistLadderRunner:
                 "классы», вне статьи",
             },
         )
+        if self._keep_levels:
+            self.levels.append(level.trained())
         level.release()
         return result
+
+    def _detail_measures(self, level: LevelPass, memory: LevelMemory) -> dict[str, float | int]:
+        """Мерки статьи по уровню: Ē карты (§5.8), разрешение и наибольший набор окон с одним кодом детали
+        (§5.13.2.5), доли пустых и упёршихся в σ деталей (§7.1.8.1). Коды деталей — по окнам обучающих картинок.
+
+        Мера §5.13.2.5 («resolution per code», «largest cluster size») в статье относится к кодам точек карты;
+        здесь она перенесена на коды деталей (вне статьи). Пустой код (ни один детектор не сработал) в расчёт
+        не входит, иначе наибольший «кластер» повторял бы долю пустых деталей: она отдельно — detail_empty."""
+        trained = level.keyholes.pieces.picture < self._groups.train_pictures
+        what, what_index = level.elements.what_packed, level.elements.what_index
+        own = what_index[trained]
+        empty_code = ~np.asarray(what).any(axis=1)
+        filled = own[~empty_code[own]]  # окна обучающих картинок с непустым кодом
+        sets = int(filled.shape[0])
+        counts = np.bincount(filled, minlength=int(what.shape[0]))
+        distinct = int(np.count_nonzero(counts))
+        rows, columns = level.firing.rows, level.firing.columns
+        if settings.LADDER_EMBEDDING_LAYERS is not None:
+            coded = level.detectors.layer_index[columns] < int(settings.LADDER_EMBEDDING_LAYERS)
+            rows = rows[coded]
+        fired = np.bincount(rows, minlength=int(level.firing.sets))
+        limit = int(settings.LADDER_SATURATION)
+        return {
+            "energy_mean": float(np.mean(memory.energies)) if len(memory.energies) else 0.0,
+            "code_resolution": float(sets) / max(1, distinct),
+            "code_largest": int(counts.max()) if counts.size else 0,
+            "detail_empty": float(np.mean(empty_code[own])) if own.shape[0] else 0.0,
+            "detail_full": float(np.mean(fired[trained] >= limit)) if own.shape[0] and limit > 0 else 0.0,
+        }
 
     def _same_details(self, details: LadderElements) -> dict[tuple[int, int], float]:
         """Доля общих кодов деталей у картинки и её сдвига (мера Жаккара по различным кодам, среднее по картинкам)."""
@@ -614,14 +732,6 @@ class MnistLadderRunner:
                     fill=colour,
                     width=width,
                 )
-
-    @staticmethod
-    def _figure_picture(atoms: DigitAtoms) -> int:
-        """Картинка для рисунков: LADDER_FIGURE_PICTURE-я по счёту цифра LADDER_FIGURE_DIGIT; нет такой — первая."""
-        found = np.flatnonzero(atoms.labels == int(settings.LADDER_FIGURE_DIGIT))
-        if found.size == 0:
-            return 0
-        return int(found[min(int(settings.LADDER_FIGURE_PICTURE), found.size - 1)])
 
     def _cluster_figure(self, atoms: DigitAtoms, picture: int, circles: Sequence[tuple[int, float, float, float]]) -> None:
         """Картинка с найденными полями зрения одной цифры: окружность — поле, цвет и номер — уровень."""

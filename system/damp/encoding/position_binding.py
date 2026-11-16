@@ -98,7 +98,10 @@ class PositionBindingEncoder:
         seed: int,
         use_gpu: bool = True,
         name: str = "keyholes",
+        concepts: int | None = None,
     ) -> None:
+        if concepts is not None and int(concepts) < 1:
+            raise ValueError("concepts must be positive or None")
         if len(place.dimensions) != 1 or place.dimensions[0].arity != 2:
             raise ValueError("place must be an encoder of one two-dimensional position (§4.3)")
         if pooling not in self.POOLINGS:
@@ -122,6 +125,8 @@ class PositionBindingEncoder:
         self._max_length = int(max_length)
         self._seed = int(seed)
         self._name = str(name)
+        # П.7: окно объединяет около 5–7 понятий; коды остальных элементов окна отбрасываются целиком. None — все.
+        self._concepts = None if concepts is None else int(concepts)
         # Раскраска битов, слияние цветов и упаковка кодов окон идут на видеокарте, если она есть; действия целые,
         # результат тот же, что на процессоре.
         self._torch = None
@@ -172,6 +177,13 @@ class PositionBindingEncoder:
     def content_length(self) -> int:
         """Длина сегмента содержания; 0 — ещё не подобрана (подбирается первым вызовом encode)."""
         return self._content_length
+
+    def fix_content_length(self, length: int) -> None:
+        """Длина сегмента содержания, подобранная раньше по окнам обучающих картинок (§6.6, шаг 3): encode её не
+        подбирает. Так кодируется новая картинка обученного уровня — тем же кодом, что в прогоне."""
+        if int(length) <= 0:
+            raise ValueError("content length must be positive")
+        self._content_length = int(length)
 
     # ------------------------------------------------------------------ маски
     def address_masks(self, length: int) -> "np.ndarray":
@@ -253,6 +265,11 @@ class PositionBindingEncoder:
         pair = keyhole * detectors + detector
         active = np.unique(pair)
         stats["pairs"] = int(active.shape[0])
+        if self._concepts is not None:
+            # П.7: окно объединяет около 5–7 понятий. В содержание идут только самые сильные элементы окна, коды
+            # остальных отбрасываются целиком («отбрасывать … целые коды»); их биты места уже выставлены выше.
+            keep = np.isin(entry, self._strongest_entries(source, entry, first))
+            entry, detector, keyhole, pair = entry[keep], detector[keep], keyhole[keep], pair[keep]
         if self._pooling == "strongest":
             # Перечисление выбранных: из области детектора берётся один, самый сильный признак.
             order = np.lexsort((entry, -source["strength"][entry], pair))
@@ -271,6 +288,17 @@ class PositionBindingEncoder:
         else:
             pair = pair[rows]
         return place, pair, bit, active, stats
+
+    def _strongest_entries(self, source: dict, entry: "np.ndarray", first: int) -> "np.ndarray":
+        """Вхождения-понятия окна (П.7): в каждом окне — self._concepts самых сильных элементов (ничья — по номеру
+        вхождения). Без уровней активации все элементы равны, и берутся первые по порядку."""
+        mine = np.unique(entry)
+        keyhole = source["groups"][mine] - first
+        strength = source["strength"][mine] if source["strength"] is not None else np.zeros(mine.shape[0])
+        order = np.lexsort((mine, -strength, keyhole))
+        ranked = keyhole[order]
+        rank = np.arange(order.shape[0]) - np.searchsorted(ranked, ranked, side="left")
+        return mine[order][rank < self._concepts]
 
     def _paint(
         self, source: dict, pair: "np.ndarray", bit: "np.ndarray", active: "np.ndarray", keyholes: int, length: int

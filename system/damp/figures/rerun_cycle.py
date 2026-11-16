@@ -348,15 +348,18 @@ class CycleRerunView(LadderObserver):
         self.upscale = float(settings.MNIST_SOBEL_UPSCALE) if settings.MNIST_SOBEL_UPSCALE_ENABLED else 1.0
         self.unit = float(settings.MNIST_PATCH_SIZE)  # пикселей рабочей картинки на клетку сетки
         train_first, train_last = trace.ranges["train"]
-        digit = int(settings.LADDER_FIGURE_DIGIT)
-        found = np.flatnonzero(trace.labels[train_first:train_last] == digit) + train_first
-        self.main = int(found[min(int(settings.LADDER_FIGURE_PICTURE), found.size - 1)]) if found.size else train_first
+        # Пример — пятёрка прогона: её выбрал MnistLadderRunner (в каждом прогоне другая).
+        self.main = int(trace.example) if trace.example is not None else train_first
+        self.main_index = int(trace.example_index) if trace.example_index is not None else self.main
         group = trace.ranges.get("test", trace.ranges["train"])
         self.examples: dict[int, int] = {}
         for value in settings.RERUN_EXAMPLE_DIGITS:
             own = np.flatnonzero(trace.labels[group[0] : group[1]] == int(value)) + group[0]
             if own.size:
                 self.examples[int(value)] = int(own[0])
+        if trace.example is not None:
+            # Пятёрка во всех панелях (d5, голоса, ответ) - одна и та же: пример прогона, а не первая в группе.
+            self.examples[int(settings.LADDER_FIGURE_DIGIT)] = self.main
         # Цвета и подписи цифр — одни на весь прогон (как цвет класса на картах README).
         step = float(settings.LADDER_CLASS_HUE_STEP)
         self._log(ROOT, rr.AnnotationContext([(k, f"цифра {k}", hue_colour(k * step)) for k in range(10)]))
@@ -370,14 +373,22 @@ class CycleRerunView(LadderObserver):
         counts = np.bincount(per_picture, minlength=int(per_picture.max()) + 1 if per_picture.size else 1)
         self._log(f"{STIMULI}/sticks_per_picture", rr.BarChart(counts, abscissa=np.arange(counts.shape[0], dtype=np.float64)))
         sticks = int(self.starts[self.main + 1] - self.starts[self.main])
+        views = trace.ranges.get("views")
+        if views is None:
+            taught = f"{train_last - train_first}"
+        else:
+            # §7.1.4: каждая обучающая цифра идёт ещё и в сдвинутых видах (LADDER_TRAIN_VIEWS); виды — тоже обучающие.
+            originals = views[0] - train_first
+            taught = (f"{originals} цифр и их сдвинутые виды, {(views[1] - views[0]) // max(1, originals)} на цифру "
+                      f"(§7.1.4): всего {train_last - train_first}")
         self._text(
             f"{STIMULI}/about",
             f"### Этап 1. Стимулы: углопозиции MNIST\n\nКартинка распадается на штрихи контура: где край и куда он смотрит. "
             f"Стрелка идёт вдоль края, цвет — направление перепада яркости (0–360°).\n\n"
-            f"| | |\n|---|---|\n| цифра-пример | {digit} (как на рисунках README) |\n| штрихов у неё | {sticks} |\n"
-            f"| обучающих картинок | {train_last - train_first} |\n| штрихов на картинку, в среднем | {per_picture.mean():.1f} |\n"
+            f"| | |\n|---|---|\n| цифра-пример | пятёрка № {self.main_index} в MNIST (в каждом прогоне другая, среди пятёрок со штрихами; как на рисунках README этого прогона) |\n| штрихов у неё | {sticks} |\n"
+            f"| обучающих картинок | {taught} |\n| штрихов на картинку, в среднем | {per_picture.mean():.1f} |\n"
             f"| сетка | 24×24 клетки, окно Собеля {int(self.unit)} px |\n"
-            f"| **Итого** | пятёрка — {sticks} штрихов; дальше весь путь показан на ней |\n\n"
+            f"| **Итого** | пятёрка № {self.main_index} — {sticks} штрихов; дальше весь путь показан на ней |\n\n"
             "Внизу — по одной проверочной цифре каждого класса. Источник: вне статьи (извлечение стимулов).",
         )
         # Этап 2: детекторы угла штриха (статично: кодер один на прогон).
@@ -646,25 +657,33 @@ class CycleRerunView(LadderObserver):
         if "test" not in self.run.ranges:
             return
         first, last = self.run.ranges["test"]
-        train = np.flatnonzero(trace.picture < self.run.ranges["train"][1])
-        asked = np.flatnonzero((trace.picture >= first) & (trace.picture < last))
-        classifier = NearestCodeClassifier(trace.codes[train], labels[trace.picture[train]], int(trace.code_length),
-                                           use_gpu=settings.ACTIVATION_USE_GPU)
-        nearest = labels[trace.picture[train]][classifier.neighbours(trace.codes[asked], 1)][:, 0]
+        # Пустые детали (нулевой код) не голосуют и не входят в базу; картинка без голосов ответа не получает.
+        filled = np.asarray(trace.codes).any(axis=1)
+        train = np.flatnonzero((trace.picture < self.run.ranges["train"][1]) & filled)
+        asked = np.flatnonzero((trace.picture >= first) & (trace.picture < last) & filled)
         votes = np.zeros((last - first, 10), dtype=np.int64)
-        np.add.at(votes, (trace.picture[asked] - first, nearest), 1)
+        if train.size and asked.size:
+            classifier = NearestCodeClassifier(trace.codes[train], labels[trace.picture[train]], int(trace.code_length),
+                                               use_gpu=settings.ACTIVATION_USE_GPU)
+            nearest = labels[trace.picture[train]][classifier.neighbours(trace.codes[asked], 1)][:, 0]
+            np.add.at(votes, (trace.picture[asked] - first, nearest), 1)
+        voted = votes.sum(axis=1) > 0
         answer = votes.argmax(axis=1)
         confusion = np.zeros((10, 10), dtype=np.int64)
-        np.add.at(confusion, (labels[first:last], answer), 1)
+        np.add.at(confusion, (labels[first:last][voted], answer[voted]), 1)
         self._log(f"{RECOGNITION}/confusion", rr.Tensor(confusion, dim_names=["цифра", "ответ"]), n)
         for value, picture in self.examples.items():
-            if first <= picture < last:
+            if first <= picture < last:  # пример прогона вне группы подписан в тексте вкладки
                 self._log(f"{RECOGNITION}/votes/d{value}", rr.BarChart(votes[picture - first].astype(np.float64),
                                                                      abscissa=np.arange(10, dtype=np.float64)), n)
         five = self.examples.get(int(settings.LADDER_FIGURE_DIGIT))
         self.top_numbers = dict(level=n, details=int(trace.picture.shape[0]), right=int(np.trace(confusion)), asked=int(last - first),
                                 map_points=None if trace.map_cells is None else int(trace.map_cells.shape[0]),
-                                five_answer=None if five is None or not first <= five < last else int(answer[five - first]))
+                                empty_details=float(1.0 - filled.mean()) if filled.size else 0.0,
+                                no_votes=float(1.0 - voted.mean()) if voted.size else 0.0,
+                                five_answer=None if five is None or not first <= five < last or not voted[five - first]
+                                else int(answer[five - first]),
+                                five_outside=five is not None and not first <= five < last)
 
     # ------------------------------------------------------------------ итоги
     def finish(self, reports: list, accuracy: dict | None) -> None:
@@ -676,7 +695,10 @@ class CycleRerunView(LadderObserver):
             s.update(same_label=float(report.same_label), same_label_random=float(report.same_label_random),
                      field_radius=float(report.field_radius), picture_seen=float(report.picture_seen),
                      keyholes=float(report.fields_per_picture), elements=float(report.elements_per_field),
-                     distinct=int(report.distinct_details), map_points=int(report.map_points), alone=report.alone, glued=report.glued)
+                     distinct=int(report.distinct_details), map_points=int(report.map_points), alone=report.alone, glued=report.glued,
+                     energy_mean=float(report.energy_mean), code_resolution=float(report.code_resolution),
+                     code_largest=int(report.code_largest), detail_empty=float(report.detail_empty),
+                     detail_full=float(report.detail_full))
             self._scalar(f"{LAYOUT}/stats/same_label", float(report.same_label), n, "соседи одной цифры")
             self._scalar(f"{LAYOUT}/stats/same_label_random", float(report.same_label_random), n, "то же у случайной карты")
             self._scalar(f"{CYCLE}/stats/radius", float(report.field_radius), n, "радиус окна, клеток")
@@ -739,12 +761,16 @@ class CycleRerunView(LadderObserver):
             f"| секунд: детекторы / срабатывания | {_num(seconds.get('detectors'), '.1f')} / {_num(seconds.get('firing'), '.1f')} |\n"
             f"| **Итого** | у окна-примера сработало {_num(s.get('fired'))} детекторов из {_num(s.get('detectors'))} |\n"
         ), n)
+        levels_note = ("уровни E(d) нормированы по обучающим окнам в [0, 1] (доработка вне статьи; §7.1.12 требует лишь [0, 1])" if str(settings.LADDER_LEVEL_NORMALISATION) == "train_max" else "уровни E(d) по формуле §6.5, сверху не ограничены")
         self._text(f"{EMBEDDINGS}/about", (
             f"### Этап 5. Эмбеддинги — уровень {n}\n\nСильнейшие сработавшие детекторы дают код детали (§6.5, §7.1.12); "
-            f"деталь встаёт в центр окна, её сила — самый сильный детектор (П.1). Детали — элементы следующего уровня.\n\n"
+            f"деталь встаёт в центр окна, её сила — самый сильный детектор (П.1). Детали — элементы следующего уровня. Окно, на котором не сработал ни один детектор, даёт **пустую деталь**: в базу она не входит и не голосует.\n\n"
             f"| | |\n|---|---|\n| код детали | {_num(s.get('detail_length'))} бит, у примера {_num(s.get('detail_ones'))} единиц |\n"
             f"| единиц на деталь, в среднем | {_num(s.get('detail_bits'), '.1f')} |\n| разных деталей | {_num(s.get('distinct'))} |\n"
-            f"| сила детали-примера | {_num(s.get('strength'), '.2f')} (в среднем {_num(s.get('strength_mean'), '.2f')}) |\n"
+            f"| сила детали-примера | {_num(s.get('strength'), '.2f')} (в среднем {_num(s.get('strength_mean'), '.2f')}); {levels_note} |\n"
+            f"| качество карты Ē (§5.8) | {_num(s.get('energy_mean'), '.3f')} |\n"
+            f"| окон на один код детали (§5.13.2.5) | {_num(s.get('code_resolution'), '.2f')}; самый большой набор — {_num(s.get('code_largest'))} |\n"
+            f"| пустых деталей / упёршихся в σ (§7.1.8.1) | {_num(s.get('detail_empty'), '.1%')} / {_num(s.get('detail_full'), '.1%')} |\n"
             f"| **Итого** | у пятёрки {_num(s.get('details'))} деталей — элементы уровня {n + 1} |\n"
         ), n)
         seen = s.get("picture_seen", s.get("seen"))
@@ -761,11 +787,13 @@ class CycleRerunView(LadderObserver):
         five = self.top_numbers.get("five_answer") if vote else None
         self._text(f"{RECOGNITION}/about", (
             f"### Этап 7. Распознавание — уровень {n}\n\nОтклик картинки — сколько раз сработал каждый детектор на её окнах; ответ — "
-            f"по самым похожим откликам обучающих (§2.2.5). Точность уровня появляется сразу после него. Наверху детали голосуют "
+            f"по самым похожим откликам обучающих (§2.2.5). Точность уровня появляется сразу после него. Наверху детали голосуют (пустые не голосуют; картинка без голосов или без отклика — неверная) "
             f"за цифру.\n\n"
             f"| | |\n|---|---|\n| по отклику уровня | {_share(s.get('alone'))} |\n| склейка уровней 1…{n} | {_share(s.get('glued'))} |\n"
             + ("" if not vote else "| голосование верхних деталей | " + ", ".join(f"k={k}: **{v:.1%}**" for k, v in vote.items()) + " |\n")
             + ("" if five is None else f"| проверочная пятёрка | ответ {five} |\n")
+            + ("" if not self.top_numbers.get("five_outside") else
+               f"| пятёрка прогона № {self.main_index} | не в проверочной группе (обучающая): ответ для неё не считается |\n")
             + f"| **Итого** | {_share(vote) if vote else _share(s.get('glued'))} |\n"
             + ("" if not vote or not self.top_numbers else f"\nВерно {self.top_numbers.get('right')} из {self.top_numbers.get('asked')} проверочных "
                "(k=1). Таблица ошибок: строка — цифра, столбец — ответ. Голоса — у проверочной цифры каждого класса.\n")

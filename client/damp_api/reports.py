@@ -10,7 +10,10 @@
 | `Code` | разреженный код | `Coding.encode` |
 | `LayoutSummary`, `PinwheelReport` | итог раскладки, тест пинвила | `Layout.build`, `Layout.pinwheel` |
 | `CycleLevel`, `CycleReport` | уровень цикла и итог цикла | `Cycle.run` |
+| `Sight`, `SightLevel` | путь новой картинки через обученный цикл | `TrainedLadder.see` |
+| `LevelMap`, `TrainingSticks` | карты уровней обученного цикла и углопозиции обучающих картинок | `TrainedLadder.maps`, `TrainedLadder.sticks` |
 | `Prediction`, `Evaluation` | ответ и точность распознавания | `Recognition.predict`, `Recognition.evaluate` |
+| `BenchScore`, `BenchRobustness`, `BenchMethod`, `BenchLevel`, `BenchReport` | честное сравнение DAMP, kNN и CNN | `Recognition.bench` |
 | `LevelFailed` | ошибка: уровень цикла не сложился | кубики цикла |
 """
 from __future__ import annotations
@@ -68,9 +71,11 @@ class Picture:
     Attributes:
         index: номер картинки в прогоне (обучающие идут первыми).
         digit: цифра на картинке, 0…9.
-        group: группа картинки: `"train"`, `"test"` или сдвиг в виде `"dy,dx"`.
+        group: группа картинки: `"train"`, `"validation"`, `"test"`, сдвиг на клетки `"dy,dx"` или сдвиг на
+            пиксели `"pixel:dy,dx"`.
         image: сама картинка, массив numpy 28×28 со значениями 0…255.
         stimuli: углопозиции картинки.
+        mnist: номер картинки в своём наборе MNIST (train либо t10k); -1 — неизвестен.
     """
 
     index: int
@@ -78,6 +83,7 @@ class Picture:
     group: str
     image: object  # numpy-массив 28×28
     stimuli: tuple[Stimulus, ...]
+    mnist: int = -1
 
 
 class LevelFailed(RuntimeError):
@@ -162,6 +168,12 @@ class CycleLevel:
             `None`, если проверочных картинок нет.
         peak: то же по сильнейшему отклику каждого детектора; `None`, если проверочных нет.
         glued: то же по склейке откликов уровней 1…number; `None`, если проверочных нет.
+        energy_mean: качество раскладки Ē карты уровня: средняя нормированная энергия точек (§5.8), 0…1.
+        code_resolution: окон обучающих картинок на один различный код детали (§5.13.2.5, «resolution per code»).
+        code_largest: самый большой набор окон обучающих картинок с одним кодом детали (§5.13.2.5, «largest cluster size»).
+        detail_bits: средняя насыщенность кода детали: единиц на деталь (§7.1.8.1).
+        detail_empty: доля обучающих окон с пустой деталью: ни один детектор не сработал, 0…1.
+        detail_full: доля обучающих окон, у которых сработавших детекторов не меньше σ (код упёрся в предел), 0…1.
     """
 
     number: int
@@ -175,6 +187,12 @@ class CycleLevel:
     response: dict[int, float] | None
     peak: dict[int, float] | None
     glued: dict[int, float] | None
+    energy_mean: float
+    code_resolution: float
+    code_largest: int
+    detail_bits: float
+    detail_empty: float
+    detail_full: float
 
 
 @dataclass(frozen=True)
@@ -189,6 +207,135 @@ class CycleReport:
 
     levels: tuple[CycleLevel, ...]
     vote: dict[int, float] | None = field(default=None)
+
+
+@dataclass(frozen=True)
+class SightLevel:
+    """Что один уровень обученного цикла сделал с новой картинкой: кусочки, зажжённые точки, детекторы, детали.
+
+    Кусочек — окно внимания (П.2) на элементе уровня. Его код зажигает точки карты (§6.1), по ним срабатывают
+    детекторы (§6.5), сильнейшие из них дают деталь окна (§6.5, §7.1.12) — элемент следующего уровня (П.1).
+    Все поля — массивы numpy; номера окон — внутри картинки (0…K−1), точки — в порядке карты (`LevelMap`),
+    детекторы — по слоям, как в `LevelMap.detectors`.
+
+    Attributes:
+        number: номер уровня, 1…
+        keyhole_centre: центр каждого окна `(y, x)`, узлы сетки картинки, форма (K, 2).
+        keyhole_extent: сколько клеток картинки видит окно, (K,).
+        entry_keyhole: окно каждого вхождения элемента, (E,).
+        entry_element: элемент вхождения: номер углопозиции на уровне 1, номер окна прошлого уровня выше, (E,).
+        lit_keyhole: окно, зажёгшее точку карты, (L,).
+        lit_point: зажжённая точка карты, (L,).
+        lit_value: её активация a_j, (L,).
+        fired_keyhole: окно, на котором сработал детектор, (R,).
+        fired_detector: сработавший детектор, (R,).
+        fired_level: его уровень активации E(d), (R,).
+        detail_length: длина кода детали, бит.
+        strength: уровень активации детали каждого окна — сильнейший сработавший детектор, (K,).
+        peak: сильнейший уровень каждого детектора по окнам картинки, единичной длины (§9.3), (D,).
+    """
+
+    number: int
+    keyhole_centre: object
+    keyhole_extent: object
+    entry_keyhole: object
+    entry_element: object
+    lit_keyhole: object
+    lit_point: object
+    lit_value: object
+    fired_keyhole: object
+    fired_detector: object
+    fired_level: object
+    detail_length: int
+    strength: object
+    peak: object
+
+
+@dataclass(frozen=True)
+class Sight:
+    """Путь новой картинки через обученный цикл (`TrainedLadder.see`): углопозиции, уровни и ответ читателя (§9.3).
+
+    Attributes:
+        stick_angle: угол каждой углопозиции, градусы (§4.4).
+        stick_y: клетка сетки картинки по вертикали.
+        stick_x: клетка по горизонтали.
+        stick_strength: сила штриха, доля сильнейшего штриха картинки.
+        levels: уровни, до которых картинка дошла, по порядку.
+        probabilities: вероятности цифр 0…9 по линейному читателю; все нули — ответа нет.
+        digit: самая вероятная цифра; -1 — ни один детектор не сработал.
+        seconds: сколько секунд шёл путь картинки.
+    """
+
+    stick_angle: object
+    stick_y: object
+    stick_x: object
+    stick_strength: object
+    levels: tuple[SightLevel, ...]
+    probabilities: tuple[float, ...]
+    digit: int
+    seconds: float
+
+
+@dataclass(frozen=True)
+class LevelMap:
+    """Карта уровня обученного цикла для показа: точки, откуда взята каждая, и детекторы над картой (§5, §6.4).
+
+    Точка карты хранит код окна обучающей картинки (§5): по картинке, центру и полю окна видно её содержимое.
+
+    Attributes:
+        number: номер уровня.
+        height: высота карты, клеток.
+        width: ширина карты, клеток.
+        cells: клетка каждой точки `(y, x)`, (P, 2).
+        labels: цифра обучающей картинки каждой точки, (P,).
+        energies: нормированная энергия точки Ê (§5.7), (P,).
+        point_picture: обучающая картинка окна точки — номер в `TrainingSticks`, (P,).
+        point_centre: центр этого окна `(y, x)`, узлы сетки картинки, (P, 2).
+        point_extent: сколько клеток картинки видит окно, (P,).
+        detectors: детекторы по слоям, строки `(центр y, центр x, радиус, порог λ_d, энергия e_d)` в клетках карты, (D, 5).
+        layer: слой каждого детектора; 0 — самый низкий порог λ_d, самые широкие поля (§7.1.10), (D,).
+        layer_thresholds: пороги λ_d слоёв по возрастанию.
+        activation_threshold: порог зажигания точки λ_a (§6.1, §7.1.11).
+        field_half: половина поля зрения уровня в клетках картинки — ячейка рисунка содержимого.
+    """
+
+    number: int
+    height: int
+    width: int
+    cells: object
+    labels: object
+    energies: object
+    point_picture: object
+    point_centre: object
+    point_extent: object
+    detectors: object
+    layer: object
+    layer_thresholds: tuple[float, ...]
+    activation_threshold: float
+    field_half: int
+
+
+@dataclass(frozen=True)
+class TrainingSticks:
+    """Углопозиции обучающих картинок обученного цикла (с видами §7.1.4): из них рисуется содержимое точек карт.
+
+    Attributes:
+        picture: картинка каждой углопозиции, по возрастанию, (S,).
+        y: клетка сетки картинки по вертикали, (S,).
+        x: клетка по горизонтали, (S,).
+        angle: угол, градусы, (S,).
+        labels: цифра каждой картинки, (N,).
+        index: номер картинки в MNIST train, (N,).
+        originals: сколько первых картинок — исходные цифры; дальше — их сдвинутые виды.
+    """
+
+    picture: object
+    y: object
+    x: object
+    angle: object
+    labels: object
+    index: object
+    originals: int
 
 
 @dataclass(frozen=True)
@@ -236,3 +383,155 @@ class CacheStep:
     entries: int
     bytes: int
     last_used_seconds: float
+
+
+@dataclass(frozen=True)
+class BenchScore:
+    """Точность метода по обучающим наборам стенда: среднее, разброс и 95 % доверительный интервал (вне статьи).
+
+    Наборы — случайные выборки номеров MNIST train с закреплённым зерном; точность каждого набора считается на одной и
+    той же конечной выборке (report или test), поэтому интервал по наборам не включает её собственную ошибку: её
+    биномиальная ошибка записана в JSON стенда.
+
+    Attributes:
+        mean: средняя доля верных ответов по наборам, 0…1.
+        std: стандартное отклонение по наборам (n − 1); у одного набора 0.
+        ci_low: нижняя граница 95 % интервала (t-распределение); `None`, если набор один.
+        ci_high: верхняя граница интервала; `None`, если набор один.
+        per_set: доля верных ответов по наборам, по порядку.
+    """
+
+    mean: float
+    std: float
+    ci_low: float | None
+    ci_high: float | None
+    per_set: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class BenchRobustness:
+    """Устойчивость метода к деформации: картинки отложенной выборки и они же, сдвинутые на пиксели (вне статьи).
+
+    Берутся первые `pictures` картинок отложенной выборки (`BENCH_PIXEL_PICTURES`), сдвиг — `BENCH_PIXEL_SHIFT`.
+    Мерка не связана с выбором настроек.
+
+    Attributes:
+        pictures: сколько картинок отложенной выборки сдвигалось.
+        shift: сдвиг `(dy, dx)` в пикселях.
+        same_answers: доля картинок, чей ответ при сдвиге не изменился, среднее по наборам, 0…1.
+        accuracy_plain: доля верных ответов на этих картинках без сдвига, среднее по наборам.
+        accuracy_shifted: то же на сдвинутых картинках.
+    """
+
+    pictures: int
+    shift: tuple[int, int]
+    same_answers: float
+    accuracy_plain: float
+    accuracy_shifted: float
+
+
+@dataclass(frozen=True)
+class BenchMethod:
+    """Итог метода при одном режиме аугментации: настройка, выбранная по select, и её точность на report и test (вне статьи).
+
+    Настройка выбрана по средней точности на части select отложенной выборки (при ничьей — первая по порядку), ранняя
+    остановка CNN тоже по select. `validation` — точность на части report, которая ни в каком выборе не участвовала,
+    `test` — на MNIST t10k, только у выбранной настройки.
+
+    Attributes:
+        method: `"damp"`, `"pixels"` (kNN по пикселям) или `"cnn"`.
+        augment: `"none"` или `"shifts"` (случайный сдвиг при обучении).
+        supported: `False` — метод не умеет этот режим (у DAMP `"shifts"` — не отдельный режим: сдвиги задают виды обучающих `LADDER_TRAIN_VIEWS`, §7.1.4; у kNN — не поддержано); точностей нет.
+        setting: выбранная настройка: `"k=5"` у DAMP и kNN, имя конфигурации у CNN; `None`, если не посчитано.
+        candidates: средняя точность на select каждой настройки перебора, `{настройка: доля}`.
+        validation: точность выбранной настройки на части report отложенной выборки, по наборам.
+        test: точность на проверочных (MNIST t10k) по наборам; `None`, если `test=0`. Считается только у выбранной настройки.
+        robustness: устойчивость к сдвигу; `None`, если картинок для неё нет.
+        note: пояснение, почему строка пустая.
+    """
+
+    method: str
+    augment: str
+    supported: bool
+    setting: str | None
+    candidates: dict[str, float]
+    validation: BenchScore | None
+    test: BenchScore | None
+    robustness: BenchRobustness | None
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class BenchLevel:
+    """Уровень цикла DAMP в стенде: мерки статьи и узнавание на report, среднее по наборам (§5.8, §5.13.2; §7.1.8.1; вне статьи).
+
+    Мерки `energy_mean`, `code_resolution`, `code_largest`, `detail_empty`, `detail_full` считаются по обучающим окнам; `detail_bits` — по всем окнам уровня.
+    `code_resolution` и `code_largest` — мерки §5.13.2.5, перенесённые с кодов точек карты на коды деталей (вне статьи).
+
+    Attributes:
+        number: номер уровня.
+        sets: в скольких наборах такой уровень построен.
+        picture_seen: доля углопозиций картинки, которую видит окно.
+        map_points: точек карты уровня.
+        detectors: детекторов над картой.
+        same_label: доля соседних точек карты с одной цифрой.
+        energy_mean: качество раскладки Ē (§5.8).
+        code_resolution: окон обучающих картинок на один различный код детали (§5.13.2.5).
+        code_largest: самый большой набор окон с одним кодом детали (§5.13.2.5).
+        detail_bits: единиц в коде детали, среднее по всем окнам уровня (насыщенность, §7.1.8.1).
+        detail_empty: доля обучающих окон с пустой деталью: ни один детектор не сработал (вне статьи).
+        detail_full: доля обучающих окон, чей код упёрся в предел σ (§7.1.8.1).
+        alone: узнавание по отклику уровня на report, `{k: доля}`; картинка без отклика считается неверной.
+        glued: узнавание по склейке откликов уровней 1…number на report, `{k: доля}`.
+        response_cosine: косинус откликов картинки и её сдвига; `None`, если сдвинутых картинок нет.
+    """
+
+    number: int
+    sets: int
+    picture_seen: float
+    map_points: int
+    detectors: int
+    same_label: float
+    energy_mean: float
+    code_resolution: float
+    code_largest: int
+    detail_bits: float
+    detail_empty: float
+    detail_full: float
+    alone: dict[int, float]
+    glued: dict[int, float]
+    response_cosine: float | None
+
+
+@dataclass(frozen=True)
+class BenchReport:
+    """Итог стенда честного сравнения: методы, уровни DAMP и разрыв до CNN (вне статьи).
+
+    Протокол: случайные выборки номеров MNIST с закреплённым зерном; отложенная выборка делится на select (выбор настроек,
+    ранняя остановка CNN) и report (итог, ни в чём не участвовала); test считается один раз, у выбранных настроек.
+
+    Attributes:
+        methods: строки по методу и режиму аугментации, в порядке таблицы.
+        levels: уровни DAMP (среднее по наборам); пусто, если DAMP не считался.
+        train: обучающих картинок в наборе.
+        sets: сколько наборов.
+        validation: картинок отложенной выборки (select + report).
+        test: проверочных картинок (0 — не считались).
+        map_points: предел точек карты уровня у DAMP.
+        gap: сколько DAMP до CNN, доля: `damp_minus_cnn_none` и `damp_minus_best_cnn` (по report, ключ `validation`, и по
+            `test`), `intervals` — парные 95 % интервалы по наборам, `best_cnn` — лучшая CNN (выбрана по select); `None`,
+            если не считались DAMP или CNN.
+        path: файл `data/bench/bench-<время>.json` со всеми цифрами; `None`, если не сохранялся.
+        seconds: время по методам и `total`, секунд.
+    """
+
+    methods: tuple[BenchMethod, ...]
+    levels: tuple[BenchLevel, ...]
+    train: int
+    sets: int
+    validation: int
+    test: int
+    map_points: int
+    gap: dict[str, object] | None
+    path: str | None
+    seconds: dict[str, float]

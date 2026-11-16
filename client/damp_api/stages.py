@@ -17,8 +17,8 @@
 | 3 | `Layout` | `layout` | `memory` | `build`, `pinwheel` |
 | 4 | `Detectors` | `detectors` | `build`, `fire` | — |
 | 5 | `Embeddings` | `embeddings` | `details` | `build` |
-| 6 | `Cycle` | `cycle` | `keyholes`, `step`, `covers` | `run` |
-| 7 | `Recognition` | `recognition` | `by_response`, `vote` | `evaluate`, `predict`, `predict_dataset`, `calibrate` |
+| 6 | `Cycle` | `cycle` | `keyholes`, `step`, `covers`, `trained` | `run` |
+| 7 | `Recognition` | `recognition` | `by_response`, `vote` | `evaluate`, `predict`, `predict_dataset`, `calibrate`, `bench` |
 | — | `Figures` | `figures` | — | `readme`, `structure` |
 """
 from __future__ import annotations
@@ -26,10 +26,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from ._system import system
-from .parts import Digits, Elements, Firing, Level, MapDetectors, Memory, Session, KeyholeCodes, Keyholes
+from .parts import Digits, Elements, Firing, Level, MapDetectors, Memory, Session, KeyholeCodes, Keyholes, TrainedLadder
 from .reports import (
     Code,
     CycleLevel,
+    BenchLevel,
+    BenchMethod,
+    BenchReport,
+    BenchRobustness,
+    BenchScore,
     CycleReport,
     Evaluation,
     LayoutSummary,
@@ -90,7 +95,7 @@ class Stimuli(_Stage):
     number = 1
 
     def digits(self, train: int, test: int = 0, *, split: str = "test", shifts: tuple[tuple[int, int], ...] = (),
-               shift_pictures: int | None = None) -> Digits:
+               shift_pictures: int | None = None, train_views: tuple[tuple[int, int], ...] | None = None) -> Digits:
         """Кубик. Цифры MNIST с углопозициями: вход цикла.
 
         Args:
@@ -99,13 +104,21 @@ class Stimuli(_Stage):
             split: из какого набора MNIST брать проверочные: `"test"` или `"train"`.
             shifts: сдвиги `(dy, dx)` для проверки устойчивости; пусто — без сдвигов.
             shift_pictures: у скольких первых проверочных картинок делать сдвиги; `None` — `LADDER_SHIFT_PICTURES`.
+            train_views: виды каждой обучающей цифры — сдвиги `(dy, dx)` на пиксели (§7.1.4: несколько разбиений
+                одной картинки на клетки сетки); виды тоже обучающие. `None` — `LADDER_TRAIN_VIEWS`, как у готового
+                прогона цикла; `()` — без видов.
 
         Returns:
-            `Digits`: сначала обучающие картинки, затем проверочные и их сдвиги.
+            `Digits`: сначала обучающие картинки, следом их виды, затем проверочные и их сдвиги.
+
+        Example:
+            >>> digits = Damp().stimuli.digits(100, 500, train_views=((0, 1), (0, -1)))
         """
         with self._session.active():
             pictures = system.settings.LADDER_SHIFT_PICTURES if shift_pictures is None else int(shift_pictures)
-            groups = system.digits(train=int(train), test=int(test), split=split, shifts=shifts, shift_pictures=pictures)
+            views = system.settings.LADDER_TRAIN_VIEWS if train_views is None else train_views
+            groups = system.digits(train=int(train), test=int(test), split=split, shifts=shifts, shift_pictures=pictures,
+                                   train_views=views)
         return Digits(self._session, groups)
 
     def of_image(self, image, label: int = 0) -> list[Stimulus]:  # noqa: ANN001
@@ -402,6 +415,9 @@ class Detectors(_Stage):
     def fire(self, detectors: MapDetectors, codes: KeyholeCodes) -> Firing:
         """Кубик. Какие детекторы сработали на каждом окне (§6.1, §6.5); то же, что `detectors.fire(codes)`.
 
+        Уровни активации нормируются в [0, 1] по окнам обучающих картинок (`LADDER_LEVEL_NORMALISATION`; способ нормировки —
+        доработка автора проекта, вне статьи: §7.1.12 и §9.3 требуют лишь значений в [0, 1]).
+
         Args:
             detectors: детекторы над картой (`build`).
             codes: коды окон.
@@ -424,7 +440,8 @@ class Embeddings(_Stage):
         """Кубик. Детали окон — эмбеддинги по сработавшим детекторам (§6.5, §7.1.12).
 
         Деталь стоит в центре окна, её уровень активации — самый сильный детектор (П.1). Это элементы
-        следующего уровня: с них цикл снова идёт на этап 2.
+        следующего уровня: с них цикл снова идёт на этап 2. Длина кода детали подбирается только по окнам
+        обучающих картинок.
 
         Args:
             firing: срабатывания (`MapDetectors.fire`).
@@ -461,7 +478,8 @@ class Embeddings(_Stage):
 class Cycle(_Stage):
     """Этап 6. Цикл (§6.2, §6.6; П.2, П.3, П.9): детали уровня снова идут на этап 2 (↺), пока окно не увидит цифру целиком.
 
-    Кубики: `keyholes`, `step`, `covers`. Готовый прогон — `run` (команда `ladder`).
+    Кубики: `keyholes`, `step`, `covers`, `trained` (обученный цикл для новых картинок — дашборд). Готовый прогон —
+    `run` (команда `ladder`).
 
     Example:
         >>> elements = damp.coding.sticks(damp.stimuli.digits(train=100, test=500))
@@ -536,6 +554,36 @@ class Cycle(_Stage):
         with self._session.active():
             return level.keyholes.picture_seen >= float(system.settings.LADDER_TOP_COVERAGE)
 
+    def trained(self, train: int | None = None, *, map_points: int | None = None, decay: float | None = None) -> TrainedLadder:
+        """Кубик. Обученный цикл и его линейный читатель (§6.6, §9.3): по ним идёт любая новая картинка 28×28.
+
+        Цикл учится на `train` обучающих цифрах с их видами (`LADDER_TRAIN_VIEWS`, §7.1.4), без проверочных; шаги —
+        из кеша, если такой цикл уже был. Читатель учится на пиках срабатываний уровней обучающих картинок.
+
+        Args:
+            train: сколько обучающих цифр; `None` — `DASHBOARD_TRAIN`.
+            map_points: предел точек карты уровня; `None` — `DASHBOARD_MAP_POINTS`.
+            decay: штраф L2 линейного читателя; `None` — `DASHBOARD_LINEAR_DECAY`.
+
+        Returns:
+            `TrainedLadder`: `see(картинка)` — путь картинки по уровням и вероятности цифр; `maps()` — карты уровней.
+
+        Raises:
+            RuntimeError: цикл не построил ни одного уровня.
+
+        Example:
+            >>> ladder = damp.cycle.trained(100)
+            >>> ladder.see(picture).digit
+        """
+        with self._session.active():
+            s = system.settings
+            ladder = system.trained_ladder(
+                int(s.DASHBOARD_TRAIN if train is None else train),
+                map_points=s.DASHBOARD_MAP_POINTS if map_points is None else int(map_points),
+                decay=float(s.DASHBOARD_LINEAR_DECAY if decay is None else decay),
+            )
+        return TrainedLadder(self._session, ladder)
+
     def run(self, train: int, test: int, *, split: str = "test", map_points: int | None = None,
             shifts: tuple[tuple[int, int], ...] | None = None) -> CycleReport:
         """Прогон. Цикл уровней на обучающих цифрах и проверка на проверочных (команда `ladder`).
@@ -573,6 +621,12 @@ class Cycle(_Stage):
                 response=r.alone,
                 peak=r.peak,
                 glued=r.glued,
+                energy_mean=float(r.energy_mean),
+                code_resolution=float(r.code_resolution),
+                code_largest=int(r.code_largest),
+                detail_bits=float(r.detail_bits),
+                detail_empty=float(r.detail_empty),
+                detail_full=float(r.detail_full),
             )
             for r in runner.reports
         )
@@ -582,10 +636,63 @@ class Cycle(_Stage):
 class Recognition(_Stage):
     """Этап 7. Распознавание (§2.2.5; мерка вне статьи): детали верхнего уровня голосуют за класс цифры.
 
-    Кубики цикла: `by_response`, `vote`. Проход без цикла: `evaluate`, `predict`, `predict_dataset`, `calibrate`.
+    Кубики цикла: `by_response`, `vote`, `linear`. Проход без цикла: `evaluate`, `predict`, `predict_dataset`,
+    `calibrate`. Честное сравнение с kNN по пикселям и обычной CNN: `bench`.
     """
 
     number = 7
+
+    def linear(self, firings: Firing | list[Firing] | tuple[Firing, ...], decays: tuple[float, ...] | None = None) -> dict[float, float]:
+        """Кубик. Доля верных ответов линейного читателя над нормированными уровнями активации иерархии детекторов (§9.3).
+
+        §9.3: уровни активации — эмбеддинг в ℝⁿ, вход нейросети. Эмбеддинг картинки — самый сильный уровень
+        активации каждого детектора по её окнам, у каждого уровня свой сегмент единичной длины; класс читает один
+        линейный слой с softmax, обученный на обучающих картинках (вместе с видами) со штрафом L2 `λ` на веса.
+        Читатель — с учителем и вне памяти DAMP; проверочные на него не влияют.
+
+        Args:
+            firings: срабатывания уровней (`Level.firing` или `MapDetectors.fire`): один уровень или уровни 1…k
+                одного прогона.
+            decays: штрафы `λ`; `None` — `BENCH_LINEAR_DECAYS`.
+
+        Returns:
+            `{λ: доля верных ответов}` на проверочных.
+
+        Raises:
+            ValueError: проверочных картинок нет (`digits(train, test)` с `test > 0`), срабатываний нет, или `λ`
+                не заданы.
+
+        Example:
+            >>> levels = [damp.cycle.step(elements)]  # и дальше по деталям уровней
+            >>> damp.recognition.linear([level.firing for level in levels])
+        """
+        import numpy as np
+
+        items = [firings] if isinstance(firings, Firing) else list(firings)
+        if not items:
+            raise ValueError("нет срабатываний: передайте Level.firing хотя бы одного уровня")
+        groups = items[0].codes.keyholes.elements.digits._groups
+        if "test" not in groups.ranges:
+            raise ValueError("нет проверочных картинок: digits(train, test) с test > 0")
+        with self._session.active():
+            values = tuple(float(value) for value in (system.settings.BENCH_LINEAR_DECAYS if decays is None else decays))
+            if not values:
+                raise ValueError("нет λ: задайте decays или BENCH_LINEAR_DECAYS")
+            recognition = system.level_recognition(groups.labels, groups.ranges["train"])
+            peaks = []
+            for firing in items:
+                found = firing._firing
+                _, peak = recognition.responses(
+                    firing.codes.keyholes._keyholes.pieces.picture, found.rows, found.columns, found.levels,
+                    groups.pictures, firing.detectors.count,
+                )
+                peaks.append(peak)
+            first, last = groups.ranges["test"]
+            answers = system.linear_reader().answers_for(
+                np.concatenate(peaks, axis=1), groups.labels, groups.ranges["train"], {"test": (first, last)}, values
+            )
+        truth = groups.labels[first:last]
+        return {decay: float(np.mean((found["test"] == truth) & (found["test"] >= 0))) for decay, found in answers.items()}
 
     def by_response(self, firing: Firing) -> dict[int, float]:
         """Кубик. Доля верных ответов по отклику картинки на уровне: сколько раз сработал каждый детектор на её окнах.
@@ -635,6 +742,102 @@ class Recognition(_Stage):
         with self._session.active():
             recognition = system.level_recognition(groups.labels, groups.ranges["train"])
             return recognition.by_vote(found.codes(), found.what_length, found.picture, groups.ranges["test"])
+
+    def bench(self, train: int | None = None, sets: int | None = None, validation: int | None = None, test: int | None = None,
+              map_points: int | None = None, methods: tuple[str, ...] | None = None,
+              augment: tuple[str, ...] | None = None) -> BenchReport:
+        """Прогон. Стенд честного сравнения DAMP, kNN по пикселям и обычной CNN на одних и тех же картинках (команда `bench`; вне статьи).
+
+        Картинки — случайная выборка номеров MNIST с закреплённым зерном (`BENCH_SEED`), а не сплошные блоки: MNIST train
+        не перемешан по авторам, и соседние блоки заметно отличаются по трудности. Обучающие наборы (по `train` картинок,
+        не пересекаются) берутся из пула `BENCH_TRAIN_POOL`, отложенная выборка `validation` — из `BENCH_VALIDATION_POOL`;
+        те же картинки у всех методов. Отложенная выборка делится на две части. **select** (доля `BENCH_SELECT_SHARE`):
+        по ней выбираются k у DAMP и kNN, конфигурация CNN и момент ранней остановки CNN. **report**: в выборе не участвует,
+        по ней считаются итоговая точность `validation` каждого метода и разрыв до CNN. `test` (MNIST t10k) считается
+        лишь для выбранных настроек, один раз в конце этапа, и на выбор не влияет. Итог по методу — среднее, стандартное
+        отклонение и 95 % t-интервал по наборам; у разрыва DAMP − CNN парный интервал по наборам; ошибка самой конечной
+        выборки report — биномиальная. Мерки статьи по уровням DAMP (§5.8, §5.13.2.5, §7.1.8.1) и устойчивость к
+        сдвигу на пиксели (доля неизменившихся ответов) — в отчёте; все цифры, настройки и номера картинок — в JSON из
+        `BenchReport.path`. Каждый DAMP-прогон идёт в своей записи Rerun со всеми вкладками, сама запись «bench» — таблица
+        результатов и ход обучения CNN.
+
+        Args:
+            train: обучающих картинок в наборе; `None` — `BENCH_TRAIN`.
+            sets: сколько наборов; `None` — `BENCH_SETS`.
+            validation: картинок отложенной выборки (select + report, не меньше 2); `None` — `BENCH_VALIDATION`.
+            test: проверочных картинок t10k; `None` — `BENCH_TEST` (0 — не считать).
+            map_points: предел точек карты уровня у DAMP; `None` — `BENCH_MAP_POINTS`.
+            methods: из `"damp"`, `"pixels"`, `"cnn"`; `None` — `BENCH_METHODS`.
+            augment: режимы аугментации, `"none"` и `"shifts"`; `None` — `BENCH_AUGMENT`. У DAMP сдвиги задают виды
+                обучающих `LADDER_TRAIN_VIEWS` (§7.1.4), у kNN `"shifts"` не поддержан (в отчёте строка без точностей).
+
+        Returns:
+            `BenchReport`: методы, уровни DAMP, разрыв до CNN и путь к JSON.
+
+        Raises:
+            ValueError: неизвестный метод или режим; `train`, `sets` не положительны, `test` отрицателен; в отложенной
+                выборке меньше двух картинок (её нельзя разделить на select и report); обучающие наборы, отложенная
+                выборка или test не помещаются в свои пулы (`train * sets` больше `BENCH_TRAIN_POOL` и т. п.).
+
+        Example:
+            >>> report = damp.recognition.bench(train=100, sets=5, validation=500, test=500)
+            >>> [(m.method, m.augment, m.setting, round(m.validation.mean, 3)) for m in report.methods if m.supported]
+            >>> report.gap["damp_minus_best_cnn"]["validation"]  # доля, по report
+        """
+        with self._session.active():
+            result = system.bench(
+                train=train, sets=sets, validation=validation, test=test, map_points=map_points,
+                methods=methods, augment=augment,
+            ).run()
+        protocol = result["protocol"]
+
+        def score(found: dict | None) -> BenchScore | None:
+            if found is None:
+                return None
+            return BenchScore(
+                mean=float(found["mean"]), std=float(found["std"]),
+                ci_low=None if found["ci_low"] is None else float(found["ci_low"]),
+                ci_high=None if found["ci_high"] is None else float(found["ci_high"]),
+                per_set=tuple(float(v) for v in found["per_set"]),
+            )
+
+        def robustness(found: dict | None) -> BenchRobustness | None:
+            if found is None:
+                return None
+            return BenchRobustness(
+                pictures=int(found["pictures"]), shift=(int(found["shift"][0]), int(found["shift"][1])),
+                same_answers=float(found["same_answers"]), accuracy_plain=float(found["accuracy_plain"]),
+                accuracy_shifted=float(found["accuracy_shifted"]),
+            )
+
+        methods_found = tuple(
+            BenchMethod(
+                method=row["method"], augment=row["augment"], supported=bool(row["supported"]), setting=row["setting"],
+                candidates={str(k): float(v) for k, v in row["candidates"].items()},
+                validation=score(row["validation"]), test=score(row["test"]), robustness=robustness(row["robustness"]),
+                note=str(row["note"]),
+            )
+            for row in result["methods"]
+        )
+        levels = tuple(
+            BenchLevel(
+                number=int(level["number"]), sets=int(level["sets"]), picture_seen=float(level["picture_seen"]),
+                map_points=int(round(level["map_points"])), detectors=int(round(level["detectors"])),
+                same_label=float(level["same_label"]), energy_mean=float(level["energy_mean"]),
+                code_resolution=float(level["code_resolution"]), code_largest=int(round(level["code_largest"])),
+                detail_bits=float(level["detail_bits"]), detail_empty=float(level["detail_empty"]),
+                detail_full=float(level["detail_full"]),
+                alone={int(k): float(v) for k, v in level["alone"].items()},
+                glued={int(k): float(v) for k, v in level["glued"].items()},
+                response_cosine=level["response_cosine"],
+            )
+            for level in result["levels"]
+        )
+        return BenchReport(
+            methods=methods_found, levels=levels, train=int(protocol["train"]), sets=int(protocol["sets"]),
+            validation=int(protocol["validation"]), test=int(protocol["test"]), map_points=int(protocol["map_points"]),
+            gap=result["gap"], path=result["path"], seconds=dict(result["seconds"]),
+        )
 
     def evaluate(self, count: int, *, split: str = "test", limit: int | None = None, temperature: float | None = None,
                  layout_path: str | None = None) -> Evaluation:

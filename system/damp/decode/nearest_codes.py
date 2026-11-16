@@ -29,6 +29,22 @@ class NearestVectorClassifier:
         norms = np.sqrt((vectors * vectors).sum(axis=1, keepdims=True))
         return vectors / np.maximum(norms, 1e-12)
 
+    def neighbours(self, vectors: "np.ndarray", count: int, *, use_gpu: bool = True, block: int = 2048) -> "np.ndarray":
+        """Номера count самых похожих векторов базы (косинус) для каждого вектора запроса, от самого похожего.
+
+        Пачками на видеокарте: матрица «запросы × база» целиком в память не помещается."""
+        import torch
+
+        device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
+        base = torch.as_tensor(self._vectors, device=device)
+        count = min(int(count), int(base.shape[0]))
+        found = []
+        for start in range(0, int(vectors.shape[0]), int(block)):
+            part = self._normalised(np.asarray(vectors[start : start + int(block)], dtype=np.float32))
+            cosine = torch.as_tensor(part, device=device) @ base.T
+            found.append(cosine.topk(count, dim=1).indices.cpu().numpy())
+        return np.concatenate(found) if found else np.zeros((0, count), dtype=np.int64)
+
     def accuracy(self, vectors: "np.ndarray", labels: Sequence[int], *, neighbours: Sequence[int] = (1,)) -> dict[int, float]:
         """Доля верных ответов при голосовании k ближайших векторов для каждого k из neighbours."""
         labels = np.asarray(labels, dtype=np.int64)
@@ -97,6 +113,36 @@ class NearestCodeClassifier:
             values, indices = np.concatenate(values, axis=1), np.concatenate(indices, axis=1)
             order = np.argsort(-values, axis=1, kind="stable")[:, :count]
             result.append(np.take_along_axis(indices, order, axis=1))
+        return np.concatenate(result)
+
+    def within(self, packed: "np.ndarray", thresholds: Sequence[float], classes: int) -> "np.ndarray":
+        """Нечёткий поиск §2.2.5: S(v) — все коды базы, близкие к коду v с точностью ε (косинус ≥ ε).
+
+        Возвращает (запросы × len(thresholds) × classes): сколько кодов базы каждого класса в ε-окрестности
+        каждого кода запроса, для каждого ε. Числитель и знаменатель косинуса — целые счётчики единиц, поэтому
+        сравнение с ε не зависит от того, с какими кодами запрос попал в одну пачку.
+        """
+        torch = self._torch
+        packed = np.ascontiguousarray(packed, dtype=np.uint8)
+        levels = [float(value) for value in thresholds]
+        onehot = torch.zeros((self._packed.shape[0], int(classes)), dtype=torch.float32, device=self._device)
+        onehot[torch.arange(self._packed.shape[0], device=self._device), torch.as_tensor(self._labels, device=self._device)] = 1.0
+        result = []
+        for start in range(0, packed.shape[0], self.BLOCK):
+            query = self._tensor(packed[start : start + self.BLOCK])
+            query_ones = query.sum(dim=1)
+            counts = torch.zeros((query.shape[0], len(levels), int(classes)), dtype=torch.float32, device=self._device)
+            for base in range(0, self._packed.shape[0], self.BLOCK):
+                block = self._tensor(self._packed[base : base + self.BLOCK])
+                cosine = (query @ block.T) / torch.sqrt(
+                    torch.clamp(query_ones[:, None] * block.sum(dim=1)[None, :], min=1.0)
+                )
+                members = onehot[base : base + block.shape[0]]
+                for index, level in enumerate(levels):
+                    counts[:, index, :] += (cosine >= level).to(torch.float32) @ members
+            result.append(counts.cpu().numpy())
+        if not result:
+            return np.zeros((0, len(levels), int(classes)), dtype=np.float32)
         return np.concatenate(result)
 
     def accuracy(self, packed: "np.ndarray", labels: Sequence[int], *, neighbours: Sequence[int] = (1,)) -> dict[int, float]:

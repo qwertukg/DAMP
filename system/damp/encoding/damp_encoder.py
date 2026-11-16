@@ -169,6 +169,15 @@ def plane_detector_layers(
     if not (0.0 <= overlap < 1.0):
         raise ValueError("overlap must be in [0.0, 1.0)")
     widest = max(1, int(math.floor(1.0 / (2.0 * widest_radius * (1.0 - overlap)) + 0.5)))
+    if int(layers_count) == 1:
+        # Один слой — только самые широкие круги: содержание окна собирают несколько крупных областей (П.7).
+        LOGGER.event(
+            "detectors.plane_layers",
+            section=TWO_DIM_CODES,
+            data={"layers_count": 1, "widest_radius": widest_radius, "overlap": overlap, "widest_per_side": widest,
+                  "note": "один слой: только самые широкие круги, число по стороне = 1 / (2 · r · (1 − overlap))"},
+        )
+        return (Detectors(widest, overlap),)
     narrowest = int(math.floor(1.0 / (2.0 * narrowest_radius * (1.0 - overlap)) + 0.5))
     narrowest = max(narrowest, widest + layers_count - 1)
     LOGGER.event(

@@ -26,12 +26,48 @@ class Firing:
     rows: "np.ndarray"  # номер набора
     columns: "np.ndarray"  # номер детектора (по слоям, слой 0 — самый широкий)
     levels: "np.ndarray"  # уровень активации E(d) ≥ μ_d
+    scale: "np.ndarray | None" = None  # делители нормировки уровней по детекторам (scaled), None — без нормировки
 
     def strength(self) -> "np.ndarray":
         """Уровень активации каждого набора — самый сильный из сработавших на нём детекторов (П.1)."""
         strength = np.zeros(int(self.sets), dtype=np.float64)
         np.maximum.at(strength, self.rows, self.levels.astype(np.float64))
         return strength
+
+    def train_maxima(self, trained: "np.ndarray", detectors: int) -> "np.ndarray":
+        """Наибольший уровень активации каждого детектора по наборам обучающих картинок (0 — не срабатывал)."""
+        trained = np.asarray(trained, dtype=bool)
+        if trained.shape != (int(self.sets),):
+            raise ValueError("trained: нужна маска по числу наборов")
+        inside = trained[self.rows]
+        maxima = np.zeros(int(detectors), dtype=np.float64)
+        np.maximum.at(maxima, self.columns[inside], self.levels[inside].astype(np.float64))
+        return maxima
+
+    def normalised(self, trained: "np.ndarray", detectors: int) -> "Firing":
+        """Уровни активации в [0, 1]. ДОРАБОТКА автора проекта (вне статьи): статья (§7.1.12: «detector activity
+        levels … in an interval [0, 1]»; §9.3: «Normalised activation levels») требует лишь значений в [0, 1] и
+        способа нормировки не задаёт. Здесь уровень делится на наибольший уровень этого детектора по наборам
+        обучающих картинок и обрезается единицей. Детектор, ни разу не сработавший на обучающих, — min(E, 1).
+        Проверочные картинки на нормировку не влияют: её задают только обучающие.
+
+        После нормировки у каждого детектора, сработавшего на обучающих, максимум по ним ровно 1, поэтому
+        «сильнейший» детектор на обучающих окнах выбирается среди многих ничьих (уровень 1).
+
+        Args:
+            trained: маска наборов, взятых из обучающих картинок (по числу наборов).
+            detectors: сколько всего детекторов (номера столбцов — 0…detectors−1).
+        """
+        return self.scaled(self.train_maxima(trained, detectors))
+
+    def scaled(self, maxima: "np.ndarray") -> "Firing":
+        """Уровни, делённые на maxima своего детектора и обрезанные единицей (normalised, вне статьи); maxima
+        запоминаются в scale — так нормируется новая картинка обученного уровня теми же делителями."""
+        maxima = np.asarray(maxima, dtype=np.float64)
+        scale = maxima[self.columns]
+        levels = self.levels.astype(np.float64)
+        levels = np.minimum(np.where(scale > 0.0, levels / np.where(scale > 0.0, scale, 1.0), levels), 1.0)
+        return Firing(sets=self.sets, rows=self.rows, columns=self.columns, levels=levels.astype(self.levels.dtype), scale=maxima)
 
 
 def map_hierarchy(
@@ -213,6 +249,28 @@ class LevelDetectors:
         """Пороги λ_d слоёв по возрастанию."""
         return self._layers()[2]
 
+    def dominance(self, classes: int) -> "np.ndarray":
+        """Господство классов в детекторах (§8.2: «The stimulus that generated each point of the code space … is known
+        and can be preserved. This information can be used afterwards to determine cluster dominance»).
+
+        Для каждого детектора (порядок detectors, как у срабатываний) — доли цифр точек карты в его поле (§6.5) с
+        весом энергии точки; точки ниже порога μ_e не считаются. Подпись точки — цифра обучающей картинки, чей код
+        её породил: проверочные картинки на профиль не влияют. Детектор без весомых точек — нулевой профиль.
+        """
+        cells = self.layout.cells_array().astype(np.float64)
+        labels = np.asarray([int(label) for label in self.layout.code_table.labels()], dtype=np.int64)
+        energy = np.asarray(self.energies, dtype=np.float64)
+        weights = np.where(energy >= float(settings.ACTIVATION_ENERGY_THRESHOLD), energy, 0.0)
+        detectors = self.detectors
+        centre = np.asarray([detector.center for detector in detectors], dtype=np.float64)
+        radius = np.asarray([detector.radius for detector in detectors], dtype=np.float64)
+        inside = np.hypot(cells[:, None, 0] - centre[None, :, 0], cells[:, None, 1] - centre[None, :, 1]) <= radius[None, :]
+        weighted = np.zeros((cells.shape[0], int(classes)), dtype=np.float64)
+        weighted[np.arange(cells.shape[0]), labels] = weights
+        profile = inside.T.astype(np.float64) @ weighted
+        total = profile.sum(axis=1, keepdims=True)
+        return np.divide(profile, total, out=np.zeros_like(profile), where=total > 0)
+
     def fire(self, codes: "np.ndarray", index: "np.ndarray", group: "np.ndarray", sets: int) -> Firing:
         """Срабатывания на наборы кодов: index — номер кода у каждого вхождения, group — номер набора (§6.5).
 
@@ -220,6 +278,11 @@ class LevelDetectors:
         """
         rows, columns, levels = self.detection.active_sets(codes, index, group, int(sets))
         return Firing(sets=int(sets), rows=rows, columns=columns, levels=levels)
+
+    def lit(self, codes: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+        """Точки карты, которые зажигает каждый код (§6.1): тройки (код, точка, активация a_j > 0). Та же пороговая
+        активация, из которой складывается уровень детектора (§6.5), — для показа на карте; на срабатывания не влияет."""
+        return self.detection.lit(codes)
 
     def release(self) -> None:
         """Освободить память видеокарты под срабатыванием."""

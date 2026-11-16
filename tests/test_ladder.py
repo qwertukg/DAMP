@@ -327,6 +327,32 @@ class PositionBindingTest(unittest.TestCase):
             expected |= moved
         self.assertEqual(set(np.flatnonzero(content[0]).tolist()), expected)
 
+    def test_one_layer_of_place_circles_is_the_widest(self) -> None:
+        """П.7: один слой кругов места — только самые широкие круги (несколько крупных областей окна)."""
+        from damp.encoding.damp_encoder import plane_detector_layers
+
+        one = plane_detector_layers(layers_count=1, widest_radius=0.1875, narrowest_radius=0.09375, overlap=0.4)
+        two = plane_detector_layers(layers_count=2, widest_radius=0.1875, narrowest_radius=0.09375, overlap=0.4)
+        self.assertEqual(len(one), 1)
+        self.assertEqual(one[0].count, two[0].count)
+
+    def test_concepts_keep_the_strongest_codes_and_every_place_bit(self) -> None:
+        """П.7: окно объединяет K самых сильных понятий — коды остальных отброшены целиком, биты места — у всех."""
+        packed = self._random_features(3, seed=5)
+        strength = np.asarray([0.2, 0.9, 0.5])  # понятие 0 — самое слабое
+        full = self._encode(self._encoder(pooling="strongest"), packed, [[(0, 0), (1, 4), (2, 8)]], strength=strength)
+        two = self._encode(
+            self._encoder(pooling="strongest", concepts=2), packed, [[(0, 0), (1, 4), (2, 8)]], strength=strength
+        )
+        without = self._encode(self._encoder(pooling="strongest"), packed, [[(1, 4), (2, 8)]], strength=strength[1:])
+        place_full, _ = self._segments(full)
+        place_two, content_two = self._segments(two)
+        _, content_without = self._segments(without)
+        np.testing.assert_array_equal(place_two, place_full)  # место отмечено и у отброшенного понятия
+        np.testing.assert_array_equal(content_two, content_without)  # его код в содержание не вошёл
+        with self.assertRaises(ValueError):
+            self._encoder(concepts=0)
+
     def test_same_feature_in_two_places_differs_in_place_bits_and_in_content(self) -> None:
         encoder = self._encoder()
         # Одна и та же вертикальная линия в левом верхнем и в правом нижнем углу окна.
@@ -479,6 +505,28 @@ class DenseKeyholesTest(unittest.TestCase):
         bits = np.zeros((count, 32), dtype=np.float32)
         bits[:, :8] = 1
         return bits
+
+    def test_concepts_cap_the_keyhole_at_the_kth_nearest_element(self) -> None:
+        """П.7: окно объединяет не больше concepts понятий — радиус не дальше concepts-го ближайшего элемента."""
+        from damp.cycle.plane_fields import PlaneFieldBuilder
+
+        positions = np.asarray([[0.0, float(x)] for x in range(9)])
+        builder = PlaneFieldBuilder(
+            lambda_thresholds=0.9, activation_radius=6.0, eps=1.5, min_samples=3, min_points=5, radius_min=1.0,
+            energy_radius=3.0, energy_threshold=0.12, dense=True, concepts=5,
+        )
+        radius = {x: r for _, x, r, _ in builder.picture_fields(positions, self._alike(9))}
+        # Середина ряда: 5-й ближайший (с самим элементом) — на расстоянии 2, как и без ограничения; у конца ряда
+        # окно было 4, а теперь — до 5-го ближайшего, тоже 4 (0, 1, 2, 3, 4).
+        self.assertAlmostEqual(radius[4.0], 2.0)
+        self.assertAlmostEqual(radius[0.0], 4.0)
+        narrow = PlaneFieldBuilder(
+            lambda_thresholds=0.9, activation_radius=6.0, eps=1.5, min_samples=3, min_points=3, radius_min=1.0,
+            energy_radius=3.0, energy_threshold=0.12, dense=True, concepts=3,
+        )
+        radius = {x: r for _, x, r, _ in narrow.picture_fields(positions, self._alike(9))}
+        self.assertAlmostEqual(radius[4.0], 1.0)  # 3 элемента: сам и два соседа
+        self.assertLessEqual(radius[0.0], 2.0)  # у конца ряда: сам, 1, 2
 
     def test_every_element_gets_a_keyhole_centred_on_itself(self) -> None:
         positions = np.asarray([[0.0, float(x)] for x in range(9)])

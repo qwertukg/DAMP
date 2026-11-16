@@ -16,6 +16,7 @@
 | `MapDetectors` | 4 | `Damp.detectors.build` | детекторы над картой (§6.4) |
 | `Firing` | 4 | `MapDetectors.fire` | какие детекторы сработали на окнах (§6.5) |
 | `Level` | 2–6 | `Damp.cycle.step` | весь проход уровня разом |
+| `TrainedLadder` | 6, 7 | `Damp.cycle.trained` | обученный цикл и читатель: путь новой картинки по уровням |
 
 Example:
     >>> digits = damp.stimuli.digits(train=100, test=500)
@@ -32,7 +33,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._system import system
-from .reports import Picture, Stimulus
+from .reports import LevelMap, Picture, Sight, SightLevel, Stimulus, TrainingSticks
 
 
 class Session:
@@ -108,8 +109,21 @@ class Digits(_Part):
 
     @property
     def groups(self) -> dict[str, tuple[int, int]]:
-        """Группа → (первая картинка, после последней): "train", "test", сдвиги "dy,dx"."""
-        return {key if isinstance(key, str) else f"{key[0]},{key[1]}": value for key, value in self._groups.ranges.items()}
+        """Группа → (первая картинка, после последней).
+
+        Имена: `"train"`, `"validation"`, `"test"`; сдвиг на клетки сетки — `"dy,dx"`; сдвиг на пиксели —
+        `"pixel:dy,dx"` (у разных сдвигов разные имена).
+        """
+        return {self._group_name(key): value for key, value in self._groups.ranges.items()}
+
+    @staticmethod
+    def _group_name(key) -> str:  # noqa: ANN001
+        """Имя группы по её ключу: строка — как есть, (dy, dx) — "dy,dx", ("pixel", dy, dx) — "pixel:dy,dx"."""
+        if isinstance(key, str):
+            return key
+        if key[0] == "pixel":
+            return f"pixel:{key[1]},{key[2]}"
+        return f"{key[0]},{key[1]}"
 
     @property
     def labels(self) -> tuple[int, ...]:
@@ -134,7 +148,8 @@ class Digits(_Part):
         first, last = self._groups.sticks(int(index))
         group = next(name for name, (begin, end) in self.groups.items() if begin <= index < end)
         stimuli = tuple(Stimulus(float(atoms.angle[i]), int(atoms.x[i]), int(atoms.y[i])) for i in range(first, last))
-        return Picture(index=int(index), digit=int(atoms.labels[index]), group=group, image=atoms.images[index], stimuli=stimuli)
+        return Picture(index=int(index), digit=int(atoms.labels[index]), group=group, image=atoms.images[index], stimuli=stimuli,
+                       mnist=int(atoms.index[index]))
 
 
 class Elements(_Part):
@@ -360,11 +375,15 @@ class MapDetectors(_Part):
             codes: коды окон; обычно те, по которым построена карта.
 
         Returns:
-            `Firing`: на каком окне какой детектор сработал и с каким уровнем активации.
+            `Firing`: на каком окне какой детектор сработал и с каким уровнем активации; при
+            `LADDER_LEVEL_NORMALISATION = "train_max"` уровень в [0, 1] (способ — доработка
+            автора проекта, вне статьи; §7.1.12 и §9.3 требуют лишь значений в [0, 1]).
         """
-        every = np.arange(codes.count, dtype=np.int64)
+        keyholes = codes.keyholes
         with self._session.active():
-            firing = self._detectors.fire(codes._codes.packed, every, every, codes.count)
+            # Тот же шаг, что у цикла: уровни нормируются по окнам обучающих картинок (доработка, вне статьи).
+            step = system.cycle_step(keyholes.elements.digits._groups, map_points=system.settings.LADDER_MAP_MAX_POINTS)
+            firing = step.fire(self._detectors, codes._codes, step.trained(keyholes._keyholes))
         return Firing(self._session, firing, self, codes)
 
 
@@ -432,3 +451,128 @@ class Level:
     def number(self) -> int:
         """Номер уровня (совпадает с `keyholes.level`)."""
         return self.keyholes.level
+
+
+class TrainedLadder(_Part):
+    """Этапы 6–7. Обученный цикл и его линейный читатель (§6.6, §9.3): по ним идёт любая новая картинка 28×28.
+
+    Часть делает `Damp.cycle.trained`. Картинка идёт теми же шагами, что картинка прогона `ladder`: углопозиции
+    (§4.4), окна (П.2), их коды (П.4–П.7), срабатывания детекторов карт (§6.5), детали (П.1) — уровень за уровнем;
+    всё подобранное по обучающим картинкам берётся из обученных уровней. Поэтому у цифры MNIST путь тот же, что в
+    прогоне, цифра в цифру. Так работает живой дашборд (`python client/run.py dashboard`).
+
+    Example:
+        >>> ladder = damp.cycle.trained(100)
+        >>> sight = ladder.see(picture)          # numpy 28×28, 0…255, белая цифра на чёрном
+        >>> sight.digit, [len(level.keyhole_extent) for level in sight.levels]
+    """
+
+    def __init__(self, session: Session, ladder) -> None:  # noqa: ANN001
+        super().__init__(session)
+        self._ladder = ladder
+
+    @property
+    def levels(self) -> int:
+        """Сколько уровней у обученного цикла."""
+        return len(self._ladder.levels)
+
+    @property
+    def train_pictures(self) -> int:
+        """Обучающих картинок вместе с видами (§7.1.4)."""
+        return int(self._ladder.groups.train_pictures)
+
+    @property
+    def decay(self) -> float:
+        """Штраф L2 линейного читателя (§9.3)."""
+        return float(self._ladder.decay)
+
+    def see(self, image, *, log: bool = False) -> Sight:  # noqa: ANN001
+        """Путь картинки через все уровни и ответ линейного читателя (§6.5, §9.3; П.1–П.5).
+
+        Args:
+            image: картинка 28×28: numpy uint8 0…255 либо float в [0, 1], белая цифра на чёрном, как в MNIST.
+            log: записать итог в журнал событием `dashboard.see` (у дашборда — по окончании штриха).
+
+        Returns:
+            `Sight`: углопозиции, уровни (кусочки, зажжённые точки, сработавшие детекторы, детали) и вероятности цифр.
+
+        Raises:
+            ValueError: картинка не 28×28.
+
+        Example:
+            >>> sight = ladder.see(np.zeros((28, 28), dtype=np.uint8))
+            >>> sight.digit, sight.levels                # пустая картинка: (-1, ())
+        """
+        with self._session.active():
+            found = self._ladder.see(np.asarray(image), log=log)
+        return Sight(
+            stick_angle=found.stick_angle,
+            stick_y=found.stick_y,
+            stick_x=found.stick_x,
+            stick_strength=found.stick_strength,
+            levels=tuple(
+                SightLevel(
+                    number=level.number, keyhole_centre=level.keyhole_centre, keyhole_extent=level.keyhole_extent,
+                    entry_keyhole=level.entry_keyhole, entry_element=level.entry_element,
+                    lit_keyhole=level.lit_keyhole, lit_point=level.lit_point, lit_value=level.lit_value,
+                    fired_keyhole=level.fired_keyhole, fired_detector=level.fired_detector, fired_level=level.fired_level,
+                    detail_length=level.detail_length, strength=level.strength, peak=level.peak,
+                )
+                for level in found.levels
+            ),
+            probabilities=tuple(float(value) for value in found.probabilities),
+            digit=int(found.answer),
+            seconds=float(found.seconds),
+        )
+
+    def maps(self) -> tuple[LevelMap, ...]:
+        """Карты уровней для показа: точки карты, окно обучающей картинки каждой точки, детекторы по слоям (§5, §6.4).
+
+        Returns:
+            `LevelMap` по уровням, от первого к верхнему.
+        """
+        found = []
+        for level in self._ladder.levels:
+            layout, detectors = level.memory.layout, level.detectors
+            found.append(
+                LevelMap(
+                    number=int(level.number),
+                    height=int(layout.height),
+                    width=int(layout.width),
+                    cells=np.asarray(layout.cells_array(), dtype=np.int64),
+                    labels=np.asarray([int(label) for label in layout.code_table.labels()], dtype=np.int64),
+                    energies=np.asarray(level.memory.energies, dtype=np.float64),
+                    point_picture=np.asarray(level.point_picture, dtype=np.int64),
+                    point_centre=np.asarray(level.point_centre, dtype=np.float64),
+                    point_extent=np.asarray(level.point_extent, dtype=np.float64),
+                    detectors=np.asarray(
+                        [(d.center[0], d.center[1], d.radius, d.lambda_threshold, d.energy) for d in detectors.detectors],
+                        dtype=np.float64,
+                    ).reshape(-1, 5),
+                    layer=np.asarray(detectors.layer_index, dtype=np.int64),
+                    layer_thresholds=tuple(float(value) for value in detectors.layer_thresholds),
+                    activation_threshold=float(detectors.activation_lambda),
+                    field_half=int(max(abs(value) for value in level.field.box)),
+                )
+            )
+        return tuple(found)
+
+    def sticks(self) -> TrainingSticks:
+        """Углопозиции обучающих картинок (с видами): из них рисуется содержимое точек карт.
+
+        Returns:
+            `TrainingSticks`: картинка, клетка и угол каждой углопозиции; цифра и номер MNIST каждой картинки.
+        """
+        groups = self._ladder.groups
+        atoms = groups.atoms
+        taught = groups.train_pictures
+        rows = atoms.picture < taught
+        return TrainingSticks(
+            picture=np.asarray(atoms.picture[rows], dtype=np.int64),
+            y=np.asarray(atoms.y[rows], dtype=np.int64),
+            x=np.asarray(atoms.x[rows], dtype=np.int64),
+            angle=np.asarray(atoms.angle[rows], dtype=np.float64),
+            labels=np.asarray(atoms.labels[:taught], dtype=np.int64),
+            index=np.asarray(atoms.index[:taught], dtype=np.int64),
+            originals=int(groups.original_pictures),
+        )

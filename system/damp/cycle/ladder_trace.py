@@ -28,6 +28,8 @@ class LadderRunTrace:
     stick_angle: np.ndarray  # (S,) направление перепада яркости, градусы
     ranges: dict[str, tuple[int, int]]  # группа картинок → (первая, после последней)
     angle_encoder: "Encoder"  # детекторы угла: код «что» углопозиции (§4.4)
+    example: int | None = None  # номер картинки-примера в наборе (обучающая цифра LADDER_FIGURE_DIGIT, одна на прогон)
+    example_index: int | None = None  # её номер в наборе MNIST
 
 
 @dataclass(frozen=True)

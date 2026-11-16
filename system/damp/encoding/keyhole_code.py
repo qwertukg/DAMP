@@ -55,22 +55,32 @@ class KeyholeCoder:
             seed=settings.LADDER_RANDOM_SEED + number,
             use_gpu=settings.ACTIVATION_USE_GPU,
             name=f"level{number}",
+            concepts=settings.LADDER_BINDING_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
         )
 
-    def encode(self, elements: LadderElements, pieces: KeyholePieces, *, number: int, unit: float, taught: int) -> KeyholeCodes:
+    def encode(
+        self, elements: LadderElements, pieces: KeyholePieces, *, number: int, unit: float, taught: int,
+        content_length: int | None = None,
+    ) -> KeyholeCodes:
         """Код каждого окна: его элементы со своими местами в координатах окна (П.4, П.5).
 
         unit — шаг мест элементов в долях радиуса окна; taught — окон на обучающих картинках (они идут первыми,
-        по ним подбирается длина кода, §6.6). Результат — из кеша шагов, если такой вход уже был.
+        по ним подбирается длина кода, §6.6); content_length — длина сегмента содержания, уже подобранная по
+        обучающим (обученный уровень, новая картинка): тогда она не подбирается. Результат — из кеша шагов, если
+        такой вход уже был.
         """
         from damp.cache import CACHE
 
         what_index = elements.what_index[pieces.element]
         strength = elements.power()[pieces.element]
         calibration = max(1, min(int(taught), int(settings.LADDER_CALIBRATION_SETS)))
+        fixed = 0 if content_length is None else int(content_length)
 
         def compute() -> dict[str, object]:
-            codes = self.encoder(number).encode(
+            encoder = self.encoder(number)
+            if fixed:
+                encoder.fix_content_length(fixed)
+            codes = encoder.encode(
                 elements.what_packed,
                 elements.what_length,
                 what_index,
@@ -91,6 +101,7 @@ class KeyholeCoder:
             "what": elements.what_packed, "what_length": elements.what_length, "what_index": what_index,
             "offsets": pieces.offsets, "offset": pieces.offset, "piece": pieces.piece, "keyholes": pieces.count,
             "unit": float(unit), "strength": strength, "calibration": calibration, "number": int(number),
+            "content_length": fixed,
         }
         found = CACHE.run("coding.keyholes", inputs, compute, modules=("damp.encoding.keyhole_code",))
         return KeyholeCodes(

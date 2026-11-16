@@ -89,12 +89,13 @@ class System:
 
         return _build_extractor(patch_size, contour_only=contour_only, upscale=upscale)
 
-    def digits(self, *, train: int, test: int, split: str, shifts, shift_pictures: int):  # noqa: ANN001, ANN201
-        """Цифры MNIST с углопозициями: обучающие, проверочные и их сдвиги одним набором (DigitGroups)."""
+    def digits(self, *, train: int, test: int, split: str, shifts, shift_pictures: int, train_views=()):  # noqa: ANN001, ANN201
+        """Цифры MNIST с углопозициями: обучающие и их виды (§7.1.4), проверочные и их сдвиги одним набором (DigitGroups)."""
         from damp.stimuli.digits import DigitGroups, MnistDigits
 
         return DigitGroups.load(
-            MnistDigits(), train=train, test=test, split=split, shifts=tuple(shifts), shift_pictures=shift_pictures
+            MnistDigits(), train=train, test=test, split=split, shifts=tuple(shifts), shift_pictures=shift_pictures,
+            train_views=tuple(tuple(view) for view in train_views),
         )
 
     def sketch_tools(self) -> ModuleType:
@@ -162,12 +163,30 @@ class System:
 
         return MnistLadderRunner(**options)
 
+    def trained_ladder(self, count: int, *, map_points: int | None, decay: float):  # noqa: ANN201
+        """Обученный цикл на count обучающих цифрах и его линейный читатель (§6.6, §9.3): по нему идёт новая картинка."""
+        from damp.cycle.trained import TrainedLadder
+
+        return TrainedLadder.train(int(count), map_points=map_points, decay=float(decay))
+
     # ------------------------------------------------------------------ этап 7: распознавание
+    def linear_reader(self):  # noqa: ANN201
+        """Линейный читатель класса над нормированными уровнями активации (§9.3): класс LinearReader."""
+        from damp.decode.linear_reader import LinearReader
+
+        return LinearReader
+
     def level_recognition(self, labels, train: tuple[int, int]):  # noqa: ANN001, ANN201
         """Узнавание по уровню цикла: отклик картинки и голосование деталей (§2.2.5)."""
         from damp.decode.level_recognition import LevelRecognition
 
         return LevelRecognition(labels, train)
+
+    def bench(self, **options):  # noqa: ANN201
+        """Стенд честного сравнения DAMP, kNN по пикселям и CNN: настройки выбираются по отложенной выборке (вне статьи)."""
+        from damp.decode.bench import HonestBench
+
+        return HonestBench(**options)
 
     def decoder(self, **options):  # noqa: ANN201
         """Распознавание по эмбеддингам первого уровня: нечёткий поиск (§2.2.5)."""

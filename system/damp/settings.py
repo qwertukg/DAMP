@@ -128,7 +128,7 @@ def _derive() -> None:
     # Порог срабатывания детектора μ_d на набор элементов поля (§6.5).
     LADDER_DETECTOR_THRESHOLD = ACTIVATION_DETECTOR_THRESHOLD
     # Эмбеддинг детали (§6.5, §7.1.12): не больше LADDER_SATURATION самых сильных детекторов, длина кода под
-    # среднюю плотность LADDER_TARGET_DENSITY (§6.6), подбирается по первым LADDER_CALIBRATION_SETS полям.
+    # среднюю плотность LADDER_TARGET_DENSITY (§6.6), подбирается по окнам обучающих картинок уровня.
     LADDER_SATURATION = ACTIVATION_SATURATION_LIMIT
     LADDER_RANDOM_SEED = ENCODER_RANDOM_SEED
     PINWHEEL_POSITION_X = (MNIST_POSITION_MIN + MNIST_POSITION_MAX) / 2.0

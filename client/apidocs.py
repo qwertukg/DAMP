@@ -110,7 +110,7 @@ class ReadmeApiLinks:
         "stimuli": "Stimuli", "coding": "Coding", "layout": "Layout", "detectors": "Detectors",
         "embeddings": "Embeddings", "cycle": "Cycle", "recognition": "Recognition", "figures": "Figures",
     }
-    PARTS = ("Digits", "Elements", "Keyholes", "KeyholeCodes", "Memory", "MapDetectors", "Firing", "Level")
+    PARTS = ("Digits", "Elements", "Keyholes", "KeyholeCodes", "Memory", "MapDetectors", "Firing", "Level", "TrainedLadder")
 
     def __init__(self, readme: Path = ROOT / "README.md", api: Path = CLIENT / "damp_api") -> None:
         self.readme, self.api = Path(readme), Path(api)

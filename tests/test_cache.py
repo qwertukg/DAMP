@@ -72,6 +72,21 @@ class StepCacheTest(unittest.TestCase):
         self.run_step(np.ones(5))  # кеш выключен (так в тестах по умолчанию) — счёт
         self.assertEqual(self.calls, 4)
 
+    def test_bypassed_steps_are_computed_and_not_written(self) -> None:
+        """CACHE.bypassed (одна картинка дашборда): шаг считается заново, в кеш ничего не пишется, тот же результат."""
+        with cache_in(self.folder.name):
+            stored = self.run_step(np.ones(5))
+            with CACHE.bypassed():
+                again = self.run_step(np.ones(5))  # такая запись есть, но счёт идёт заново
+                fresh = self.run_step(np.full(5, 2.0))  # новой записи нет и не появится
+            self.assertEqual(self.calls, 3)
+            self.assertTrue(StepCache.same(stored, again))
+            self.assertTrue(StepCache.same(stored, fresh))
+            entries = list((Path(self.folder.name) / "steps" / "test.step").glob("*.json"))
+            self.assertEqual(len(entries), 1)
+            self.run_step(np.ones(5))  # после блока кеш снова работает — попадание
+        self.assertEqual(self.calls, 3)
+
     def test_verification_catches_spoiled_entry(self) -> None:
         with cache_in(self.folder.name):
             self.run_step(np.ones(5))
@@ -143,7 +158,8 @@ class CycleCacheTest(unittest.TestCase):
                         self.assertEqual(a, b)
 
     def test_cached_cycle_repeats_direct_cycle(self) -> None:
-        with tempfile.TemporaryDirectory() as folder, settings.overridden({"LADDER_SAVE_MAPS": True}):
+        # Без видов обучающих (§7.1.4): кеш от них не зависит, а цикл с ними впятеро дольше.
+        with tempfile.TemporaryDirectory() as folder, settings.overridden({"LADDER_SAVE_MAPS": True, "LADDER_TRAIN_VIEWS": ()}):
             direct = self.run_cycle(folder)  # без кеша
             cache = str(Path(folder) / "cache")
             with cache_in(cache):

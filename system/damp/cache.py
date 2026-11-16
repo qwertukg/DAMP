@@ -10,7 +10,8 @@
 
 Запись атомарная (временный файл → переименование). Сверка: доля CACHE_VERIFY_SHARE попаданий пересчитывается и
 сравнивается с кешем бит в бит; расхождение — предупреждение и свежий результат. Предел размера — CACHE_MAX_BYTES:
-сверх него удаляются давно не нужные записи. Выключение — CACHE_ENABLED = false либо DAMP_CACHE=off.
+сверх него удаляются давно не нужные записи. Выключение — CACHE_ENABLED = false либо DAMP_CACHE=off; на время —
+CACHE.bypassed() (одна картинка дашборда: шаги на каждый штрих в кеш не пишутся).
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import os
 import re
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -142,11 +144,22 @@ class StepCache:
         self._environment: dict[str, str] | None = None
         self._size: int | None = None  # байт под кешем в папке _size_root (считается один раз, дальше — приростом)
         self._size_root: Path | None = None
+        self._bypass = 0  # > 0 — шаги считаются заново и в кеш не пишутся (bypassed)
 
     # ------------------------------------------------------------------ где и включён ли
     @property
     def enabled(self) -> bool:
         return bool(settings.CACHE_ENABLED) and os.environ.get("DAMP_CACHE", "on").lower() != "off"
+
+    @contextmanager
+    def bypassed(self):
+        """Внутри блока каждый шаг считается заново и в кеш не пишется: так идёт одна картинка дашборда — записи на
+        каждый штрих только засоряли бы кеш, а счёт шага тот же, что при промахе."""
+        self._bypass += 1
+        try:
+            yield
+        finally:
+            self._bypass -= 1
 
     @property
     def root(self) -> Path:
@@ -189,7 +202,7 @@ class StepCache:
         inputs — всё, от чего зависит результат, кроме настроек и кода (их кеш берёт сам); выходы — массивы numpy и
         простые значения JSON (числа, строки, списки). modules — модули с кодом шага.
         """
-        if not self.enabled:
+        if not self.enabled or self._bypass:
             return dict(compute())
         key, parts = self.key(step, inputs, modules)
         entry_path = self._entry_path(step, key)

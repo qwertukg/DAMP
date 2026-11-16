@@ -45,7 +45,7 @@ class CycleFigures:
         panel: int,
         strongest: int,
         digit: int,
-        digit_index: int,
+        digit_index: "int | None" = None,
         test_digits: int,
     ) -> None:
         if recorder.run is None or not recorder.levels:
@@ -60,8 +60,13 @@ class CycleFigures:
         self.test_digits = int(test_digits)
         self.starts = np.searchsorted(self.run.stick_picture, np.arange(self.run.labels.shape[0] + 1))
         train_first, train_last = self.run.ranges["train"]
-        found = np.flatnonzero(self.run.labels[train_first:train_last] == self.digit) + train_first
-        self.picture = int(found[min(int(digit_index), found.shape[0] - 1)]) if found.size else train_first
+        # Пример — пятёрка прогона (её выбирает MnistLadderRunner один раз, в каждом прогоне другая); digit_index —
+        # запасной путь для прогонов без примера.
+        if self.run.example is not None:
+            self.picture = int(self.run.example)
+        else:
+            found = np.flatnonzero(self.run.labels[train_first:train_last] == self.digit) + train_first
+            self.picture = int(found[min(int(digit_index or 0), found.shape[0] - 1)]) if found.size else train_first
         # Окно-пример каждого уровня: ближайшее к середине цифры, дальше — к окну прошлого уровня.
         y, x, _ = self.sticks(self.picture)
         anchor = (float(y.mean()), float(x.mean()))

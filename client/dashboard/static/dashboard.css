@@ -1,0 +1,75 @@
+:root {
+  color-scheme: dark;
+  --bg: #121418; --panel: #1a1d23; --panel-2: #22262e; --line: #2f343e; --text: #e4e7ec; --muted: #9aa3b2;
+  --accent: #6ea8ff; --pin: #ff9a2e; --lit: #ffffff; --gap: 10px; --left: 300px; --trace: 168px; --head: 40px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--text); font: 13px/1.4 "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+  display: grid; grid-template-rows: var(--head) 1fr var(--trace); overflow: hidden;
+}
+header { display: flex; align-items: center; gap: 14px; padding: 0 14px; border-bottom: 1px solid var(--line); min-width: 0; }
+header h1 { font-size: 16px; margin: 0; white-space: nowrap; }
+header h1 span { color: var(--muted); font-weight: 400; }
+.grow { flex: 1; }
+.muted { color: var(--muted); font-weight: 400; }
+#status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+#legend { display: flex; gap: 10px; align-items: center; white-space: nowrap; color: var(--muted); font-size: 12px; }
+#legend i { display: inline-block; width: 12px; height: 12px; border-radius: 50%; border: 2px solid; margin-right: 4px; vertical-align: -2px; }
+main { display: grid; grid-template-columns: var(--left) 1fr; gap: var(--gap); padding: var(--gap); min-height: 0; }
+#left { display: flex; flex-direction: column; gap: var(--gap); min-height: 0; overflow: auto; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+h2 { font-size: 11.5px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+h2 .muted { text-transform: none; letter-spacing: 0; font-weight: 400; }
+#pad { width: 100%; aspect-ratio: 1; display: block; background: #000; border: 1px solid var(--line); border-radius: 6px; cursor: crosshair; touch-action: none; }
+.tools { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+button:hover { border-color: var(--accent); }
+button.on { border-color: var(--pin); color: var(--pin); }
+#pad.moving { cursor: grab; }
+#pad.grabbing { cursor: grabbing; }
+#moveNote:empty, #padNote:empty { display: none; }
+.check { display: flex; gap: 6px; align-items: center; margin-top: 8px; color: var(--muted); cursor: pointer; }
+.note { color: var(--muted); margin: 6px 0 0; font-size: 12px; }
+#answer { display: flex; gap: 12px; align-items: center; }
+#digit { font-size: 52px; font-weight: 700; width: 64px; text-align: center; line-height: 1; }
+#bars { flex: 1; display: grid; grid-template-columns: 14px 1fr 38px; gap: 2px 6px; align-items: center; font-size: 12px; }
+#bars .bar { height: 9px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+#bars .bar span { display: block; height: 100%; background: var(--accent); }
+#bars .top { color: var(--text); font-weight: 700; }
+#bars .top + .bar span { background: var(--pin); }
+#levels { display: grid; gap: var(--gap); min-width: 0; min-height: 0; }
+.level { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px; display: grid;
+  grid-template-rows: auto auto 1fr; gap: 6px; min-width: 0; min-height: 0; }
+.level .head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.badge { width: 24px; height: 24px; border-radius: 50%; background: var(--accent); color: #0b1220; display: grid; place-items: center; font-weight: 700; flex: none; }
+.level .head b { white-space: nowrap; }
+.chips { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.level .top { display: grid; grid-template-columns: minmax(0, 46%) 1fr; gap: 8px; min-height: 0; }
+canvas.pieces { width: 100%; aspect-ratio: 1; display: block; background: #000; border-radius: 6px; cursor: pointer; }
+.stats { font-size: 12px; color: var(--muted); overflow: hidden; min-width: 0; }
+.stats b { color: var(--text); font-weight: 600; }
+.stats .row { display: flex; justify-content: space-between; gap: 6px; border-bottom: 1px dashed #2a2e37; padding: 1px 0; }
+.stats .clusters { margin-top: 6px; }
+.stats .cl { display: flex; align-items: center; gap: 6px; padding: 1px 0; white-space: nowrap; }
+.stats .cl i { width: 10px; height: 10px; border-radius: 50%; border: 2px solid; flex: none; }
+.mapwrap { position: relative; min-height: 0; display: flex; align-items: flex-start; justify-content: center; }
+canvas.map { max-width: 100%; max-height: 100%; aspect-ratio: 1; display: block; background: #000; border-radius: 6px; cursor: grab; touch-action: none; }
+.zoom { position: absolute; top: 6px; right: 6px; display: flex; flex-direction: column; gap: 4px; }
+.zoom button { width: 26px; height: 26px; padding: 0; background: rgba(20, 22, 26, .85); }
+footer { border-top: 1px solid var(--line); padding: 8px 12px; min-height: 0; overflow: hidden; }
+#traceBody { display: flex; gap: 12px; align-items: stretch; height: calc(100% - 22px); overflow-x: auto; color: var(--muted); }
+.step { display: grid; grid-template-columns: auto 1fr; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; min-width: 300px; max-width: 420px; }
+.step canvas { height: 116px; width: 116px; background: #000; border-radius: 4px; }
+.step .text { font-size: 12px; overflow: hidden; }
+.step .text b { color: var(--text); }
+.glyphs { display: flex; gap: 4px; margin-top: 4px; }
+.glyphs canvas { width: 40px; height: 40px; border-radius: 3px; }
+#tip { position: fixed; z-index: 20; pointer-events: none; background: #0c0d10; border: 1px solid #5a6170; border-radius: 8px; padding: 8px;
+  width: 300px; font-size: 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, .5); }
+#tip canvas { float: left; margin: 0 8px 4px 0; background: #000; border: 1px solid var(--line); border-radius: 4px; }
+#tip .mosaic { display: flex; flex-wrap: wrap; gap: 3px; clear: both; padding-top: 4px; }
+#tip .mosaic canvas { float: none; margin: 0; }
+#tip b { color: var(--text); }
+@media (max-width: 1100px) { :root { --left: 240px; --trace: 140px; } #digit { font-size: 40px; width: 48px; } }

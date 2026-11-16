@@ -70,9 +70,11 @@ DETECTOR_INSERTION = "6.4.5"
 STIMULUS_DETECTION = "6.5"
 NEURAL_ANALOGY = "6.6"
 PRACTICE = "7"
+TOKEN_ENCODING = "7.1.4"
 SPACE_FILLING = "7.1.6"
 DETECTOR_LEVELS = "7.1.10"
 MORPHOLOGICAL_EMBEDDINGS = "7.1.12"
+NEURAL_INTEGRATION = "9.3"
 
 # Продолжение статьи — docs/DAMP_continuation.md («Кодирование признаков и их положения в иерархической модели
 # зрения»). В нём разделы без номеров; номера здесь — по порядку заголовков, с буквой «П» (продолжение).

@@ -30,8 +30,8 @@ MNIST. Проход «код → раскладка → детекторы → �
 У каждого этапа два вида вызовов:
 
 - **кубики** — один шаг этапа. Результат — часть (`damp_api.parts`: `Digits`, `Elements`, `Keyholes`,
-  `KeyholeCodes`, `Memory`, `MapDetectors`, `Firing`, `Level`) — идёт в следующий вызов; так клиент собирает
-  свой цикл;
+  `KeyholeCodes`, `Memory`, `MapDetectors`, `Firing`, `Level`, `TrainedLadder`) — идёт в следующий вызов; так
+  клиент собирает свой цикл. `cycle.trained` — обученный цикл: по нему идёт любая новая картинка (дашборд);
 - **готовые прогоны** — то же, собранное системой целиком: `cycle.run`, `layout.build`, `recognition.evaluate`
   и другие. Они возвращают простые записи из `damp_api.reports`.
 
@@ -62,8 +62,13 @@ MNIST. Проход «код → раскладка → детекторы → �
 """
 from .cache import Cache
 from .damp import Damp, Settings
-from .parts import Digits, DetectorLayer, Elements, Firing, Level, MapDetectors, Memory, KeyholeCodes, Keyholes
+from .parts import Digits, DetectorLayer, Elements, Firing, Level, MapDetectors, Memory, KeyholeCodes, Keyholes, TrainedLadder
 from .reports import (
+    BenchLevel,
+    BenchMethod,
+    BenchReport,
+    BenchRobustness,
+    BenchScore,
     CacheStep,
     Code,
     CycleLevel,
@@ -71,11 +76,15 @@ from .reports import (
     Evaluation,
     LayoutSummary,
     LevelFailed,
+    LevelMap,
     Picture,
     PinwheelReport,
     Prediction,
+    Sight,
+    SightLevel,
     Stage,
     Stimulus,
+    TrainingSticks,
 )
 
 __all__ = [
@@ -91,6 +100,7 @@ __all__ = [
     "DetectorLayer",
     "Firing",
     "Level",
+    "TrainedLadder",
     "LevelFailed",
     # простые результаты
     "Stage",
@@ -101,8 +111,18 @@ __all__ = [
     "PinwheelReport",
     "CycleLevel",
     "CycleReport",
+    "Sight",
+    "SightLevel",
+    "LevelMap",
+    "TrainingSticks",
     "Prediction",
     "Evaluation",
+    # честное сравнение
+    "BenchReport",
+    "BenchMethod",
+    "BenchScore",
+    "BenchRobustness",
+    "BenchLevel",
     # кеш шагов
     "Cache",
     "CacheStep",

@@ -289,6 +289,8 @@ class DampLogger:
         self._watchers: dict[str, list[Callable[..., None]]] = {}  # ход шагов по мере счёта → подписчики (показ)
         self._interval_policy: LogIntervalPolicy | None = None
         self._blueprint_builder: Callable[[], Any] = RerunViewerBlueprint.build
+        # «Базовая» раскладка — последняя, заданная use_blueprint без cycle=True: к ней окно возвращается после цикла.
+        self._base_blueprint: Callable[[], Any] = RerunViewerBlueprint.build
         self._cycle_blueprint = False  # в окне раскладка прогона цикла (вне цикла — вернуть ход раскладки)
         # True — журнал выключен целиком (рабочие процессы: записи ведёт основной процесс).
         self._muted = False
@@ -320,10 +322,13 @@ class DampLogger:
         """Своя раскладка панелей окна для отдельного скрипта; по умолчанию — ход раскладки DAMP.
 
         Если окно уже открыто, новая раскладка сразу становится активной. cycle — раскладка прогона цикла: с первым
-        событием вне цикла окно само возвращается к ходу раскладки (работа вне цикла видна на нём).
+        событием вне цикла окно само возвращается к «базовой» раскладке — последней, заданной без cycle=True
+        (по умолчанию — ход раскладки; у стенда bench — его раскладка), работа вне цикла видна на ней.
         """
         self._blueprint_builder = builder
         self._cycle_blueprint = bool(cycle)
+        if not cycle:
+            self._base_blueprint = builder
         if self._spawned:
             self._send_blueprint()
 
@@ -335,7 +340,11 @@ class DampLogger:
             # DAMP_RERUN_VIEWER=off — без окна: прогон цикла пишется только в файл .rrd (скриншоты, свой UI).
             self._viewer = os.environ.get("DAMP_RERUN_VIEWER", "on").lower() != "off"
             if self._viewer:
-                rr.spawn()
+                from damp import settings  # здесь, а не наверху: settings сам пишет в журнал
+
+                # Окно копит записи всех прогонов сессии: без предела (по умолчанию rerun — 75 % ОЗУ) оно однажды
+                # заняло 25 ГБ из 24, и тестам не хватило памяти. На пределе окно сбрасывает самые старые данные.
+                rr.spawn(memory_limit=str(getattr(settings, "RERUN_MEMORY_LIMIT", "25%")))
             self._spawned = True
             self._send_blueprint()
 
@@ -561,8 +570,9 @@ class DampLogger:
         if self._muted:
             return
         if self._cycle_blueprint and self._cycle is None:
-            # Прогон цикла закончился, идёт другая работа: окно возвращается к ходу раскладки (вся история по времени).
-            self.use_blueprint(RerunViewerBlueprint.build)
+            # Прогон цикла закончился, идёт другая работа: окно возвращается к базовой раскладке (по умолчанию —
+            # ход раскладки, вся история по времени; у стенда — его раскладка).
+            self.use_blueprint(self._base_blueprint)
         if force is None:
             if not self.should_log(event):
                 return
@@ -593,6 +603,21 @@ class DampLogger:
                 if visual.timeline is not None and visual.time is not None and self._cycle is None:
                     rr.set_time(visual.timeline, sequence=visual.time)
                 rr.log(visual.path, visual.payload, static=visual.static)
+        rr.reset_time()
+
+    def series(self, path: str, values: Mapping[str, float | int | None], *, step: int, timeline: str = "epoch") -> None:
+        """Точки рядов в Rerun на своей шкале (по умолчанию «epoch») — только в окно, без консоли и файла (вне статьи).
+
+        Для рядов, которые идут на каждом шаге обучения (потеря и точность по эпохам): событие на каждую точку
+        журнал бы раздул, поэтому итог пишется отдельным событием, а ход — сюда. Пути: path/<имя ряда>.
+        """
+        if self._muted or not self.visuals_enabled():
+            return
+        rr.reset_time()
+        rr.set_time(timeline, sequence=int(step))
+        for name, value in values.items():
+            if value is not None:
+                rr.log(f"{path}/{name}", rr.Scalars(float(value)))
         rr.reset_time()
 
     def visual_image(self, path: str, image, *, static: bool = False) -> LogVisual:
@@ -630,8 +655,12 @@ class DampLogger:
             static=static,
         )
 
-    def visual_bar_chart(self, path: str, values: Sequence[int]) -> LogVisual:
-        return LogVisual(path=path, payload=rr.BarChart(list(values)))
+    def visual_bar_chart(self, path: str, values: Sequence[int | float], *, static: bool = False) -> LogVisual:
+        return LogVisual(path=path, payload=rr.BarChart(list(values)), static=static)
+
+    def visual_text(self, path: str, markdown: str, *, static: bool = False) -> LogVisual:
+        """Текст в формате Markdown (таблица, пояснение); static — виден на любой шкале и заменяется новой записью."""
+        return LogVisual(path=path, payload=rr.TextDocument(markdown, media_type=rr.MediaType.MARKDOWN), static=static)
 
     def visual_boxes2d(
         self,

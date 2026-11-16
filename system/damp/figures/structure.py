@@ -45,7 +45,8 @@ class StructureFigure:
         )
         return [
             ("config.toml", "все настройки: важные сверху,\nтехника внизу", False),
-            ("run.py", "команды поверх damp_api: ladder,\nlayout, evaluate, predict, cache, docs, …", False),
+            ("run.py", "команды поверх damp_api: ladder, bench,\ndashboard, figures, cache, docs, …", False),
+            ("dashboard/", "живой дашборд: рисуем цифру кистью —\nкусочки и кластеры всех уровней", False),
             ("apidocs.py", "HTML-справка по damp_api\nиз docstring'ов (pdoc) → docs/api/", False),
             (
                 "damp_api/",

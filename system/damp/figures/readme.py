@@ -84,7 +84,6 @@ class ReadmeFigures:
             panel=settings.README_FIGURES_PANEL,
             strongest=settings.README_FIGURES_STRONGEST,
             digit=settings.LADDER_FIGURE_DIGIT,
-            digit_index=settings.LADDER_FIGURE_PICTURE,
             test_digits=settings.README_FIGURES_TEST_DIGITS,
         )
         figures.stimuli(self.doc("stage1-sticks.png"), self.doc("stage1-digits.png"))

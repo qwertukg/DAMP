@@ -352,7 +352,10 @@ class MnistSobelAngleMap:
         )
         return patches
 
-    def extract(self, image: Union[np.ndarray, "np.typing.ArrayLike"], label: int) -> ResultMap:
+    def extract(
+        self, image: Union[np.ndarray, "np.typing.ArrayLike"], label: int, with_magnitude: bool = False
+    ) -> ResultMap:
+        """Углопозиции картинки: (угол, x, y); при with_magnitude — (угол, x, y, сила), сила — модуль среднего градиента."""
         img, normalized = self._normalized(image)
 
         LOGGER.event(
@@ -401,10 +404,12 @@ class MnistSobelAngleMap:
                 "patch_size": self.patch_size,
                 "grid_size": self.grid_size,
                 "patches_total": self.patches_total,
-                "patches_kept": len({(x, y) for _, x, y in out}),
+                "patches_kept": len({(item[1], item[2]) for item in out}),
                 "angle_positions": len(out),
             },
         )
+        if not with_magnitude:
+            out = [item[:3] for item in out]
         return {int(label): out}
 
     def _field_mean_vector(self, gx: np.ndarray, gy: np.ndarray) -> Callable[[int, int], Tuple[float, float]]:
@@ -469,7 +474,7 @@ class MnistSobelAngleMap:
                     },
                 )
 
-                out.append((angle, bx, by))
+                out.append((angle, bx, by, mag))
 
         return out
 
@@ -579,7 +584,7 @@ class MnistSobelAngleMap:
                     section=CYCLIC_COORDS,
                     data={"x": bx, "y": by, "angle": angle, "magnitude": mag},
                 )
-                out.append((angle, bx, by))
+                out.append((angle, bx, by, mag))
 
         LOGGER.event(
             "sobel_map.contour",

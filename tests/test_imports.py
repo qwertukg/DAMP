@@ -42,7 +42,7 @@ class ImportsTest(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         parser = module.Commands().parser
-        for command in ("ladder", "layout", "evaluate", "predict", "figures", "pinwheel", "detectors", "sketch", "contour"):
+        for command in ("ladder", "layout", "evaluate", "predict", "figures", "pinwheel", "detectors", "sketch", "contour", "dashboard"):
             with self.subTest(command=command):
                 self.assertIn(command, parser._subparsers._group_actions[0].choices)
 

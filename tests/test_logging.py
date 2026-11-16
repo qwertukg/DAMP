@@ -55,7 +55,10 @@ class LoggerNotMutedTest(unittest.TestCase):
 
 
 class CycleBlueprintReturnTest(unittest.TestCase):
-    """Пока идёт цикл — его раскладка; первое событие вне цикла возвращает окно к ходу раскладки (вся история)."""
+    """Пока идёт цикл — его раскладка; первое событие вне цикла возвращает окно к базовой раскладке.
+
+    Базовая — последняя, заданная use_blueprint без cycle=True (по умолчанию — ход раскладки).
+    """
 
     def test_returns_to_layout_progress_outside_cycle(self) -> None:
         from unittest import mock
@@ -65,7 +68,8 @@ class CycleBlueprintReturnTest(unittest.TestCase):
         def builder() -> None:
             return None
 
-        previous = LOGGER.cycle
+        previous, saved = LOGGER.cycle, (LOGGER._base_blueprint, LOGGER._blueprint_builder, LOGGER._cycle_blueprint)
+        LOGGER._base_blueprint = RerunViewerBlueprint.build  # базовая раскладка по умолчанию, что бы ни задали другие тесты
         with mock.patch.object(LOGGER, "_send_blueprint"):
             try:
                 LOGGER.use_blueprint(builder, cycle=True)
@@ -77,6 +81,34 @@ class CycleBlueprintReturnTest(unittest.TestCase):
                 self.assertEqual(LOGGER._blueprint_builder, RerunViewerBlueprint.build)
             finally:
                 LOGGER.set_cycle(previous)
+                LOGGER._base_blueprint, LOGGER._blueprint_builder, LOGGER._cycle_blueprint = saved
+
+    def test_returns_to_last_base_blueprint(self) -> None:
+        from unittest import mock
+
+        from damp.logging import LOGGER, RerunViewerBlueprint
+
+        def base() -> None:
+            return None
+
+        def cycle_layout() -> None:
+            return None
+
+        previous, saved = LOGGER.cycle, (LOGGER._base_blueprint, LOGGER._blueprint_builder, LOGGER._cycle_blueprint)
+        with mock.patch.object(LOGGER, "_send_blueprint"):
+            try:
+                LOGGER.use_blueprint(base)
+                LOGGER.use_blueprint(cycle_layout, cycle=True)
+                self.assertIs(LOGGER._base_blueprint, base, "раскладка цикла не должна стать базовой")
+                LOGGER.set_cycle(1)
+                LOGGER.event("test.cycle.inside", section="вне статьи")
+                self.assertIs(LOGGER._blueprint_builder, cycle_layout)
+                LOGGER.set_cycle(None)
+                LOGGER.event("test.cycle.outside", section="вне статьи")
+                self.assertIs(LOGGER._blueprint_builder, base)
+            finally:
+                LOGGER.set_cycle(previous)
+                LOGGER._base_blueprint, LOGGER._blueprint_builder, LOGGER._cycle_blueprint = saved
 
 
 if __name__ == "__main__":

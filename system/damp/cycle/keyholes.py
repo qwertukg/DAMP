@@ -61,6 +61,7 @@ class LevelKeyholes:
     sight: float  # среднее поле окна обучающих картинок, клеток
     step: float  # мера плоскости уровня: что видит одна деталь, но не меньше шага между соседями
     taught: int  # окон на обучающих картинках
+    thresholds: tuple[float, ...] = ()  # пороги слоёв построения окон — квантили сходства соседей обучающих (§6.4)
 
     @property
     def number(self) -> int:
@@ -105,6 +106,7 @@ class KeyholeBuilder:
             "element": pieces.element, "offset": pieces.offset, "extent": keyholes.extent,
             "seen": keyholes.seen, "sight": keyholes.sight, "step": keyholes.step, "taught": keyholes.taught,
             "number": field.number, "unit": field.unit, "box": list(field.box), "inner": list(field.inner),
+            "thresholds": [float(value) for value in keyholes.thresholds],
         }
 
     @staticmethod
@@ -119,7 +121,49 @@ class KeyholeBuilder:
         return LevelKeyholes(
             field=field, pieces=pieces, extent=found["extent"], seen=float(found["seen"]), sight=float(found["sight"]),
             step=float(found["step"]), taught=int(found["taught"]),
+            thresholds=tuple(float(value) for value in found.get("thresholds", ())),
         )
+
+    @staticmethod
+    def fields(step: float, thresholds: "tuple[float, ...] | list[float]", name: str) -> PlaneFieldBuilder:
+        """Построитель окон уровня по его мере плоскости step и порогам слоёв (§6.4.1–§6.4.3): окрестность кластера,
+        радиус активации и наименьший радиус окна заданы в мере «что видит одна деталь уровня»."""
+        return PlaneFieldBuilder(
+            lambda_thresholds=thresholds,
+            activation_radius=settings.LADDER_CLUSTER_ACTIVATION_RADIUS * step,
+            eps=settings.LADDER_CLUSTER_EPS * step,
+            min_samples=settings.LADDER_CLUSTER_MIN_SAMPLES,
+            min_points=settings.LADDER_CLUSTER_MIN_POINTS,
+            radius_min=settings.LADDER_CLUSTER_RADIUS_MIN * step,
+            energy_radius=settings.LADDER_CLUSTER_ENERGY_RADIUS * step,
+            energy_threshold=settings.ACTIVATION_ENERGY_THRESHOLD,
+            dense=True,
+            name=name,
+            concepts=settings.LADDER_KEYHOLE_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
+        )
+
+    @staticmethod
+    def extent(elements: LadderElements, pieces: KeyholePieces) -> "np.ndarray":
+        """Сколько клеток картинки видит каждое окно: его элементы вместе с тем, что видят они сами."""
+        reach = np.hypot(
+            elements.y[pieces.element] - pieces.centre[pieces.piece, 0],
+            elements.x[pieces.element] - pieces.centre[pieces.piece, 1],
+        ) + elements.reach()[pieces.element]
+        extent = np.zeros(pieces.count, dtype=np.float64)
+        np.maximum.at(extent, pieces.piece, reach)
+        return extent
+
+    @classmethod
+    def place(
+        cls, elements: LadderElements, *, number: int, step: float, thresholds: "tuple[float, ...]"
+    ) -> tuple[KeyholePieces, "np.ndarray"]:
+        """Окна новой картинки на обученном уровне number (П.2): мера плоскости step и пороги слоёв thresholds — те,
+        что сняты с обучающих картинок, заново не меряются. Окна картинки строятся независимо от других картинок,
+        поэтому у картинки прогона здесь те же окна, что в прогоне. Возвращает куски и поле каждого окна."""
+        built = cls.fields(step, thresholds, f"level{number}").build(
+            elements.picture, elements.y, elements.x, elements.what_packed, elements.what_index, elements.what_length
+        )
+        return built.pieces, cls.extent(elements, built.pieces)
 
     def _build(self, elements: LadderElements, number: int) -> LevelKeyholes:
         name = f"level{number}"
@@ -136,38 +180,27 @@ class KeyholeBuilder:
             tuple(settings.LADDER_CLUSTER_SIMILARITY_QUANTILES),
             name=name,
         )
+        thresholds = tuple(float(value) for value in thresholds)
         # Мера плоскости уровня — то, что видит одна его деталь, но не меньше шага между соседними
         # элементами. В ней заданы окрестность кластера, радиус активации и наименьший радиус окна (§6.4):
         # окно на карте равно полю своей детали. У углопозиций мера — одна клетка, и значения совпадают с
         # настройками детекторов над раскладкой.
         step = max(neighbour_step, float(np.median(elements.reach()[taught])))
-        fields = PlaneFieldBuilder(
-            lambda_thresholds=thresholds,
-            activation_radius=settings.LADDER_CLUSTER_ACTIVATION_RADIUS * step,
-            eps=settings.LADDER_CLUSTER_EPS * step,
-            min_samples=settings.LADDER_CLUSTER_MIN_SAMPLES,
-            min_points=settings.LADDER_CLUSTER_MIN_POINTS,
-            radius_min=settings.LADDER_CLUSTER_RADIUS_MIN * step,
-            energy_radius=settings.LADDER_CLUSTER_ENERGY_RADIUS * step,
-            energy_threshold=settings.ACTIVATION_ENERGY_THRESHOLD,
-            dense=True,
-            name=name,
-        ).build(elements.picture, elements.y, elements.x, elements.what_packed, elements.what_index, elements.what_length)
+        fields = self.fields(step, thresholds, name).build(
+            elements.picture, elements.y, elements.x, elements.what_packed, elements.what_index, elements.what_length
+        )
         pieces = fields.pieces
         taught_fields = int(np.count_nonzero(pieces.picture < train_pictures))
-        # Сколько клеток картинки видит окно: его элементы вместе с тем, что видят они сами.
-        reach = np.hypot(
-            elements.y[pieces.element] - pieces.centre[pieces.piece, 0],
-            elements.x[pieces.element] - pieces.centre[pieces.piece, 1],
-        ) + elements.reach()[pieces.element]
-        extent = np.zeros(pieces.count, dtype=np.float64)
-        np.maximum.at(extent, pieces.piece, reach)
+        extent = self.extent(elements, pieces)
         if taught_fields < settings.LADDER_MAP_MIN_POINTS:
             # Окон на обучающих картинках слишком мало, чтобы из них сложилась память: уровень не строится.
             empty = LadderField(number=number, unit=float(settings.LADDER_CLUSTER_PLACE_UNIT), box=(0, 0, 0, 0), inner=(0, 0, 0, 0))
-            return LevelKeyholes(field=empty, pieces=pieces, extent=extent, seen=0.0, sight=0.0, step=step, taught=taught_fields)
-        half = int(math.ceil(float(extent.mean())))
-        inner = int(math.ceil(float(elements.reach().mean())))
+            return LevelKeyholes(field=empty, pieces=pieces, extent=extent, seen=0.0, sight=0.0, step=step, taught=taught_fields,
+                                 thresholds=thresholds)
+        # Масштаб мест — только по обучающим окнам и элементам: отложенные, проверочные и сдвинутые картинки
+        # не должны влиять на коды обучающих окон (честная мерка, вне статьи).
+        half = int(math.ceil(float(extent[pieces.picture < train_pictures].mean())))
+        inner = int(math.ceil(float(elements.reach()[taught].mean())))
         field = LadderField(
             number=number,
             unit=float(settings.LADDER_CLUSTER_PLACE_UNIT),
@@ -195,7 +228,8 @@ class KeyholeBuilder:
                 "детали; growth — во сколько раз поле на картинке шире, чем у детали предыдущего уровня",
             },
         )
-        return LevelKeyholes(field=field, pieces=pieces, extent=extent, seen=seen, sight=sight, step=step, taught=taught_fields)
+        return LevelKeyholes(field=field, pieces=pieces, extent=extent, seen=seen, sight=sight, step=step, taught=taught_fields,
+                             thresholds=thresholds)
 
     def _picture_seen(self, pieces: KeyholePieces, extent: "np.ndarray", pictures: int) -> float:
         """Какую долю углопозиций своей картинки видит окно, в среднем по окнам первых pictures картинок."""

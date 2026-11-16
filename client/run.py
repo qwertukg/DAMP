@@ -61,6 +61,29 @@ class Commands:
         predict.add_argument("--temperature", type=float, default=None)
         predict.add_argument("--calibrate", action="store_true", help="подобрать температуру softmax")
 
+        bench = commands.add_parser(
+            "bench", help="честное сравнение DAMP, kNN по пикселям и CNN: настройки по validation, наборы, интервалы"
+        )
+        bench.add_argument("--count", type=int, default=s["BENCH_TRAIN"], help="обучающих в наборе")
+        bench.add_argument("--sets", type=int, default=s["BENCH_SETS"], help="обучающих наборов")
+        bench.add_argument("--validation", type=int, default=s["BENCH_VALIDATION"], help="картинок отложенной выборки")
+        bench.add_argument("--test", type=int, default=s["BENCH_TEST"], help="проверочных из t10k; 0 — не считать")
+        bench.add_argument("--map-points", type=int, default=s["BENCH_MAP_POINTS"], help="предел точек карты уровня у DAMP")
+        bench.add_argument("--methods", nargs="+", choices=["damp", "pixels", "cnn"], default=list(s["BENCH_METHODS"]))
+        # «none» в файле настроек читается как None: по умолчанию — те же строки, что принимает --augment.
+        augment = ["none" if mode is None else mode for mode in s["BENCH_AUGMENT"]]
+        bench.add_argument("--augment", nargs="+", choices=["none", "shifts"], default=augment)
+
+        dashboard = commands.add_parser(
+            "dashboard", help="живой дашборд: рисуем цифру кистью — кусочки и кластеры всех уровней цикла на одном экране"
+        )
+        dashboard.add_argument("--count", type=int, default=s["DASHBOARD_TRAIN"], help="обучающих цифр цикла")
+        dashboard.add_argument("--map-points", type=int, default=s["DASHBOARD_MAP_POINTS"], help="предел точек карты уровня")
+        dashboard.add_argument("--port", type=int, default=s["DASHBOARD_PORT"])
+        dashboard.add_argument("--no-browser", action="store_true", help="не открывать страницу в браузере")
+        dashboard.add_argument("--snapshot", type=str, default=None,
+                               help="только снимок страницы в файл (пример-пятёрка и след кусочка; нужен playwright)")
+
         figures = commands.add_parser("figures", help="все рисунки README в docs/")
         figures.add_argument("--rerun", action="store_true", help="только скриншоты вкладок цикла в Rerun (окна ненадолго откроются)")
         commands.add_parser("pinwheel", help="тест пинвила: 360 кодов угла на позицию в одной раскладке")
@@ -117,6 +140,58 @@ class Commands:
             vote = " ".join(f"vote@{k}={value:.4f}" for k, value in report.vote.items())
             print(f"ladder top: dataset={args.split} samples={args.limit} {vote}")
 
+    def _dashboard(self, args: argparse.Namespace) -> None:
+        import webbrowser
+
+        from dashboard.server import DashboardServer
+
+        server = DashboardServer(self.damp, count=args.count, map_points=args.map_points, port=args.port)
+        print(f"dashboard: учу цикл на {args.count} обучающих цифрах (шаги — из кеша, если такой цикл уже был)…", flush=True)
+        ladder = server.prepare()
+        if args.snapshot:
+            print(f"dashboard: снимок страницы — {server.snapshot(args.snapshot)}")
+            return
+        print(f"dashboard: уровней {ladder.levels}, обучающих картинок {ladder.train_pictures}; страница — {server.address} (Ctrl+C — стоп)",
+              flush=True)
+        if not args.no_browser:
+            webbrowser.open(server.address)
+        server.serve()
+
+    def _bench(self, args: argparse.Namespace) -> None:
+        report = self.damp.recognition.bench(
+            train=args.count, sets=args.sets, validation=args.validation, test=args.test, map_points=args.map_points,
+            methods=tuple(args.methods), augment=tuple(args.augment),
+        )
+
+        def cell(score) -> str:  # noqa: ANN001
+            if score is None:
+                return "—"
+            text = f"{100 * score.mean:.1f} ± {100 * score.std:.1f}"
+            return text if score.ci_low is None else f"{text} [{100 * score.ci_low:.1f}; {100 * score.ci_high:.1f}]"
+
+        print(f"bench: train={report.train} sets={report.sets} validation={report.validation} test={report.test or 'нет'}")
+        print(f"{'метод':<10} {'аугм.':<7} {'настройка':<34} {'validation, %':<24} {'test, %':<24} ответы при сдвиге")
+        for row in report.methods:
+            if not row.supported:
+                print(f"{row.method:<10} {row.augment:<7} {row.note}")
+                continue
+            same = "—" if row.robustness is None else f"{100 * row.robustness.same_answers:.1f} %"
+            print(f"{row.method:<10} {row.augment:<7} {row.setting or '—':<34} {cell(row.validation):<24} {cell(row.test):<24} {same}")
+        gap = report.gap
+        if gap is None:
+            print("Итого: для вывода нужны DAMP и CNN")
+        else:
+            def points(value) -> str:  # noqa: ANN001
+                return "—" if value is None else f"{100 * value:+.1f} п.п."
+
+            best = gap["damp_minus_best_cnn"]
+            same = gap["damp_minus_cnn_none"] or {}
+            print(
+                f"Итого: DAMP − CNN без аугментации: validation {points(same.get('validation'))}, test {points(same.get('test'))}; "
+                f"DAMP − лучшая CNN ({gap['best_cnn']}): validation {points(best['validation'])}, test {points(best['test'])}"
+            )
+        print(f"bench: файл {report.path}")
+
     def _layout(self, args: argparse.Namespace) -> None:
         if args.layout_only:
             summary = self.damp.layout.build(args.count, label=args.label, rebuild=args.rebuild)
@@ -151,6 +226,18 @@ class Commands:
                 print(f"figures: {path}")
             return
         print(f"figures: {self.damp.figures.readme()}")
+        # Снимок живого дашборда для README (пример-пятёрка и след кусочка); без playwright — пропускается.
+        import importlib.util
+
+        if importlib.util.find_spec("playwright") is None:
+            print("figures: снимок дашборда пропущен — нет playwright (pip install playwright)")
+            return
+        from dashboard.server import DashboardServer
+
+        s = self.damp.settings
+        server = DashboardServer(self.damp)
+        server.prepare()
+        print(f"figures: {server.snapshot(str(Path(s['README_FIGURES_DIR']) / 'dashboard.png'))}")
 
     def _pinwheel(self, args: argparse.Namespace) -> None:
         report = self.damp.layout.pinwheel()

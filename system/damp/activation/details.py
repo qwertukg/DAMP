@@ -18,12 +18,19 @@ class DetailCoder:
     def __init__(self, number: int) -> None:
         self.number = int(number)
 
-    def encode(self, firing: Firing, layer_index: "np.ndarray", detectors: int) -> tuple["np.ndarray", int]:
-        """Коды деталей, по строке на окно, и их длина (из кеша шагов, если такие срабатывания уже были)."""
+    def encode(
+        self, firing: Firing, layer_index: "np.ndarray", detectors: int, trained: "np.ndarray", *, length: int | None = None
+    ) -> tuple["np.ndarray", int]:
+        """Коды деталей, по строке на окно, и их длина (из кеша шагов, если такие срабатывания уже были).
+
+        trained — маска окон обучающих картинок: длина кода подбирается только по ним (§6.6, шаг 3), проверочные
+        окна на неё не влияют; length — длина, уже подобранная по обучающим (обученный уровень, новая картинка)."""
         from damp.cache import CACHE
 
         rows, columns, levels = firing.rows, firing.columns, firing.levels
         layer_index = np.asarray(layer_index)
+        trained = np.asarray(trained, dtype=bool)
+        fixed = None if length is None else int(length)
 
         def compute() -> dict[str, object]:
             coded = slice(None)
@@ -38,14 +45,14 @@ class DetailCoder:
                 max_length=settings.LADDER_CODE_LENGTH_MAX,
                 seed=settings.LADDER_RANDOM_SEED + self.number,
                 name=f"details{self.number}",
-            ).encode(rows[coded], columns[coded], levels[coded], firing.sets, calibration=settings.LADDER_CALIBRATION_SETS)
+            ).encode(rows[coded], columns[coded], levels[coded], firing.sets, calibration=trained, length=fixed)
             return {"details": details, "length": int(length)}
 
         inputs = {
             "rows": rows, "columns": columns, "levels": levels, "sets": int(firing.sets), "layer_index": layer_index,
-            "detectors": int(detectors), "number": self.number,
+            "detectors": int(detectors), "number": self.number, "trained": trained, "length": 0 if fixed is None else fixed,
         }
-        found = CACHE.run("embeddings.details", inputs, compute, modules=("damp.activation.details",))
+        found = CACHE.run("embeddings.details", inputs, compute, modules=("damp.activation.details", "damp.activation.set_embedding"))
         return found["details"], int(found["length"])
 
     @staticmethod

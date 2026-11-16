@@ -70,9 +70,15 @@ class PlaneFieldBuilder:
         energy_threshold: float,
         dense: bool = False,
         name: str = "fields",
+        concepts: int | None = None,
     ) -> None:
         # True — окно на каждом элементе, без вытеснения перекрывающихся полей (продолжение статьи, П.2).
         self._dense = bool(dense)
+        # П.7: окно объединяет около 5–7 понятий — радиус окна не больше расстояния до concepts-го ближайшего
+        # элемента (считая сам элемент). None — без ограничения (радиус только по §6.4.3).
+        if concepts is not None and int(concepts) < 1:
+            raise ValueError("concepts must be positive or None")
+        self._concepts = None if concepts is None else int(concepts)
         thresholds = (lambda_thresholds,) if isinstance(lambda_thresholds, (int, float)) else tuple(lambda_thresholds)
         if not thresholds or any(not 0.0 <= float(value) <= 1.0 for value in thresholds):
             raise ValueError("lambda thresholds must be in [0, 1]")
@@ -245,6 +251,11 @@ class PlaneFieldBuilder:
         fill = np.where(allowed, inside / (math.pi * radii * radii), -np.inf)
         found = allowed.any(axis=2)
         radius = np.where(found, np.take_along_axis(radii, fill.argmax(axis=2)[:, :, None], axis=2)[:, :, 0], 0.0)
+        if self._concepts is not None:
+            # П.7: окно объединяет около 5–7 понятий — радиус не больше расстояния до concepts-го ближайшего
+            # элемента картинки (считая сам элемент): в окно попадает не больше concepts элементов (кроме равных).
+            nearest = np.sort(distance, axis=1)[:, min(self._concepts, count) - 1]
+            radius = np.where(found, np.minimum(radius, np.maximum(nearest, 1e-6)[None, :]), radius)
         # §6.3: n_d — точки поля с энергией не ниже порога.
         points = ((distance[None] <= radius[:, :, None]) & alive[:, None, :]).sum(axis=2)
         valid = alive & found & (members.sum(axis=2) >= self._min_points) & (points >= self._min_points)

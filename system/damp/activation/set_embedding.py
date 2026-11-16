@@ -138,14 +138,31 @@ class DetectorEmbeddings:
         levels: "np.ndarray",
         count: int,
         *,
-        calibration: int | None = None,
+        calibration: "np.ndarray | None" = None,
+        length: int | None = None,
     ) -> tuple["np.ndarray", int]:
-        """Упакованные коды наборов 0…count−1 и длина кода; длина подбирается по первым calibration наборам."""
+        """Упакованные коды наборов 0…count−1 и длина кода.
+
+        calibration — булева маска наборов (по числу наборов), по которым подбирается длина кода: обучающие окна;
+        None — все наборы. Выбор идёт по маске, а не по порядку строк, чтобы проверочные окна не влияли на код.
+        length — длина, уже подобранная по обучающим окнам (обученный уровень, новая картинка): тогда она не
+        подбирается.
+        """
         fired = np.bincount(np.asarray(rows, dtype=np.int64), minlength=int(count))
         rows, columns = self.strongest(rows, columns, levels)
-        sample = int(count) if calibration is None else max(1, min(int(calibration), int(count)))
-        inside = rows < sample
-        length = self.fit_length(rows[inside], columns[inside], sample)
+        if length is not None:
+            sample = int(count)
+            length = int(length)
+        elif calibration is None:
+            sample = int(count)
+            length = self.fit_length(rows, columns, sample)
+        else:
+            mask = np.asarray(calibration, dtype=bool)
+            if mask.shape != (int(count),):
+                raise ValueError("calibration: нужна булева маска по числу наборов")
+            sample = max(1, int(mask.sum()))
+            inside = mask[rows]
+            length = self.fit_length(rows[inside], columns[inside], sample)
         bits = self.detector_bits(length)
         packed = np.zeros((int(count), length // 8), dtype=np.uint8)
         order = np.argsort(rows, kind="stable")
@@ -166,6 +183,7 @@ class DetectorEmbeddings:
             data={
                 "name": self._name,
                 "calibration_sets": sample,
+                "calibration": "обучающие окна" if calibration is not None else "все наборы",
                 "target_density": self._target,
                 "code_length": length,
                 "density": ones / (max(1, int(count)) * length),

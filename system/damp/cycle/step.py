@@ -15,7 +15,7 @@ import numpy as np
 from damp import settings
 from damp.activation.details import DetailCoder
 from damp.activation.level_detectors import Firing, LevelDetectors
-from damp.cycle.keyholes import KeyholeBuilder, LevelKeyholes
+from damp.cycle.keyholes import KeyholeBuilder, LadderField, LevelKeyholes
 from damp.encoding.elements import LadderElements
 from damp.encoding.position_binding import KeyholeCodes
 from damp.encoding.keyhole_code import KeyholeCoder
@@ -50,6 +50,56 @@ class LevelPass:
         """Освободить память видеокарты под картой уровня и срабатыванием детекторов."""
         self.detectors.release()
         self.memory.release()
+
+    def trained(self) -> "TrainedLevel":
+        """Уровень после обучения — всё, что подобрано по обучающим картинкам; срабатывания и коды всех окон в нём
+        не хранятся (они на каждый уровень — сотни мегабайт)."""
+        from damp.layout.glyph_map import LayoutGlyphMap
+
+        # Точка карты — образец словаря: строка кода с тем же кодом (раскладка держит точки в своём порядке).
+        sample = LayoutGlyphMap(self.memory.layout, self.memory.dictionary.packed).rows
+        rows = np.asarray(self.memory.rows, dtype=np.int64)[np.maximum(sample, 0)]
+        pieces = self.keyholes.pieces
+        return TrainedLevel(
+            field=self.keyholes.field,
+            step=float(self.keyholes.step),
+            thresholds=tuple(float(value) for value in self.keyholes.thresholds),
+            content_length=int(self.codes.content_length),
+            memory=self.memory,
+            detectors=self.detectors,
+            detail_length=int(self.detail_length),
+            scale=self.firing.scale,
+            point_picture=np.where(sample >= 0, pieces.picture[rows], -1),
+            point_centre=pieces.centre[rows],
+            point_extent=np.asarray(self.keyholes.extent, dtype=np.float64)[rows],
+        )
+
+
+@dataclass(frozen=True)
+class TrainedLevel:
+    """Уровень цикла после обучения (§6.6): всё, что подобрано по обучающим картинкам, — по нему идёт новая картинка.
+
+    Мера плоскости и пороги слоёв окон (§6.4.1–§6.4.3, П.2), длина сегмента содержания кода окна (П.5, §6.6),
+    карта памяти (§5) с детекторами (§6.4), делители нормировки уровней активации (вне статьи) и длина кода детали
+    (§6.6, §7.1.12). Каждая точка карты помнит окно обучающей картинки, чей код она хранит: картинку, центр окна и его
+    поле, — по ним видно содержимое точки (вне статьи, для показа).
+    """
+
+    field: LadderField
+    step: float
+    thresholds: tuple[float, ...]
+    content_length: int
+    memory: LevelMemory
+    detectors: LevelDetectors
+    detail_length: int
+    scale: "np.ndarray | None"  # делители нормировки уровней по детекторам; None — без нормировки
+    point_picture: "np.ndarray"  # обучающая картинка окна каждой точки карты (порядок точек раскладки)
+    point_centre: "np.ndarray"  # центр этого окна (y, x), узлы сетки картинки
+    point_extent: "np.ndarray"  # сколько клеток картинки видит это окно
+
+    @property
+    def number(self) -> int:
+        return self.field.number
 
 
 class CycleStep:
@@ -110,17 +160,30 @@ class CycleStep:
             memory.release()
             raise LadderLevelDegenerate(f"{memory.name}: над картой из {memory.points} точек {error}") from error
 
-    @staticmethod
-    def fire(detectors: LevelDetectors, codes: KeyholeCodes) -> Firing:
-        """Каждое окно сверяется с картой одним кодом (§6.5)."""
-        every = np.arange(codes.count, dtype=np.int64)
-        return detectors.fire(codes.packed, every, every, codes.count)
+    def trained(self, keyholes: LevelKeyholes) -> "np.ndarray":
+        """Маска окон обучающих картинок (по маске, а не по порядку строк): по ним подбирается длина кода детали и
+        нормировка уровней активации — проверочные окна на обучение не влияют."""
+        return np.asarray(keyholes.pieces.picture) < int(self.groups.train_pictures)
 
     @staticmethod
-    def embed(firing: Firing, detectors: LevelDetectors, keyholes: LevelKeyholes) -> tuple["np.ndarray", int, "np.ndarray", LadderElements]:
-        """Детали окон (§6.5, П.1): коды, их длина, уровни активации и детали как элементы следующего уровня."""
+    def fire(detectors: LevelDetectors, codes: KeyholeCodes, trained: "np.ndarray") -> Firing:
+        """Каждое окно сверяется с картой одним кодом (§6.5). LADDER_LEVEL_NORMALISATION = "train_max": уровни
+        активации нормируются в [0, 1] по обучающим окнам; trained — маска обучающих окон. Способ нормировки —
+        доработка автора проекта (вне статьи): §7.1.12 и §9.3 требуют лишь значений в [0, 1]."""
+        every = np.arange(codes.count, dtype=np.int64)
+        firing = detectors.fire(codes.packed, every, every, codes.count)
+        mode = settings.LADDER_LEVEL_NORMALISATION  # "none" в файле настроек читается как None
+        if mode == "train_max":
+            firing = firing.normalised(trained, detectors.built)
+        elif mode is not None:
+            raise ValueError(f"LADDER_LEVEL_NORMALISATION: ожидалось 'train_max' или 'none', получено {mode!r}")
+        return firing
+
+    def embed(self, firing: Firing, detectors: LevelDetectors, keyholes: LevelKeyholes) -> tuple["np.ndarray", int, "np.ndarray", LadderElements]:
+        """Детали окон (§6.5, П.1): коды, их длина, уровни активации и детали как элементы следующего уровня.
+        Длина кода подбирается только по окнам обучающих картинок."""
         coder = DetailCoder(keyholes.number)
-        details, length = coder.encode(firing, detectors.layer_index, detectors.built)
+        details, length = coder.encode(firing, detectors.layer_index, detectors.built, self.trained(keyholes))
         strength = firing.strength()
         pieces = keyholes.pieces
         elements = coder.elements(details, length, pieces.picture, pieces.centre, keyholes.extent, strength)
@@ -151,7 +214,7 @@ class CycleStep:
         lap("memory", memory)
         detectors = self.detect(memory)
         lap("detectors", detectors)
-        firing = self.fire(detectors, codes)
+        firing = self.fire(detectors, codes, self.trained(keyholes))
         lap("firing", firing)
         details, length, strength, following = self.embed(firing, detectors, keyholes)
         lap("details", (details, length, strength, following))

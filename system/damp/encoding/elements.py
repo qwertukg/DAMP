@@ -103,7 +103,10 @@ class StickCoder:
         )
 
     def encode(self, atoms: "DigitAtoms") -> LadderElements:
-        """Элементы уровня 0: углопозиции набора и коды их направлений (результат — из кеша шагов, если есть)."""
+        """Элементы уровня 0: углопозиции набора и коды их направлений (результат — из кеша шагов, если есть).
+
+        При LADDER_STROKE_STRENGTH у элементов есть сила — сила края штриха, нормированная внутри картинки.
+        """
         from damp.cache import CACHE
 
         def compute() -> dict[str, object]:
@@ -118,6 +121,8 @@ class StickCoder:
             what_packed=found["what"],
             what_length=self.encoder.code_length,
             what_index=found["index"],
+            # Сила штриха — сила его края (вне статьи): по ней пулинг "strongest" выбирает сильнейший элемент круга места.
+            strength=np.asarray(atoms.strength, dtype=np.float64) if settings.LADDER_STROKE_STRENGTH else None,
         )
 
     def _codes(self, atoms: "DigitAtoms") -> tuple["np.ndarray", "np.ndarray"]:

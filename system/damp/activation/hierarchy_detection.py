@@ -126,7 +126,7 @@ class HierarchyDetection:
             for start in range(0, packed.shape[0], self.BLOCK):
                 activation = self._activation(self._to_device(packed[start : start + self.BLOCK]))
                 lit += int((activation > 0).sum().item())
-                level = ((activation * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
+                level = self._level(activation, self.BLOCK)
                 found = torch.nonzero(level >= self._detector_threshold)
                 rows.append(found[:, 0].cpu().numpy() + start)
                 columns.append(found[:, 1].cpu().numpy())
@@ -151,6 +151,43 @@ class HierarchyDetection:
             },
         )
         return rows, columns
+
+    def lit(self, packed: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+        """Зажжённые точки карты (§6.1): тройки (номер кода, номер точки, активация a_j > 0) — та же активация, что
+        в active и active_sets; без свёртки в уровни детекторов. Для показа карты отклика (вне статьи)."""
+        torch = self._torch
+        packed = np.ascontiguousarray(packed, dtype=np.uint8)
+        if packed.ndim != 2 or packed.shape[1] != self._row_bytes:
+            raise ValueError("codes must be rows × ceil(code_length / 8) packed bytes")
+        rows, points, values = [], [], []
+        with torch.no_grad():
+            for start in range(0, packed.shape[0], self.BLOCK):
+                activation = self._activation(self._to_device(packed[start : start + self.BLOCK]))
+                found = torch.nonzero(activation > 0)
+                rows.append(found[:, 0].cpu().numpy() + start)
+                points.append(found[:, 1].cpu().numpy())
+                values.append(activation[found[:, 0], found[:, 1]].cpu().numpy())
+        if not rows:
+            return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+        return (np.concatenate(rows).astype(np.int64), np.concatenate(points).astype(np.int64),
+                np.concatenate(values).astype(np.float32))
+
+    def _level(self, activation, rows: int):  # noqa: ANN001, ANN202
+        """Уровень активации детекторов E(d) = Σ a_j · e_j / e_d по полю детектора (§6.5), строка за строкой.
+
+        Строки умножения независимы, но видеокарта выбирает ядро матричного умножения по числу строк, и порядок
+        сложения в float32 менялся бы от размера пачки: уровень окна сдвигался бы на ~1e-6 от того, сколько
+        проверочных окон идёт с ним в одной пачке. Поэтому пачка всегда дополняется нулевыми строками до rows
+        (не меньше строк пачки): ядро одно и то же, уровень строки зависит только от неё самой (вне статьи —
+        техника счёта; проверочные картинки на обучающие окна не влияют бит в бит).
+        """
+        torch = self._torch
+        count = int(activation.shape[0])
+        size = max(int(rows), count)
+        if count < size:
+            activation = torch.cat([activation, activation.new_zeros((size - count, activation.shape[1]))])
+        level = ((activation * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
+        return level[:count]
 
     def _activation(self, block):  # noqa: ANN001, ANN202
         """Пороговая активация точек карты кодами блока (§6.1): строки — коды, столбцы — точки."""
@@ -221,7 +258,7 @@ class HierarchyDetection:
                         picked = activation[torch.as_tensor(inverse[chosen], device=self._device)]
                         combined[local] = torch.maximum(combined[local], picked)
                     lit += int((combined > 0).sum().item())
-                    level = ((combined * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
+                    level = self._level(combined, limit)
                     found = torch.nonzero(level >= self._detector_threshold)
                     rows.append(found[:, 0].cpu().numpy() + first)
                     columns.append(found[:, 1].cpu().numpy())
