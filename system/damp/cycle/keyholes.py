@@ -170,10 +170,15 @@ class KeyholeBuilder:
         train_pictures = self._groups.train_pictures
         taught = elements.picture < train_pictures
         previous = 0.5 if elements.extent is None else float(elements.reach()[taught].mean())
+        # Шаг между соседями и пары соседей меряются по сетке окон Собеля: углопозиции стоят по одной на окно, а
+        # элементы всех уровней — на местах углопозиций (окно стоит на своём элементе, П.2). Дробное место
+        # (MNIST_SUBCELL_POSITION, вне статьи) уточняет, где край проходит внутри окна, но шаг выборки не меняет:
+        # у углопозиций шаг — одна клетка. По дробным местам соседи на косом крае сближаются (медиана 0.68 клетки),
+        # и все радиусы построения окон сжимаются. При целом месте округление ничего не меняет.
         neighbour_step, thresholds = self._scale.measure(
             elements.picture[taught],
-            elements.y[taught],
-            elements.x[taught],
+            np.rint(elements.y[taught]),
+            np.rint(elements.x[taught]),
             elements.what_packed,
             elements.what_index[taught],
             elements.what_length,

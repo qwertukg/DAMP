@@ -94,7 +94,7 @@ class TrainedLevel:
     detail_length: int
     scale: "np.ndarray | None"  # делители нормировки уровней по детекторам; None — без нормировки
     point_picture: "np.ndarray"  # обучающая картинка окна каждой точки карты (порядок точек раскладки)
-    point_centre: "np.ndarray"  # центр этого окна (y, x), узлы сетки картинки
+    point_centre: "np.ndarray"  # центр этого окна (y, x), в клетках сетки картинки (дробный при MNIST_SUBCELL_POSITION)
     point_extent: "np.ndarray"  # сколько клеток картинки видит это окно
 
     @property

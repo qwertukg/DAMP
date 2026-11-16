@@ -36,7 +36,7 @@ const S = {
 function prepareModel(raw) {
   const st = raw.sticks;
   const sticks = {
-    picture: dec(st.picture, Int32Array), y: dec(st.y, Int16Array), x: dec(st.x, Int16Array), angle: dec(st.angle, Float32Array),
+    picture: dec(st.picture, Int32Array), y: dec(st.y, Float32Array), x: dec(st.x, Float32Array), angle: dec(st.angle, Float32Array),
     labels: dec(st.labels, Uint8Array), index: dec(st.index, Int32Array), pictures: st.pictures,
   };
   sticks.start = group(sticks.picture, st.pictures).start; // углопозиции идут по картинкам по возрастанию
@@ -58,7 +58,7 @@ function prepareModel(raw) {
 
 function prepareSight(raw) {
   const sticks = {
-    angle: dec(raw.sticks.angle, Float32Array), y: dec(raw.sticks.y, Int16Array), x: dec(raw.sticks.x, Int16Array),
+    angle: dec(raw.sticks.angle, Float32Array), y: dec(raw.sticks.y, Float32Array), x: dec(raw.sticks.x, Float32Array),
     strength: dec(raw.sticks.strength, Float32Array), count: raw.sticks.count,
   };
   const levels = raw.levels.map((L, n) => {
@@ -146,7 +146,7 @@ function glyph(ctx, M, i, left, top, size) {
   for (let j = sticks.start[p]; j < sticks.start[p + 1]; j++) {
     const dy = sticks.y[j] - cy, dx = sticks.x[j] - cx;
     if (Math.abs(dy) > half || Math.abs(dx) > half) continue;
-    const inside = Math.hypot(dy, dx) <= extent + 1e-9;
+    const inside = Math.hypot(dy, dx) <= extent + 1e-5;  // места и поле приходят в float32
     stick(ctx, left + size / 2 + dx * unit, top + size / 2 + dy * unit, unit, sticks.angle[j], inside ? 1 : 0.22);
   }
 }

@@ -166,6 +166,11 @@ class MnistSobelAngleMap:
     Рабочая картинка — та, на которой считается Собель: стимул 28×28 или его увеличенная копия
     (28·scale). patch_size и сетка участков — в пикселях рабочей картинки: при ×8 участок 3 — это
     3×3 увеличенных пикселя, сетка 224 // 3 = 74 участка, остаток у правого и нижнего края отбрасывается.
+
+    subcell_position=True (только с contour_only) — место углопозиции дробное: там, где край проходит внутри
+    участка (центр масс пикселей контура выбранного края с весом силы градиента; у линии в пиксель — центр масс
+    её пикселей по яркости), в единицах участка: целое X — середина участка. Без него X, Y — номер участка, и
+    наклонная линия ложится ступеньками по серединам участков (вне статьи).
     """
 
     angle_in_degrees: bool = True
@@ -175,6 +180,7 @@ class MnistSobelAngleMap:
     contour_level: float = 0.5
     two_edge_coherence: float = 0.5
     upscaled: Optional[UpscaledSobel] = None
+    subcell_position: bool = False
 
     # ВАЖНО: это не поля dataclass, а константы класса (ClassVar)
     EXPECTED_SIDE: ClassVar[int] = 28
@@ -244,6 +250,8 @@ class MnistSobelAngleMap:
         mode = "window"
         if self.contour_only:
             mode = f"contour(level={self.contour_level:g},edge={self.two_edge_coherence:g})"
+        if self.subcell_position:
+            mode += ",subcell"  # место дробное: старая раскладка с целыми местами не подходит
         if self.upscaled is not None:
             # patch_size — в пикселях увеличенной картинки (до этой версии было в пикселях стимула).
             mode += f",{self.upscaled.signature},patch=work_px"
@@ -514,6 +522,30 @@ class MnistSobelAngleMap:
             vx, vy = max(self._opposite_edges(vx, vy), key=lambda edge: float(np.sum(np.hypot(*edge))))
         return float(vx.mean()), float(vy.mean()), coherence, two_edges
 
+    def _edge_place(
+        self, bx: int, by: int, on_contour: np.ndarray, gx: np.ndarray, gy: np.ndarray, work: np.ndarray,
+        mean_gx: float, mean_gy: float, ridge: bool,
+    ) -> Tuple[float, float]:
+        """Где край проходит внутри участка (bx, by), в единицах участка: целое число — середина участка (вне статьи).
+
+        Центр масс пикселей контура, чей градиент смотрит туда же, что выбранный край (вес — сила градиента): при
+        двух краях в участке берётся тот, по которому мерился угол. У линии в пиксель (ridge: градиент в контуре
+        гасится) — центр масс пикселей линии по яркости. Нет веса — середина участка.
+        """
+        rows, cols = np.nonzero(on_contour)
+        if ridge:
+            weights = work[on_contour].astype(np.float64)
+        else:
+            vx, vy = gx[on_contour].astype(np.float64), gy[on_contour].astype(np.float64)
+            weights = np.hypot(vx, vy) * ((vx * mean_gx + vy * mean_gy) > 0.0)
+        total = float(weights.sum())
+        if total <= 0.0:
+            return float(bx), float(by)
+        p = float(self.work_patch)
+        x = bx + float((cols + 0.5) @ weights) / total / p - 0.5
+        y = by + float((rows + 0.5) @ weights) / total / p - 0.5
+        return x, y
+
     def _contour_angles(self, work: np.ndarray, gx: np.ndarray, gy: np.ndarray) -> List[AngleTriplet]:
         """Углопозиции только по контуру: одна на участок, угол — средний градиент края в пикселях контура."""
         out: List[AngleTriplet] = []
@@ -579,12 +611,15 @@ class MnistSobelAngleMap:
                 angle = float(np.arctan2(mean_gy, mean_gx))
                 if self.angle_in_degrees:
                     angle = float(np.degrees(angle))
+                x, y = bx, by
+                if self.subcell_position:
+                    x, y = self._edge_place(bx, by, on_contour, gx[window], gy[window], work[window], mean_gx, mean_gy, ridge)
                 LOGGER.event(
                     "sobel_map.patch.angle",
                     section=CYCLIC_COORDS,
-                    data={"x": bx, "y": by, "angle": angle, "magnitude": mag},
+                    data={"x": bx, "y": by, "place": [x, y], "angle": angle, "magnitude": mag},
                 )
-                out.append((angle, bx, by, mag))
+                out.append((angle, x, y, mag))
 
         LOGGER.event(
             "sobel_map.contour",

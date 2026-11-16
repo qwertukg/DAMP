@@ -63,7 +63,7 @@ class ClientApiTest(unittest.TestCase):
         direct = _build_extractor().extract(image, label=1).get(1, [])
         self.assertTrue(stimuli)
         self.assertTrue(all(isinstance(item, Stimulus) for item in stimuli))
-        self.assertEqual([(s.angle, s.x, s.y) for s in stimuli], [(float(a), int(round(x)), int(round(y))) for a, x, y in direct])
+        self.assertEqual([(s.angle, s.x, s.y) for s in stimuli], [(float(a), float(x), float(y)) for a, x, y in direct])
 
     def test_detectors_picture_is_saved(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

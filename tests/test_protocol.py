@@ -276,5 +276,60 @@ class RunnerProtocolTest(unittest.TestCase):
         self.assertTrue(all(report.alone is not None for report in runner.reports))  # метки — по отложенной выборке
 
 
+class SubcellPositionTest(unittest.TestCase):
+    """Дробное место штриха (MNIST_SUBCELL_POSITION, вне статьи): у наклонной полосы место лежит на крае, без ступенек
+    в клетку; клетка и угол — те же, что у целого места."""
+
+    ANGLES = (15.0, 30.0, 60.0, 75.0, 105.0, 120.0, 150.0, 165.0)
+    WIDTH, LENGTH, SUPER = 2.2, 20.0, 8
+
+    @classmethod
+    def stroke(cls, phi_deg: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Сглаженная полоса через (13.5, 13.5) под углом φ (экранные оси): картинка, середина, направление."""
+        phi = np.radians(phi_deg)
+        along_unit = np.array([np.cos(phi), np.sin(phi)])
+        centre = np.array([13.5, 13.5])
+        sub = (np.arange(28 * cls.SUPER) + 0.5) / cls.SUPER - 0.5
+        xx, yy = np.meshgrid(sub, sub)
+        rel = np.stack([xx - centre[0], yy - centre[1]], axis=-1)
+        along = rel @ along_unit
+        across = rel @ np.array([-along_unit[1], along_unit[0]])
+        dist = np.hypot(along - np.clip(along, -cls.LENGTH / 2, cls.LENGTH / 2), across)
+        image = (dist <= cls.WIDTH / 2).astype(np.float32).reshape(28, cls.SUPER, 28, cls.SUPER).mean(axis=(1, 3))
+        return image, centre, along_unit
+
+    @classmethod
+    def spread(cls, sticks, centre: np.ndarray, along_unit: np.ndarray) -> list[float]:  # noqa: ANN001
+        """СКО места поперёк каждого края полосы, пиксели MNIST; концы полосы (по 2 px) не берутся."""
+        cell = float(settings.MNIST_PATCH_SIZE) / float(settings.MNIST_SOBEL_UPSCALE)
+        place = np.asarray([(cell * (x + 0.5) - 0.5, cell * (y + 0.5) - 0.5) for _, x, y in sticks]) - centre
+        along = place @ along_unit
+        across = place @ np.array([-along_unit[1], along_unit[0]])
+        inner = np.abs(along) <= cls.LENGTH / 2 - 2.0
+        return [float(np.std(across[inner & side])) for side in (across > 0, across <= 0) if (inner & side).sum() >= 4]
+
+    def test_place_lies_on_the_edge_inside_the_same_cell(self) -> None:
+        whole_spread, fine_spread = [], []
+        for phi in self.ANGLES:
+            image, centre, along_unit = self.stroke(phi)
+            with settings.overridden({"MNIST_SUBCELL_POSITION": False}):
+                whole = _build_extractor().extract(image, label=0)[0]
+            with settings.overridden({"MNIST_SUBCELL_POSITION": True}):
+                fine = _build_extractor().extract(image, label=0)[0]
+            with self.subTest(phi=phi):
+                self.assertTrue(whole)
+                self.assertTrue(all(isinstance(x, int) and isinstance(y, int) for _, x, y in whole))
+                self.assertEqual([angle for angle, _, _ in fine], [angle for angle, _, _ in whole])
+                self.assertEqual([(int(round(x)), int(round(y))) for _, x, y in fine], [(x, y) for _, x, y in whole])
+                self.assertTrue(all(abs(x - round(x)) < 0.5 and abs(y - round(y)) < 0.5 for _, x, y in fine))
+            whole_spread += self.spread(whole, centre, along_unit)
+            fine_spread += self.spread(fine, centre, along_unit)
+        whole_rms = float(np.sqrt(np.mean(np.square(whole_spread))))
+        fine_rms = float(np.sqrt(np.mean(np.square(fine_spread))))
+        self.assertGreater(whole_rms, 0.25)  # целое место: ступеньки в клетку (1.125 px)
+        self.assertLess(fine_rms, 0.1)
+        self.assertLess(fine_rms, whole_rms / 4)
+
+
 if __name__ == "__main__":
     unittest.main()

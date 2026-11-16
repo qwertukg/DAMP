@@ -81,7 +81,8 @@ class DigitAtoms:
     ) -> "DigitAtoms":
         """Набор из углопозиций картинок: rows — по массиву на картинку, строки (картинка, угол, x, y, сила штриха).
 
-        Сила штриха нормируется внутри своей картинки: доля от самого сильного штриха этой картинки, (0, 1].
+        Сила штриха нормируется внутри своей картинки: доля от самого сильного штриха этой картинки, (0, 1]. Место —
+        дробное при MNIST_SUBCELL_POSITION (там, где край проходит внутри окна Собеля), иначе номер окна (целое).
         """
         data = np.concatenate(rows) if rows else np.zeros((0, 1 + PictureSticks.COLUMNS), dtype=np.float64)
         picture = data[:, 0].astype(np.int64)
@@ -90,11 +91,12 @@ class DigitAtoms:
         np.maximum.at(peak, picture, strength)
         peak[peak <= 0.0] = 1.0
         strength = strength / np.maximum(peak[picture], np.finfo(np.float64).tiny)
+        fractional = bool(settings.MNIST_SUBCELL_POSITION)
         return cls(
             picture=data[:, 0].astype(np.int64),
             angle=data[:, 1],
-            y=np.rint(data[:, 3]).astype(np.int64),
-            x=np.rint(data[:, 2]).astype(np.int64),
+            y=data[:, 3].astype(np.float64) if fractional else np.rint(data[:, 3]).astype(np.int64),
+            x=data[:, 2].astype(np.float64) if fractional else np.rint(data[:, 2]).astype(np.int64),
             labels=np.asarray(labels, dtype=np.int64),
             images=np.stack(images) if len(images) else np.zeros((0, 28, 28), dtype=np.uint8),
             strength=strength,

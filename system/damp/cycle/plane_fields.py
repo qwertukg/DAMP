@@ -56,6 +56,9 @@ class PlaneFieldBuilder:
 
     # Смещение элемента от центра поля — в долях радиуса поля, с этим шагом (число различных мест конечно).
     OFFSET_STEP = 0.125
+    # Центр и радиус поля хранятся с 6 знаками (picture_fields); элемент входит в поле с этим допуском — больше
+    # ошибки округления (не больше 1.3·10⁻⁶ клетки), иначе сосед на самой границе, задавший радиус (§6.4.3), выпадает.
+    ROUNDING = 2e-6
 
     def __init__(
         self,
@@ -306,7 +309,7 @@ class PlaneFieldBuilder:
             own = position[first:last]
             for centre_y, centre_x, radius, inside in self.picture_fields(own, table[index[first:last]]):
                 reach = np.hypot(own[:, 0] - centre_y, own[:, 1] - centre_x)
-                rows = np.flatnonzero(reach <= radius)
+                rows = np.flatnonzero(reach <= radius + self.ROUNDING)
                 owner.append(np.full(rows.size, len(radii), dtype=np.int64))
                 members.append(rows + first)
                 # Место элемента — смещение от центра поля в долях его радиуса: поле любого размера кодируется

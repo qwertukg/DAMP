@@ -147,7 +147,7 @@ class Digits(_Part):
         atoms = self._groups.atoms
         first, last = self._groups.sticks(int(index))
         group = next(name for name, (begin, end) in self.groups.items() if begin <= index < end)
-        stimuli = tuple(Stimulus(float(atoms.angle[i]), int(atoms.x[i]), int(atoms.y[i])) for i in range(first, last))
+        stimuli = tuple(Stimulus(float(atoms.angle[i]), float(atoms.x[i]), float(atoms.y[i])) for i in range(first, last))
         return Picture(index=int(index), digit=int(atoms.labels[index]), group=group, image=atoms.images[index], stimuli=stimuli,
                        mnist=int(atoms.index[index]))
 
@@ -569,8 +569,8 @@ class TrainedLadder(_Part):
         rows = atoms.picture < taught
         return TrainingSticks(
             picture=np.asarray(atoms.picture[rows], dtype=np.int64),
-            y=np.asarray(atoms.y[rows], dtype=np.int64),
-            x=np.asarray(atoms.x[rows], dtype=np.int64),
+            y=np.asarray(atoms.y[rows], dtype=np.float64),
+            x=np.asarray(atoms.x[rows], dtype=np.float64),
             angle=np.asarray(atoms.angle[rows], dtype=np.float64),
             labels=np.asarray(atoms.labels[:taught], dtype=np.int64),
             index=np.asarray(atoms.index[:taught], dtype=np.int64),

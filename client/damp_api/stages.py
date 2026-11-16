@@ -138,7 +138,7 @@ class Stimuli(_Stage):
             pixels = pixels / 255.0
         with self._session.active():
             found = system.extractor().extract(pixels, label=int(label)).get(int(label), [])
-        return [Stimulus(float(angle), int(round(x)), int(round(y))) for angle, x, y in found]
+        return [Stimulus(float(angle), float(x), float(y)) for angle, x, y in found]
 
     def sketch(self, digit: int, *, seed: int | None = None, split: str | None = None, patch_size: int | None = None,
                upscale: bool | None = None) -> None:

@@ -570,6 +570,22 @@ class DenseKeyholesTest(unittest.TestCase):
         self.assertTrue(np.array_equal(own.pieces.element, moved.pieces.element))
         self.assertTrue(np.allclose(own.pieces.offsets[own.pieces.offset], moved.pieces.offsets[moved.pieces.offset]))
 
+    def test_keyhole_holds_the_element_that_sets_its_radius(self) -> None:
+        """§6.4.3: радиус окна — расстояние до самого дальнего вошедшего соседа, и этот сосед — в окне. Центр и радиус
+        хранятся с 6 знаками; на дробных местах (MNIST_SUBCELL_POSITION) округление не должно выбрасывать его."""
+        rng = np.random.default_rng(7)
+        count = 60
+        y, x = rng.uniform(0.0, 9.0, count), rng.uniform(0.0, 9.0, count)
+        packed = np.packbits(self._alike(1).astype(np.uint8), axis=1)
+        built = self._builder().build(np.zeros(count, dtype=np.int64), y, x, packed, np.zeros(count, dtype=np.int64), 32)
+        pieces = built.pieces
+        reach = np.hypot(y[pieces.element] - pieces.centre[pieces.piece, 0], x[pieces.element] - pieces.centre[pieces.piece, 1])
+        farthest = np.zeros(pieces.count)
+        np.maximum.at(farthest, pieces.piece, reach)
+        bounded = built.radius > 1.0 + 1e-6  # радиус задан соседом, а не наименьшим радиусом поля
+        self.assertGreater(int(bounded.sum()), 10)
+        np.testing.assert_allclose(farthest[bounded], built.radius[bounded], atol=2e-6)
+
 
 class MatrixClustersTest(unittest.TestCase):
     """Кластеры всех центров разом (умножением матриц) совпадают с обходом от каждого центра по отдельности."""

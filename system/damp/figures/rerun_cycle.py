@@ -163,7 +163,7 @@ class CycleRerunView(LadderObserver):
         self._log(path, rr.TextDocument(markdown, media_type=rr.MediaType.MARKDOWN), level)
 
     def _px(self, cells: np.ndarray) -> np.ndarray:
-        """Клетки сетки углопозиций → пиксели рабочей картинки (центр клетки)."""
+        """Место на сетке углопозиций, в клетках → пиксели рабочей картинки (целое — центр клетки)."""
         return (np.asarray(cells, dtype=np.float64) + 0.5) * self.unit
 
     def _digit(self, path: str, picture: int, level: int | None = None, *, brightness: float = 0.55) -> None:
@@ -388,6 +388,7 @@ class CycleRerunView(LadderObserver):
             f"| | |\n|---|---|\n| цифра-пример | пятёрка № {self.main_index} в MNIST (в каждом прогоне другая, среди пятёрок со штрихами; как на рисунках README этого прогона) |\n| штрихов у неё | {sticks} |\n"
             f"| обучающих картинок | {taught} |\n| штрихов на картинку, в среднем | {per_picture.mean():.1f} |\n"
             f"| сетка | 24×24 клетки, окно Собеля {int(self.unit)} px |\n"
+            f"| место штриха | {'дробное: где край проходит внутри клетки' if settings.MNIST_SUBCELL_POSITION else 'середина клетки'} |\n"
             f"| **Итого** | пятёрка № {self.main_index} — {sticks} штрихов; дальше весь путь показан на ней |\n\n"
             "Внизу — по одной проверочной цифре каждого класса. Источник: вне статьи (извлечение стимулов).",
         )

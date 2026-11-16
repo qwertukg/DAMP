@@ -12,7 +12,7 @@ def _build_extractor(
     upscale: bool | None = None,
 ) -> MnistSobelAngleMap:
     """Извлечение углопозиций; None — значение из настроек в момент вызова (MNIST_PATCH_SIZE, MNIST_CONTOUR_ONLY,
-    MNIST_SOBEL_UPSCALE_ENABLED)."""
+    MNIST_SOBEL_UPSCALE_ENABLED). Дробное место штриха внутри участка — MNIST_SUBCELL_POSITION (только по контуру)."""
     patch_size = settings.MNIST_PATCH_SIZE if patch_size is None else patch_size
     contour_only = settings.MNIST_CONTOUR_ONLY if contour_only is None else contour_only
     upscale = settings.MNIST_SOBEL_UPSCALE_ENABLED if upscale is None else upscale
@@ -31,6 +31,7 @@ def _build_extractor(
         contour_level=settings.MNIST_CONTOUR_LEVEL,
         two_edge_coherence=settings.MNIST_CONTOUR_TWO_EDGE_COHERENCE,
         upscaled=upscaled,
+        subcell_position=bool(settings.MNIST_SUBCELL_POSITION) and contour_only,
     )
 
 

@@ -163,17 +163,18 @@ class AnglePositionLines:
         r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
         return int(r * 255), int(g * 255), int(b * 255)
 
-    def segment(self, angle: float, x: int, y: int) -> AnglePositionSegment:
+    def segment(self, angle: float, x: float, y: float) -> AnglePositionSegment:
+        """Отрезок углопозиции: центр — её место (дробное — где край проходит внутри окна), x, y отрезка — номер окна."""
         degrees = self._angle_degrees(angle)
         radians = math.radians(degrees)
         direction_x, direction_y = math.sin(radians), math.cos(radians)
-        center_x = (int(x) + 0.5) * self.patch_size
-        center_y = (int(y) + 0.5) * self.patch_size
+        center_x = (float(x) + 0.5) * self.patch_size
+        center_y = (float(y) + 0.5) * self.patch_size
         half = self.line_length / 2.0
         segment = AnglePositionSegment(
             angle=degrees,
-            x=int(x),
-            y=int(y),
+            x=int(round(float(x))),
+            y=int(round(float(y))),
             start=(center_x - half * direction_x, center_y - half * direction_y),
             end=(center_x + half * direction_x, center_y + half * direction_y),
             color=self._angle_color(degrees),

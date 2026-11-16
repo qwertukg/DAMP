@@ -23,7 +23,7 @@ class LadderRunTrace:
     images: np.ndarray  # (N, 28, 28) картинки, 0…255
     labels: np.ndarray  # (N,) цифра каждой картинки
     stick_picture: np.ndarray  # (S,) картинка каждой углопозиции, по возрастанию
-    stick_y: np.ndarray  # (S,) клетка сетки углопозиций
+    stick_y: np.ndarray  # (S,) место на сетке углопозиций, в клетках (дробное при MNIST_SUBCELL_POSITION)
     stick_x: np.ndarray
     stick_angle: np.ndarray  # (S,) направление перепада яркости, градусы
     ranges: dict[str, tuple[int, int]]  # группа картинок → (первая, после последней)

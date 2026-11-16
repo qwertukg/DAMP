@@ -64,7 +64,7 @@ class Sight:
     """Путь одной картинки: углопозиции, уровни и ответ линейного читателя (§9.3)."""
 
     stick_angle: "np.ndarray"  # (n,) угол углопозиции, градусы (§4.4)
-    stick_y: "np.ndarray"  # (n,) узел сетки картинки
+    stick_y: "np.ndarray"  # (n,) место на сетке картинки, в клетках (дробное при MNIST_SUBCELL_POSITION)
     stick_x: "np.ndarray"
     stick_strength: "np.ndarray"  # (n,) сила штриха, доля сильнейшего штриха картинки
     levels: tuple[SightLevel, ...]
@@ -178,8 +178,8 @@ class TrainedLadder:
         answer = int(self.reader.answers(features)[0])
         sight = Sight(
             stick_angle=np.asarray(atoms.angle, dtype=np.float64),
-            stick_y=np.asarray(atoms.y, dtype=np.int64),
-            stick_x=np.asarray(atoms.x, dtype=np.int64),
+            stick_y=np.asarray(atoms.y, dtype=np.float64),
+            stick_x=np.asarray(atoms.x, dtype=np.float64),
             stick_strength=np.asarray(atoms.strength, dtype=np.float64),
             levels=tuple(levels),
             probabilities=probabilities,
