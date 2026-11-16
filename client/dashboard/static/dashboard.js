@@ -37,7 +37,7 @@ function prepareModel(raw) {
   const st = raw.sticks;
   const sticks = {
     picture: dec(st.picture, Int32Array), y: dec(st.y, Float32Array), x: dec(st.x, Float32Array), angle: dec(st.angle, Float32Array),
-    labels: dec(st.labels, Uint8Array), index: dec(st.index, Int32Array), pictures: st.pictures,
+    span: dec(st.span, Float32Array), labels: dec(st.labels, Uint8Array), index: dec(st.index, Int32Array), pictures: st.pictures,
   };
   sticks.start = group(sticks.picture, st.pictures).start; // углопозиции идут по картинкам по возрастанию
   const levels = raw.levels.map(L => {
@@ -59,7 +59,7 @@ function prepareModel(raw) {
 function prepareSight(raw) {
   const sticks = {
     angle: dec(raw.sticks.angle, Float32Array), y: dec(raw.sticks.y, Float32Array), x: dec(raw.sticks.x, Float32Array),
-    strength: dec(raw.sticks.strength, Float32Array), count: raw.sticks.count,
+    strength: dec(raw.sticks.strength, Float32Array), span: dec(raw.sticks.span, Float32Array), count: raw.sticks.count,
   };
   const levels = raw.levels.map((L, n) => {
     const M = S.model.levels[n], K = L.keyholes;
@@ -126,12 +126,19 @@ function composition(M, d) {
 }
 
 // ================================================================== рисование содержимого
-function stick(ctx, px, py, unit, angle, alpha, ink) {
+function stick(ctx, px, py, unit, angle, alpha, ink, span) {
   // Угол углопозиции — направление перепада яркости, поперёк линии цифры: отрезок рисуется вдоль края.
   const along = (angle + 90) * Math.PI / 180, half = unit * 0.45;
   const ux = Math.cos(along) * half, uy = -Math.sin(along) * half;
-  ctx.globalAlpha = alpha;
   ctx.strokeStyle = ink || hue(angle);
+  // Поле штриха (§6.4.3): детектор покрывает край на span клеток в каждую сторону от центра — тонкая линия под
+  // отрезком. Центры детекторов стоят на расстоянии от одного до двух таких полуполей (§6.4.5), край покрыт целиком.
+  if (span > 0.45) {
+    const fx = ux / 0.45 * span, fy = uy / 0.45 * span;
+    ctx.globalAlpha = alpha * 0.5; ctx.lineWidth = Math.max(1, unit / 10);
+    ctx.beginPath(); ctx.moveTo(px - fx, py - fy); ctx.lineTo(px + fx, py + fy); ctx.stroke();
+  }
+  ctx.globalAlpha = alpha;
   ctx.lineWidth = Math.max(1, unit / 5);
   ctx.beginPath(); ctx.moveTo(px - ux, py - uy); ctx.lineTo(px + ux, py + uy); ctx.stroke();
   ctx.globalAlpha = 1;
@@ -147,7 +154,7 @@ function glyph(ctx, M, i, left, top, size) {
     const dy = sticks.y[j] - cy, dx = sticks.x[j] - cx;
     if (Math.abs(dy) > half || Math.abs(dx) > half) continue;
     const inside = Math.hypot(dy, dx) <= extent + 1e-5;  // места и поле приходят в float32
-    stick(ctx, left + size / 2 + dx * unit, top + size / 2 + dy * unit, unit, sticks.angle[j], inside ? 1 : 0.22);
+    stick(ctx, left + size / 2 + dx * unit, top + size / 2 + dy * unit, unit, sticks.angle[j], inside ? 1 : 0.22, null, sticks.span[j]);
   }
 }
 
@@ -514,7 +521,7 @@ function drawPieces(item) {
   ctx.lineCap = "round";
   if (item.n === 0) {
     const st = sight.sticks;
-    for (let i = 0; i < st.count; i++) stick(ctx, px(st.x[i]), px(st.y[i]), unit * S.model.cell, st.angle[i], 0.85);
+    for (let i = 0; i < st.count; i++) stick(ctx, px(st.x[i]), px(st.y[i]), unit * S.model.cell, st.angle[i], 0.85, null, st.span[i]);
   }
   const V = sight.levels[item.n];
   if (!V) { ctx.fillStyle = "#9aa3b2"; ctx.font = `${Math.round(W / 16)}px Segoe UI`; ctx.textAlign = "center"; ctx.fillText("до уровня не дошло", W / 2, W / 2); return; }
@@ -560,7 +567,7 @@ function drawPieces(item) {
       if (kind === "member") continue;
       for (let j = V.entries.start[k]; j < V.entries.start[k + 1]; j++) {
         const e = V.entryElement[V.entries.order[j]], st = sight.sticks;
-        stick(ctx, px(st.x[e]), px(st.y[e]), unit * S.model.cell * 1.2, st.angle[e], 1, "#ffffff");
+        stick(ctx, px(st.x[e]), px(st.y[e]), unit * S.model.cell * 1.2, st.angle[e], 1, "#ffffff", st.span[e] / 1.2);
       }
     }
   }

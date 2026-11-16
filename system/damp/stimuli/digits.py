@@ -26,6 +26,9 @@ class DigitAtoms:
     images: "np.ndarray"  # сами картинки (N × 28 × 28, 0…255) — для рисунков карт
     strength: "np.ndarray"  # сила штриха (модуль среднего градиента), нормированная внутри своей картинки: (0, 1]
     index: "np.ndarray"  # номер каждой картинки в наборе MNIST (int64)
+    # Полудлина поля штриха вдоль края, клеток (до самой дальней точки поля детектора, §6.4.3; у штриха по сетке — 0.5):
+    # для показа штриха по длине его поля, в коды не входит. None — не задана.
+    span: "np.ndarray | None" = None
 
     @property
     def pictures(self) -> int:
@@ -44,6 +47,7 @@ class DigitAtoms:
             images=np.concatenate([self.images, other.images]),
             strength=np.concatenate([self.strength, other.strength]),
             index=np.concatenate([self.index, other.index]),
+            span=None if self.span is None or other.span is None else np.concatenate([self.span, other.span]),
         )
 
     def shifted(self, dy: int, dx: int, *, pictures: int) -> "DigitAtoms":
@@ -59,6 +63,7 @@ class DigitAtoms:
             images=self.images[:pictures],
             strength=self.strength[rows],
             index=self.index[:pictures],
+            span=None if self.span is None else self.span[rows],
         )
 
     def only(self, first: int, last: int) -> "DigitAtoms":
@@ -73,16 +78,19 @@ class DigitAtoms:
             images=self.images[first:last],
             strength=self.strength[rows],
             index=self.index[first:last],
+            span=None if self.span is None else self.span[rows],
         )
 
     @classmethod
     def from_rows(
         cls, rows: Sequence["np.ndarray"], labels: Sequence[int], images: Sequence["np.ndarray"], index: Sequence[int]
     ) -> "DigitAtoms":
-        """Набор из углопозиций картинок: rows — по массиву на картинку, строки (картинка, угол, x, y, сила штриха).
+        """Набор из углопозиций картинок: rows — по массиву на картинку, строки (картинка, угол, x, y, сила штриха,
+        полудлина поля штриха).
 
         Сила штриха нормируется внутри своей картинки: доля от самого сильного штриха этой картинки, (0, 1]. Место —
-        дробное при MNIST_SUBCELL_POSITION (там, где край проходит внутри окна Собеля), иначе номер окна (целое).
+        дробное при MNIST_SUBCELL_POSITION (там, где край проходит внутри окна Собеля) и при MNIST_STROKE_DETECTORS
+        (центр детектора над точками края), иначе номер окна (целое).
         """
         data = np.concatenate(rows) if rows else np.zeros((0, 1 + PictureSticks.COLUMNS), dtype=np.float64)
         picture = data[:, 0].astype(np.int64)
@@ -91,7 +99,7 @@ class DigitAtoms:
         np.maximum.at(peak, picture, strength)
         peak[peak <= 0.0] = 1.0
         strength = strength / np.maximum(peak[picture], np.finfo(np.float64).tiny)
-        fractional = bool(settings.MNIST_SUBCELL_POSITION)
+        fractional = bool(settings.MNIST_SUBCELL_POSITION) or bool(settings.MNIST_STROKE_DETECTORS)
         return cls(
             picture=data[:, 0].astype(np.int64),
             angle=data[:, 1],
@@ -101,20 +109,22 @@ class DigitAtoms:
             images=np.stack(images) if len(images) else np.zeros((0, 28, 28), dtype=np.uint8),
             strength=strength,
             index=np.asarray(index, dtype=np.int64),
+            span=data[:, 5].astype(np.float64),
         )
 
 
 class PictureSticks:
     """Кеш углопозиций по картинкам (вне статьи): каждая картинка набора разбирается на штрихи один раз.
 
-    Один файл на набор MNIST и способ извлечения: номера картинок и их углопозиции (угол, x, y, сила штриха);
+    Один файл на набор MNIST и способ извлечения: номера картинок и их углопозиции (угол, x, y, сила штриха,
+    полудлина поля штриха);
     новые картинки дописываются. Файлы старого формата (три столбца, без силы) не читаются: ключ другой, а при
     чтении проверяется ширина.
     Ключ — содержимое файлов набора MNIST, настройки и код извлечения (system/damp/cache.py).
     """
 
-    MODULES = ("damp.stimuli.digits", "damp.stimuli.MnistSobelAngleMap")
-    COLUMNS = 4  # угол, x, y, сила штриха
+    MODULES = ("damp.stimuli.digits", "damp.stimuli.MnistSobelAngleMap", "damp.stimuli.stroke_detectors")
+    COLUMNS = 5  # угол, x, y, сила штриха, полудлина поля штриха
 
     def __init__(self, split: str, raw_files: Sequence[str]) -> None:
         from damp.cache import CACHE
@@ -170,7 +180,7 @@ class MnistDigits:
         self._root = str(root)
 
     def sticks_of(self, pixels: "np.ndarray", label: int = 0) -> "np.ndarray":
-        """Углопозиции одной картинки 28×28 (§4.4): строки (угол, x, y, сила штриха); пикселы — float32 в [0, 1],
+        """Углопозиции одной картинки 28×28 (§4.4): строки (угол, x, y, сила штриха, полудлина поля); пикселы — float32 в [0, 1],
         белая цифра на чёрном, как у MNIST после ToTensor. Тот же разбор, что у load, — для любой картинки; label —
         цифра картинки, только для журнала разбора (на углопозиции не влияет)."""
         found = self.extractor.extract(pixels, label=int(label), with_magnitude=True).get(int(label), [])

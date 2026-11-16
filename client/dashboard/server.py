@@ -59,7 +59,8 @@ class DashboardData:
                      if settings["MNIST_SOBEL_UPSCALE_ENABLED"] else float(settings["MNIST_PATCH_SIZE"])},
             "sticks": {
                 "picture": packed(sticks.picture, "<i4"), "y": packed(sticks.y, "<f4"), "x": packed(sticks.x, "<f4"),
-                "angle": packed(sticks.angle, "<f4"), "labels": packed(sticks.labels, "u1"), "index": packed(sticks.index, "<i4"),
+                "angle": packed(sticks.angle, "<f4"), "span": packed(sticks.span, "<f4"),
+                "labels": packed(sticks.labels, "u1"), "index": packed(sticks.index, "<i4"),
                 "pictures": int(np.asarray(sticks.labels).shape[0]),
             },
             "levels": [
@@ -120,7 +121,8 @@ class DashboardData:
             "probabilities": list(sight.probabilities),
             "ms": sight.seconds * 1000.0,
             "sticks": {"angle": packed(sight.stick_angle, "<f4"), "y": packed(sight.stick_y, "<f4"), "x": packed(sight.stick_x, "<f4"),
-                       "strength": packed(sight.stick_strength, "<f4"), "count": int(np.asarray(sight.stick_angle).shape[0])},
+                       "strength": packed(sight.stick_strength, "<f4"), "span": packed(sight.stick_span, "<f4"),
+                       "count": int(np.asarray(sight.stick_angle).shape[0])},
             "levels": levels,
         }
 

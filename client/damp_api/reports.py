@@ -58,11 +58,14 @@ class Stimulus:
         x: место по горизонтали в клетках сетки: целое — середина клетки; дробное — где край проходит внутри клетки
             (`MNIST_SUBCELL_POSITION`).
         y: то же по вертикали.
+        span: полудлина поля штриха вдоль края, в клетках: расстояние от центра детектора до самой дальней точки его поля (§6.4.3);
+            у штриха по сетке — 0.5, половина клетки.
     """
 
     angle: float
     x: float
     y: float
+    span: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -261,6 +264,8 @@ class Sight:
         stick_y: место на сетке картинки по вертикали, в клетках; дробное при `MNIST_SUBCELL_POSITION`.
         stick_x: то же по горизонтали.
         stick_strength: сила штриха, доля сильнейшего штриха картинки.
+        stick_span: полудлина поля штриха вдоль края, в клетках (до самой дальней точки поля детектора, §6.4.3): штрих
+            рисуется по длине своего поля.
         levels: уровни, до которых картинка дошла, по порядку.
         probabilities: вероятности цифр 0…9 по линейному читателю; все нули — ответа нет.
         digit: самая вероятная цифра; -1 — ни один детектор не сработал.
@@ -271,6 +276,7 @@ class Sight:
     stick_y: object
     stick_x: object
     stick_strength: object
+    stick_span: object
     levels: tuple[SightLevel, ...]
     probabilities: tuple[float, ...]
     digit: int
@@ -325,6 +331,7 @@ class TrainingSticks:
         y: место на сетке картинки по вертикали, в клетках; дробное при `MNIST_SUBCELL_POSITION`, (S,).
         x: то же по горизонтали, (S,).
         angle: угол, градусы, (S,).
+        span: полудлина поля штриха вдоль края, в клетках (§6.4.3), (S,).
         labels: цифра каждой картинки, (N,).
         index: номер картинки в MNIST train, (N,).
         originals: сколько первых картинок — исходные цифры; дальше — их сдвинутые виды.
@@ -334,6 +341,7 @@ class TrainingSticks:
     y: object
     x: object
     angle: object
+    span: object
     labels: object
     index: object
     originals: int

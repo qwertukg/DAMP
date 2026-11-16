@@ -137,8 +137,8 @@ class Stimuli(_Stage):
         if pixels.max() > 1.0:
             pixels = pixels / 255.0
         with self._session.active():
-            found = system.extractor().extract(pixels, label=int(label)).get(int(label), [])
-        return [Stimulus(float(angle), float(x), float(y)) for angle, x, y in found]
+            found = system.extractor().extract(pixels, label=int(label), with_magnitude=True).get(int(label), [])
+        return [Stimulus(float(angle), float(x), float(y), float(span)) for angle, x, y, _, span in found]
 
     def sketch(self, digit: int, *, seed: int | None = None, split: str | None = None, patch_size: int | None = None,
                upscale: bool | None = None) -> None:

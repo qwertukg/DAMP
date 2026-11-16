@@ -7,6 +7,7 @@ import numpy as np
 
 from damp.article_refs import CYCLIC_COORDS, OUTSIDE_ARTICLE
 from damp.logging import LOGGER
+from damp.stimuli.stroke_detectors import StrokeDetectors
 
 
 AngleTriplet = Tuple[float, int, int]      # (angle, X_patch, Y_patch)
@@ -171,6 +172,10 @@ class MnistSobelAngleMap:
     участка (центр масс пикселей контура выбранного края с весом силы градиента; у линии в пиксель — центр масс
     её пикселей по яркости), в единицах участка: целое X — середина участка. Без него X, Y — номер участка, и
     наклонная линия ложится ступеньками по серединам участков (вне статьи).
+
+    stroke_detectors (только с contour_only) — штрихи не по сетке участков, а детекторами над точками края
+    (StrokeDetectors: §6.4 на плоскости картинки, доработка): место штриха — центр детектора, в тех же единицах
+    участка, дробное; угол — по куску края длиннее шага; сетка участков тогда не используется.
     """
 
     angle_in_degrees: bool = True
@@ -181,6 +186,7 @@ class MnistSobelAngleMap:
     two_edge_coherence: float = 0.5
     upscaled: Optional[UpscaledSobel] = None
     subcell_position: bool = False
+    stroke_detectors: Optional[StrokeDetectors] = None
 
     # ВАЖНО: это не поля dataclass, а константы класса (ClassVar)
     EXPECTED_SIDE: ClassVar[int] = 28
@@ -252,6 +258,8 @@ class MnistSobelAngleMap:
             mode = f"contour(level={self.contour_level:g},edge={self.two_edge_coherence:g})"
         if self.subcell_position:
             mode += ",subcell"  # место дробное: старая раскладка с целыми местами не подходит
+        if self.contour_only and self.stroke_detectors is not None:
+            mode += "," + self.stroke_detectors.signature  # штрихи детекторами над точками края, не по сетке
         if self.upscaled is not None:
             # patch_size — в пикселях увеличенной картинки (до этой версии было в пикселях стимула).
             mode += f",{self.upscaled.signature},patch=work_px"
@@ -363,7 +371,8 @@ class MnistSobelAngleMap:
     def extract(
         self, image: Union[np.ndarray, "np.typing.ArrayLike"], label: int, with_magnitude: bool = False
     ) -> ResultMap:
-        """Углопозиции картинки: (угол, x, y); при with_magnitude — (угол, x, y, сила), сила — модуль среднего градиента."""
+        """Углопозиции картинки: (угол, x, y); при with_magnitude — (угол, x, y, сила, полудлина поля): сила — модуль
+        среднего градиента либо энергия детектора, полудлина поля штриха вдоль края — в участках."""
         img, normalized = self._normalized(image)
 
         LOGGER.event(
@@ -387,15 +396,18 @@ class MnistSobelAngleMap:
             },
         )
 
+        by_detectors = self.contour_only and self.stroke_detectors is not None
         if self.upscaled is not None:
             work, gx, gy = self.upscaled.apply(img, self.KX, self.KY)
-            if self.contour_only:
+            if by_detectors:
+                out = self._detector_strokes(work, gx, gy)
+            elif self.contour_only:
                 out = self._contour_angles(work, gx, gy)
             else:
                 out = self._window_angles(self._field_mean_vector(gx, gy))
         elif self.contour_only:
             gx, gy = self._sobel_field(img)
-            out = self._contour_angles(img, gx, gy)
+            out = self._detector_strokes(img, gx, gy) if by_detectors else self._contour_angles(img, gx, gy)
         else:
             # Нули вокруг картинки: ядру у края нужен сосед. Внутри участка ≥ 3×3 они не используются.
             padded = np.pad(img, self.KERNEL_SIZE // 2)
@@ -418,6 +430,10 @@ class MnistSobelAngleMap:
         )
         if not with_magnitude:
             out = [item[:3] for item in out]
+        else:
+            # Пятое число — полудлина поля штриха вдоль края, в участках (до самой дальней точки поля детектора, §6.4.3);
+            # у штриха по сетке поле — его участок: половина участка в каждую сторону.
+            out = [item if len(item) == 5 else (*item, 0.5) for item in out]
         return {int(label): out}
 
     def _field_mean_vector(self, gx: np.ndarray, gy: np.ndarray) -> Callable[[int, int], Tuple[float, float]]:
@@ -545,6 +561,32 @@ class MnistSobelAngleMap:
         x = bx + float((cols + 0.5) @ weights) / total / p - 0.5
         y = by + float((rows + 0.5) @ weights) / total / p - 0.5
         return x, y
+
+    def _detector_strokes(self, work: np.ndarray, gx: np.ndarray, gy: np.ndarray) -> List[AngleTriplet]:
+        """Углопозиции детекторами над точками края (§6.4 на плоскости картинки, доработка): по одной на детектор.
+
+        Место — центр детектора в единицах участка (целое — середина участка), как у дробного места по сетке:
+        остальной пайплайн меряет места в тех же единицах. Угол — направление суммы градиентов по куску края
+        длиннее шага; сила — энергия детектора (§6.3).
+        """
+        mask = self._contour_mask_of(work)
+        p = float(self.work_patch)
+        out: List[AngleTriplet] = []
+        for stroke in self.stroke_detectors.strokes(mask, gx, gy):
+            angle = float(np.degrees(stroke.angle)) if self.angle_in_degrees else float(stroke.angle)
+            out.append((angle, stroke.x / p - 0.5, stroke.y / p - 0.5, stroke.strength, stroke.half_length / p))
+        LOGGER.event(
+            "sobel_map.stroke_detectors",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "contour_level": self.contour_level,
+                "scale": self.scale,
+                "contour_pixels": int(mask.sum()),
+                "angle_positions": len(out),
+                "method": self.stroke_detectors.signature,
+            },
+        )
+        return out
 
     def _contour_angles(self, work: np.ndarray, gx: np.ndarray, gy: np.ndarray) -> List[AngleTriplet]:
         """Углопозиции только по контуру: одна на участок, угол — средний градиент края в пикселях контура."""

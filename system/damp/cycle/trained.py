@@ -67,6 +67,7 @@ class Sight:
     stick_y: "np.ndarray"  # (n,) место на сетке картинки, в клетках (дробное при MNIST_SUBCELL_POSITION)
     stick_x: "np.ndarray"
     stick_strength: "np.ndarray"  # (n,) сила штриха, доля сильнейшего штриха картинки
+    stick_span: "np.ndarray"  # (n,) полудлина поля штриха вдоль края, клеток (§6.4.3) — для показа
     levels: tuple[SightLevel, ...]
     probabilities: "np.ndarray"  # (классов,) вероятности классов; нули — ответа нет
     answer: int  # самый вероятный класс; -1 — ни один детектор не сработал
@@ -181,6 +182,7 @@ class TrainedLadder:
             stick_y=np.asarray(atoms.y, dtype=np.float64),
             stick_x=np.asarray(atoms.x, dtype=np.float64),
             stick_strength=np.asarray(atoms.strength, dtype=np.float64),
+            stick_span=np.asarray(atoms.span, dtype=np.float64),
             levels=tuple(levels),
             probabilities=probabilities,
             answer=answer,
