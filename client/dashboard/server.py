@@ -8,10 +8,10 @@
 |---|---|
 | `GET /` | страница `static/index.html` |
 | `GET /static/<файл>` | её стили и код (только файлы папки `static/`) |
-| `GET /api/model` | один раз: карты уровней (точки, их окна, детекторы по слоям), углопозиции обучающих картинок, кисть |
+| `GET /api/model` | один раз: первичная карта («уровень 0»: точки с углом и местом штриха, детекторы), карты уровней (точки, их окна, детекторы по слоям), углопозиции обучающих картинок, кисть |
 | `GET /api/example` | пример: случайная пятёрка из первых `DASHBOARD_EXAMPLES` картинок MNIST t10k и её номер в MNIST |
 | `GET /api/status` | сколько рабочих процессов готово считать рисунки (страница шлёт столько запросов сразу) |
-| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали; класс — ответ памяти («знаю целиком / по частям / не знаю», §7.1.13.3), голоса кусочков по уровням и вероятности линейного читателя (§9.3); с выбранной точкой карты — ещё и её кусочки |
+| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали; класс — ответ памяти (среднее долей голосов кусочков по уровням и согласие уровней, §7.1.13.3), голоса по уровням и вероятности линейного читателя (§9.3); с выбранной точкой карты — ещё и её кусочки |
 | `POST /api/point` | рисунок и выбранная точка карты → все кусочки рисунка, которые её зажгли, по убыванию активации |
 
 Рисунки считают рабочие процессы (`DASHBOARD_WORKERS`): у каждого свой обученный цикл, поэтому несколько рисунков
@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from damp_api import Damp, LevelMap, Sight, TrainedLadder, TrainingSticks
+from damp_api import Damp, LevelMap, PrimaryMap, PrimarySight, Sight, TrainedLadder, TrainingSticks
 
 STATIC = Path(__file__).resolve().parent / "static"
 KINDS = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
@@ -53,8 +53,47 @@ class DashboardData:
     """Ответы сервера в JSON: карты обученного цикла (один раз) и путь рисунка (на каждый штрих)."""
 
     @staticmethod
+    def primary_map(primary: "PrimaryMap | None") -> "dict | None":
+        """Первичная карта — «уровень 0»: точки с углом и местом своей углопозиции и детекторы над картой."""
+        if primary is None:
+            return None
+        return {
+            "height": primary.height, "width": primary.width, "points": int(np.asarray(primary.angle).shape[0]),
+            "cells": packed(primary.cells, "<i2"), "angle": packed(primary.angle, "<f4"), "y": packed(primary.y, "<f4"),
+            "x": packed(primary.x, "<f4"), "labels": packed(primary.labels, "u1"), "period": primary.angle_period,
+            "detectors": packed(primary.detectors, "<f4"), "count": int(np.asarray(primary.layer).shape[0]),
+            "layer": packed(primary.layer, "u1"), "layerThresholds": list(primary.layer_thresholds),
+            "activation": primary.activation_threshold,
+        }
+
+    @staticmethod
+    def primary_sight(found: "PrimarySight | None", sticks: int) -> "dict | None":
+        """Отклик первичной карты на рисунок: у точки — её сильнейшая активация и сколько штрихов её зажгли, у
+        детектора — сильнейший уровень и сколько штрихов в него набилось."""
+        if found is None:
+            return None
+        lit_point, lit_value = np.asarray(found.lit_point), np.asarray(found.lit_value, dtype=np.float32)
+        rising = np.argsort(lit_value, kind="stable")
+        activation = np.zeros(found.points, dtype=np.float32)
+        activation[lit_point[rising]] = lit_value[rising]
+        fired_detector, fired_level = np.asarray(found.fired_detector), np.asarray(found.fired_level, dtype=np.float32)
+        rising = np.argsort(fired_level, kind="stable")
+        strongest = np.zeros(found.detectors, dtype=np.float32)
+        strongest[fired_detector[rising]] = fired_level[rising]
+        return {
+            "sticks": int(sticks),
+            "pointActivation": packed(activation, "<f4"),
+            "pointCount": packed(np.minimum(np.bincount(lit_point, minlength=found.points), 65535), "<u2"),
+            "litPairs": int(lit_point.shape[0]), "fired": int(fired_detector.shape[0]),
+            "detectorCount": packed(np.minimum(np.bincount(fired_detector, minlength=found.detectors), 65535), "<u2"),
+            "detectorLevel": packed(strongest, "<f4"),
+        }
+
+    @staticmethod
     def model(ladder: TrainedLadder, maps: tuple[LevelMap, ...], sticks: TrainingSticks, settings) -> dict:  # noqa: ANN001
         return {
+            # Уровень 0 — первичная карта углопозиций (пинвилы); None — карты нет.
+            "primary": DashboardData.primary_map(ladder.primary_map()),
             "train": ladder.train_pictures,
             "originals": sticks.originals,
             "decay": ladder.decay,
@@ -133,14 +172,17 @@ class DashboardData:
                 "strength": packed(level.strength, "<f4"), "detailLength": level.detail_length,
             })
         return {
-            # Ответ памяти (§7.1.13.3): знаю целиком, по частям или не знаю — и голоса кусочков по уровням (§2.2.5).
-            "memory": {"kind": sight.verdict, "digit": sight.memory_digit, "level": sight.memory_level, "share": sight.memory_share},
+            # Ответ памяти (§2.2.5, §7.1.13.3): цифра по среднему долей голосов уровней, согласие уровней и сами голоса.
+            "memory": {"kind": sight.verdict, "digit": sight.memory_digit, "share": sight.memory_share,
+                       "agreed": sight.memory_agreed, "votes": list(sight.memory_votes)},
             "votes": [
                 {"number": level.number, "votes": list(level.votes), "digit": level.digit, "share": level.share,
                  "knowledge": level.knowledge, "threshold": level.threshold, "knows": level.knows,
                  "keyholes": level.keyholes, "voted": level.voted}
                 for level in sight.votes
             ],
+            # Уровень 0: отклик первичной карты на штрихи рисунка.
+            "primary": DashboardData.primary_sight(sight.primary, int(np.asarray(sight.stick_angle).shape[0])),
             # Линейный читатель (§9.3) — мерка для целых цифр.
             "digit": sight.digit,
             "probabilities": list(sight.probabilities),

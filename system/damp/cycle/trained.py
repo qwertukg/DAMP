@@ -2,8 +2,8 @@
 
 Цикл учится как обычно (MnistLadderRunner с keep_levels): по обучающим картинкам строятся окна, карты памяти и
 детекторы уровней, а линейный читатель (§9.3) учится на пиках их срабатываний. Класс читается двумя способами:
-голоса памяти (§2.2.5, §7.1.13.3: «знаю целиком / по частям / не знаю», decode/memory_votes.py) и линейный читатель
-(§9.3, мерка для целых цифр). Новая картинка — рисунок дашборда —
+голоса памяти (§2.2.5, §7.1.13.3: среднее долей голосов кусочков по уровням и согласие уровней,
+decode/memory_votes.py) и линейный читатель (§9.3, мерка для целых цифр). Новая картинка — рисунок дашборда —
 идёт теми же классами, что картинка прогона: углопозиции (§4.4), окна (П.2), коды окон (П.4–П.7), срабатывания
 детекторов (§6.5), детали (П.1) — уровень за уровнем. Всё, что подобрано по обучающим (мера и пороги окон, длины
 кодов, нормировка), берётся из обученных уровней, а не меряется заново: поэтому у картинки MNIST здесь те же окна,
@@ -24,7 +24,8 @@ from damp.activation.details import DetailCoder
 from damp.article_refs import NEURAL_ANALOGY, STIMULUS_DETECTION
 from damp.cycle.keyholes import KeyholeBuilder
 from damp.cycle.lateral_inhibition import LateralInhibition
-from damp.cycle.step import TrainedLevel
+from damp.cycle.primary import PrimaryLevel, PrimarySight
+from damp.cycle.step import LadderLevelDegenerate, TrainedLevel
 from damp.decode.level_recognition import LevelRecognition
 from damp.decode.linear_reader import LinearReader
 from damp.decode.memory_votes import LevelVotes, MemoryVerdict, MemoryVotes
@@ -74,8 +75,9 @@ class Sight:
     levels: tuple[SightLevel, ...]
     probabilities: "np.ndarray"  # (классов,) вероятности классов линейного читателя (§9.3); нули — ответа нет
     answer: int  # самый вероятный класс читателя; -1 — ни один детектор не сработал
+    primary: "PrimarySight | None"  # уровень 0: что первичная карта сделала с углопозициями (None — карты нет)
     votes: tuple[LevelVotes, ...]  # голоса памяти по уровням, до которых дошла картинка (§2.2.5, §7.1.13.3)
-    verdict: MemoryVerdict  # ответ памяти: знаю целиком, по частям или не знаю (§7.1.13.3)
+    verdict: MemoryVerdict  # ответ памяти: цифра по среднему долей голосов уровней и согласие уровней (§7.1.13.3)
     seconds: float
 
 
@@ -85,16 +87,19 @@ class TrainedLadder:
     groups — картинки обучения (память строится по ним, ranges["train"] — с видами §7.1.4); levels — обученные уровни
     (TrainedLevel); peaks — пики срабатываний всех картинок прогона по уровням (строки ranges["train"] — обучение
     читателя); decay — штраф L2 читателя. memory — голоса памяти (MemoryVotes) с порогами знания уровней: пороги
-    меряются здесь же, по обучающим картинкам без своих точек памяти.
+    меряются здесь же, по обучающим картинкам без своих точек памяти. primary — уровень 0: первичная карта
+    углопозиций (PrimaryLevel); None — без неё.
     """
 
-    def __init__(self, groups: DigitGroups, levels: list[TrainedLevel], peaks: list["np.ndarray"], *, decay: float) -> None:
+    def __init__(self, groups: DigitGroups, levels: list[TrainedLevel], peaks: list["np.ndarray"], *, decay: float,
+                 primary: PrimaryLevel | None = None) -> None:
         if not levels:
             raise ValueError("нет ни одного обученного уровня")
         if len(peaks) != len(levels):
             raise ValueError("пики нужны по каждому обученному уровню")
         self.groups = groups
         self.levels = tuple(levels)
+        self.primary = primary
         first, last = groups.ranges["train"]
         features = np.concatenate(peaks, axis=1)
         self.reader = LinearReader(features[first:last], groups.labels[first:last], float(decay))
@@ -130,7 +135,14 @@ class TrainedLadder:
                 observer=observer, keep_levels=True,
             )
             runner.run()
-        ladder = cls(runner.groups, runner.levels, runner.level_peaks, decay=decay)
+            # Уровень 0 — первичная карта углопозиций (этапы 2–3): в счёте уровней не участвует, поэтому строится
+            # после цикла; предел точек — тот же, что у карт уровней.
+            try:
+                primary = PrimaryLevel.build(runner.groups, max_points=map_points)
+            except LadderLevelDegenerate as stop:
+                primary = None
+                LOGGER.event("primary.map.warning", section=NEURAL_ANALOGY, data={"reason": str(stop)})
+        ladder = cls(runner.groups, runner.levels, runner.level_peaks, decay=decay, primary=primary)
         LOGGER.event(
             "dashboard.ladder",
             section=NEURAL_ANALOGY,
@@ -139,6 +151,7 @@ class TrainedLadder:
                 "train_pictures": int(runner.groups.train_pictures),
                 "levels": len(ladder.levels),
                 "map_points": [int(level.memory.points) for level in ladder.levels],
+                "primary_points": 0 if primary is None else int(primary.memory.points),
                 "detectors": [int(level.detectors.built) for level in ladder.levels],
                 "decay": float(decay),
                 "knowledge_thresholds": list(ladder.memory.thresholds or ()),
@@ -170,8 +183,8 @@ class TrainedLadder:
         """Картинка 28×28 (uint8 0…255 либо float в [0, 1], белая цифра на чёрном) через все обученные уровни.
 
         Каждый уровень: окна на элементах (П.2) → коды окон (П.4–П.7) → срабатывания детекторов карты (§6.5) →
-        детали — элементы следующего уровня (П.1). Затем класс: голоса памяти по уровням и их вердикт — знаю целиком,
-        по частям или не знаю (§2.2.5, §7.1.13.3) — и ответ линейного читателя по пикам уровней (§9.3). Шаги
+        детали — элементы следующего уровня (П.1). Затем класс: голоса памяти по уровням, их среднее и согласие
+        уровней (§2.2.5, §7.1.13.3) — и ответ линейного читателя по пикам уровней (§9.3). Шаги
         считаются заново и в кеш не пишутся; журнал шагов молчит. log — записать итог событием dashboard.see.
         """
         return self._see(image, log=log)
@@ -182,6 +195,7 @@ class TrainedLadder:
         pixels = self._pixels(image)
         levels: list[SightLevel] = []
         peaks: list["np.ndarray"] = []
+        primary = None
         from damp.cache import CACHE
 
         with CACHE.bypassed(), LOGGER.quiet():
@@ -191,6 +205,9 @@ class TrainedLadder:
                 [-1], [np.clip(np.rint(pixels * 255.0), 0, 255).astype(np.uint8)], [-1],
             )
             elements = self._sticks.encode(atoms) if values.shape[0] else None
+            if self.primary is not None and own < 0:
+                # Уровень 0: штрихи рисунка на первичной карте (мерке порогов знания он не нужен).
+                primary = self.primary.see(atoms.angle, atoms.y, atoms.x)
             for trained in self.levels:
                 if elements is None or elements.count == 0:
                     break
@@ -228,6 +245,7 @@ class TrainedLadder:
             stick_strength=np.asarray(atoms.strength, dtype=np.float64),
             stick_span=np.asarray(atoms.span, dtype=np.float64),
             levels=tuple(levels),
+            primary=primary,
             probabilities=probabilities,
             answer=answer,
             votes=votes,
@@ -245,7 +263,7 @@ class TrainedLadder:
                          "points_lit": int(np.unique(level.lit_point).shape[0]), "detectors_fired": int(np.unique(level.fired_detector).shape[0])}
                         for level in sight.levels
                     ],
-                    "memory": {"verdict": verdict.kind, "digit": verdict.digit, "level": verdict.level, "share": verdict.share},
+                    "memory": {"verdict": verdict.kind, "digit": verdict.digit, "share": verdict.share, "agreed": verdict.agreed},
                     "votes": [
                         {"level": level.number, "digit": level.digit, "share": level.share, "knowledge": level.knowledge}
                         for level in votes
@@ -254,8 +272,8 @@ class TrainedLadder:
                     "probability": float(probabilities.max()) if answer >= 0 else 0.0,
                     "seconds": sight.seconds,
                     "note": "рисунок дашборда через обученные уровни: окна (П.2), их коды (П.4–П.7), срабатывания "
-                    "детекторов карт (§6.5), детали (П.1); класс — голоса памяти и их вердикт (§2.2.5, §7.1.13.3) и "
-                    "ответ линейного читателя (§9.3)",
+                    "детекторов карт (§6.5), детали (П.1); класс — среднее долей голосов памяти по уровням и согласие "
+                    "уровней (§2.2.5, §7.1.13.3) и ответ линейного читателя (§9.3)",
                 },
             )
         return sight

@@ -1,5 +1,5 @@
-"""Класс из памяти (system/damp/decode/memory_votes.py; §2.2.5, §7.1.13.3, §8.2): голоса кусочков по уровням и вердикт
-«знаю целиком / по частям / не знаю»."""
+"""Класс из памяти (system/damp/decode/memory_votes.py; §2.2.5, §7.1.13.3, §8.2): голоса кусочков по уровням, ответ —
+среднее долей голосов по уровням, уверенность — согласие уровней."""
 
 from __future__ import annotations
 
@@ -76,37 +76,63 @@ class LevelVotesTest(unittest.TestCase):
 
 
 class MemoryVerdictTest(unittest.TestCase):
-    def test_top_level_that_knows_answers_whole(self) -> None:
-        """Знаю целиком: верхний уровень знает рисунок (знание не ниже порога) — ответ его голосов (§7.1.13.3)."""
-        verdict = _memory((0.7, 0.5)).verdict([_level(1, 3, 0.9, 0.8), _level(2, 8, 0.6, 0.55)])
-        self.assertEqual((verdict.kind, verdict.digit, verdict.level), (MemoryVotes.WHOLE, 8, 2))
-        self.assertAlmostEqual(verdict.share, 0.6)
+    @staticmethod
+    def _three() -> MemoryVotes:
+        """Память трёх уровней (сами точки для вердикта не нужны)."""
+        return MemoryVotes([np.zeros(1, dtype=np.int64)] * 3, [np.zeros(1, dtype=np.int64)] * 3, 10)
 
-    def test_unknown_whole_with_agreeing_parts_answers_by_parts(self) -> None:
-        """По частям: верх не знает, а на уровне ниже за одну цифру больше половины кусочков."""
-        verdict = _memory((0.7, 0.5)).verdict([_level(1, 8, 0.9, 0.6), _level(2, 2, 0.6, 0.4)])
-        self.assertEqual((verdict.kind, verdict.digit, verdict.level), (MemoryVotes.PARTS, 8, 1))
+    def test_answer_is_the_digit_with_the_highest_mean_share(self) -> None:
+        """Ответ — цифра с наибольшей средней долей голосов по уровням (§2.2.5, §7.1.13.3)."""
+        verdict = self._three().verdict([_level(1, 5, 0.40, 0.7), _level(2, 8, 0.41, 0.6), _level(3, 8, 0.63, 0.5)])
+        self.assertEqual(verdict.digit, 8)
+        self.assertAlmostEqual(verdict.share, (0.60 / 9 + 0.41 + 0.63) / 3)
+        self.assertAlmostEqual(float(verdict.votes.sum()), 1.0)
+        self.assertEqual(int(verdict.votes.argmax()), 8)
 
-    def test_parts_need_a_majority(self) -> None:
-        """Не знаю: верх не знает, и кусочки нижнего уровня не сходятся на одной цифре."""
-        memory = _memory((0.7, 0.5))
-        self.assertEqual(memory.verdict([_level(1, 8, 0.5, 0.9), _level(2, 2, 0.9, 0.4)]).kind, MemoryVotes.UNKNOWN)
-        with settings.overridden({"RECOGNITION_PARTS_MAJORITY": 0.4}):
-            self.assertEqual(memory.verdict([_level(1, 8, 0.5, 0.9), _level(2, 2, 0.9, 0.4)]).kind, MemoryVotes.PARTS)
+    def test_confident_level_outweighs_two_unsure_ones(self) -> None:
+        """Усредняются доли, а не ответы уровней: уверенный верхний уровень весит больше двух неуверенных нижних."""
+        verdict = self._three().verdict([_level(1, 8, 0.30, 0.7), _level(2, 8, 0.30, 0.6), _level(3, 3, 0.90, 0.5)])
+        self.assertEqual(verdict.digit, 3)  # большинство ответов уровней сказало бы «8»
+        self.assertEqual((verdict.kind, verdict.agreed), (MemoryVotes.SPLIT, 1))
 
-    def test_top_level_does_not_answer_by_parts(self) -> None:
-        """Верхний уровень, не знающий рисунка, «по частям» не отвечает, как бы дружно ни голосовал: его окно — целое."""
-        verdict = _memory((0.7, 0.5)).verdict([_level(1, 8, 0.3, 0.9), _level(2, 2, 1.0, 0.4)])
-        self.assertEqual((verdict.kind, verdict.digit, verdict.level), (MemoryVotes.UNKNOWN, -1, 0))
+    def test_all_levels_naming_the_answer_agree(self) -> None:
+        verdict = self._three().verdict([_level(1, 8, 0.3, 0.7), _level(2, 8, 0.5, 0.6), _level(3, 8, 0.9, 0.5)])
+        self.assertEqual((verdict.kind, verdict.digit, verdict.agreed), (MemoryVotes.AGREE, 8, 3))
 
-    def test_picture_that_stopped_below_the_top_is_not_known_whole(self) -> None:
-        memory = _memory((0.7, 0.5))
-        self.assertEqual(memory.verdict([_level(1, 8, 0.9, 0.95)]).kind, MemoryVotes.PARTS)
-        self.assertEqual(memory.verdict([]).kind, MemoryVotes.UNKNOWN)
+    def test_two_top_levels_naming_the_answer_mostly_agree(self) -> None:
+        verdict = self._three().verdict([_level(1, 5, 0.40, 0.7), _level(2, 8, 0.41, 0.6), _level(3, 8, 0.63, 0.5)])
+        self.assertEqual((verdict.kind, verdict.agreed), (MemoryVotes.MOSTLY, 2))
 
-    def test_silent_top_level_is_not_known(self) -> None:
-        silent = LevelVotes(number=2, votes=np.zeros(10), knowledge=0.0, keyholes=4, voted=0)
-        self.assertEqual(_memory().verdict([_level(1, 8, 0.4, 0.9), silent]).kind, MemoryVotes.UNKNOWN)
+    def test_answer_named_by_the_lower_levels_only_is_a_split(self) -> None:
+        """Цифру назвали два нижних уровня, верхний — другую: уровни расходятся, сколько бы их ни согласилось."""
+        verdict = self._three().verdict([_level(1, 8, 0.9, 0.7), _level(2, 8, 0.9, 0.6), _level(3, 3, 0.4, 0.5)])
+        self.assertEqual((verdict.kind, verdict.digit, verdict.agreed), (MemoryVotes.SPLIT, 8, 2))
+
+    def test_picture_that_stopped_below_the_top_is_a_split(self) -> None:
+        """Рисунок не дошёл до верхнего уровня: ответ есть, но все уровни согласиться не могли."""
+        verdict = self._three().verdict([_level(1, 8, 0.9, 0.95), _level(2, 8, 0.8, 0.9)])
+        self.assertEqual((verdict.kind, verdict.digit, verdict.agreed), (MemoryVotes.SPLIT, 8, 2))
+        self.assertEqual(_memory().verdict([_level(1, 8, 0.9, 0.95), _level(2, 8, 0.8, 0.9)]).kind, MemoryVotes.AGREE)
+
+    def test_silent_level_does_not_dilute_the_answer(self) -> None:
+        """Уровень, где не голосовал ни один кусочек, в среднее не входит."""
+        silent = LevelVotes(number=1, votes=np.zeros(10), knowledge=0.0, keyholes=4, voted=0)
+        verdict = self._three().verdict([silent, _level(2, 8, 0.6, 0.5), _level(3, 8, 0.8, 0.5)])
+        self.assertEqual((verdict.kind, verdict.digit, verdict.agreed), (MemoryVotes.MOSTLY, 8, 2))
+        self.assertAlmostEqual(verdict.share, 0.7)
+
+    def test_no_votes_no_answer(self) -> None:
+        silent = LevelVotes(number=1, votes=np.zeros(10), knowledge=0.0, keyholes=4, voted=0)
+        for levels in ([], [silent]):
+            verdict = self._three().verdict(levels)
+            self.assertEqual((verdict.kind, verdict.digit, verdict.share, verdict.agreed), (MemoryVotes.UNKNOWN, -1, 0.0, 0))
+            self.assertFalse(verdict.votes.any())
+
+    def test_equal_mean_shares_give_the_lower_digit(self) -> None:
+        first, second = np.zeros(10), np.zeros(10)
+        first[7], second[2] = 1.0, 1.0
+        levels = [LevelVotes(1, first, 0.5, 4, 4), LevelVotes(2, second, 0.5, 4, 4)]
+        self.assertEqual(_memory().verdict(levels).digit, 2)
 
     def test_thresholds_are_a_quantile_of_training_knowledge(self) -> None:
         """Порог знания уровня — квантиль знания обучающих картинок (каждая — без своих точек памяти)."""

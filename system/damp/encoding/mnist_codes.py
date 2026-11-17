@@ -22,8 +22,13 @@ from damp.stimuli.MnistSobelAngleMap import MnistSobelAngleMap
 from damp.stimuli.mnist import _build_extractor, _stimulus_metadata
 
 
-def _build_encoder() -> Encoder:
-    """Кодер MNIST-стимула (угол, X, Y): общий код или конкатенация сегментов (§2.2.3, §4.2.1, §4.4)."""
+def _build_encoder(angle_span: float | None = None) -> Encoder:
+    """Кодер MNIST-стимула (угол, X, Y): общий код или конкатенация сегментов (§2.2.3, §4.2.1, §4.4).
+
+    angle_span — период угла, градусы; None — весь круг MNIST_ANGLE_MIN…MNIST_ANGLE_MAX. У направления без стрелки
+    (штрихи по середине линии) период — половина круга: 0° и 180° — одна и та же линия.
+    """
+    angle_top = settings.MNIST_ANGLE_MAX if angle_span is None else float(settings.MNIST_ANGLE_MIN) + float(angle_span)
     angle_layers = geometric_detector_layers(
         layers_count=settings.MNIST_ANGLE_LAYERS,
         widest_detectors=settings.MNIST_ANGLE_WIDEST_DETECTORS,
@@ -41,7 +46,7 @@ def _build_encoder() -> Encoder:
     encoder = Encoder(
         ClosedDimension(
             "Angle",
-            (settings.MNIST_ANGLE_MIN, settings.MNIST_ANGLE_MAX),
+            (settings.MNIST_ANGLE_MIN, angle_top),
             angle_layers,
             code_length=angle_length,
         ),

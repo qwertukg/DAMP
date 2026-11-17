@@ -883,7 +883,7 @@ damp.recognition.vote(elements)                      # этап 7: {1: 0.64, 5: 
 | [`MapDetectors`](client/damp_api/parts.py#L342) | детекторы над картой | `count`, `layers`, `activation_threshold`; [`fire(codes)`](client/damp_api/parts.py#L373) |
 | [`Firing`](client/damp_api/parts.py#L392) | срабатывания | `keyholes`, `fired`, `per_keyhole`, `silent` |
 | [`Level`](client/damp_api/parts.py#L431) | проход уровня целиком | `number`, `keyholes`, `codes`, `memory`, `detectors`, `firing`, `details` |
-| [`TrainedLadder`](client/damp_api/parts.py#L458) | обученный цикл и читатель (дашборд) | `levels`, `train_pictures`, `decay`; [`see(картинка)`](client/damp_api/parts.py#L496) → `Sight`; [`maps()`](client/damp_api/parts.py#L553) → `LevelMap` по уровням; [`sticks()`](client/damp_api/parts.py#L585) → `TrainingSticks` |
+| [`TrainedLadder`](client/damp_api/parts.py#L458) | обученный цикл и читатель (дашборд) | `levels`, `train_pictures`, `decay`; [`see(картинка)`](client/damp_api/parts.py#L496) → `Sight`; [`maps()`](client/damp_api/parts.py#L560) → `LevelMap` по уровням; [`sticks()`](client/damp_api/parts.py#L628) → `TrainingSticks` |
 | **Итого** | 9 частей; все держат системные объекты внутри и отдают простые значения | |
 
 **Что можно узнать у отчёта стенда** (`damp.recognition.bench`, `damp_api/reports.py`)

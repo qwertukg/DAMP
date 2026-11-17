@@ -33,7 +33,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._system import system
-from .reports import LevelMap, LevelVotes, Picture, Sight, SightLevel, Stimulus, TrainingSticks
+from .reports import LevelMap, LevelVotes, Picture, PrimaryMap, PrimarySight, Sight, SightLevel, Stimulus, TrainingSticks
 
 
 class Session:
@@ -502,7 +502,7 @@ class TrainedLadder(_Part):
 
         Returns:
             `Sight`: углопозиции, уровни (кусочки, зажжённые точки, сработавшие детекторы, детали), голоса памяти по
-            уровням с вердиктом «знаю целиком / по частям / не знаю» и вероятности цифр по линейному читателю.
+            уровням, ответ памяти (среднее долей голосов) с согласием уровней и вероятности цифр по линейному читателю.
 
         Raises:
             ValueError: картинка не 28×28.
@@ -546,8 +546,15 @@ class TrainedLadder(_Part):
             ),
             verdict=str(found.verdict.kind),
             memory_digit=int(found.verdict.digit),
-            memory_level=int(found.verdict.level),
             memory_share=float(found.verdict.share),
+            memory_agreed=int(found.verdict.agreed),
+            memory_votes=tuple(float(value) for value in found.verdict.votes),
+            primary=None if found.primary is None or self._ladder.primary is None else PrimarySight(
+                points=int(self._ladder.primary.memory.points), detectors=int(self._ladder.primary.detectors.built),
+                lit_stick=found.primary.lit_stick, lit_point=found.primary.lit_point, lit_value=found.primary.lit_value,
+                fired_stick=found.primary.fired_stick, fired_detector=found.primary.fired_detector,
+                fired_level=found.primary.fired_level,
+            ),
         )
 
     def maps(self) -> tuple[LevelMap, ...]:
@@ -581,6 +588,42 @@ class TrainedLadder(_Part):
                 )
             )
         return tuple(found)
+
+    def primary_map(self) -> "PrimaryMap | None":
+        """Первичная карта — «уровень 0»: раскладка первичных кодов углопозиций обучающих цифр (§4.6, §5, §5.13.2).
+
+        Returns:
+            `PrimaryMap`: точки карты с углом и местом своей углопозиции и детекторы над картой; `None` — карта не
+            построена.
+
+        Example:
+            >>> primary = ladder.primary_map()
+            >>> primary.width, primary.angle_period      # сетка карты и период угла: 180 у штрихов без стрелки
+        """
+        level = self._ladder.primary
+        if level is None:
+            return None
+        layout, detectors = level.memory.layout, level.detectors
+        with self._session.active():
+            s = system.settings
+            period = (float(s.MNIST_ANGLE_MAX) - float(s.MNIST_ANGLE_MIN)) / (2.0 if level.axial() else 1.0)
+        labels = np.asarray(self._ladder.groups.atoms.labels, dtype=np.int64)
+        return PrimaryMap(
+            height=int(layout.height),
+            width=int(layout.width),
+            cells=np.asarray(layout.cells_array(), dtype=np.int64),
+            angle=np.asarray(level.point_angle, dtype=np.float64),
+            y=np.asarray(level.point_y, dtype=np.float64),
+            x=np.asarray(level.point_x, dtype=np.float64),
+            labels=labels[np.maximum(np.asarray(level.point_picture, dtype=np.int64), 0)],
+            angle_period=float(period),
+            detectors=np.asarray(
+                [(d.center[0], d.center[1], d.radius, d.lambda_threshold, d.energy) for d in detectors.detectors], dtype=np.float64
+            ).reshape(-1, 5),
+            layer=np.asarray(detectors.layer_index, dtype=np.int64),
+            layer_thresholds=tuple(float(value) for value in detectors.layer_thresholds),
+            activation_threshold=float(detectors.activation_lambda),
+        )
 
     def sticks(self) -> TrainingSticks:
         """Углопозиции обучающих картинок (с видами): из них рисуется содержимое точек карт.

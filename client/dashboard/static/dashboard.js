@@ -56,7 +56,21 @@ function prepareModel(raw) {
     for (let i = 0; i < M.points; i++) M.index[M.cells[2 * i] * M.width + M.cells[2 * i + 1]] = i;
     return M;
   });
-  return {train: raw.train, originals: raw.originals, decay: raw.decay, brush: raw.brush, cell: raw.grid.cell, sticks, levels,
+  // Уровень 0 — первичная карта: точка хранит код углопозиции обучающей цифры (угол и место, §4.6).
+  let primary = null;
+  if (raw.primary) {
+    const P = raw.primary;
+    primary = {
+      height: P.height, width: P.width, points: P.points, count: P.count, period: P.period, activation: P.activation,
+      cells: dec(P.cells, Int16Array), angle: dec(P.angle, Float32Array), y: dec(P.y, Float32Array), x: dec(P.x, Float32Array),
+      labels: dec(P.labels, Uint8Array), det: dec(P.detectors, Float32Array), layer: dec(P.layer, Uint8Array),
+    };
+    primary.index = new Int32Array(primary.width * primary.height).fill(-1);
+    for (let i = 0; i < primary.points; i++) primary.index[primary.cells[2 * i] * primary.width + primary.cells[2 * i + 1]] = i;
+    // Цвет точки — угол её штриха, полный круг цвета на период угла (тот же, что у штрихов на рисунках).
+    primary.colour = Array.from(primary.angle, a => `hsl(${((((a / primary.period) * 360) % 360 + 360) % 360).toFixed(0)},95%,60%)`);
+  }
+  return {train: raw.train, originals: raw.originals, decay: raw.decay, brush: raw.brush, cell: raw.grid.cell, sticks, levels, primary,
     axial: Boolean(raw.axial),
     topClusters: raw.topClusters, litPerPiece: raw.litPerPiece, ownClusters: raw.ownClusters, litFloor: raw.litFloor};
 }
@@ -107,7 +121,24 @@ function prepareSight(raw) {
   });
   // Кусочек уровня n + 1 состоит из деталей уровня n: обратная связь «кусочек n → кусочки n + 1, куда он вошёл».
   for (let n = 1; n < levels.length; n++) levels[n].parents = group(levels[n].entryElement, levels[n - 1].K);
-  return {sticks, levels, digit: raw.digit, probabilities: raw.probabilities, ms: raw.ms, memory: raw.memory || null, votes: raw.votes || []};
+  // Уровень 0: отклик первичной карты — сильнейшая активация каждой точки и сработавшие детекторы.
+  let primary = null;
+  if (raw.primary && S.model.primary) {
+    const Q = raw.primary, M = S.model.primary;
+    primary = {
+      sticks: Q.sticks, litPairs: Q.litPairs, firedTotal: Q.fired,
+      pointAct: dec(Q.pointActivation, Float32Array), pointCount: dec(Q.pointCount, Uint16Array),
+      detCount: dec(Q.detectorCount, Uint16Array), detLevel: dec(Q.detectorLevel, Float32Array),
+    };
+    primary.actHigh = 0; primary.litPoints = 0;
+    for (let p = 0; p < M.points; p++) { if (primary.pointAct[p] > 0) primary.litPoints++; primary.actHigh = Math.max(primary.actHigh, primary.pointAct[p]); }
+    const ranked = [];
+    for (let d = 0; d < M.count; d++) if (primary.detCount[d]) ranked.push(d);
+    ranked.sort((a, b) => primary.detCount[b] - primary.detCount[a] || primary.detLevel[b] - primary.detLevel[a]);
+    primary.ranked = ranked;
+    primary.top = new Set(ranked.slice(0, S.model.topClusters));
+  }
+  return {sticks, levels, primary, digit: raw.digit, probabilities: raw.probabilities, ms: raw.ms, memory: raw.memory || null, votes: raw.votes || []};
 }
 
 // Точки карты в поле детектора d (§6.5: точки не дальше r_d от центра) — для состава кластера.
@@ -577,7 +608,8 @@ function remember() {
 function buildCards() {
   const box = $("levels");
   box.innerHTML = "";
-  box.style.gridTemplateColumns = `repeat(${S.model.levels.length}, minmax(0, 1fr))`;
+  box.style.gridTemplateColumns = `repeat(${S.model.levels.length + (S.model.primary ? 1 : 0)}, minmax(0, 1fr))`;
+  S.primaryCard = S.model.primary ? buildPrimaryCard(box) : null;
   S.cards = S.model.levels.map((M, n) => {
     const card = document.createElement("article");
     card.className = "level";
@@ -599,7 +631,7 @@ function buildCards() {
 }
 
 function resize() {
-  for (const item of S.cards) {
+  for (const item of (S.primaryCard ? [S.primaryCard] : []).concat(S.cards)) {
     const wrap = item.map.parentElement, side = Math.max(120, Math.min(wrap.clientWidth, wrap.clientHeight));
     item.map.style.width = item.map.style.height = side + "px";
     item.map.width = item.map.height = Math.round(side * DPR);
@@ -622,6 +654,142 @@ function zoomAt(item, mx, my, factor) {
   const M = item.M, view = item.view;
   const next = Math.min(120 * DPR, Math.max(item.map.width / (Math.max(M.width, M.height) * 1.6), view.s * factor));
   view.ox = mx - (mx - view.ox) * next / view.s; view.oy = my - (my - view.oy) * next / view.s; view.s = next;
+}
+
+// ================================================================== уровень 0: первичная карта (пинвилы)
+// Точка первичной карты — углопозиция обучающей цифры: её первичный код — угол и место (§4.6). Раскладка ставит рядом
+// штрихи с близкими углом и местом (§5); цвет точки — угол её штриха, поэтому на карте видны пинвилы (§5.13.2).
+// Штрихи рисунка зажигают точки карты (§6.1): зажжённые горят своим цветом, остальные приглушены; кольца — сработавшие
+// детекторы (§6.5). В счёте уровней первичная карта не участвует — она показывает первичное кодирование.
+function buildPrimaryCard(box) {
+  const card = document.createElement("article");
+  card.className = "level";
+  card.innerHTML = `<div class="head"><span class="badge">0</span><b>Уровень 0</b><span class="chips"></span></div>
+    <div class="top"><canvas class="pieces"></canvas><div class="stats"></div></div>
+    <div class="mapwrap"><canvas class="map"></canvas><div class="zoom"><button data-z="1.4">+</button><button data-z="0.7">−</button><button data-z="0">⤢</button></div></div>`;
+  box.appendChild(card);
+  const item = {card, M: S.model.primary, pieces: card.querySelector(".pieces"), map: card.querySelector(".map"),
+    chips: card.querySelector(".chips"), stats: card.querySelector(".stats"), view: null, keep: {}, under: -1};
+  const canvas = item.map;
+  let drag = null;
+  card.querySelectorAll(".zoom button").forEach(button => button.addEventListener("click", () => {
+    const z = +button.dataset.z;
+    if (!z) item.view = fit(item); else zoomAt(item, canvas.width / 2, canvas.height / 2, z);
+    drawPrimaryMap(item);
+  }));
+  canvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    const rect = canvas.getBoundingClientRect(), k = canvas.width / rect.width;
+    zoomAt(item, (event.clientX - rect.left) * k, (event.clientY - rect.top) * k, Math.pow(1.0015, -event.deltaY));
+    drawPrimaryMap(item);
+  }, {passive: false});
+  canvas.addEventListener("pointerdown", event => { drag = [event.clientX, event.clientY]; canvas.style.cursor = "grabbing"; });
+  window.addEventListener("pointerup", () => { if (drag) { drag = null; canvas.style.cursor = "grab"; } });
+  window.addEventListener("pointermove", event => {
+    if (!drag) return;
+    const k = canvas.width / canvas.getBoundingClientRect().width;
+    item.view.ox += (event.clientX - drag[0]) * k; item.view.oy += (event.clientY - drag[1]) * k; drag = [event.clientX, event.clientY];
+    drawPrimaryMap(item);
+  });
+  // Точка под курсором: её штрих (угол, место, цифра) — в строке заголовка карточки, без всплывающих окон.
+  canvas.addEventListener("pointermove", event => {
+    if (drag) return;
+    const rect = canvas.getBoundingClientRect(), k = canvas.width / rect.width, view = item.view, M = item.M;
+    const x = Math.floor(((event.clientX - rect.left) * k - view.ox) / view.s), y = Math.floor(((event.clientY - rect.top) * k - view.oy) / view.s);
+    const i = x >= 0 && y >= 0 && x < M.width && y < M.height ? M.index[y * M.width + x] : -1;
+    if (i !== item.under) { item.under = i; renderPrimaryStats(item); drawPrimaryPicture(item); }
+  });
+  canvas.addEventListener("pointerleave", () => { if (item.under !== -1) { item.under = -1; renderPrimaryStats(item); drawPrimaryPicture(item); } });
+  canvas.addEventListener("dblclick", () => { item.view = fit(item); drawPrimaryMap(item); });
+  return item;
+}
+
+// Рисунок уровня 0: сам рисунок и его углопозиции, цвет — угол (тот же, что у точек первичной карты). Точка карты под
+// курсором показана своим штрихом — белым, на своём месте картинки.
+function drawPrimaryPicture(item) {
+  const ctx = item.pieces.getContext("2d"), {W, unit, px} = pieceGeometry(item), M = item.M;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, W);
+  if (S.image) {
+    const tile = document.createElement("canvas"); tile.width = tile.height = DRAW.side;
+    const t = tile.getContext("2d"), data = t.createImageData(DRAW.side, DRAW.side);
+    for (let i = 0; i < S.image.length; i++) { const v = S.image[i] * 0.45; data.data.set([v, v, v, 255], 4 * i); }
+    t.putImageData(data, 0, 0);
+    ctx.imageSmoothingEnabled = true; ctx.drawImage(tile, 0, 0, W, W);
+  }
+  ctx.lineCap = "round";
+  const sight = S.sight;
+  if (sight) {
+    const st = sight.sticks;
+    for (let i = 0; i < st.count; i++) stick(ctx, px(st.x[i]), px(st.y[i]), unit * S.model.cell, st.angle[i], 0.95, null, st.span[i]);
+  }
+  if (item.under >= 0) stick(ctx, px(M.x[item.under]), px(M.y[item.under]), unit * S.model.cell * 1.6, M.angle[item.under], 1, "#ffffff", 0);
+}
+
+function drawPrimaryMap(item) {
+  const canvas = item.map, ctx = canvas.getContext("2d"), M = item.M, view = item.view, W = canvas.width, H = canvas.height, s = view.s;
+  const V = S.sight && S.sight.primary;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  // Без рисунка карта видна целиком; с рисунком точки приглушены, а зажжённые горят: яркость растёт от доли
+  // DASHBOARD_LIT_FLOOR диапазона «λ_a … сильнейшая активация» до его верха (как у карт уровней).
+  const low = M.activation, span = V ? Math.max(1e-6, V.actHigh - low) : 1, floor = S.model.litFloor, dim = V ? 0.24 : 0.9;
+  const x0 = Math.max(0, Math.floor(-view.ox / s)), x1 = Math.min(M.width - 1, Math.floor((W - view.ox) / s));
+  const y0 = Math.max(0, Math.floor(-view.oy / s)), y1 = Math.min(M.height - 1, Math.floor((H - view.oy) / s));
+  const size = Math.max(1, s), marks = s >= 12 * DPR;
+  ctx.lineCap = "round";
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const i = M.index[y * M.width + x];
+    if (i < 0) continue;
+    let alpha = dim;
+    if (V && V.pointAct[i] > 0) {
+      const t = (V.pointAct[i] - low) / span;
+      if (t >= floor) alpha = dim + (1 - dim) * Math.pow(Math.min(1, (t - floor) / Math.max(1e-6, 1 - floor)), 1.4);
+    }
+    const left = view.ox + x * s, top = view.oy + y * s;
+    ctx.globalAlpha = alpha; ctx.fillStyle = M.colour[i]; ctx.fillRect(left, top, size, size);
+    if (marks) {
+      // Крупно: в клетке — сам штрих точки (отрезок вдоль линии).
+      const along = (M.angle[i] + 90) * Math.PI / 180, half = s * 0.36;
+      ctx.globalAlpha = Math.min(1, alpha + 0.35); ctx.strokeStyle = "#000"; ctx.lineWidth = Math.max(1, s / 7);
+      ctx.beginPath(); ctx.moveTo(left + s / 2 - Math.cos(along) * half, top + s / 2 + Math.sin(along) * half);
+      ctx.lineTo(left + s / 2 + Math.cos(along) * half, top + s / 2 - Math.sin(along) * half); ctx.stroke();
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (item.under >= 0) {
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 * DPR;
+    ctx.strokeRect(view.ox + M.cells[2 * item.under + 1] * s - 1, view.oy + M.cells[2 * item.under] * s - 1, size + 2, size + 2);
+  }
+  if (!V) return;
+  // Кластеры — сработавшие детекторы (§6.5): цвет — слой, толщина — сколько штрихов рисунка в него набилось.
+  const cx = d => view.ox + (M.det[5 * d + 1] + 0.5) * s, cy = d => view.oy + (M.det[5 * d] + 0.5) * s;
+  for (const d of V.ranked) {
+    if (!V.top.has(d)) continue;
+    ctx.strokeStyle = LAYER[M.layer[d] % LAYER.length];
+    ctx.globalAlpha = 0.55 + 0.45 * Math.min(1, V.detLevel[d]);
+    ctx.lineWidth = Math.max(1.5, Math.min(6, 1 + Math.log2(1 + V.detCount[d]))) * DPR;
+    ctx.beginPath(); ctx.arc(cx(d), cy(d), Math.max(2, M.det[5 * d + 2] * s), 0, 2 * Math.PI); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function renderPrimaryStats(item) {
+  const M = item.M, V = S.sight && S.sight.primary;
+  const under = item.under >= 0
+    ? `точка: угол ${M.angle[item.under].toFixed(0)}° · место x ${M.x[item.under].toFixed(1)}, y ${M.y[item.under].toFixed(1)} · из цифры «${M.labels[item.under]}»` : "";
+  item.chips.textContent = under || (V ? `штрихов ${V.sticks} · точек ${V.litPoints} · кластеров ${V.ranked.length}` : "первичная карта: цвет — угол штриха");
+  const rows = [
+    `<div class="row"><span>точек на карте</span><b>${M.points}</b></div>`,
+    `<div class="row"><span>сетка карты</span><b>${M.width} × ${M.height}</b></div>`,
+    `<div class="row"><span>период угла</span><b>${M.period.toFixed(0)}°</b></div>`,
+  ];
+  if (V) rows.push(
+    `<div class="row"><span>штрихов рисунка</span><b>${V.sticks}</b></div>`,
+    `<div class="row"><span>зажжено точек</span><b>${V.litPoints} из ${M.points}</b></div>`,
+    `<div class="row"><span>пар «штрих → точка»</span><b>${V.litPairs}</b></div>`,
+    `<div class="row"><span>срабатываний</span><b>${V.firedTotal}</b></div>`,
+    `<div class="row"><span>кластеров набито</span><b>${V.ranked.length}</b></div>`);
+  rows.push(`<div class="clusters"><div class="cl">точка — штрих: угол и место</div><div class="cl">цвет — угол штриха</div></div>`);
+  item.stats.innerHTML = rows.join("");
 }
 
 // ================================================================== рисунок уровня: кусочки
@@ -1082,9 +1250,9 @@ function renderStats(item) {
   const top = V.ranked;
   item.stats.innerHTML =
     `<div class="row"><span>кусочков (окон)</span><b>${V.K}</b></div>` +
-    `<div class="row"><span>зажжено точек карты</span><b>${V.litPoints} из ${M.points}</b></div>` +
+    `<div class="row"><span>зажжено точек</span><b>${V.litPoints} из ${M.points}</b></div>` +
     `<div class="row"><span>пар «кусочек → точка»</span><b>${V.litPairs}</b></div>` +
-    `<div class="row"><span>срабатываний детекторов</span><b>${V.firedTotal}</b></div>` +
+    `<div class="row"><span>срабатываний</span><b>${V.firedTotal}</b></div>` +
     `<div class="row"><span>кластеров набито</span><b>${V.clusters}${added && fresh ? ` <span style="color:${PIN}">+${added}</span>` : ""}</b></div>` +
     `<div class="row"><span>кусочков без отклика</span><b>${silent}</b></div>` +
     `<div class="row"><span>сила деталей, средняя</span><b>${mean.toFixed(2)}</b></div>` +
@@ -1094,9 +1262,10 @@ function renderStats(item) {
     }).join("")}</div>`;
 }
 
-// Ответ памяти (§7.1.13.3): «знаю целиком» — верхний уровень знает рисунок; «по частям» — верх не знает, а на уровне
-// ниже за одну цифру больше половины кусочков; «не знаю». Под ним — уровни: полоска знания (насколько память знает
-// кусочки уровня) с риской порога и победитель голосов кусочков (цифра самой похожей точки памяти у каждого).
+// Ответ памяти (§2.2.5, §7.1.13.3): цифра с наибольшей средней долей голосов кусочков по уровням; уверенность —
+// согласие уровней: все уровни назвали эту цифру, её назвали два верхних, уровни расходятся. Под ним — уровни: полоска
+// знания (насколько память знает кусочки уровня) с риской порога и победитель голосов кусочков (цифра самой похожей
+// точки памяти у каждого); уровни, согласные с ответом, выделены.
 function renderMemory() {
   const sight = S.sight, memory = sight && sight.memory, box = $("memory");
   box.className = memory ? memory.kind : "unknown";
@@ -1106,12 +1275,13 @@ function renderMemory() {
   }
   const percent = value => `${(100 * value).toFixed(0)} %`;
   $("memoryDigit").textContent = memory.digit >= 0 ? String(memory.digit) : "?";
-  $("memoryKind").textContent = memory.kind === "whole" ? "знаю целиком" : memory.kind === "parts" ? "по частям" : "не знаю";
-  $("memoryWhy").textContent = memory.kind === "whole" ? `верхний уровень ${memory.level} знает рисунок · ${percent(memory.share)} кусочков за «${memory.digit}»`
-    : memory.kind === "parts" ? `целиком не знаю · на уровне ${memory.level} ${percent(memory.share)} кусочков — как у «${memory.digit}»`
-    : sight.votes.length ? "целого не знаю, и кусочки не сходятся на одной цифре" : "ни одна точка памяти не зажглась";
+  $("memoryKind").textContent = memory.kind === "agree" ? "все уровни согласны" : memory.kind === "mostly" ? "два верхних уровня согласны"
+    : memory.kind === "split" ? "уровни расходятся" : "не знаю";
+  $("memoryWhy").textContent = memory.digit >= 0
+    ? `в среднем по уровням ${percent(memory.share)} кусочков за «${memory.digit}» · согласны ${memory.agreed} из ${S.model.levels.length}`
+    : "ни одна точка памяти не зажглась";
   $("voteRows").innerHTML = sight.votes.map(level => {
-    const used = level.number === memory.level ? " used" : "";
+    const used = level.digit === memory.digit && memory.digit >= 0 ? " used" : "";
     const title = `знание ${level.knowledge.toFixed(2)}, порог ${level.threshold.toFixed(2)}: память ${level.knows ? "знает" : "не знает"} кусочки уровня; голосовало ${level.voted} из ${level.keyholes}`;
     return `<span class="${used.trim()}" title="${title}">ур. ${level.number}</span>` +
       `<div class="know${level.knows ? " yes" : ""}" title="${title}"><span style="width:${(100 * Math.min(1, level.knowledge)).toFixed(1)}%"></span><i style="left:${(100 * Math.min(1, level.threshold)).toFixed(1)}%"></i></div>` +
@@ -1358,6 +1528,7 @@ function render() {
   if (!S.model) return;
   renderStatus();
   renderAnswer();
+  if (S.primaryCard) { drawPrimaryPicture(S.primaryCard); drawPrimaryMap(S.primaryCard); renderPrimaryStats(S.primaryCard); }
   for (const item of S.cards) { drawPieces(item); drawMap(item); renderStats(item); }
   renderTrace();
   if (S.flashAt && performance.now() - S.flashAt < 900) {

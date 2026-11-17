@@ -8,6 +8,11 @@ HierarchyDetection.active_sets отвечает, какие детекторы �
     - код набора — объединение их бит (§6.5; при одном бите на детектор colour merge с бюджетом σ и есть
       выбор σ сильнейших);
     - длина кода — наименьшая, при которой средняя плотность кодов не выше заданной (§6.6, шаг 3; §2).
+
+Скорость (вне статьи; ответ тот же, tests/test_detail_codes_fast.py). На 5 000 цифр сборка шла 120 с на уровень:
+90 % — подбор длины кода, где на каждом шаге двоичного поиска сортировались все пары «набор — бит». Теперь единицы
+считаются по битовой карте, без сортировки, а σ сильнейших детекторов набора выбирает скомпилированный цикл numba
+(без numba и на парах не по порядку — прежняя плотная матрица).
 """
 from __future__ import annotations
 
@@ -15,6 +20,48 @@ import numpy as np
 
 from damp.article_refs import MORPHOLOGICAL_EMBEDDINGS, NEURAL_ANALOGY
 from damp.logging import LOGGER
+
+try:  # numba — необязательная зависимость: без неё σ сильнейших выбирает numpy по плотной матрице.
+    import numba
+except ImportError:  # pragma: no cover
+    numba = None
+
+
+def _strongest_py(starts, columns, levels, saturation, kept):  # noqa: ANN001, ANN201
+    """Отбор σ самых сильных детекторов в каждом наборе — то же, что по плотной матрице «наборы × детекторы».
+
+    starts — границы наборов в парах, идущих по наборам; kept — булева маска пар, остающихся после отбора (пишется
+    на месте). В наборе, где детекторов не больше σ, остаются все. В остальных — уровни выше σ-го по силе и столько
+    равных ему, сколько не хватает до σ, по возрастанию номера детектора. Возвращает False, если в каком-то наборе
+    номера детекторов идут не строго по возрастанию (пары не по порядку или повторы): тогда отбор делает прямой путь.
+    """
+    for row in range(starts.shape[0] - 1):
+        first, last = starts[row], starts[row + 1]
+        count = last - first
+        if count == 0:
+            continue
+        for index in range(first + 1, last):
+            if columns[index] <= columns[index - 1]:
+                return False
+        if count <= saturation:
+            for index in range(first, last):
+                kept[index] = True
+            continue
+        border = np.partition(levels[first:last], count - saturation)[count - saturation]
+        missing = saturation
+        for index in range(first, last):
+            if levels[index] > border:
+                missing -= 1
+        for index in range(first, last):
+            if levels[index] > border:
+                kept[index] = True
+            elif levels[index] == border and missing > 0:
+                kept[index] = True
+                missing -= 1
+    return True
+
+
+_strongest_compiled = None if numba is None else numba.njit(cache=True, nogil=True)(_strongest_py)
 
 
 class DetectorEmbeddings:
@@ -26,6 +73,8 @@ class DetectorEmbeddings:
     CHUNK_ROWS = 32768
     # Ячеек плотной матрицы «наборы × детекторы» за один проход отбора самых сильных детекторов.
     SELECT_CELLS = 8_000_000
+    # Ячеек битовой карты «наборы × биты» за один проход счёта плотности кодов.
+    DENSITY_CELLS = 64_000_000
 
     def __init__(
         self,
@@ -62,10 +111,24 @@ class DetectorEmbeddings:
         columns = np.asarray(columns, dtype=np.int64)
         if self._saturation == 0 or rows.size == 0:
             return rows, columns
-        levels = np.asarray(levels, dtype=np.float64)
+        levels = np.asarray(levels)
         if np.any(np.diff(rows) < 0):
             order = np.argsort(rows, kind="stable")
             rows, columns, levels = rows[order], columns[order], levels[order]
+        if _strongest_compiled is not None:
+            # Быстрый путь: скомпилированный цикл по наборам, без плотной матрицы. Ответ тот же; пары, где номера
+            # детекторов набора идут не по возрастанию, он не берёт — их разбирает прямой путь ниже.
+            starts = np.searchsorted(rows, np.arange(int(rows[-1]) + 2))
+            kept = np.zeros(rows.shape[0], dtype=np.bool_)
+            if _strongest_compiled(starts, np.ascontiguousarray(columns), np.ascontiguousarray(levels), self._saturation, kept):
+                return rows[kept], columns[kept]
+        return self._strongest_dense(rows, columns, levels)
+
+    def _strongest_dense(
+        self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Прямой путь отбора σ сильнейших: плотная матрица «наборы × детекторы». Пары идут по наборам."""
+        levels = np.asarray(levels, dtype=np.float64)
         # Наборы, где детекторов не больше σ, остаются целиком. В остальных — σ самых сильных; при равной силе
         # раньше идёт детектор с меньшим номером. Вместо сортировки всех пар — порог внутри набора: в плотной
         # матрице «наборы × детекторы» находится σ-й по силе уровень, проходят уровни выше него и столько равных
@@ -110,6 +173,33 @@ class DetectorEmbeddings:
         return np.concatenate(parts).astype(np.int64)
 
     def _density(self, rows: "np.ndarray", columns: "np.ndarray", count: int, length: int) -> float:
+        """Средняя плотность кодов наборов 0…count−1 при длине кода length: доля единичных бит.
+
+        Единицы считаются по битовой карте «наборы × биты», кусками по DENSITY_CELLS ячеек: пара (набор, бит) ставит
+        единицу, два детектора набора с общим битом дают одну. То же число, что у прямого счёта (_density_sorted),
+        без сортировки всех пар.
+        """
+        length = int(length)
+        place = self.detector_bits(length)[columns]
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.size and np.any(np.diff(rows) < 0):
+            order = np.argsort(rows, kind="stable")
+            rows, place = rows[order], place[order]
+        sets = int(rows[-1]) + 1 if rows.size else 0
+        step = max(1, self.DENSITY_CELLS // length)
+        starts = np.searchsorted(rows, np.arange(0, sets + step, step))
+        ones = 0
+        for chunk, first in enumerate(range(0, sets, step)):
+            entries = slice(int(starts[chunk]), int(starts[chunk + 1]))
+            if entries.stop == entries.start:
+                continue
+            seen = np.zeros(min(step, sets - first) * length, dtype=np.bool_)
+            seen[(rows[entries] - first) * length + place[entries]] = True
+            ones += int(np.count_nonzero(seen))
+        return float(ones) / (max(1, int(count)) * length)
+
+    def _density_sorted(self, rows: "np.ndarray", columns: "np.ndarray", count: int, length: int) -> float:
+        """Прямой счёт плотности: различные пары (набор, бит) сортировкой. Мерка для быстрого счёта _density."""
         bits = self.detector_bits(length)
         keys = np.unique(rows * int(length) + bits[columns])
         return float(keys.shape[0]) / (max(1, int(count)) * int(length))

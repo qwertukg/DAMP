@@ -119,7 +119,7 @@ class TrainedLadderTest(unittest.TestCase):
                     self.assertTrue(set(np.unique(level.fired_keyhole).tolist()) <= set(np.unique(level.lit_keyhole).tolist()))
 
     def test_memory_votes_read_the_lit_points(self) -> None:
-        """Голоса памяти (§2.2.5, §7.1.13.3): по уровню на каждый пройденный, из зажжённых точек; вердикт — по ним."""
+        """Голоса памяти (§2.2.5, §7.1.13.3): по уровню на каждый пройденный, из зажжённых точек; ответ — их среднее."""
         memory = self.ladder.memory
         self.assertEqual(len(memory.thresholds), len(self.runner.levels))
         self.assertTrue(all(0.0 <= value <= 1.0 for value in memory.thresholds))
@@ -132,8 +132,12 @@ class TrainedLadderTest(unittest.TestCase):
                     self.assertEqual(votes.knowledge, expected.knowledge)
                     self.assertEqual(votes.keyholes, level.keyhole_centre.shape[0])
                     self.assertEqual(votes.voted, np.unique(level.lit_keyhole).shape[0])
-            self.assertEqual(sight.verdict, memory.verdict(sight.votes))
-            self.assertIn(sight.verdict.kind, (memory.WHOLE, memory.PARTS, memory.UNKNOWN))
+            expected = memory.verdict(sight.votes)
+            self.assertEqual((sight.verdict.kind, sight.verdict.digit, sight.verdict.share, sight.verdict.agreed),
+                             (expected.kind, expected.digit, expected.share, expected.agreed))
+            self.assertTrue(np.array_equal(sight.verdict.votes, expected.votes))
+            self.assertIn(sight.verdict.kind, (memory.AGREE, memory.MOSTLY, memory.SPLIT))
+            self.assertEqual(sight.verdict.digit, int(np.mean([votes.votes for votes in sight.votes], axis=0).argmax()))
 
     def test_training_picture_knows_itself_unless_left_out(self) -> None:
         """Обучающая картинка находит в памяти саму себя; мерка порога знания считает её без своих точек памяти."""

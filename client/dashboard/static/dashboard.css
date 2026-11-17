@@ -32,13 +32,15 @@ button.on { border-color: var(--pin); color: var(--pin); }
 #moveNote:empty, #padNote:empty { display: none; }
 .check { display: flex; gap: 6px; align-items: center; margin-top: 8px; color: var(--muted); cursor: pointer; }
 .note { color: var(--muted); margin: 6px 0 0; font-size: 12px; }
-/* Ответ памяти (§7.1.13.3): цифра, вердикт «знаю целиком / по частям / не знаю» и голоса кусочков по уровням. */
+/* Ответ памяти (§7.1.13.3): цифра по среднему долей голосов уровней, согласие уровней и голоса кусочков по уровням. */
 #memory { display: flex; gap: 12px; align-items: center; }
 #memoryDigit { font-size: 52px; font-weight: 700; width: 64px; text-align: center; line-height: 1; }
-#memory.parts #memoryDigit { color: var(--pin); }
+#memory.mostly #memoryDigit { color: var(--accent); }
+#memory.split #memoryDigit { color: var(--pin); }
 #memory.unknown #memoryDigit { color: var(--muted); }
 #memoryKind { font-size: 14px; font-weight: 600; }
-#memory.parts #memoryKind { color: var(--pin); }
+#memory.mostly #memoryKind { color: var(--accent); }
+#memory.split #memoryKind { color: var(--pin); }
 #memory.unknown #memoryKind { color: var(--muted); }
 #memoryWhy { margin: 2px 0 0; }
 #voteRows { display: grid; grid-template-columns: auto 1fr auto; gap: 3px 8px; align-items: center; font-size: 12px; margin: 8px 0 0; color: var(--muted); }
