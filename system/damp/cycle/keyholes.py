@@ -140,6 +140,8 @@ class KeyholeBuilder:
             dense=True,
             name=name,
             concepts=settings.LADDER_KEYHOLE_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
+            # Нижний предел радиуса окна — доля того, что видит одна деталь уровня: от неё зависит рост поля за уровень.
+            radius_floor=settings.LADDER_KEYHOLE_RADIUS_SHARE * step,
         )
 
     @staticmethod

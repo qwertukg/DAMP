@@ -74,6 +74,7 @@ class PlaneFieldBuilder:
         dense: bool = False,
         name: str = "fields",
         concepts: int | None = None,
+        radius_floor: float | None = None,
     ) -> None:
         # True — окно на каждом элементе, без вытеснения перекрывающихся полей (продолжение статьи, П.2).
         self._dense = bool(dense)
@@ -97,6 +98,11 @@ class PlaneFieldBuilder:
         self._min_samples = int(min_samples)
         self._min_points = int(min_points)
         self._radius_min = float(radius_min)
+        # Нижний предел радиуса поля. None — тот же radius_min, что и наименьшее расстояние в энергии точки. Свой
+        # предел нужен окнам цикла: от него зависит, во сколько раз поле растёт от уровня к уровню.
+        self._radius_floor = float(radius_min) if radius_floor is None else float(radius_floor)
+        if self._radius_floor <= 0:
+            raise ValueError("radius_floor must be positive")
         self._energy_radius = float(energy_radius)
         self._energy_threshold = float(energy_threshold)
         self._name = str(name)
@@ -211,7 +217,7 @@ class PlaneFieldBuilder:
             # §6.4.3: радиус по максимуму f(p) = |{q: r(q) ≤ r(p)}| / (π r(p)²).
             reach = np.sort(np.hypot(positions[cluster, 0] - middle[0], positions[cluster, 1] - middle[1]))
             inside = np.arange(1, reach.size + 1, dtype=np.float64)
-            radii = np.maximum(self._radius_min, reach)
+            radii = np.maximum(self._radius_floor, reach)
             allowed = (radii <= self._activation_radius) & (inside >= self._min_points)
             if not allowed.any():
                 continue
@@ -249,7 +255,7 @@ class PlaneFieldBuilder:
         members = self._clusters(disc, distance <= self._eps)
         reach = np.sort(np.where(members, distance[None], np.inf), axis=2)
         inside = np.arange(1, count + 1, dtype=np.float64)[None, None, :]
-        radii = np.maximum(self._radius_min, reach)
+        radii = np.maximum(self._radius_floor, reach)
         allowed = np.isfinite(reach) & (radii <= self._activation_radius) & (inside >= self._min_points)
         fill = np.where(allowed, inside / (math.pi * radii * radii), -np.inf)
         found = allowed.any(axis=2)

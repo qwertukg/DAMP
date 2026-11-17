@@ -15,7 +15,7 @@ def _build_extractor(
     """Извлечение углопозиций; None — значение из настроек в момент вызова (MNIST_PATCH_SIZE, MNIST_CONTOUR_ONLY,
     MNIST_SOBEL_UPSCALE_ENABLED). Дробное место штриха внутри участка — MNIST_SUBCELL_POSITION (только по контуру).
     MNIST_STROKE_DETECTORS (только по контуру) — штрихи детекторами над точками края, а не по сетке участков; шаг
-    штрихов — сторона участка patch_size."""
+    штрихов — MNIST_STROKE_STEP, места штрихов — в прежних единицах, участках patch_size."""
     patch_size = settings.MNIST_PATCH_SIZE if patch_size is None else patch_size
     contour_only = settings.MNIST_CONTOUR_ONLY if contour_only is None else contour_only
     upscale = settings.MNIST_SOBEL_UPSCALE_ENABLED if upscale is None else upscale
@@ -29,7 +29,7 @@ def _build_extractor(
     detectors = None
     if settings.MNIST_STROKE_DETECTORS and contour_only:
         detectors = StrokeDetectors(
-            step=float(patch_size),
+            step=float(settings.MNIST_STROKE_STEP),
             similarity=settings.MNIST_STROKE_SIMILARITY,
             angle_span=settings.MNIST_STROKE_ANGLE_SPAN,
             min_points=settings.MNIST_STROKE_MIN_POINTS,

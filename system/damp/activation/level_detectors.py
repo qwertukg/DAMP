@@ -221,6 +221,9 @@ class LevelDetectors:
                 energy_threshold=settings.ACTIVATION_ENERGY_THRESHOLD,
                 detector_threshold=settings.LADDER_DETECTOR_THRESHOLD,
                 activate_best=settings.LADDER_ACTIVATE_BEST,
+                # Энергия активации: одиночные зажжённые точки гаснут (§5.7 на матрице активации, расширение статьи).
+                local_energy_threshold=settings.ACTIVATION_LOCAL_ENERGY_THRESHOLD,
+                local_energy_radius=settings.ACTIVATION_POINT_ENERGY_RADIUS,
                 use_gpu=settings.ACTIVATION_USE_GPU,
                 name=self.name,
             )

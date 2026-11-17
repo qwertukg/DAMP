@@ -5,6 +5,9 @@ ActivationEngine считает реакцию кодового простран
 детекторы зажигает каждый код. Здесь те же формулы считаются пакетами на устройстве:
 
     a_j = sim_λa(s, v_j)                         — пороговая активация точки стимулом (§6.1);
+    Ê_a(j) = Σ a_v / d(j, v) по R(j, r_e) / max  — энергия активации точки: формула §5.7 на матрице активации
+                                                   (расширение статьи); точка с Ê_a < μ_a гаснет — одиночные
+                                                   зажжённые точки на отшибе молчат;
     E(d) = Σ a_j · e_j / e_d по точкам поля d    — уровень активации детектора, точки с e_j ≥ μ_e (§6.5);
     детектор активен при E(d) ≥ μ_d.
 
@@ -46,6 +49,8 @@ class HierarchyDetection:
         energy_threshold: float,
         detector_threshold: float,
         activate_best: bool = False,
+        local_energy_threshold: float = 0.0,
+        local_energy_radius: float = 0.0,
         use_gpu: bool = True,
         name: str = "layout",
     ) -> None:
@@ -88,6 +93,25 @@ class HierarchyDetection:
         # Поле детектора — точки не дальше r_d от его центра (§6.5), как в ActivationEngine.
         inside = np.hypot(cells[:, None, 0] - centre[None, :, 0], cells[:, None, 1] - centre[None, :, 1]) <= radius[None, :]
         self._coverage = torch.as_tensor(inside.astype(np.float32), device=self._device)
+        # Энергия активации точки (расширение статьи): формула энергии точки §5.7, где вместо сходства с соседями —
+        # их активация a_v, с нормировкой на наибольшую по карте для того же стимула (Ê = E / E_max, §5.7). Точка с
+        # Ê_a ниже μ_a гаснет: одиночная зажжённая точка, вокруг которой ничего не горит, в детекторы не идёт. В §6.5
+        # энергия e_j — неподвижная энергия раскладки и одиночных точек не гасит. 0 — выключено (как в статье).
+        self._local_threshold = float(local_energy_threshold)
+        self._neighbours = None
+        if self._local_threshold > 0.0:
+            if float(local_energy_radius) <= 0.0:
+                raise ValueError("local_energy_radius must be positive when local_energy_threshold is set")
+            from scipy.spatial import cKDTree
+
+            pairs = cKDTree(cells).query_pairs(r=float(local_energy_radius), output_type="ndarray")
+            first = np.concatenate([pairs[:, 0], pairs[:, 1]]).astype(np.int64)
+            second = np.concatenate([pairs[:, 1], pairs[:, 0]]).astype(np.int64)
+            weight = (1.0 / np.hypot(cells[first, 0] - cells[second, 0], cells[first, 1] - cells[second, 1])).astype(np.float32)
+            self._neighbours = torch.sparse_coo_tensor(
+                torch.as_tensor(np.stack([first, second])), torch.as_tensor(weight), (int(cells.shape[0]), int(cells.shape[0]))
+            ).coalesce().to(self._device)
+        self._local_radius = float(local_energy_radius)
         self._detector_energy = torch.as_tensor(
             np.asarray([detector.energy for detector in self.detectors], dtype=np.float32), device=self._device
         )
@@ -107,7 +131,11 @@ class HierarchyDetection:
                 "energy_threshold": float(energy_threshold),
                 "detector_threshold": self._detector_threshold,
                 "activate_best": self._activate_best,
-                "note": "детекторы упорядочены по слоям: слой 0 — самый низкий порог λ_d (самые широкие области)",
+                "local_energy_threshold": self._local_threshold,
+                "local_energy_radius": self._local_radius,
+                "local_energy_pairs": 0 if self._neighbours is None else int(self._neighbours.values().shape[0]),
+                "note": "детекторы упорядочены по слоям: слой 0 — самый низкий порог λ_d (самые широкие области); "
+                "точка с энергией активации Ê_a < μ_a гаснет (§5.7 на матрице активации, расширение статьи; 0 — выключено)",
             },
         )
 
@@ -121,11 +149,13 @@ class HierarchyDetection:
         packed = np.ascontiguousarray(packed, dtype=np.uint8)
         if packed.ndim != 2 or packed.shape[1] != self._row_bytes:
             raise ValueError("codes must be rows × ceil(code_length / 8) packed bytes")
-        rows, columns, lit = [], [], 0
+        rows, columns, lit, dropped = [], [], 0, 0
         with torch.no_grad():
             for start in range(0, packed.shape[0], self.BLOCK):
-                activation = self._activation(self._to_device(packed[start : start + self.BLOCK]))
+                raw = self._activation(self._to_device(packed[start : start + self.BLOCK]))
+                activation = self._local(raw, self.BLOCK)
                 lit += int((activation > 0).sum().item())
+                dropped += int((raw > 0).sum().item()) - int((activation > 0).sum().item())
                 level = self._level(activation, self.BLOCK)
                 found = torch.nonzero(level >= self._detector_threshold)
                 rows.append(found[:, 0].cpu().numpy() + start)
@@ -140,6 +170,7 @@ class HierarchyDetection:
                 "name": self._name,
                 "codes": int(packed.shape[0]),
                 "points_lit_per_code": lit / max(1, packed.shape[0]),
+                "points_dropped_by_local_energy_per_code": dropped / max(1, packed.shape[0]),
                 "detectors_per_code": float(per_code.mean()) if per_code.size else 0.0,
                 "detectors_per_code_by_layer": [
                     float(np.count_nonzero(self.layer_index[columns] == number)) / max(1, packed.shape[0])
@@ -154,7 +185,8 @@ class HierarchyDetection:
 
     def lit(self, packed: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
         """Зажжённые точки карты (§6.1): тройки (номер кода, номер точки, активация a_j > 0) — та же активация, что
-        в active и active_sets; без свёртки в уровни детекторов. Для показа карты отклика (вне статьи)."""
+        в active и active_sets (после энергии активации, если она включена); без свёртки в уровни детекторов. Для
+        показа карты отклика (вне статьи)."""
         torch = self._torch
         packed = np.ascontiguousarray(packed, dtype=np.uint8)
         if packed.ndim != 2 or packed.shape[1] != self._row_bytes:
@@ -162,7 +194,7 @@ class HierarchyDetection:
         rows, points, values = [], [], []
         with torch.no_grad():
             for start in range(0, packed.shape[0], self.BLOCK):
-                activation = self._activation(self._to_device(packed[start : start + self.BLOCK]))
+                activation = self._local(self._activation(self._to_device(packed[start : start + self.BLOCK])), self.BLOCK)
                 found = torch.nonzero(activation > 0)
                 rows.append(found[:, 0].cpu().numpy() + start)
                 points.append(found[:, 1].cpu().numpy())
@@ -188,6 +220,25 @@ class HierarchyDetection:
             activation = torch.cat([activation, activation.new_zeros((size - count, activation.shape[1]))])
         level = ((activation * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
         return level[:count]
+
+    def _local(self, activation, rows: int):  # noqa: ANN001, ANN202
+        """Энергия активации (расширение статьи): Ê_a(j) = E_a(j) / max E_a, E_a(j) = Σ a_v / d(j, v) по точкам
+        R(j, r_e) без самой j — формула §5.7, где вместо сходства с соседями их активация. Точки с Ê_a < μ_a гаснут.
+
+        Пачка дополняется нулевыми строками до rows, как в _level: порядок сложения не зависит от размера пачки.
+        """
+        if self._neighbours is None:
+            return activation
+        torch = self._torch
+        count = int(activation.shape[0])
+        size = max(int(rows), count)
+        padded = activation
+        if count < size:
+            padded = torch.cat([activation, activation.new_zeros((size - count, activation.shape[1]))])
+        energy = torch.sparse.mm(self._neighbours, padded.T).T[:count]
+        top = energy.max(dim=1, keepdim=True).values
+        relative = torch.where(top > 0, energy / torch.clamp(top, min=1e-12), torch.zeros_like(energy))
+        return torch.where(relative >= self._local_threshold, activation, torch.zeros_like(activation))
 
     def _activation(self, block):  # noqa: ANN001, ANN202
         """Пороговая активация точек карты кодами блока (§6.1): строки — коды, столбцы — точки."""
@@ -235,7 +286,7 @@ class HierarchyDetection:
         starts = np.searchsorted(groups, np.arange(int(group_count) + 1))
         # Вхождений в одном проходе — столько, чтобы матрица «вхождения × точки» помещалась в память устройства.
         limit = max(64, self.SET_CELLS // max(1, int(self._points.shape[0])))
-        rows, columns, levels, lit = [], [], [], 0
+        rows, columns, levels, lit, dropped = [], [], [], 0, 0
         first = 0
         with torch.no_grad():
             while first < group_count:
@@ -257,7 +308,11 @@ class HierarchyDetection:
                         local = torch.as_tensor(members[chosen] - first, device=self._device)
                         picked = activation[torch.as_tensor(inverse[chosen], device=self._device)]
                         combined[local] = torch.maximum(combined[local], picked)
+                    # Энергия активации — по объединённой реакции набора (расширение статьи; 0 — выключено).
+                    before = int((combined > 0).sum().item())
+                    combined = self._local(combined, limit)
                     lit += int((combined > 0).sum().item())
+                    dropped += before - int((combined > 0).sum().item())
                     level = self._level(combined, limit)
                     found = torch.nonzero(level >= self._detector_threshold)
                     rows.append(found[:, 0].cpu().numpy() + first)
@@ -278,6 +333,7 @@ class HierarchyDetection:
                 "stimuli_per_set": float(index.shape[0]) / max(1, int(group_count)),
                 "distinct_codes": int(packed.shape[0]),
                 "points_lit_per_set": lit / max(1, int(group_count)),
+                "points_dropped_by_local_energy_per_set": dropped / max(1, int(group_count)),
                 "detectors_per_set": float(per_set.mean()) if per_set.size else 0.0,
                 "detectors_per_set_by_layer": [
                     float(np.count_nonzero(self.layer_index[columns] == number)) / max(1, int(group_count))
