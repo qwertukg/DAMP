@@ -10,7 +10,13 @@
 | `GET /static/<файл>` | её стили и код (только файлы папки `static/`) |
 | `GET /api/model` | один раз: карты уровней (точки, их окна, детекторы по слоям), углопозиции обучающих картинок, кисть |
 | `GET /api/example` | пример: случайная пятёрка из первых `DASHBOARD_EXAMPLES` картинок MNIST t10k и её номер в MNIST |
-| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали, вероятности |
+| `GET /api/status` | сколько рабочих процессов готово считать рисунки (страница шлёт столько запросов сразу) |
+| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали, вероятности; с выбранной точкой карты — ещё и её кусочки |
+| `POST /api/point` | рисунок и выбранная точка карты → все кусочки рисунка, которые её зажгли, по убыванию активации |
+
+Рисунки считают рабочие процессы (`DASHBOARD_WORKERS`): у каждого свой обученный цикл, поэтому несколько рисунков
+идут параллельно и страница обновляется чаще. Рисунок, которым штрих закончен, считает главный процесс: его итог
+пишется в журнал. Пока рабочие процессы загружаются (и когда их нет), всё считает главный.
 
 Массивы идут строкой base64 своих байтов (little-endian, как у numpy и у типизированных массивов браузера); тип
 каждого поля задан здесь и на странице одинаково. Сервер слушает только 127.0.0.1.
@@ -19,6 +25,9 @@ from __future__ import annotations
 
 import base64
 import json
+import multiprocessing
+import os
+import queue
 import random
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -49,6 +58,7 @@ class DashboardData:
             "train": ladder.train_pictures,
             "originals": sticks.originals,
             "decay": ladder.decay,
+            "workers": int(settings["DASHBOARD_WORKERS"]),
             "topClusters": int(settings["DASHBOARD_TOP_CLUSTERS"]),
             "litPerPiece": int(settings["DASHBOARD_LIT_PER_PIECE"]),
             "ownClusters": int(settings["DASHBOARD_OWN_CLUSTERS"]),
@@ -89,16 +99,20 @@ class DashboardData:
             keyholes = int(np.asarray(level.keyhole_extent).shape[0])
             lit_keyhole, lit_point = np.asarray(level.lit_keyhole), np.asarray(level.lit_point)
             lit_value = np.asarray(level.lit_value, dtype=np.float32)
+            # Сильнейшая активация точки: пары идут от слабых к сильным, при повторе точки остаётся последняя запись —
+            # наибольшая. То же, что np.maximum.at, но в разы быстрее (пар — десятки тысяч на уровень).
+            rising = np.argsort(lit_value, kind="stable")
             activation = np.zeros(points, dtype=np.float32)
-            np.maximum.at(activation, lit_point, lit_value)
+            activation[lit_point[rising]] = lit_value[rising]
             order = np.lexsort((-lit_value, lit_keyhole))  # по кусочку, внутри — сильнейшие первыми
             ordered = lit_keyhole[order]
             rank = np.arange(order.shape[0]) - np.searchsorted(ordered, np.arange(keyholes))[ordered]
             top = order[rank < int(lit_per_piece)]
             fired_detector = np.asarray(level.fired_detector)
             fired_level = np.asarray(level.fired_level, dtype=np.float32)
+            rising = np.argsort(fired_level, kind="stable")
             strongest = np.zeros(detectors, dtype=np.float32)
-            np.maximum.at(strongest, fired_detector, fired_level)
+            strongest[fired_detector[rising]] = fired_level[rising]
             levels.append({
                 "number": level.number, "keyholes": keyholes,
                 "centre": packed(level.keyhole_centre, "<f4"), "extent": packed(level.keyhole_extent, "<f4"),
@@ -127,6 +141,151 @@ class DashboardData:
         }
 
 
+    @staticmethod
+    def point(sight: Sight, level: int, index: int) -> dict:
+        """Кусочки рисунка, зажёгшие точку карты index уровня level (с нуля), по убыванию её активации. Страница
+        получает у кусочка только его сильнейшие точки (DASHBOARD_LIT_PER_PIECE), поэтому для выбранной точки карты
+        список кусочков идёт отдельно и целиком."""
+        if not 0 <= int(level) < len(sight.levels):
+            return {"keyholes": packed([], "<u2"), "values": packed([], "<f4")}
+        found = sight.levels[int(level)]
+        chosen = np.flatnonzero(np.asarray(found.lit_point) == int(index))
+        values = np.asarray(found.lit_value, dtype=np.float32)[chosen]
+        order = np.argsort(-values, kind="stable")
+        return {"keyholes": packed(np.asarray(found.lit_keyhole)[chosen][order], "<u2"), "values": packed(values[order], "<f4")}
+
+
+def encoded(payload: dict) -> bytes:
+    """Ответ страницы байтами JSON."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+class SightAnswers:
+    """Ответы на рисунок в одном процессе: путь через обученный цикл и его упаковка для страницы.
+
+    Последний путь помнится вместе со своим рисунком: запрос точки того же рисунка его не пересчитывает.
+    """
+
+    def __init__(self, ladder: TrainedLadder, maps: tuple[LevelMap, ...], lit_per_piece: int) -> None:
+        self._ladder = ladder
+        self._maps = maps
+        self._lit = int(lit_per_piece)
+        self._image: bytes = b""
+        self._sight: Sight | None = None
+        self._lock = threading.Lock()  # один рисунок за раз: системный слой и видеокарта общие
+
+    def _path(self, image: bytes, final: bool) -> Sight:
+        with self._lock:
+            if self._sight is None or self._image != image or final:
+                pixels = np.frombuffer(image, dtype=np.uint8).reshape(SIDE, SIDE)
+                self._sight = self._ladder.see(pixels, log=final)
+                self._image = image
+            return self._sight
+
+    def see(self, image: bytes, final: bool, point: "tuple[int, int] | None") -> bytes:
+        """Путь рисунка для страницы; point — выбранная точка карты (уровень, номер): её кусочки идут в том же ответе."""
+        sight = self._path(image, final)
+        answer = {"ok": True, **DashboardData.sight(sight, self._maps, self._lit)}
+        if point is not None:
+            answer["point"] = DashboardData.point(sight, int(point[0]), int(point[1]))
+        return encoded(answer)
+
+    def point(self, image: bytes, level: int, index: int) -> bytes:
+        return encoded({"ok": True, **DashboardData.point(self._path(image, False), level, index)})
+
+
+def worker(connection, changes: dict, count: "int | None", map_points: "int | None") -> None:  # noqa: ANN001
+    """Рабочий процесс: свой обученный цикл (шаги — из кеша) и ответы на рисунки по запросам главного процесса.
+
+    Запрос — ("see", рисунок, точка) или ("point", рисунок, уровень, номер точки); ответ — ("ok", байты JSON) или
+    ("error", причина). Главный процесс закрылся — соединение рвётся, и рабочий выходит сам.
+    """
+    try:
+        damp = Damp(changes=changes or None, log_file=False)
+        ladder = damp.cycle.trained(count, map_points=map_points)
+        answers = SightAnswers(ladder, ladder.maps(), int(damp.settings["DASHBOARD_LIT_PER_PIECE"]))
+        connection.send(("ready", ""))
+    except Exception as error:  # noqa: BLE001 — причину видит главный процесс
+        connection.send(("failed", f"{type(error).__name__}: {error}"))
+        return
+    while True:
+        try:
+            request = connection.recv()
+        except (EOFError, OSError):
+            return
+        try:
+            if request[0] == "see":
+                connection.send(("ok", answers.see(request[1], False, request[2])))
+            else:
+                connection.send(("ok", answers.point(request[1], request[2], request[3])))
+        except Exception as error:  # noqa: BLE001 — странице нужна причина
+            connection.send(("error", f"{type(error).__name__}: {error}"))
+
+
+class SightWorkers:
+    """Рабочие процессы пути рисунка: в каждом свой обученный цикл, рисунки считаются параллельно.
+
+    Процессы поднимаются по одному в фоне (цикл каждого — из кеша шагов; рабочие файлы у них общие, поэтому не
+    разом). Они — копии главного цикла: в окно Rerun и в журнал не пишут.
+    """
+
+    def __init__(self, count: int, changes: dict, train: "int | None", map_points: "int | None") -> None:
+        self.count = int(count)
+        self.ready = 0
+        self.failed = ""
+        self._changes = dict(changes)
+        self._train = train
+        self._map_points = map_points
+        self._idle: "queue.Queue[int]" = queue.Queue()
+        self._connections: dict[int, object] = {}
+
+    def start(self) -> None:
+        threading.Thread(target=self._launch, daemon=True).start()
+
+    def _launch(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        for number in range(self.count):
+            parent, child = context.Pipe()
+            before = os.environ.get("RERUN")
+            os.environ["RERUN"] = "off"  # окно Rerun — у главного процесса
+            try:
+                process = context.Process(target=worker, args=(child, self._changes, self._train, self._map_points), daemon=True)
+                process.start()
+            finally:
+                if before is None:
+                    os.environ.pop("RERUN", None)
+                else:
+                    os.environ["RERUN"] = before
+            child.close()
+            try:
+                status, note = parent.recv()
+            except (EOFError, OSError):
+                status, note = "failed", "рабочий процесс закрылся при запуске"
+            if status != "ready":
+                self.failed = str(note)
+                continue
+            self._connections[number] = parent
+            self._idle.put(number)
+            self.ready += 1
+
+    def ask(self, request: tuple) -> "bytes | None":
+        """Ответ свободного рабочего процесса; None — готовых процессов нет (считает главный)."""
+        if not self.ready:
+            return None
+        number = self._idle.get()
+        connection = self._connections[number]
+        try:
+            connection.send(request)
+            status, payload = connection.recv()
+        except (EOFError, OSError):
+            self.ready -= 1  # процесс закрылся: в очередь свободных он не возвращается
+            return None
+        self._idle.put(number)
+        if status != "ok":
+            raise RuntimeError(str(payload))
+        return payload
+
+
 class DashboardServer:
     """Обученный цикл и сервер страницы на этом компьютере (адрес 127.0.0.1: снаружи недоступен)."""
 
@@ -137,12 +296,13 @@ class DashboardServer:
         self._host = str(damp.settings["DASHBOARD_HOST"])
         self._port = int(damp.settings["DASHBOARD_PORT"] if port is None else port)
         self._ladder: TrainedLadder | None = None
+        self._answers: SightAnswers | None = None  # ответы главного процесса
+        self._workers: SightWorkers | None = None  # рабочие процессы: поднимаются в serve
         self._maps: tuple[LevelMap, ...] = ()
         self._lit = int(damp.settings["DASHBOARD_LIT_PER_PIECE"])
         self._model: bytes = b""
         self._examples = None  # Digits: картинки MNIST t10k для кнопки «пример»
         self._fives: list[int] = []
-        self._lock = threading.Lock()  # один рисунок за раз: системный слой и видеокарта общие
 
     @property
     def address(self) -> str:
@@ -152,6 +312,7 @@ class DashboardServer:
         """Обучить цикл (шаги — из кеша, если такой цикл уже был) и собрать карты уровней для страницы."""
         self._ladder = self._damp.cycle.trained(self._count, map_points=self._map_points)
         self._maps = self._ladder.maps()
+        self._answers = SightAnswers(self._ladder, self._maps, self._lit)
         model = DashboardData.model(self._ladder, self._maps, self._ladder.sticks(), self._damp.settings)
         self._model = json.dumps(model, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         # Примеры — проверочные картинки MNIST t10k (в обучении их нет); цифра — та же, что у рисунков проекта.
@@ -170,17 +331,50 @@ class DashboardServer:
         image = np.asarray(picture.image, dtype=np.uint8)
         return {"image": packed(image, "u1"), "mnist": picture.mnist, "digit": picture.digit}
 
-    def see(self, body: dict) -> dict:
-        """Путь рисунка из запроса страницы: {"image": base64 784 байт, "final": штрих закончен}."""
-        pixels = np.frombuffer(base64.b64decode(str(body["image"])), dtype=np.uint8)
-        if pixels.shape[0] != SIDE * SIDE:
+    @staticmethod
+    def _image(body: dict) -> bytes:
+        raw = base64.b64decode(str(body["image"]))
+        if len(raw) != SIDE * SIDE:
             raise ValueError(f"рисунок должен быть {SIDE}×{SIDE} байт")
-        with self._lock:
-            sight = self._ladder.see(pixels.reshape(SIDE, SIDE), log=bool(body.get("final", False)))
-        return DashboardData.sight(sight, self._maps, self._lit)
+        return raw
+
+    def see(self, body: dict) -> bytes:
+        """Путь рисунка из запроса страницы: {"image": base64 784 байт, "final": штрих закончен, "point": выбранная
+        точка карты [уровень с нуля, номер] или её нет}. Ответ — байты JSON.
+
+        Рисунок посреди штриха считает свободный рабочий процесс; последний рисунок штриха (final) — главный: его
+        итог пишется в журнал. Нет готовых рабочих процессов — всё считает главный.
+        """
+        raw, final = self._image(body), bool(body.get("final", False))
+        point = None if body.get("point") is None else (int(body["point"][0]), int(body["point"][1]))
+        if not final and self._workers is not None:
+            answer = self._workers.ask(("see", raw, point))
+            if answer is not None:
+                return answer
+        return self._answers.see(raw, final, point)
+
+    def point(self, body: dict) -> bytes:
+        """Кусочки рисунка, зажёгшие точку карты: {"image": рисунок, "level": уровень с нуля, "index": номер точки}."""
+        raw, level, index = self._image(body), int(body["level"]), int(body["index"])
+        if self._workers is not None:
+            answer = self._workers.ask(("point", raw, level, index))
+            if answer is not None:
+                return answer
+        return self._answers.point(raw, level, index)
+
+    def status(self) -> dict:
+        """Сколько рабочих процессов готово, сколько задано и причина, если процесс не поднялся."""
+        workers = self._workers
+        if workers is None:
+            return {"ready": 0, "workers": 0, "failed": ""}
+        return {"ready": workers.ready, "workers": workers.count, "failed": workers.failed}
 
     def serve(self) -> None:
-        """Обслуживать страницу, пока процесс не остановят (Ctrl+C)."""
+        """Обслуживать страницу, пока процесс не остановят (Ctrl+C). Рабочие процессы поднимаются в фоне."""
+        count = int(self._damp.settings["DASHBOARD_WORKERS"])
+        if count > 0:
+            self._workers = SightWorkers(count, self._damp.settings.changes, self._count, self._map_points)
+            self._workers.start()
         http = self._http()
         try:
             http.serve_forever()
@@ -240,6 +434,9 @@ class DashboardServer:
                 if path == "/api/model":
                     self._send(200, server._model, "application/json; charset=utf-8")
                     return
+                if path == "/api/status":
+                    self._json({"ok": True, **server.status()})
+                    return
                 if path == "/api/example":
                     try:
                         self._json({"ok": True, **server.example()})
@@ -258,7 +455,8 @@ class DashboardServer:
                 self._send(200, file.read_bytes(), kind)
 
             def do_POST(self) -> None:  # noqa: N802
-                if urlparse(self.path).path != "/api/see":
+                path = urlparse(self.path).path
+                if path not in ("/api/see", "/api/point"):
                     self._send(404, b"", "text/plain")
                     return
                 try:
@@ -269,7 +467,8 @@ class DashboardServer:
                     self._json({"ok": False, "error": "пустой или слишком большой запрос"}, 400)
                     return
                 try:
-                    self._json({"ok": True, **server.see(json.loads(self.rfile.read(length).decode("utf-8")))})
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    self._send(200, server.see(body) if path == "/api/see" else server.point(body), "application/json; charset=utf-8")
                 except Exception as error:  # noqa: BLE001 — странице нужна причина, а не оборванное соединение
                     self._json({"ok": False, "error": f"{type(error).__name__}: {error}"}, 500)
 

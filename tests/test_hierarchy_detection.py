@@ -86,11 +86,11 @@ class HierarchyDetectionTest(unittest.TestCase):
         activation = np.zeros((1, cells.shape[0]), dtype=np.float32)
         activation[0, patch] = 0.8
         activation[0, lonely] = 0.8
-        kept = self._local_detection(layout, 0.2)._local(torch.as_tensor(activation), 1).numpy()[0]
+        kept = self._local_detection(layout, 0.2)._local(torch.as_tensor(activation)).numpy()[0]
         self.assertEqual(kept[lonely], 0.0)
         self.assertGreater(kept[0], 0.0)  # середина пятна горит
         self.assertGreater(np.count_nonzero(kept[patch]), patch.size // 2)
-        off = self._local_detection(layout, 0.0)._local(torch.as_tensor(activation), 1).numpy()[0]
+        off = self._local_detection(layout, 0.0)._local(torch.as_tensor(activation)).numpy()[0]
         np.testing.assert_array_equal(off, activation[0])  # 0 — выключено: активация как в статье
 
     def test_local_energy_does_not_depend_on_the_batch(self) -> None:

@@ -217,9 +217,9 @@ class TrainedLadder:
             elements, pieces, number=trained.number, unit=trained.field.unit, taught=pieces.count,
             content_length=trained.content_length,
         )
-        every = np.arange(codes.count, dtype=np.int64)
         detectors = trained.detectors
-        firing = detectors.fire(codes.packed, every, every, codes.count)
+        # Каждое окно — набор из одного кода; срабатывания и зажжённые точки карты — за один проход активации.
+        firing, (lit_keyhole, lit_point, lit_value) = detectors.fire_and_light(codes.packed)
         if trained.scale is not None:
             firing = firing.scaled(trained.scale)  # нормировка — делителями обучающих окон (вне статьи)
         details, length = DetailCoder(trained.number).encode(
@@ -227,7 +227,6 @@ class TrainedLadder:
         )
         strength = firing.strength()
         _, peak = LevelRecognition.responses(pieces.picture, firing.rows, firing.columns, firing.levels, 1, detectors.built)
-        lit_keyhole, lit_point, lit_value = detectors.lit(codes.packed)
         level = SightLevel(
             number=trained.number,
             keyhole_centre=np.asarray(pieces.centre, dtype=np.float64),

@@ -60,12 +60,6 @@ canvas.map { max-width: 100%; max-height: 100%; aspect-ratio: 1; display: block;
 .zoom button { width: 26px; height: 26px; padding: 0; background: rgba(20, 22, 26, .85); }
 footer { border-top: 1px solid var(--line); padding: 8px 12px; min-height: 0; overflow: hidden; }
 #traceBody { display: flex; gap: 12px; align-items: stretch; height: calc(100% - 22px); overflow-x: auto; color: var(--muted); }
-.step { display: grid; grid-template-columns: auto 1fr; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; min-width: 300px; max-width: 420px; }
-.step canvas { height: 116px; width: 116px; background: #000; border-radius: 4px; }
-.step .text { font-size: 12px; overflow: hidden; }
-.step .text b { color: var(--text); }
-.glyphs { display: flex; gap: 4px; margin-top: 4px; }
-.glyphs canvas { width: 40px; height: 40px; border-radius: 3px; }
 #tip { position: fixed; z-index: 20; pointer-events: none; background: #0c0d10; border: 1px solid #5a6170; border-radius: 8px; padding: 8px;
   width: 300px; font-size: 12px; box-shadow: 0 6px 24px rgba(0, 0, 0, .5); }
 #tip canvas { float: left; margin: 0 8px 4px 0; background: #000; border: 1px solid var(--line); border-radius: 4px; }
@@ -73,3 +67,9 @@ footer { border-top: 1px solid var(--line); padding: 8px 12px; min-height: 0; ov
 #tip .mosaic canvas { float: none; margin: 0; }
 #tip b { color: var(--text); }
 @media (max-width: 1100px) { :root { --left: 240px; --trace: 140px; } #digit { font-size: 40px; width: 48px; } }
+
+/* Путь выбранного: по полю на уровень, в нём кусочки рисунка вплотную, как они вложены в уровень выше. */
+body.pinned { --trace: 44vh; }
+.step { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px; }
+.steptitle { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.step canvas { flex: 1; width: 100%; min-height: 0; background: #000; border-radius: 4px; cursor: grab; }

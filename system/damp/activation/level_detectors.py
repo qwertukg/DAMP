@@ -140,6 +140,7 @@ class LevelDetectors:
         self.activation_lambda = float(activation_lambda)
         self.name = name
         self._detection: HierarchyDetection | None = None
+        self._layered: tuple | None = None  # детекторы по слоям: считаются один раз (их спрашивает каждая картинка)
 
     @classmethod
     def build(cls, memory: "LevelMemory") -> "LevelDetectors":
@@ -232,10 +233,14 @@ class LevelDetectors:
     def _layers(self) -> tuple[tuple[Detector, ...], "np.ndarray", tuple[float, ...]]:
         """Порядок по слоям, как у HierarchyDetection: слой — номер порога λ_d по возрастанию, внутри слоя — порядок
         построения. Без видеокарты: срабатывание из кеша её не требует."""
-        thresholds = sorted({float(detector.lambda_threshold) for detector in self._built})
-        layer = np.asarray([thresholds.index(float(detector.lambda_threshold)) for detector in self._built], dtype=np.int64)
-        order = np.argsort(layer, kind="stable")
-        return tuple(self._built[int(index)] for index in order), layer[order], tuple(thresholds)
+        if self._layered is None or self._layered[0] is not self._built or self._layered[1] != len(self._built):
+            thresholds = sorted({float(detector.lambda_threshold) for detector in self._built})
+            layer = np.asarray([thresholds.index(float(detector.lambda_threshold)) for detector in self._built], dtype=np.int64)
+            order = np.argsort(layer, kind="stable")
+            layers = (tuple(self._built[int(index)] for index in order), layer[order], tuple(thresholds))
+            self._layered = (self._built, len(self._built), layers)
+        detectors, layer, thresholds = self._layered[2]
+        return detectors, layer.copy(), thresholds
 
     @property
     def detectors(self) -> tuple[Detector, ...]:
@@ -281,6 +286,13 @@ class LevelDetectors:
         """
         rows, columns, levels = self.detection.active_sets(codes, index, group, int(sets))
         return Firing(sets=int(sets), rows=rows, columns=columns, levels=levels)
+
+    def fire_and_light(self, codes: "np.ndarray") -> tuple[Firing, tuple["np.ndarray", "np.ndarray", "np.ndarray"]]:
+        """Срабатывания на каждый код как на набор из одного кода и зажжённые точки карты — за один проход (§6.1,
+        §6.5). То же, что fire(codes, все, все, число кодов) и lit(codes), но активация карты считается один раз."""
+        rows, columns, levels, lit_rows, lit_points, lit_values = self.detection.active_with_lit(codes)
+        firing = Firing(sets=int(np.asarray(codes).shape[0]), rows=rows, columns=columns, levels=levels)
+        return firing, (lit_rows, lit_points, lit_values)
 
     def lit(self, codes: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
         """Точки карты, которые зажигает каждый код (§6.1): тройки (код, точка, активация a_j > 0). Та же пороговая

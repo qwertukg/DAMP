@@ -29,7 +29,10 @@ function group(rows, count) {
 
 const S = {
   model: null, sight: null, image: null, example: null, hover: null, pin: null,
-  previous: [], flash: [], views: [], cards: [], busy: false, dirty: false, final: false, frame: 0,
+  previous: [], flash: [], views: [], cards: [], dirty: false, final: false, frame: 0,
+  // Запросы рисунка: сколько в пути, номер последнего отправленного и последнего показанного, время круга (мс),
+  // сколько запросов идёт сразу (готовых рабочих процессов сервера), моменты последних обновлений.
+  inflight: 0, sequence: 0, applied: 0, lastSend: 0, round: 150, parallel: 1, workers: null, updates: [],
 };
 
 // ================================================================== данные
@@ -125,7 +128,84 @@ function composition(M, d) {
   return counts.map((c, digit) => ({digit, share: inside.length ? c / inside.length : 0})).sort((a, b) => b.share - a.share);
 }
 
+// Сильнейшая зажжённая точка кусочка k — окно памяти, на которое кусочек больше всего похож (−1 — ничего не зажёг).
+function strongestPoint(V, k) {
+  let best = -1, value = 0;
+  for (let j = V.lit.start[k]; j < V.lit.start[k + 1]; j++) {
+    const i = V.lit.order[j];
+    if (V.litValue[i] > value) { value = V.litValue[i]; best = V.litPoint[i]; }
+  }
+  return best;
+}
+
+// Выбранное — кусочек на рисунке, кластер или точка карты — как кусочки своего уровня, с которых идёт путь вниз
+// (из чего собраны) и вверх (куда вошли). У точки — кусочки, в чьих DASHBOARD_LIT_PER_PIECE сильнейших она есть.
+// Кусочки идут от сильнейшего: у кластера — по уровню его активации E, у точки — по её активации a. Точные кусочки
+// точки приходят с сервера (/api/point → S.pin.keys); пока их нет — по сильнейшим точкам кусочков. Ответ помнится,
+// пока не сменились рисунок или выбор: его спрашивают несколько раз за кадр.
+function pinKey() {
+  const P = S.pin;
+  return P ? `${P.kind}:${P.level}:${P.kind === "piece" ? P.keyhole : P.index}:${P.keys ? P.keys.length : -1}` : "";
+}
+
+function pinnedPieces() {
+  const sight = S.sight, P = S.pin;
+  if (!sight || !P) return null;
+  const V = sight.levels[P.level];
+  if (!V) return null;
+  const key = pinKey(), known = S.pinnedCache;
+  if (known && known.sight === sight && known.key === key) return known.value;
+  let keys;
+  if (P.kind === "piece") keys = [P.keyhole];
+  else if (P.kind === "cluster") {
+    const B = V.byDetector, found = [];
+    for (let j = B.start[P.index]; j < B.start[P.index + 1]; j++) found.push(B.order[j]);
+    found.sort((a, b) => V.firedLevel[b] - V.firedLevel[a]);
+    keys = [...new Set(found.map(i => V.firedKeyhole[i]))];
+  } else if (P.keys) keys = P.keys.filter(k => k < V.K);
+  else {
+    const found = [];
+    for (let i = 0; i < V.litPoint.length; i++) if (V.litPoint[i] === P.index) found.push(i);
+    found.sort((a, b) => V.litValue[b] - V.litValue[a]);
+    keys = [...new Set(found.map(i => V.litKeyhole[i]))];
+  }
+  const value = {level: P.level, keys};
+  S.pinnedCache = {sight, key, value};
+  return value;
+}
+
+// Все кусочки рисунка, зажёгшие выбранную точку карты, — с сервера (у страницы — лишь сильнейшие точки кусочков).
+async function loadPointPieces() {
+  const P = S.pin;
+  if (!P || P.kind !== "point" || !S.image) return;
+  try {
+    // Рисунок идёт вместе с запросом: сервер помнит путь последнего рисунка, а вкладок может быть несколько.
+    const body = JSON.stringify({image: btoa(String.fromCharCode.apply(null, S.image)), level: P.level, index: P.index});
+    const answer = await (await fetch("/api/point", {method: "POST", body})).json();
+    if (answer.ok && S.pin === P) P.keys = Array.from(dec(answer.keyholes, Uint16Array));
+  } catch (error) { /* останется список по сильнейшим точкам кусочков */ }
+}
+
 // ================================================================== рисование содержимого
+// Деталь кусочка на рисунке (П.1): штрихи окна памяти i карты M, на которое кусочек больше всего похож, — на месте
+// кусочка (cx, cy) в настоящем масштабе (cellPx — пикселей на клетку сетки), одним цветом.
+function fragment(ctx, M, i, cx, cy, cellPx, alpha, ink, width) {
+  const sticks = S.model.sticks, p = M.pointPicture[i];
+  if (p < 0) return;
+  const py = M.pointCentre[2 * i], px = M.pointCentre[2 * i + 1], extent = M.pointExtent[i] + 1e-5, half = cellPx * 0.45;
+  ctx.strokeStyle = ink; ctx.globalAlpha = alpha; ctx.lineWidth = width; ctx.lineCap = "round";
+  ctx.beginPath();
+  for (let j = sticks.start[p]; j < sticks.start[p + 1]; j++) {
+    const dy = sticks.y[j] - py, dx = sticks.x[j] - px;
+    if (Math.hypot(dy, dx) > extent) continue;
+    const along = (sticks.angle[j] + 90) * Math.PI / 180, ux = Math.cos(along) * half, uy = -Math.sin(along) * half;
+    const x = cx + dx * cellPx, y = cy + dy * cellPx;
+    ctx.moveTo(x - ux, y - uy); ctx.lineTo(x + ux, y + uy);
+  }
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
 function stick(ctx, px, py, unit, angle, alpha, ink, span) {
   // Угол углопозиции — направление перепада яркости, поперёк линии цифры: отрезок рисуется вдоль края.
   const along = (angle + 90) * Math.PI / 180, half = unit * 0.45;
@@ -394,35 +474,65 @@ async function loadExample() {
 
 function changed(final) { drawPad(); schedule(final); }
 
-// Одновременно идёт один запрос; пока он идёт, рисунок меняется — следом уходит свежий.
+// Рисунки считают рабочие процессы сервера, поэтому сразу идёт столько запросов, сколько процессов готово (S.parallel;
+// без них — один). Запросы уходят равномерно — через долю времени круга, — иначе ответы приходили бы пачками. У
+// запроса свой номер: ответ старше уже показанного отбрасывается. Последний рисунок штриха (final) уходит сразу.
 function schedule(final) {
   S.final = S.final || final;
-  if (S.busy) { S.dirty = true; return; }
+  S.dirty = true;
+  pump();
+}
+
+function pump() {
+  if (!S.dirty) return;
+  clearTimeout(S.pumpTimer);
+  const parallel = Math.max(1, S.parallel || 1);
+  if (S.inflight >= parallel) return;  // свободного места нет: рисунок уйдёт, когда вернётся ответ
+  const wait = S.inflight ? S.lastSend + S.round / parallel - performance.now() : 0;
+  if (wait > 1 && !S.final) { S.pumpTimer = setTimeout(pump, wait); return; }
   send();
 }
 
 async function send() {
+  S.dirty = false;
   if (!DRAW.strokes.length && !S.example) {
-    S.final = false; S.sight = null; S.image = null; render(); return;
+    // Холст пуст: ответы на прежние рисунки, которые ещё в пути, больше не нужны.
+    S.final = false; S.sight = null; S.image = null; S.applied = ++S.sequence; render(); return;
   }
-  S.busy = true; S.dirty = false;
-  const final = S.final, image = padPicture();
+  const number = ++S.sequence, final = S.final, image = padPicture(), sent = performance.now();
   S.final = false;
+  S.inflight++;
+  S.lastSend = sent;
   try {
-    const body = JSON.stringify({image: btoa(String.fromCharCode.apply(null, image)), final});
+    const point = S.pin && S.pin.kind === "point" ? [S.pin.level, S.pin.index] : null;
+    const body = JSON.stringify({image: btoa(String.fromCharCode.apply(null, image)), final, point});
     const answer = await (await fetch("/api/see", {method: "POST", body})).json();
     if (!answer.ok) throw new Error(answer.error);
-    if (DRAW.strokes.length || S.example) {
+    S.round = 0.7 * S.round + 0.3 * (performance.now() - sent);  // время круга «рисунок → ответ», сглаженное
+    if (number > S.applied && (DRAW.strokes.length || S.example)) {
+      S.applied = number;
+      S.updates.push(performance.now());
       S.image = image;
       remember();
       S.sight = prepareSight(answer);
+      S.sightId = (S.sightId || 0) + 1;  // номер рисунка: по нему помнятся слои карт и картинки кусочков
+      S.sprites = null;
+      // Вспышка новых кластеров — только когда штрих закончен: пока кисть ведут, карты не перерисовываются по кадрам.
+      if (final) S.flashAt = performance.now();
+      // У выбранной точки карты кусочки нового рисунка другие: их список приходит в том же ответе.
+      if (S.pin && S.pin.kind === "point") {
+        const same = point && point[0] === S.pin.level && point[1] === S.pin.index;
+        S.pin.keys = same && answer.point ? Array.from(dec(answer.point.keyholes, Uint16Array)) : null;
+        if (!S.pin.keys) await loadPointPieces();
+      }
       if (S.wishPin) {
         // ?pin=уровень:кусочек — выбрать кусочек сразу (для снимков страницы).
         const [level, keyhole] = S.wishPin.split(":").map(Number);
         if (level >= 1 && level <= S.sight.levels.length) pin(level - 1, Math.min(keyhole || 0, S.sight.levels[level - 1].K - 1));
         S.wishPin = null;
-      } else if (S.pin) {
+      } else if (S.pin && S.pin.kind === "piece") {
         // Выбранный кусочек держится за место на рисунке: после штриха — ближайший кусочек того же уровня.
+        // Выбранные кластер и точка карты от рисунка не зависят: их кусочки находятся заново (pinnedPieces).
         const V = S.sight.levels[S.pin.level];
         if (!V || !V.K) S.pin = null;
         else {
@@ -439,16 +549,26 @@ async function send() {
   } catch (error) {
     $("status").textContent = `ошибка сервера: ${error.message}`;
   }
-  S.busy = false;
-  if (S.dirty) send();
+  S.inflight--;
+  pump();
+}
+
+// Сколько рабочих процессов сервера готово: столько запросов рисунка идёт сразу. Процессы поднимаются в фоне после
+// запуска — страница спрашивает, пока не поднимутся все.
+async function watchWorkers() {
+  try {
+    const status = await (await fetch("/api/status")).json();
+    S.workers = status;
+    S.parallel = Math.max(1, status.ready || 0);
+    renderStatus();
+    if (status.ready < status.workers && !status.failed) setTimeout(watchWorkers, 2000);
+  } catch (error) { setTimeout(watchWorkers, 5000); }
 }
 
 // Кластеры, которых не было до этого штриха, вспыхивают: видно, как кусочки набиваются в кластеры.
 function remember() {
-  const now = performance.now();
   if (!S.sight) { S.previous = []; return; }
   S.previous = S.sight.levels.map(V => V.detCount);
-  S.flashAt = now;
 }
 
 // ================================================================== уровни: карточки
@@ -485,6 +605,7 @@ function resize() {
     item.pieces.width = item.pieces.height = Math.round(pieceSide * DPR);
     item.view = fit(item);
     item.keep = {};
+    item.layer = null;
   }
   render();
 }
@@ -526,6 +647,28 @@ function drawPieces(item) {
   const V = sight.levels[item.n];
   if (!V) { ctx.fillStyle = "#9aa3b2"; ctx.font = `${Math.round(W / 16)}px Segoe UI`; ctx.textAlign = "center"; ctx.fillText("до уровня не дошло", W / 2, W / 2); return; }
   const marks = highlights();
+  // Картинка уровня выше первого собрана из деталей уровня ниже (П.1, §6.6): элементы её окон — детали, прошедшие
+  // торможение. Каждая деталь — штрихи окна памяти, на которое её кусочек больше всего похож, на месте кусочка;
+  // цвет — цифра этого окна, яркость — сила детали. Когда выбран путь, детали вне его гаснут.
+  if (item.n >= 1) {
+    const below = sight.levels[item.n - 1], Mb = S.model.levels[item.n - 1], path = marks.get(item.n - 1), focus = marks.size > 0;
+    const cellPx = unit * S.model.cell;
+    // Слабые детали — снизу и почти не видны, сильные — сверху и ярко: прозрачность растёт как (сила / сильнейшая)^2.5;
+    // толщина у всех одна (автор: «толщину не увеличивай — только прозрачность»). При выборе и наведении детали вне
+    // пути не рисуются вовсе, а детали пути видны так же, как без выбора, — по своей силе: окно верхнего уровня
+    // вмещает почти все детали (74 из 100), и подсветка «всего пути» ярче обычного заливала бы рисунок шумом.
+    const used = [...new Set(V.entryElement)].sort((a, b) => below.strength[a] - below.strength[b]);
+    let strongest = 0;
+    for (const e of used) strongest = Math.max(strongest, below.strength[e]);
+    for (const e of used) {
+      if (focus && !(path && path.has(e))) continue;
+      const i = strongestPoint(below, e);
+      if (i < 0) continue;
+      const weight = strongest > 0 ? Math.pow(below.strength[e] / strongest, 2.5) : 0;
+      fragment(ctx, Mb, i, px(below.centre[2 * e + 1]), px(below.centre[2 * e]), cellPx, 0.03 + 0.92 * weight, CLASS[Mb.labels[i]],
+        Math.max(1, cellPx / 5));
+    }
+  }
   let top = 0;
   for (let k = 0; k < V.K; k++) top = Math.max(top, V.strength[k]);
   // Поля кусочков — еле видно (их десятки, и они перекрываются); сам кусочек — точка в центре окна, цвет — сила
@@ -575,8 +718,14 @@ function drawPieces(item) {
 
 // Подсветка кусочков по уровням: выбранный (pin), под курсором (hover), его состав ниже и куда он вошёл выше.
 function highlights(withHover = true) {
-  const marks = new Map(), sight = S.sight;
-  if (!sight) return marks;
+  const sight = S.sight;
+  if (!sight) return new Map();
+  // Подсветка одна на рисунок, выбор и наведение, а спрашивают её все рисунки и карты уровней: ответ помнится.
+  const hoverKey = withHover && S.hover && S.hover.kind === "piece" ? `${S.hover.level}:${S.hover.index}` : "";
+  const slot = withHover ? "marksHover" : "marksPin", key = pinKey() + "|" + hoverKey, known = S[slot];
+  if (known && known.sight === sight && known.key === key) return known.marks;
+  const marks = new Map();
+  S[slot] = {sight, key, marks};
   const add = (n, k, kind) => { if (!marks.has(n)) marks.set(n, new Map()); const m = marks.get(n); if (!m.has(k) || kind !== "member") m.set(k, kind); };
   const chain = (n, k, kind) => {
     add(n, k, kind);
@@ -595,7 +744,8 @@ function highlights(withHover = true) {
       level = [...next];
     }
   };
-  if (S.pin) chain(S.pin.level, S.pin.keyhole, "pin");
+  const pinned = pinnedPieces();
+  if (pinned) for (const k of pinned.keys) chain(pinned.level, k, "pin");
   if (withHover && S.hover && S.hover.kind === "piece") chain(S.hover.level, S.hover.index, "hover");
   return marks;
 }
@@ -639,9 +789,33 @@ function drawMap(item) {
     item.keep = {key, canvas: back};
   }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.drawImage(item.keep.canvas, 0, 0);
   const V = S.sight?.levels[item.n];
-  if (!V) return;
+  if (!V) { ctx.drawImage(item.keep.canvas, 0, 0); return; }
+  const cx = d => view.ox + (M.det[5 * d + 1] + 0.5) * s, cy = d => view.oy + (M.det[5 * d] + 0.5) * s;
+  // Отклик карты на рисунок (зажжённые точки и кластеры) от наведения и выбора не зависит: он рисуется один раз на
+  // рисунок и вид карты в свой слой, дальше слой копируется. Пока гаснет вспышка новых кластеров — рисуется прямо.
+  const glow = S.flashAt ? Math.max(0, 1 - (performance.now() - S.flashAt) / 900) : 0;
+  if (glow > 0) {
+    ctx.drawImage(item.keep.canvas, 0, 0);
+    drawResponse(ctx, item, V, glow);
+  } else {
+    const layerKey = key + "|" + S.sightId;
+    if (!item.layer || item.layer.key !== layerKey) {
+      const layer = (item.layer && item.layer.canvas) || document.createElement("canvas");
+      layer.width = W; layer.height = H;
+      const l = layer.getContext("2d");
+      l.drawImage(item.keep.canvas, 0, 0);
+      drawResponse(l, item, V, 0);
+      item.layer = {key: layerKey, canvas: layer};
+    }
+    ctx.drawImage(item.layer.canvas, 0, 0);
+  }
+  drawMapMarks(ctx, item, V);
+}
+
+// Отклик карты на рисунок: зажжённые точки (§6.1) и сработавшие детекторы — кластеры (§6.5).
+function drawResponse(ctx, item, V, glow) {
+  const M = item.M, view = item.view, s = view.s;
   const cx = d => view.ox + (M.det[5 * d + 1] + 0.5) * s, cy = d => view.oy + (M.det[5 * d] + 0.5) * s;
   // Зажжённые точки (§6.1). Рисунок зажигает почти всю карту (порог λ_a уровня низкий), поэтому светятся только
   // сильные совпадения: яркость растёт от доли DASHBOARD_LIT_FLOOR диапазона «λ_a … сильнейшая активация» до его верха.
@@ -660,7 +834,7 @@ function drawMap(item) {
   ctx.globalAlpha = 1;
   // Кластеры — сработавшие детекторы (§6.5): цвет — слой, толщина — сколько кусочков рисунка в него набилось.
   // Жирно — DASHBOARD_TOP_CLUSTERS самых набитых, остальные — тонкой линией.
-  const fresh = S.previous[item.n], glow = S.flashAt ? Math.max(0, 1 - (performance.now() - S.flashAt) / 900) : 0;
+  const fresh = S.previous[item.n];
   ctx.lineWidth = DPR;
   for (const d of V.ranked) {
     if (V.top.has(d)) continue;
@@ -682,9 +856,15 @@ function drawMap(item) {
     }
   }
   ctx.globalAlpha = 1;
+}
+
+// Выбор и наведение поверх отклика карты.
+function drawMapMarks(ctx, item, V) {
+  const M = item.M, view = item.view, s = view.s;
+  const cx = d => view.ox + (M.det[5 * d + 1] + 0.5) * s, cy = d => view.oy + (M.det[5 * d] + 0.5) * s;
   // Выбранный кусочек и кусочек под курсором: их точки и кластеры.
   const own = [];
-  if (S.pin && S.pin.level === item.n) own.push([S.pin.keyhole, PIN]);
+  if (S.pin && S.pin.kind === "piece" && S.pin.level === item.n) own.push([S.pin.keyhole, PIN]);
   if (S.hover && S.hover.kind === "piece" && S.hover.level === item.n) own.push([S.hover.index, HOVER]);
   for (const [k, colour] of own) {
     ctx.strokeStyle = colour; ctx.fillStyle = colour;
@@ -709,6 +889,30 @@ function drawMap(item) {
     ctx.setLineDash([6 * DPR, 4 * DPR]); ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 * DPR;
     ctx.beginPath(); ctx.arc(cx(d), cy(d), Math.max(3, M.det[5 * d + 2] * s), 0, 2 * Math.PI); ctx.stroke();
     ctx.setLineDash([]);
+  }
+  // Путь выбранного по этой карте: сильнейший кластер каждого кусочка цепочки.
+  const path = S.pin ? highlights(false).get(item.n) : null;
+  if (path) {
+    const seen = new Set();
+    ctx.strokeStyle = MEMBER; ctx.lineWidth = 1.5 * DPR; ctx.globalAlpha = 0.85;
+    for (const [k] of path) {
+      const d = V.best[k];
+      if (d < 0 || seen.has(d)) continue;
+      seen.add(d);
+      ctx.beginPath(); ctx.arc(cx(d), cy(d), Math.max(3, M.det[5 * d + 2] * s), 0, 2 * Math.PI); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  // Выбранные кластер или точка карты.
+  if (S.pin && S.pin.kind !== "piece" && S.pin.level === item.n) {
+    ctx.strokeStyle = PIN; ctx.lineWidth = 3 * DPR;
+    if (S.pin.kind === "cluster") {
+      const d = S.pin.index;
+      ctx.beginPath(); ctx.arc(cx(d), cy(d), Math.max(4, M.det[5 * d + 2] * s), 0, 2 * Math.PI); ctx.stroke();
+    } else {
+      const p = S.pin.index, left = view.ox + M.cells[2 * p + 1] * s, top = view.oy + M.cells[2 * p] * s;
+      ctx.strokeRect(left - 2 * DPR, top - 2 * DPR, s + 4 * DPR, s + 4 * DPR);
+    }
   }
 }
 
@@ -740,13 +944,27 @@ function interactive(item) {
     zoomAt(item, (event.clientX - box.left) * k, (event.clientY - box.top) * k, Math.pow(1.0015, -event.deltaY));
     drawMap(item);
   }, {passive: false});
-  canvas.addEventListener("pointerdown", event => { drag = [event.clientX, event.clientY]; canvas.style.cursor = "grabbing"; hideTip(); });
+  canvas.addEventListener("pointerdown", event => { drag = [event.clientX, event.clientY]; item.moved = 0; canvas.style.cursor = "grabbing"; hideTip(); });
   window.addEventListener("pointerup", () => { if (drag) { drag = null; canvas.style.cursor = "grab"; } });
   window.addEventListener("pointermove", event => {
     if (!drag) return;
     const k = canvas.width / canvas.getBoundingClientRect().width;
+    item.moved += Math.abs(event.clientX - drag[0]) + Math.abs(event.clientY - drag[1]);
     item.view.ox += (event.clientX - drag[0]) * k; item.view.oy += (event.clientY - drag[1]) * k; drag = [event.clientX, event.clientY];
     drawMap(item);
+  });
+  // Щелчок (без перетаскивания) по карте выбирает точку раскладки под курсором: путь кусочков рисунка, которые её
+  // зажгли, по всем уровням (список кусочков точки приходит с сервера). В пустой клетке — кластер под курсором.
+  canvas.addEventListener("click", async event => {
+    if (item.moved > 4 || !S.sight) return;
+    const box = canvas.getBoundingClientRect(), k = canvas.width / box.width, view = item.view, M = item.M;
+    const x = Math.floor(((event.clientX - box.left) * k - view.ox) / view.s), y = Math.floor(((event.clientY - box.top) * k - view.oy) / view.s);
+    const i = x >= 0 && y >= 0 && x < M.width && y < M.height ? M.index[y * M.width + x] : -1;
+    const target = i >= 0 ? {kind: "point", level: item.n, index: i} : mapAt(item, event);
+    const same = S.pin && target && S.pin.kind === target.kind && S.pin.level === target.level && S.pin.index === target.index;
+    S.pin = target && !same ? {kind: target.kind, level: target.level, index: target.index} : null;
+    if (S.pin && S.pin.kind === "point") await loadPointPieces();
+    render();
   });
   canvas.addEventListener("pointermove", event => { if (!drag) hover(mapAt(item, event), event); });
   canvas.addEventListener("pointerleave", () => hover(null));
@@ -755,7 +973,7 @@ function interactive(item) {
   item.pieces.addEventListener("pointerleave", () => hover(null));
   item.pieces.addEventListener("click", event => {
     const k = pieceAt(item, event);
-    if (k >= 0 && !(S.pin && S.pin.level === item.n && S.pin.keyhole === k)) pin(item.n, k); else S.pin = null;
+    if (k >= 0 && !(S.pin && S.pin.kind === "piece" && S.pin.level === item.n && S.pin.keyhole === k)) pin(item.n, k); else S.pin = null;
     render();
   });
 }
@@ -763,15 +981,28 @@ function interactive(item) {
 // Выбрать кусочек k уровня n; его место на рисунке запоминается, чтобы выбор пережил следующий штрих.
 function pin(n, k) {
   const V = S.sight.levels[n];
-  S.pin = {level: n, keyhole: k, y: V.centre[2 * k], x: V.centre[2 * k + 1]};
+  S.pin = {kind: "piece", level: n, keyhole: k, y: V.centre[2 * k], x: V.centre[2 * k + 1]};
 }
 
 function hover(target, event) {
   const same = (a, b) => (a === b) || (a && b && a.kind === b.kind && a.level === b.level && a.index === b.index);
   if (!same(target, S.hover)) {
+    // Перерисовывается только то, что меняется: точка карты — ничего (лишь подсказка); кластер — рисунок и карта
+    // своего уровня; кусочек — рисунки всех уровней (его цепочка) и карта своего уровня.
+    const need = S.redraw || (S.redraw = {pieces: new Set(), maps: new Set()});
+    for (const h of [S.hover, target]) {
+      if (!h || h.kind === "point") continue;
+      need.maps.add(h.level);
+      if (h.kind === "piece") for (const item of S.cards) need.pieces.add(item.n); else need.pieces.add(h.level);
+    }
     S.hover = target;
     cancelAnimationFrame(S.frame);
-    S.frame = requestAnimationFrame(() => { for (const item of S.cards) { drawPieces(item); drawMap(item); } });
+    S.frame = requestAnimationFrame(() => {
+      const todo = S.redraw;
+      S.redraw = null;
+      if (!todo) return;
+      for (const item of S.cards) { if (todo.pieces.has(item.n)) drawPieces(item); if (todo.maps.has(item.n)) drawMap(item); }
+    });
     if (target && event) showTip(target, event); else hideTip();
   } else if (target && event) placeTip(event);
 }
@@ -861,73 +1092,229 @@ function renderAnswer() {
 }
 
 function renderTrace() {
-  const body = $("traceBody"), sight = S.sight;
+  const body = $("traceBody"), sight = S.sight, pinned = pinnedPieces();
+  const want = Boolean(sight && pinned && pinned.keys.length);
+  // Пока что-то выбрано, полоса пути выше: в ней кусочки всех уровней. Высота меняется — карты пересчитываются.
+  if (document.body.classList.contains("pinned") !== want) { document.body.classList.toggle("pinned", want); resize(); return; }
   body.innerHTML = "";
-  if (!sight || !S.pin) {
-    body.innerHTML = `<div class="note">Щёлкните по кусочку (кругу) на рисунке любого уровня: здесь появится, из чего он собран ниже, ` +
-      `в какие кусочки вошёл выше и какие кластеры зажёг на каждом уровне. Наведение на кластер карты подсвечивает кусочки, которые в него набились.</div>`;
+  if (!want) {
+    body.innerHTML = pinned
+      ? `<div class="note">Выбранную ${S.pin.kind === "point" ? "точку карты" : "область"} не зажёг ни один кусочек рисунка — пути нет. ` +
+        `Яркие (белые) точки карты — те, что рисунок зажёг сильно.</div>`
+      : `<div class="note">Щёлкните по точке на карте уровня (или по кусочку на рисунке): здесь по уровням появятся кусочки рисунка, ` +
+        `которые её зажгли, и кусочки, из которых они собраны, — вплотную, в том порядке, в каком стоят в уровне выше. ` +
+        `Колесо — приблизить, тянуть — сдвинуть, двойной щелчок — всё.</div>`;
     return;
   }
-  const marks = highlights(false);
+  const marks = highlights(false), plan = tracePlan(pinned);
+  S.traceSteps = [];
   for (let n = 0; n < sight.levels.length; n++) {
-    const V = sight.levels[n], M = S.model.levels[n], chosen = [...(marks.get(n) || new Map()).keys()];
     const step = document.createElement("div");
     step.className = "step";
+    const title = document.createElement("div");
+    title.className = "steptitle";
+    title.textContent = `Уровень ${n + 1}` + (n === pinned.level ? " · выбранное" : n < pinned.level ? " · из чего собрано" : " · куда вошло");
     const canvas = document.createElement("canvas");
-    canvas.width = canvas.height = 116 * DPR;
-    const ctx = canvas.getContext("2d");
-    const item = {pieces: canvas, n};
-    drawTraceDigit(ctx, item, V, chosen);
+    step.appendChild(title);
     step.appendChild(canvas);
-    const text = document.createElement("div");
-    text.className = "text";
-    const clusters = new Map();
-    for (const k of chosen) for (let j = V.fired.start[k]; j < V.fired.start[k + 1]; j++) {
-      const i = V.fired.order[j], d = V.firedDetector[i];
-      clusters.set(d, Math.max(clusters.get(d) || 0, V.firedLevel[i]));
-    }
-    const strongest = [...clusters.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
-    text.innerHTML = `<b>Уровень ${M.number}</b>${n === S.pin.level ? " — выбранный кусочек" : n < S.pin.level ? " — из чего собран" : " — куда вошёл"}<br>` +
-      `кусочков: <b>${chosen.length}</b>, кластеров зажгли: <b>${clusters.size}</b><br>` +
-      strongest.map(([d, level]) => { const c = composition(M, d)[0]; return `слой ${M.layer[d]}: E = ${level.toFixed(2)}, «${c.digit}» ${(100 * c.share).toFixed(0)} %`; }).join("<br>");
-    const glyphs = document.createElement("div");
-    glyphs.className = "glyphs";
-    for (const [d] of strongest) {
-      const inside = members(M, d).slice().sort((a, b) => V.pointAct[b] - V.pointAct[a]);
-      if (inside.length) glyphs.appendChild(glyphCanvas(M, inside[0], 40, true));
-    }
-    text.appendChild(glyphs);
-    step.appendChild(text);
     body.appendChild(step);
+    const tiles = n <= pinned.level ? plan.tiles(n) : aboveTiles(n, [...(marks.get(n) || new Map()).keys()]);
+    const entry = {n, canvas, tiles: tiles.list, span: tiles.span};
+    S.traceSteps.push(entry);
+    stepEvents(entry);
+    drawStep(entry);
   }
 }
 
-function drawTraceDigit(ctx, item, V, chosen) {
-  const W = item.pieces.width, unit = W / DRAW.side, cell = S.model.cell, px = x => (x + 0.5) * cell * unit;
-  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, W);
-  const tile = document.createElement("canvas"); tile.width = tile.height = DRAW.side;
-  const t = tile.getContext("2d"), data = t.createImageData(DRAW.side, DRAW.side);
-  for (let i = 0; i < S.image.length; i++) { const v = S.image[i] * 0.45; data.data.set([v, v, v, 255], 4 * i); }
-  t.putImageData(data, 0, 0);
-  ctx.drawImage(tile, 0, 0, W, W);
-  for (const k of chosen) {
-    const own = item.n === S.pin.level && k === S.pin.keyhole;
-    ctx.strokeStyle = own ? PIN : MEMBER; ctx.fillStyle = ctx.strokeStyle;
-    ctx.globalAlpha = own ? 1 : 0.3; ctx.lineWidth = own ? Math.max(2, W / 50) : Math.max(1, W / 160);
-    ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), V.extent[k] * cell * unit, 0, 2 * Math.PI); ctx.stroke();
-    ctx.globalAlpha = 1;
-    ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), Math.max(2, W / 60), 0, 2 * Math.PI); ctx.fill();
+// Плитки уровня n в свёртке выбранного: кусочки вплотную, вложенные так, как они стоят в уровне выше. Дети кусочка —
+// элементы его окна (кусочки уровня ниже, П.2, §6.6) в сетке g×g; клетка ребёнка — по его месту на рисунке
+// относительно родителя (слева вверху — в левой верхней клетке). Зазор между группами больше, чем внутри группы.
+const TREE_ROOTS = 4;  // у кластера и точки карты — столько сильнейших кусочков
+
+function elementsOf(n, k) {
+  const V = S.sight.levels[n], found = new Set();
+  for (let j = V.entries.start[k]; j < V.entries.start[k + 1]; j++) found.add(V.entryElement[V.entries.order[j]]);
+  return [...found];
+}
+
+function treeNode(n, k, sides, known) {
+  // Один кусочек входит во многие окна уровня выше: его узел строится один раз.
+  const key = n * 65536 + k;
+  if (known.has(key)) return known.get(key);
+  const node = {n, k, children: n > 0 ? elementsOf(n, k).map(e => treeNode(n - 1, e, sides, known)) : []};
+  if (n > 0) sides[n] = Math.max(sides[n] || 1, Math.ceil(Math.sqrt(Math.max(1, node.children.length))));
+  known.set(key, node);
+  return node;
+}
+
+// Места в сетке g×g: жадно, от ближайших пар «кусочек — клетка» по нормированному месту на рисунке.
+function gridPlaces(points, g) {
+  const ys = points.map(p => p[0]), xs = points.map(p => p[1]);
+  const y0 = Math.min(...ys), x0 = Math.min(...xs), hy = Math.max(1e-6, Math.max(...ys) - y0), hx = Math.max(1e-6, Math.max(...xs) - x0);
+  const pairs = [];
+  points.forEach((p, i) => {
+    const u = points.length > 1 ? (p[1] - x0) / hx : 0.5, v = points.length > 1 ? (p[0] - y0) / hy : 0.5;
+    for (let c = 0; c < g * g; c++) {
+      const cx = g > 1 ? (c % g) / (g - 1) : 0.5, cy = g > 1 ? Math.floor(c / g) / (g - 1) : 0.5;
+      pairs.push([(u - cx) ** 2 + (v - cy) ** 2, i, c]);
+    }
+  });
+  pairs.sort((a, b) => a[0] - b[0]);
+  const place = new Array(points.length).fill(-1), taken = new Set();
+  for (const [, i, c] of pairs) if (place[i] < 0 && !taken.has(c)) { place[i] = c; taken.add(c); }
+  return place;
+}
+
+function tracePlan(pinned) {
+  const n0 = pinned.level, Vtop = S.sight.levels[n0];
+  const roots = pinned.keys.slice(0, TREE_ROOTS);  // кусочки идут от сильнейшего (pinnedPieces)
+  const sides = {}, known = new Map(), nodes = roots.map(k => treeNode(n0, k, sides, known)), rootSide = Math.ceil(Math.sqrt(nodes.length));
+  // Места детей в сетке зависят только от кусочка: считаются один раз на кусочек.
+  const placed = new Map();
+  const placesOf = node => {
+    if (!placed.has(node)) {
+      const below = S.sight.levels[node.n - 1];
+      placed.set(node, gridPlaces(node.children.map(c => [below.centre[2 * c.k], below.centre[2 * c.k + 1]]), sides[node.n]));
+    }
+    return placed.get(node);
+  };
+  const rootPlaces = gridPlaces(nodes.map(node => [Vtop.centre[2 * node.k], Vtop.centre[2 * node.k + 1]]), rootSide);
+  return {
+    tiles(n) {
+      // Плитка — 1; узел уровня m > n — сетка своих детей; зазор: внутри группы — 0.06, между группами — 0.4 на ступень.
+      const gapAt = m => m - n === 1 ? 0.06 : 0.4 * (m - n - 1);
+      const sizeAt = m => m === n ? 1 : sides[m] * sizeAt(m - 1) + (sides[m] - 1) * gapAt(m);
+      const list = [];
+      const place = (node, left, top) => {
+        if (node.n === n) { list.push({k: node.k, left, top, size: 1}); return; }
+        const g = sides[node.n], child = sizeAt(node.n - 1), gap = gapAt(node.n), places = placesOf(node);
+        node.children.forEach((c, i) => place(c, left + (places[i] % g) * (child + gap), top + Math.floor(places[i] / g) * (child + gap)));
+      };
+      const rootSize = sizeAt(n0), rootGap = 0.4 * (n0 - n + 1);
+      nodes.forEach((node, i) => place(node, (rootPlaces[i] % rootSide) * (rootSize + rootGap), Math.floor(rootPlaces[i] / rootSide) * (rootSize + rootGap)));
+      return {list, span: rootSide * rootSize + (rootSide - 1) * rootGap};
+    },
+  };
+}
+
+// Уровни выше выбранного: кусочки, куда оно вошло, — одной сеткой по их местам на рисунке.
+function aboveTiles(n, keys) {
+  const V = S.sight.levels[n], g = Math.max(1, Math.ceil(Math.sqrt(keys.length))), gap = 0.06;
+  const places = gridPlaces(keys.map(k => [V.centre[2 * k], V.centre[2 * k + 1]]), g);
+  return {list: keys.map((k, i) => ({k, left: (places[i] % g) * (1 + gap), top: Math.floor(places[i] / g) * (1 + gap), size: 1})),
+    span: g + (g - 1) * gap};
+}
+
+// Картинка кусочка k уровня n: штрихи рисунка в его окне, окно вписано в квадрат. Рисуется один раз на рисунок —
+// в свёртке один кусочек стоит много раз (в каждом окне уровня выше, куда он вошёл).
+const SPRITE = 64;
+
+function pieceStrokes(ctx, n, k, x, y, size, alpha) {
+  const V = S.sight.levels[n], sticks = S.sight.sticks;
+  const cy = V.centre[2 * k], cx = V.centre[2 * k + 1], extent = V.extent[k], unit = (size / 2) / (extent + 0.6);
+  for (let j = 0; j < sticks.count; j++) {
+    const dy = sticks.y[j] - cy, dx = sticks.x[j] - cx;
+    if (Math.hypot(dy, dx) > extent + 1e-5) continue;
+    stick(ctx, x + size / 2 + dx * unit, y + size / 2 + dy * unit, unit, sticks.angle[j], alpha, null, 0);
   }
+}
+
+function pieceSprite(n, k) {
+  if (!S.sprites || S.sprites.id !== S.sightId) S.sprites = {id: S.sightId, levels: {}};
+  const level = S.sprites.levels[n] || (S.sprites.levels[n] = new Map());
+  let sprite = level.get(k);
+  if (!sprite) {
+    sprite = document.createElement("canvas");
+    sprite.width = sprite.height = SPRITE;
+    const ctx = sprite.getContext("2d");
+    ctx.lineCap = "round";
+    pieceStrokes(ctx, n, k, 0, 0, SPRITE, 1);
+    level.set(k, sprite);
+  }
+  return sprite;
+}
+
+// Плитка — кусочек рисунка: штрихи рисунка в окне кусочка, окно вписано в плитку; яркость — сила кусочка.
+function drawStep(entry) {
+  const {n, canvas, tiles, span} = entry, W = Math.round(canvas.clientWidth * DPR), H = Math.round(canvas.clientHeight * DPR);
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  const key = JSON.stringify([S.pin, W, H, tiles.length]);
+  S.stepViews = S.stepViews || {};
+  if (!S.stepViews[n] || S.stepViews[n].key !== key) {
+    const s = Math.min(W, H) * 0.96 / Math.max(1e-6, span);
+    S.stepViews[n] = {key, s, ox: (W - span * s) / 2, oy: (H - span * s) / 2};
+  }
+  const view = S.stepViews[n], V = S.sight.levels[n];
+  let strongest = 0;
+  for (const t of tiles) strongest = Math.max(strongest, V.strength[t.k]);
+  ctx.lineCap = "round";
+  for (const t of tiles) {
+    const x = view.ox + t.left * view.s, y = view.oy + t.top * view.s, size = t.size * view.s;
+    if (x > W || y > H || x + size < 0 || y + size < 0) continue;
+    ctx.globalAlpha = 1; ctx.fillStyle = "#15171c"; ctx.fillRect(x, y, size, size);
+    const weight = strongest > 0 ? Math.pow(V.strength[t.k] / strongest, 1.5) : 0, alpha = 0.15 + 0.85 * weight;
+    if (size < 3 * DPR) continue;
+    // Мелкая плитка — готовой картинкой кусочка; крупная (приблизили) — штрихами, чтобы было чётко.
+    if (size > 1.6 * SPRITE) pieceStrokes(ctx, n, t.k, x, y, size, alpha);
+    else { ctx.globalAlpha = alpha; ctx.drawImage(pieceSprite(n, t.k), x, y, size, size); }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function stepAt(entry, event) {
+  const box = entry.canvas.getBoundingClientRect(), k = entry.canvas.width / box.width, view = S.stepViews[entry.n];
+  const x = ((event.clientX - box.left) * k - view.ox) / view.s, y = ((event.clientY - box.top) * k - view.oy) / view.s;
+  for (const t of entry.tiles) if (x >= t.left && y >= t.top && x <= t.left + t.size && y <= t.top + t.size) return t.k;
+  return -1;
+}
+
+// Колесо — приблизить, тянуть — сдвинуть, двойной щелчок — всё; наведение подсвечивает кусочек на рисунке уровня.
+function stepEvents(entry) {
+  const canvas = entry.canvas;
+  let pan = null;
+  canvas.addEventListener("wheel", event => {
+    event.preventDefault();
+    const view = S.stepViews[entry.n], r = canvas.getBoundingClientRect(), k = canvas.width / r.width;
+    const mx = (event.clientX - r.left) * k, my = (event.clientY - r.top) * k, f = Math.pow(1.0015, -event.deltaY);
+    view.ox = mx - (mx - view.ox) * f; view.oy = my - (my - view.oy) * f; view.s *= f;
+    drawStep(entry);
+  }, {passive: false});
+  canvas.addEventListener("pointerdown", event => { pan = [event.clientX, event.clientY]; canvas.setPointerCapture(event.pointerId); });
+  canvas.addEventListener("pointerup", () => { pan = null; });
+  canvas.addEventListener("dblclick", () => { S.stepViews[entry.n] = null; drawStep(entry); });
+  canvas.addEventListener("pointermove", event => {
+    if (pan) {
+      const view = S.stepViews[entry.n], k = canvas.width / canvas.getBoundingClientRect().width;
+      view.ox += (event.clientX - pan[0]) * k; view.oy += (event.clientY - pan[1]) * k; pan = [event.clientX, event.clientY];
+      drawStep(entry);
+      return;
+    }
+    const k = stepAt(entry, event);
+    hover(k >= 0 ? {kind: "piece", level: entry.n, index: k} : null);
+  });
+  canvas.addEventListener("pointerleave", () => hover(null));
 }
 
 function renderStatus() {
   const m = S.model, levels = m.levels.length;
-  $("status").textContent = `цикл: ${m.originals} цифр MNIST и их виды — ${m.train} обучающих картинок · уровней ${levels} · ` +
+  const views = m.train > m.originals ? ` и их виды — ${m.train} обучающих картинок` : " без видов";
+  $("status").textContent = `цикл: ${m.originals} цифр MNIST${views} · уровней ${levels} · ` +
     `карты ${m.levels.map(L => L.points).join(" / ")} точек · детекторов ${m.levels.map(L => L.count).join(" / ")} · читатель λ = ${m.decay}` +
-    (S.sight ? ` · ответ сервера ${Math.round(S.sight.ms)} мс` : "");
+    (S.sight ? ` · путь рисунка ${Math.round(S.sight.ms)} мс` : "") + rateNote();
   const maxLayers = Math.max(...m.levels.map(L => L.thresholds.length));
   $("legend").innerHTML = Array.from({length: maxLayers}, (_, k) => `<span><i style="border-color:${LAYER[k % LAYER.length]}"></i>слой ${k}</span>`).join("") +
-    `<span>□ зажжённая точка</span><span style="color:${PIN}">● выбранный кусочек</span><span style="color:${MEMBER}">● его цепочка</span>`;
+    `<span>□ зажжённая точка</span><span style="color:${PIN}">● выбранное (кусочек, кластер, точка)</span><span style="color:${MEMBER}">● его путь</span>` +
+    `<span>цветные штрихи на уровне 2+ — детали уровня ниже, цвет — цифра</span>`;
+}
+
+// Частота обновления за последнюю секунду и рабочие процессы сервера.
+function rateNote() {
+  const now = performance.now();
+  S.updates = S.updates.filter(t => now - t < 1000);
+  const workers = S.workers && S.workers.workers ? ` · процессов ${S.workers.ready} из ${S.workers.workers}` : "";
+  return (S.updates.length > 1 ? ` · ${S.updates.length} обновлений/с` : "") + workers;
 }
 
 function render() {
@@ -960,6 +1347,7 @@ async function start() {
   buildCards();
   drawPad();
   render();
+  watchWorkers();
   const asked = new URLSearchParams(location.search);
   S.wishPin = asked.get("pin");
   if (asked.has("example")) loadExample();

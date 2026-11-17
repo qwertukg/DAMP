@@ -34,6 +34,12 @@ class HierarchyDetection:
     """
 
     BLOCK = 2048
+    # Строк в одном умножении «активация × поля детекторов» и «активация × соседи». Видеокарта выбирает ядро
+    # умножения по числу строк, и порядок сложения в float32 менялся бы от размера пачки. Поэтому пачка идёт частями
+    # ровно по ROWS строк (последняя дополняется нулями): ядро всегда одно, и результат строки зависит только от неё
+    # самой — не от того, сколько строк идёт рядом. Число небольшое: один рисунок дашборда — около сотни окон, и
+    # дополнять их до тысяч строк значило бы считать в десятки раз больше нужного.
+    ROWS = 256
     # Ячеек матрицы «вхождения стимулов × точки карты» за один проход по наборам (float32: 4 байта на ячейку).
     SET_CELLS = 48_000_000
 
@@ -153,10 +159,10 @@ class HierarchyDetection:
         with torch.no_grad():
             for start in range(0, packed.shape[0], self.BLOCK):
                 raw = self._activation(self._to_device(packed[start : start + self.BLOCK]))
-                activation = self._local(raw, self.BLOCK)
+                activation = self._local(raw)
                 lit += int((activation > 0).sum().item())
                 dropped += int((raw > 0).sum().item()) - int((activation > 0).sum().item())
-                level = self._level(activation, self.BLOCK)
+                level = self._level(activation)
                 found = torch.nonzero(level >= self._detector_threshold)
                 rows.append(found[:, 0].cpu().numpy() + start)
                 columns.append(found[:, 1].cpu().numpy())
@@ -194,7 +200,7 @@ class HierarchyDetection:
         rows, points, values = [], [], []
         with torch.no_grad():
             for start in range(0, packed.shape[0], self.BLOCK):
-                activation = self._local(self._activation(self._to_device(packed[start : start + self.BLOCK])), self.BLOCK)
+                activation = self._local(self._activation(self._to_device(packed[start : start + self.BLOCK])))
                 found = torch.nonzero(activation > 0)
                 rows.append(found[:, 0].cpu().numpy() + start)
                 points.append(found[:, 1].cpu().numpy())
@@ -204,38 +210,71 @@ class HierarchyDetection:
         return (np.concatenate(rows).astype(np.int64), np.concatenate(points).astype(np.int64),
                 np.concatenate(values).astype(np.float32))
 
-    def _level(self, activation, rows: int):  # noqa: ANN001, ANN202
-        """Уровень активации детекторов E(d) = Σ a_j · e_j / e_d по полю детектора (§6.5), строка за строкой.
+    def active_with_lit(
+        self, packed: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"]:
+        """Срабатывания и зажжённые точки за один проход: (код, детектор, уровень активации) и (код, точка, a_j).
 
-        Строки умножения независимы, но видеокарта выбирает ядро матричного умножения по числу строк, и порядок
-        сложения в float32 менялся бы от размера пачки: уровень окна сдвигался бы на ~1e-6 от того, сколько
-        проверочных окон идёт с ним в одной пачке. Поэтому пачка всегда дополняется нулевыми строками до rows
-        (не меньше строк пачки): ядро одно и то же, уровень строки зависит только от неё самой (вне статьи —
-        техника счёта; проверочные картинки на обучающие окна не влияют бит в бит).
+        То же, что active_sets для наборов из одного кода (набор i — код i) и lit для тех же кодов, цифра в цифру,
+        но активация карты (§6.1) и энергия активации считаются один раз, а не дважды. Нужно пути одной картинки
+        (дашборд): там каждое окно — свой набор, и карта отклика показывается вместе со срабатываниями.
         """
         torch = self._torch
-        count = int(activation.shape[0])
-        size = max(int(rows), count)
-        if count < size:
-            activation = torch.cat([activation, activation.new_zeros((size - count, activation.shape[1]))])
-        level = ((activation * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
-        return level[:count]
+        packed = np.ascontiguousarray(packed, dtype=np.uint8)
+        if packed.ndim != 2 or packed.shape[1] != self._row_bytes:
+            raise ValueError("codes must be rows × ceil(code_length / 8) packed bytes")
+        rows, columns, levels, lit_rows, lit_points, lit_values = [], [], [], [], [], []
+        with torch.no_grad():
+            for start in range(0, packed.shape[0], self.BLOCK):
+                activation = self._local(self._activation(self._to_device(packed[start : start + self.BLOCK])))
+                lit = torch.nonzero(activation > 0)
+                lit_rows.append(lit[:, 0].cpu().numpy() + start)
+                lit_points.append(lit[:, 1].cpu().numpy())
+                lit_values.append(activation[lit[:, 0], lit[:, 1]].cpu().numpy())
+                level = self._level(activation)
+                found = torch.nonzero(level >= self._detector_threshold)
+                rows.append(found[:, 0].cpu().numpy() + start)
+                columns.append(found[:, 1].cpu().numpy())
+                levels.append(level[found[:, 0], found[:, 1]].cpu().numpy())
 
-    def _local(self, activation, rows: int):  # noqa: ANN001, ANN202
+        def joined(parts: list, dtype) -> "np.ndarray":  # noqa: ANN001
+            return np.concatenate(parts).astype(dtype) if parts else np.zeros(0, dtype=dtype)
+
+        return (joined(rows, np.int64), joined(columns, np.int64), joined(levels, np.float32),
+                joined(lit_rows, np.int64), joined(lit_points, np.int64), joined(lit_values, np.float32))
+
+    def _by_rows(self, activation, compute):  # noqa: ANN001, ANN202
+        """compute над строками activation частями ровно по ROWS строк (последняя часть дополняется нулевыми
+        строками): ядро умножения одно и то же, результат строки зависит только от неё самой (вне статьи — техника
+        счёта; проверочные картинки на обучающие окна не влияют бит в бит)."""
+        torch = self._torch
+        count = int(activation.shape[0])
+        parts = []
+        for start in range(0, max(count, 1), self.ROWS):
+            part = activation[start : start + self.ROWS]
+            rows = int(part.shape[0])
+            if rows < self.ROWS:
+                part = torch.cat([part, part.new_zeros((self.ROWS - rows, part.shape[1]))])
+            parts.append(compute(part)[:rows])
+        return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+    def _level(self, activation):  # noqa: ANN001, ANN202
+        """Уровень активации детекторов E(d) = Σ a_j · e_j / e_d по полю детектора (§6.5), строка за строкой
+        (частями по ROWS строк, см. _by_rows)."""
+        return self._by_rows(
+            activation, lambda part: ((part * self._weights[None, :]) @ self._coverage) / self._detector_energy[None, :]
+        )
+
+    def _local(self, activation):  # noqa: ANN001, ANN202
         """Энергия активации (расширение статьи): Ê_a(j) = E_a(j) / max E_a, E_a(j) = Σ a_v / d(j, v) по точкам
         R(j, r_e) без самой j — формула §5.7, где вместо сходства с соседями их активация. Точки с Ê_a < μ_a гаснут.
 
-        Пачка дополняется нулевыми строками до rows, как в _level: порядок сложения не зависит от размера пачки.
+        Счёт — частями по ROWS строк, как в _level: порядок сложения не зависит от размера пачки.
         """
         if self._neighbours is None:
             return activation
         torch = self._torch
-        count = int(activation.shape[0])
-        size = max(int(rows), count)
-        padded = activation
-        if count < size:
-            padded = torch.cat([activation, activation.new_zeros((size - count, activation.shape[1]))])
-        energy = torch.sparse.mm(self._neighbours, padded.T).T[:count]
+        energy = self._by_rows(activation, lambda part: torch.sparse.mm(self._neighbours, part.T).T)
         top = energy.max(dim=1, keepdim=True).values
         relative = torch.where(top > 0, energy / torch.clamp(top, min=1e-12), torch.zeros_like(energy))
         return torch.where(relative >= self._local_threshold, activation, torch.zeros_like(activation))
@@ -310,10 +349,10 @@ class HierarchyDetection:
                         combined[local] = torch.maximum(combined[local], picked)
                     # Энергия активации — по объединённой реакции набора (расширение статьи; 0 — выключено).
                     before = int((combined > 0).sum().item())
-                    combined = self._local(combined, limit)
+                    combined = self._local(combined)
                     lit += int((combined > 0).sum().item())
                     dropped += before - int((combined > 0).sum().item())
-                    level = self._level(combined, limit)
+                    level = self._level(combined)
                     found = torch.nonzero(level >= self._detector_threshold)
                     rows.append(found[:, 0].cpu().numpy() + first)
                     columns.append(found[:, 1].cpu().numpy())
