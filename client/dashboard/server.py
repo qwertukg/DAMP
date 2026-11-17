@@ -11,7 +11,7 @@
 | `GET /api/model` | один раз: карты уровней (точки, их окна, детекторы по слоям), углопозиции обучающих картинок, кисть |
 | `GET /api/example` | пример: случайная пятёрка из первых `DASHBOARD_EXAMPLES` картинок MNIST t10k и её номер в MNIST |
 | `GET /api/status` | сколько рабочих процессов готово считать рисунки (страница шлёт столько запросов сразу) |
-| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали, вероятности; с выбранной точкой карты — ещё и её кусочки |
+| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали; класс — ответ памяти («знаю целиком / по частям / не знаю», §7.1.13.3), голоса кусочков по уровням и вероятности линейного читателя (§9.3); с выбранной точкой карты — ещё и её кусочки |
 | `POST /api/point` | рисунок и выбранная точка карты → все кусочки рисунка, которые её зажгли, по убыванию активации |
 
 Рисунки считают рабочие процессы (`DASHBOARD_WORKERS`): у каждого свой обученный цикл, поэтому несколько рисунков
@@ -59,6 +59,8 @@ class DashboardData:
             "originals": sticks.originals,
             "decay": ladder.decay,
             "workers": int(settings["DASHBOARD_WORKERS"]),
+            # Штрихи по середине линии: угол без стрелки, 0…180° (0° и 180° — одна линия).
+            "axial": bool(settings["MNIST_STROKE_DETECTORS"]) and bool(settings["MNIST_STROKE_MIDLINE"]),
             "topClusters": int(settings["DASHBOARD_TOP_CLUSTERS"]),
             "litPerPiece": int(settings["DASHBOARD_LIT_PER_PIECE"]),
             "ownClusters": int(settings["DASHBOARD_OWN_CLUSTERS"]),
@@ -131,6 +133,15 @@ class DashboardData:
                 "strength": packed(level.strength, "<f4"), "detailLength": level.detail_length,
             })
         return {
+            # Ответ памяти (§7.1.13.3): знаю целиком, по частям или не знаю — и голоса кусочков по уровням (§2.2.5).
+            "memory": {"kind": sight.verdict, "digit": sight.memory_digit, "level": sight.memory_level, "share": sight.memory_share},
+            "votes": [
+                {"number": level.number, "votes": list(level.votes), "digit": level.digit, "share": level.share,
+                 "knowledge": level.knowledge, "threshold": level.threshold, "knows": level.knows,
+                 "keyholes": level.keyholes, "voted": level.voted}
+                for level in sight.votes
+            ],
+            # Линейный читатель (§9.3) — мерка для целых цифр.
             "digit": sight.digit,
             "probabilities": list(sight.probabilities),
             "ms": sight.seconds * 1000.0,
@@ -226,7 +237,9 @@ class SightWorkers:
     """Рабочие процессы пути рисунка: в каждом свой обученный цикл, рисунки считаются параллельно.
 
     Процессы поднимаются по одному в фоне (цикл каждого — из кеша шагов; рабочие файлы у них общие, поэтому не
-    разом). Они — копии главного цикла: в окно Rerun и в журнал не пишут.
+    разом). Они — копии главного цикла: в окно Rerun и в журнал не пишут. Процессы — не «демоны»: раскладка малой
+    карты заводит свои параллельные процессы, а «демону» это запрещено. Поэтому сервер закрывает их сам (stop); если
+    главный процесс убит, соединение рвётся и рабочие выходят сами.
     """
 
     def __init__(self, count: int, changes: dict, train: "int | None", map_points: "int | None") -> None:
@@ -238,6 +251,8 @@ class SightWorkers:
         self._map_points = map_points
         self._idle: "queue.Queue[int]" = queue.Queue()
         self._connections: dict[int, object] = {}
+        self._processes: list = []
+        self._stopped = False
 
     def start(self) -> None:
         threading.Thread(target=self._launch, daemon=True).start()
@@ -245,12 +260,15 @@ class SightWorkers:
     def _launch(self) -> None:
         context = multiprocessing.get_context("spawn")
         for number in range(self.count):
+            if self._stopped:
+                return
             parent, child = context.Pipe()
             before = os.environ.get("RERUN")
             os.environ["RERUN"] = "off"  # окно Rerun — у главного процесса
             try:
-                process = context.Process(target=worker, args=(child, self._changes, self._train, self._map_points), daemon=True)
+                process = context.Process(target=worker, args=(child, self._changes, self._train, self._map_points), daemon=False)
                 process.start()
+                self._processes.append((process, parent))
             finally:
                 if before is None:
                     os.environ.pop("RERUN", None)
@@ -267,6 +285,20 @@ class SightWorkers:
             self._connections[number] = parent
             self._idle.put(number)
             self.ready += 1
+
+    def stop(self) -> None:
+        """Закрыть рабочие процессы: соединение рвётся — рабочий выходит; кто ещё загружает цикл — снимается."""
+        self._stopped = True
+        self.ready = 0
+        for process, connection in self._processes:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        for process, _ in self._processes:
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.terminate()
 
     def ask(self, request: tuple) -> "bytes | None":
         """Ответ свободного рабочего процесса; None — готовых процессов нет (считает главный)."""
@@ -382,6 +414,8 @@ class DashboardServer:
             pass
         finally:
             http.server_close()
+            if self._workers is not None:
+                self._workers.stop()
 
     def snapshot(self, path: str, *, query: str = "example&pin=2:30", width: int = 1920, height: int = 1080) -> str:
         """Снимок страницы для README: пример-пятёрка (каждый раз другая) и выбранный кусочек уровня 2 со следом.

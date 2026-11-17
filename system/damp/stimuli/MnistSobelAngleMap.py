@@ -8,6 +8,7 @@ import numpy as np
 from damp.article_refs import CYCLIC_COORDS, OUTSIDE_ARTICLE
 from damp.logging import LOGGER
 from damp.stimuli.stroke_detectors import StrokeDetectors
+from damp.stimuli.stroke_midline import StrokeMidline
 
 
 AngleTriplet = Tuple[float, int, int]      # (angle, X_patch, Y_patch)
@@ -187,6 +188,8 @@ class MnistSobelAngleMap:
     upscaled: Optional[UpscaledSobel] = None
     subcell_position: bool = False
     stroke_detectors: Optional[StrokeDetectors] = None
+    # Точки середины линии вместо точек двух её краёв (только со stroke_detectors, у которых axial=True).
+    stroke_midline: Optional[StrokeMidline] = None
 
     # ВАЖНО: это не поля dataclass, а константы класса (ClassVar)
     EXPECTED_SIDE: ClassVar[int] = 28
@@ -260,6 +263,8 @@ class MnistSobelAngleMap:
             mode += ",subcell"  # место дробное: старая раскладка с целыми местами не подходит
         if self.contour_only and self.stroke_detectors is not None:
             mode += "," + self.stroke_detectors.signature  # штрихи детекторами над точками края, не по сетке
+            if self.stroke_midline is not None:
+                mode += "," + self.stroke_midline.signature  # точки — середина линии, а не два её края
         if self.upscaled is not None:
             # patch_size — в пикселях увеличенной картинки (до этой версии было в пикселях стимула).
             mode += f",{self.upscaled.signature},patch=work_px"
@@ -569,10 +574,17 @@ class MnistSobelAngleMap:
         остальной пайплайн меряет места в тех же единицах. Угол — направление суммы градиентов по куску края
         длиннее шага; сила — энергия детектора (§6.3).
         """
-        mask = self._contour_mask_of(work)
         p = float(self.work_patch)
         out: List[AngleTriplet] = []
-        for stroke in self.stroke_detectors.strokes(mask, gx, gy):
+        if self.stroke_midline is not None:
+            # Середина линии вместо двух краёв (замысел автора 2026-11-17): точки — гребень расстояния до края линии,
+            # угол — 0…180°.
+            y, x, vx, vy = self.stroke_midline.points(work)
+            found, points = self.stroke_detectors.strokes_of(y, x, vx, vy), int(y.shape[0])
+        else:
+            mask = self._contour_mask_of(work)
+            found, points = self.stroke_detectors.strokes(mask, gx, gy), int(mask.sum())
+        for stroke in found:
             angle = float(np.degrees(stroke.angle)) if self.angle_in_degrees else float(stroke.angle)
             out.append((angle, stroke.x / p - 0.5, stroke.y / p - 0.5, stroke.strength, stroke.half_length / p))
         LOGGER.event(
@@ -581,9 +593,10 @@ class MnistSobelAngleMap:
             data={
                 "contour_level": self.contour_level,
                 "scale": self.scale,
-                "contour_pixels": int(mask.sum()),
+                "contour_pixels": points,
                 "angle_positions": len(out),
                 "method": self.stroke_detectors.signature,
+                "midline": None if self.stroke_midline is None else self.stroke_midline.signature,
             },
         )
         return out

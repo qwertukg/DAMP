@@ -32,10 +32,28 @@ button.on { border-color: var(--pin); color: var(--pin); }
 #moveNote:empty, #padNote:empty { display: none; }
 .check { display: flex; gap: 6px; align-items: center; margin-top: 8px; color: var(--muted); cursor: pointer; }
 .note { color: var(--muted); margin: 6px 0 0; font-size: 12px; }
+/* Ответ памяти (§7.1.13.3): цифра, вердикт «знаю целиком / по частям / не знаю» и голоса кусочков по уровням. */
+#memory { display: flex; gap: 12px; align-items: center; }
+#memoryDigit { font-size: 52px; font-weight: 700; width: 64px; text-align: center; line-height: 1; }
+#memory.parts #memoryDigit { color: var(--pin); }
+#memory.unknown #memoryDigit { color: var(--muted); }
+#memoryKind { font-size: 14px; font-weight: 600; }
+#memory.parts #memoryKind { color: var(--pin); }
+#memory.unknown #memoryKind { color: var(--muted); }
+#memoryWhy { margin: 2px 0 0; }
+#voteRows { display: grid; grid-template-columns: auto 1fr auto; gap: 3px 8px; align-items: center; font-size: 12px; margin: 8px 0 0; color: var(--muted); }
+#voteRows:empty { display: none; }
+#voteRows .know { position: relative; height: 9px; background: var(--panel-2); border-radius: 3px; }
+#voteRows .know span { display: block; height: 100%; border-radius: 3px; background: var(--muted); }
+#voteRows .know.yes span { background: var(--accent); }
+#voteRows .know i { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--text); }
+#voteRows b { color: var(--text); }
+#voteRows .used, #voteRows .used b { color: var(--pin); }
+h2.second { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 #answer { display: flex; gap: 12px; align-items: center; }
-#digit { font-size: 52px; font-weight: 700; width: 64px; text-align: center; line-height: 1; }
-#bars { flex: 1; display: grid; grid-template-columns: 14px 1fr 38px; gap: 2px 6px; align-items: center; font-size: 12px; }
-#bars .bar { height: 9px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+#digit { font-size: 30px; font-weight: 700; width: 64px; text-align: center; line-height: 1; color: var(--muted); }
+#bars { flex: 1; display: grid; grid-template-columns: 14px 1fr 38px; gap: 1px 6px; align-items: center; font-size: 11px; }
+#bars .bar { height: 7px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
 #bars .bar span { display: block; height: 100%; background: var(--accent); }
 #bars .top { color: var(--text); font-weight: 700; }
 #bars .top + .bar span { background: var(--pin); }
@@ -66,7 +84,7 @@ footer { border-top: 1px solid var(--line); padding: 8px 12px; min-height: 0; ov
 #tip .mosaic { display: flex; flex-wrap: wrap; gap: 3px; clear: both; padding-top: 4px; }
 #tip .mosaic canvas { float: none; margin: 0; }
 #tip b { color: var(--text); }
-@media (max-width: 1100px) { :root { --left: 240px; --trace: 140px; } #digit { font-size: 40px; width: 48px; } }
+@media (max-width: 1100px) { :root { --left: 240px; --trace: 140px; } #memoryDigit { font-size: 40px; width: 48px; } #digit { width: 48px; } }
 
 /* Путь выбранного: по полю на уровень, в нём кусочки рисунка вплотную, как они вложены в уровень выше. */
 body.pinned { --trace: 44vh; }

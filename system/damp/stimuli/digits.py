@@ -123,7 +123,10 @@ class PictureSticks:
     Ключ — содержимое файлов набора MNIST, настройки и код извлечения (system/damp/cache.py).
     """
 
-    MODULES = ("damp.stimuli.digits", "damp.stimuli.MnistSobelAngleMap", "damp.stimuli.stroke_detectors")
+    MODULES = (
+        "damp.stimuli.digits", "damp.stimuli.MnistSobelAngleMap", "damp.stimuli.stroke_detectors",
+        "damp.stimuli.stroke_midline", "damp.stimuli.mnist",
+    )
     COLUMNS = 5  # угол, x, y, сила штриха, полудлина поля штриха
 
     def __init__(self, split: str, raw_files: Sequence[str]) -> None:

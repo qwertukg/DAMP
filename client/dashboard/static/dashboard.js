@@ -9,7 +9,8 @@ const DPR = Math.max(1, window.devicePixelRatio || 1);
 const LAYER = ["#ff4d4d", "#ffd23f", "#3ddc84", "#2ec4ff", "#8f7bff", "#c0c6d0", "#7fffd4", "#ffffff"]; // слой 0 — самые широкие поля
 const CLASS = Array.from({length: 10}, (_, c) => `hsl(${c * 36},85%,58%)`);
 const PIN = "#ff8c1a", HOVER = "#ff5ad1", MEMBER = "#4dd2ff";
-const hue = a => `hsl(${(((a % 360) + 360) % 360).toFixed(0)},95%,60%)`;
+// Цвет штриха — его угол; у штриха середины линии угол без стрелки (0° и 180° — одна линия): цвет идёт по кругу за 180°.
+const hue = a => { const turn = S.model && S.model.axial ? 2 * a : a; return `hsl(${(((turn % 360) + 360) % 360).toFixed(0)},95%,60%)`; };
 
 function dec(text, Type) {
   const bin = atob(text), bytes = new Uint8Array(bin.length);
@@ -56,6 +57,7 @@ function prepareModel(raw) {
     return M;
   });
   return {train: raw.train, originals: raw.originals, decay: raw.decay, brush: raw.brush, cell: raw.grid.cell, sticks, levels,
+    axial: Boolean(raw.axial),
     topClusters: raw.topClusters, litPerPiece: raw.litPerPiece, ownClusters: raw.ownClusters, litFloor: raw.litFloor};
 }
 
@@ -105,7 +107,7 @@ function prepareSight(raw) {
   });
   // Кусочек уровня n + 1 состоит из деталей уровня n: обратная связь «кусочек n → кусочки n + 1, куда он вошёл».
   for (let n = 1; n < levels.length; n++) levels[n].parents = group(levels[n].entryElement, levels[n - 1].K);
-  return {sticks, levels, digit: raw.digit, probabilities: raw.probabilities, ms: raw.ms};
+  return {sticks, levels, digit: raw.digit, probabilities: raw.probabilities, ms: raw.ms, memory: raw.memory || null, votes: raw.votes || []};
 }
 
 // Точки карты в поле детектора d (§6.5: точки не дальше r_d от центра) — для состава кластера.
@@ -640,17 +642,20 @@ function drawPieces(item) {
   const sight = S.sight;
   if (!sight) return;
   ctx.lineCap = "round";
-  if (item.n === 0) {
-    const st = sight.sticks;
-    for (let i = 0; i < st.count; i++) stick(ctx, px(st.x[i]), px(st.y[i]), unit * S.model.cell, st.angle[i], 0.85, null, st.span[i]);
-  }
   const V = sight.levels[item.n];
-  if (!V) { ctx.fillStyle = "#9aa3b2"; ctx.font = `${Math.round(W / 16)}px Segoe UI`; ctx.textAlign = "center"; ctx.fillText("до уровня не дошло", W / 2, W / 2); return; }
   const marks = highlights();
+  // Штрихи — главное на рисунке: рисуются последними, поверх полей, точек кусочков и подсветки (автор 2026-11-17:
+  // «штрихи поверх всего, а точки уменьши»). На уровне 1 это углопозиции, выше — детали уровня ниже.
   // Картинка уровня выше первого собрана из деталей уровня ниже (П.1, §6.6): элементы её окон — детали, прошедшие
   // торможение. Каждая деталь — штрихи окна памяти, на которое её кусочек больше всего похож, на месте кусочка;
   // цвет — цифра этого окна, яркость — сила детали. Когда выбран путь, детали вне его гаснут.
-  if (item.n >= 1) {
+  const strokes = () => {
+    if (item.n === 0) {
+      const st = sight.sticks;
+      for (let i = 0; i < st.count; i++) stick(ctx, px(st.x[i]), px(st.y[i]), unit * S.model.cell, st.angle[i], 0.85, null, st.span[i]);
+      return;
+    }
+    if (!V) return;
     const below = sight.levels[item.n - 1], Mb = S.model.levels[item.n - 1], path = marks.get(item.n - 1), focus = marks.size > 0;
     const cellPx = unit * S.model.cell;
     // Слабые детали — снизу и почти не видны, сильные — сверху и ярко: прозрачность растёт как (сила / сильнейшая)^2.5;
@@ -668,16 +673,21 @@ function drawPieces(item) {
       fragment(ctx, Mb, i, px(below.centre[2 * e + 1]), px(below.centre[2 * e]), cellPx, 0.03 + 0.92 * weight, CLASS[Mb.labels[i]],
         Math.max(1, cellPx / 5));
     }
+  };
+  if (!V) {
+    strokes();
+    ctx.fillStyle = "#9aa3b2"; ctx.font = `${Math.round(W / 16)}px Segoe UI`; ctx.textAlign = "center"; ctx.fillText("до уровня не дошло", W / 2, W / 2);
+    return;
   }
   let top = 0;
   for (let k = 0; k < V.K; k++) top = Math.max(top, V.strength[k]);
-  // Поля кусочков — еле видно (их десятки, и они перекрываются); сам кусочек — точка в центре окна, цвет — сила
-  // его детали (П.1): синий — слабая, жёлтый — сильная, серый — ни один детектор не сработал.
+  // Поля кусочков — еле видно (их десятки, и они перекрываются); сам кусочек — маленькая точка в центре окна, под
+  // штрихами; цвет — сила его детали (П.1): синий — слабая, жёлтый — сильная, серый — ни один детектор не сработал.
   ctx.strokeStyle = "rgba(110,168,255,0.07)"; ctx.lineWidth = Math.max(1, W / 360);
   for (let k = 0; k < V.K; k++) {
     ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), r(V.extent[k]), 0, 2 * Math.PI); ctx.stroke();
   }
-  const dot = Math.max(2, W / 110);
+  const dot = Math.max(1.2, W / 280);
   for (let k = 0; k < V.K; k++) {
     const share = top > 0 ? V.strength[k] / top : 0;
     ctx.fillStyle = V.strength[k] > 0 ? `hsl(${(220 - 170 * share).toFixed(0)},90%,${(45 + 20 * share).toFixed(0)}%)` : "#555";
@@ -692,7 +702,7 @@ function drawPieces(item) {
       ctx.strokeStyle = colour; ctx.globalAlpha = member ? 0.35 : 1; ctx.lineWidth = member ? Math.max(1, W / 300) : Math.max(2.5, W / 120);
       ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), r(V.extent[k]), 0, 2 * Math.PI); ctx.stroke();
       ctx.globalAlpha = 1; ctx.fillStyle = colour;
-      ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), Math.max(2.5, W / (member ? 110 : 80)), 0, 2 * Math.PI); ctx.fill();
+      ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), Math.max(1.8, W / (member ? 220 : 150)), 0, 2 * Math.PI); ctx.fill();
     }
   }
   // Кусочки, набившиеся в кластер под курсором.
@@ -704,6 +714,7 @@ function drawPieces(item) {
       ctx.beginPath(); ctx.arc(px(V.centre[2 * k + 1]), px(V.centre[2 * k]), r(V.extent[k]), 0, 2 * Math.PI); ctx.fill(); ctx.stroke();
     }
   }
+  strokes();
   // Углопозиции выбранного кусочка уровня 1.
   if (item.n === 0 && levelMarks) {
     for (const [k, kind] of levelMarks) {
@@ -1083,7 +1094,33 @@ function renderStats(item) {
     }).join("")}</div>`;
 }
 
+// Ответ памяти (§7.1.13.3): «знаю целиком» — верхний уровень знает рисунок; «по частям» — верх не знает, а на уровне
+// ниже за одну цифру больше половины кусочков; «не знаю». Под ним — уровни: полоска знания (насколько память знает
+// кусочки уровня) с риской порога и победитель голосов кусочков (цифра самой похожей точки памяти у каждого).
+function renderMemory() {
+  const sight = S.sight, memory = sight && sight.memory, box = $("memory");
+  box.className = memory ? memory.kind : "unknown";
+  if (!memory) {
+    $("memoryDigit").textContent = "—"; $("memoryKind").textContent = ""; $("memoryWhy").textContent = ""; $("voteRows").innerHTML = "";
+    return;
+  }
+  const percent = value => `${(100 * value).toFixed(0)} %`;
+  $("memoryDigit").textContent = memory.digit >= 0 ? String(memory.digit) : "?";
+  $("memoryKind").textContent = memory.kind === "whole" ? "знаю целиком" : memory.kind === "parts" ? "по частям" : "не знаю";
+  $("memoryWhy").textContent = memory.kind === "whole" ? `верхний уровень ${memory.level} знает рисунок · ${percent(memory.share)} кусочков за «${memory.digit}»`
+    : memory.kind === "parts" ? `целиком не знаю · на уровне ${memory.level} ${percent(memory.share)} кусочков — как у «${memory.digit}»`
+    : sight.votes.length ? "целого не знаю, и кусочки не сходятся на одной цифре" : "ни одна точка памяти не зажглась";
+  $("voteRows").innerHTML = sight.votes.map(level => {
+    const used = level.number === memory.level ? " used" : "";
+    const title = `знание ${level.knowledge.toFixed(2)}, порог ${level.threshold.toFixed(2)}: память ${level.knows ? "знает" : "не знает"} кусочки уровня; голосовало ${level.voted} из ${level.keyholes}`;
+    return `<span class="${used.trim()}" title="${title}">ур. ${level.number}</span>` +
+      `<div class="know${level.knows ? " yes" : ""}" title="${title}"><span style="width:${(100 * Math.min(1, level.knowledge)).toFixed(1)}%"></span><i style="left:${(100 * Math.min(1, level.threshold)).toFixed(1)}%"></i></div>` +
+      `<span class="${used.trim()}" title="${title}">${level.digit >= 0 ? `<b>«${level.digit}»</b> ${percent(level.share)}` : "—"}</span>`;
+  }).join("");
+}
+
 function renderAnswer() {
+  renderMemory();
   const bars = $("bars"), sight = S.sight;
   const p = sight ? sight.probabilities : new Array(10).fill(0), best = sight ? sight.digit : -1;
   $("digit").textContent = best >= 0 ? String(best) : "—";

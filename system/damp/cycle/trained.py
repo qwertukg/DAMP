@@ -1,7 +1,9 @@
 """Этап 6: обученный цикл и путь одной новой картинки через все уровни (§6.5, §6.6, §9.3; продолжение статьи, П.1–П.5).
 
 Цикл учится как обычно (MnistLadderRunner с keep_levels): по обучающим картинкам строятся окна, карты памяти и
-детекторы уровней, а линейный читатель (§9.3) учится на пиках их срабатываний. Новая картинка — рисунок дашборда —
+детекторы уровней, а линейный читатель (§9.3) учится на пиках их срабатываний. Класс читается двумя способами:
+голоса памяти (§2.2.5, §7.1.13.3: «знаю целиком / по частям / не знаю», decode/memory_votes.py) и линейный читатель
+(§9.3, мерка для целых цифр). Новая картинка — рисунок дашборда —
 идёт теми же классами, что картинка прогона: углопозиции (§4.4), окна (П.2), коды окон (П.4–П.7), срабатывания
 детекторов (§6.5), детали (П.1) — уровень за уровнем. Всё, что подобрано по обучающим (мера и пороги окон, длины
 кодов, нормировка), берётся из обученных уровней, а не меряется заново: поэтому у картинки MNIST здесь те же окна,
@@ -25,6 +27,7 @@ from damp.cycle.lateral_inhibition import LateralInhibition
 from damp.cycle.step import TrainedLevel
 from damp.decode.level_recognition import LevelRecognition
 from damp.decode.linear_reader import LinearReader
+from damp.decode.memory_votes import LevelVotes, MemoryVerdict, MemoryVotes
 from damp.encoding.elements import LadderElements, StickCoder
 from damp.encoding.keyhole_code import KeyholeCoder
 from damp.logging import LOGGER
@@ -69,8 +72,10 @@ class Sight:
     stick_strength: "np.ndarray"  # (n,) сила штриха, доля сильнейшего штриха картинки
     stick_span: "np.ndarray"  # (n,) полудлина поля штриха вдоль края, клеток (§6.4.3) — для показа
     levels: tuple[SightLevel, ...]
-    probabilities: "np.ndarray"  # (классов,) вероятности классов; нули — ответа нет
-    answer: int  # самый вероятный класс; -1 — ни один детектор не сработал
+    probabilities: "np.ndarray"  # (классов,) вероятности классов линейного читателя (§9.3); нули — ответа нет
+    answer: int  # самый вероятный класс читателя; -1 — ни один детектор не сработал
+    votes: tuple[LevelVotes, ...]  # голоса памяти по уровням, до которых дошла картинка (§2.2.5, §7.1.13.3)
+    verdict: MemoryVerdict  # ответ памяти: знаю целиком, по частям или не знаю (§7.1.13.3)
     seconds: float
 
 
@@ -79,7 +84,8 @@ class TrainedLadder:
 
     groups — картинки обучения (память строится по ним, ranges["train"] — с видами §7.1.4); levels — обученные уровни
     (TrainedLevel); peaks — пики срабатываний всех картинок прогона по уровням (строки ranges["train"] — обучение
-    читателя); decay — штраф L2 читателя.
+    читателя); decay — штраф L2 читателя. memory — голоса памяти (MemoryVotes) с порогами знания уровней: пороги
+    меряются здесь же, по обучающим картинкам без своих точек памяти.
     """
 
     def __init__(self, groups: DigitGroups, levels: list[TrainedLevel], peaks: list["np.ndarray"], *, decay: float) -> None:
@@ -96,6 +102,15 @@ class TrainedLadder:
         self._digits = MnistDigits()
         self._sticks = StickCoder()
         self._coder = KeyholeCoder()
+        # Голоса памяти (§2.2.5, §7.1.13.3). Картинка точки памяти — номер MNIST её обучающей картинки: у видов одной
+        # цифры (§7.1.4) он общий, и мерка порога знания исключает цифру вместе со всеми её видами.
+        origin = np.asarray(groups.atoms.index, dtype=np.int64)
+        self.memory = MemoryVotes(
+            [np.asarray([int(label) for label in level.memory.layout.code_table.labels()], dtype=np.int64) for level in self.levels],
+            [origin[np.asarray(level.point_picture, dtype=np.int64)] for level in self.levels],
+            self.reader.classes,
+        )
+        self.memory = self.memory.calibrated(self._knowledge())
 
     @classmethod
     def train(cls, count: int, *, map_points: int | None, decay: float, observer=None) -> "TrainedLadder":  # noqa: ANN001
@@ -126,6 +141,7 @@ class TrainedLadder:
                 "map_points": [int(level.memory.points) for level in ladder.levels],
                 "detectors": [int(level.detectors.built) for level in ladder.levels],
                 "decay": float(decay),
+                "knowledge_thresholds": list(ladder.memory.thresholds or ()),
                 "reader_iterations": int(ladder.reader.iterations),
                 "seconds": time.perf_counter() - started,
                 "note": "обученный цикл §6.6 для новых картинок: окна, карты памяти и детекторы уровней по обучающим "
@@ -134,14 +150,34 @@ class TrainedLadder:
         )
         return ladder
 
+    def _knowledge(self) -> "np.ndarray":
+        """Знание уровней (картинка × уровень) у обучающих картинок без своих точек памяти — мерка порогов знания.
+
+        Берётся не больше RECOGNITION_KNOWLEDGE_PICTURES обучающих картинок, равномерно по обучающим; каждая идёт
+        через уровни заново, а точки памяти с её номером MNIST в голосах не считаются.
+        """
+        first, last = self.groups.ranges["train"]
+        chosen = np.unique(np.linspace(first, last - 1, min(int(settings.RECOGNITION_KNOWLEDGE_PICTURES), last - first)).astype(np.int64))
+        found = np.zeros((chosen.shape[0], len(self.levels)), dtype=np.float64)
+        for row, picture in enumerate(chosen.tolist()):
+            sight = self._see(self.groups.atoms.images[picture], own=int(self.groups.atoms.index[picture]))
+            for votes in sight.votes:
+                found[row, votes.number - 1] = votes.knowledge
+        return found
+
     # ------------------------------------------------------------------ новая картинка
     def see(self, image: "np.ndarray", *, log: bool = False) -> Sight:
         """Картинка 28×28 (uint8 0…255 либо float в [0, 1], белая цифра на чёрном) через все обученные уровни.
 
         Каждый уровень: окна на элементах (П.2) → коды окон (П.4–П.7) → срабатывания детекторов карты (§6.5) →
-        детали — элементы следующего уровня (П.1); затем ответ линейного читателя по пикам уровней (§9.3). Шаги
+        детали — элементы следующего уровня (П.1). Затем класс: голоса памяти по уровням и их вердикт — знаю целиком,
+        по частям или не знаю (§2.2.5, §7.1.13.3) — и ответ линейного читателя по пикам уровней (§9.3). Шаги
         считаются заново и в кеш не пишутся; журнал шагов молчит. log — записать итог событием dashboard.see.
         """
+        return self._see(image, log=log)
+
+    def _see(self, image: "np.ndarray", *, own: int = -1, log: bool = False) -> Sight:
+        """Путь картинки; own — номер MNIST обучающей картинки, чьи точки памяти не голосуют (мерка порога знания)."""
         started = time.perf_counter()
         pixels = self._pixels(image)
         levels: list[SightLevel] = []
@@ -177,6 +213,14 @@ class TrainedLadder:
         features = np.concatenate(peaks)[None, :]
         probabilities = self.reader.probabilities(features)[0]
         answer = int(self.reader.answers(features)[0])
+        votes = tuple(
+            self.memory.level(
+                level.number, int(level.keyhole_centre.shape[0]), level.lit_keyhole, level.lit_point, level.lit_value,
+                without_picture=own,
+            )
+            for level in levels
+        )
+        verdict = self.memory.verdict(votes)
         sight = Sight(
             stick_angle=np.asarray(atoms.angle, dtype=np.float64),
             stick_y=np.asarray(atoms.y, dtype=np.float64),
@@ -186,6 +230,8 @@ class TrainedLadder:
             levels=tuple(levels),
             probabilities=probabilities,
             answer=answer,
+            votes=votes,
+            verdict=verdict,
             seconds=time.perf_counter() - started,
         )
         if log:
@@ -199,11 +245,17 @@ class TrainedLadder:
                          "points_lit": int(np.unique(level.lit_point).shape[0]), "detectors_fired": int(np.unique(level.fired_detector).shape[0])}
                         for level in sight.levels
                     ],
+                    "memory": {"verdict": verdict.kind, "digit": verdict.digit, "level": verdict.level, "share": verdict.share},
+                    "votes": [
+                        {"level": level.number, "digit": level.digit, "share": level.share, "knowledge": level.knowledge}
+                        for level in votes
+                    ],
                     "answer": answer,
                     "probability": float(probabilities.max()) if answer >= 0 else 0.0,
                     "seconds": sight.seconds,
                     "note": "рисунок дашборда через обученные уровни: окна (П.2), их коды (П.4–П.7), срабатывания "
-                    "детекторов карт (§6.5), детали (П.1) и ответ линейного читателя (§9.3)",
+                    "детекторов карт (§6.5), детали (П.1); класс — голоса памяти и их вердикт (§2.2.5, §7.1.13.3) и "
+                    "ответ линейного читателя (§9.3)",
                 },
             )
         return sight

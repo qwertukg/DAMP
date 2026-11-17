@@ -19,6 +19,12 @@
 
 Угол штриха — направление суммы градиентов по точкам кластера на куске края длиннее шага (поля соседних детекторов
 перекрываются): чем длиннее кусок, тем точнее угол. Сила штриха — энергия детектора e_d (§6.3).
+
+Точки без стрелки (axial): на вход идут не точки края, а точки середины линии (StrokeMidline, замысел автора
+2026-11-17: «вместо двух краёв — одна середина»). У середины направление поперёк линии не имеет «внутри» и «снаружи»:
+направления θ и θ + 180° — одно и то же. Правила те же, отличий три: похожесть направлений — модуль косинуса; угол
+штриха — по сумме удвоенных углов, 0…180°; два штриха могут стоять в одном месте, если их направления разные
+(перекрестие линий).
 """
 from __future__ import annotations
 
@@ -60,6 +66,7 @@ class StrokeDetectors:
         dense_share: кандидат плотный, если точек в его поле не меньше этой доли от медианы; плотные вставляются первыми.
         smoothing: полуширина окна, по которому складывается градиент вокруг точки края.
         grad_threshold: точка края со сложенным градиентом не больше этого направления не имеет и не участвует.
+        axial: направления точек без стрелки (точки середины линии): θ и θ + 180° — одно направление.
     """
 
     step: float
@@ -69,6 +76,7 @@ class StrokeDetectors:
     dense_share: float
     smoothing: int
     grad_threshold: float
+    axial: bool = False
 
     # Соседние точки контура — пиксели, касающиеся стороной или углом: расстояние между центрами не больше √2.
     NEIGHBOUR = 1.5
@@ -94,7 +102,7 @@ class StrokeDetectors:
         """Подпись способа для кеша штрихов и раскладки."""
         return (
             f"detectors(step={self.step:g},sim={self.similarity:g},span={self.angle_span:g},"
-            f"min={self.min_points},dense={self.dense_share:g},smooth={self.smoothing})"
+            f"min={self.min_points},dense={self.dense_share:g},smooth={self.smoothing}{',axial' if self.axial else ''})"
         )
 
     # ------------------------------------------------------------------ точки края
@@ -145,7 +153,16 @@ class StrokeDetectors:
     # ------------------------------------------------------------------ штрихи картинки
     def strokes(self, contour: "np.ndarray", gx: "np.ndarray", gy: "np.ndarray") -> list[Stroke]:
         """Штрихи картинки: contour — пиксели контура, gx, gy — отклик Собеля на той же картинке (ось Y вверх)."""
-        y, x, vx, vy = self._edge_points(contour, gx, gy)
+        return self.strokes_of(*self._edge_points(contour, gx, gy))
+
+    def strokes_of(self, y: "np.ndarray", x: "np.ndarray", vx: "np.ndarray", vy: "np.ndarray") -> list[Stroke]:
+        """Штрихи по готовым точкам: место центра пикселя (y, x) и вектор направления точки (vx, vy), ось Y вверх.
+
+        Точки края — направление перепада яркости; точки середины линии (axial) — направление поперёк линии, без
+        стрелки. Длина вектора — сила точки.
+        """
+        y, x = np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)
+        vx, vy = np.asarray(vx, dtype=np.float64), np.asarray(vy, dtype=np.float64)
         count = int(y.shape[0])
         if count == 0:
             return []
@@ -153,6 +170,8 @@ class StrokeDetectors:
         ux, uy = vx / magnitude, vy / magnitude
         distance = np.hypot(y[:, None] - y[None, :], x[:, None] - x[None, :])
         cosine = ux[:, None] * ux[None, :] + uy[:, None] * uy[None, :]
+        if self.axial:
+            cosine = np.abs(cosine)  # без стрелки: θ и θ + 180° — одно направление
         member = self._clusters(distance, cosine)
         # Поле детектора — точки кластера не дальше шага от точки-центра (r_d = шаг).
         field = member & (distance <= float(self.step))
@@ -168,8 +187,13 @@ class StrokeDetectors:
         centre_y, centre_x = (weight @ y) / safe, (weight @ x) / safe
         # Угол — по куску края длиннее шага: сумма градиентов точек кластера (весь кластер лежит в пределах куска).
         span = member.astype(np.float64)
-        angle = np.arctan2(span @ vy, span @ vx)
-        chosen = self._insert(y, x, centre_y, centre_x, points, valid)
+        if self.axial:
+            # Векторы без стрелки складываются удвоенными углами (иначе встречные гасили бы друг друга); угол — 0…180°.
+            double_x, double_y = (vx * vx - vy * vy) / magnitude, 2.0 * vx * vy / magnitude
+            angle = np.mod(0.5 * np.arctan2(span @ double_y, span @ double_x), np.pi)
+        else:
+            angle = np.arctan2(span @ vy, span @ vx)
+        chosen = self._insert(y, x, centre_y, centre_x, points, valid, angle)
         found = []
         for i in chosen:
             # Длина поля вдоль края: расстояние от центра до самой дальней точки поля (r(p), §6.4.3).
@@ -193,6 +217,7 @@ class StrokeDetectors:
                 "step": float(self.step),
                 "similarity": float(self.similarity),
                 "angle_span_steps": float(self.angle_span),
+                "axial": bool(self.axial),
                 "note": "штрихи — детекторы над точками края по §6.4, перенесённому на картинку (доработка): в детектор "
                 "идут точки с похожим направлением (один край), место — взвешенный центр (§6.4.2), центры не ближе "
                 "шага (§6.4.5), угол — по куску края длиннее шага",
@@ -202,9 +227,12 @@ class StrokeDetectors:
 
     def _insert(
         self, y: "np.ndarray", x: "np.ndarray", centre_y: "np.ndarray", centre_x: "np.ndarray", points: "np.ndarray",
-        valid: "np.ndarray",
+        valid: "np.ndarray", angle: "np.ndarray",
     ) -> list[int]:
         """Вставка детекторов (§6.4.5): центры не попадают в поля друг друга; номера принятых кандидатов.
+
+        У точек без стрелки (середина линии) мешают друг другу только детекторы похожего направления: на перекрестии
+        двух линий в одном месте стоят два штриха — по одному на линию.
 
         Сначала плотные кандидаты — середины ровных кусков края, потом редкие — концы и изгибы, от плотных к редким.
         Равные по плотности идут по порядку мест (сверху вниз, слева направо): на ровном крае центры ложатся
@@ -221,7 +249,10 @@ class StrokeDetectors:
         for index in order.tolist():
             if count:
                 held = taken[:count]
-                if bool(np.any(np.hypot(centre_y[held] - centre_y[index], centre_x[held] - centre_x[index]) < step)):
+                near = np.hypot(centre_y[held] - centre_y[index], centre_x[held] - centre_x[index]) < step
+                if self.axial:
+                    near &= np.abs(np.cos(angle[held] - angle[index])) >= float(self.similarity)
+                if bool(np.any(near)):
                     continue
             taken[count] = index
             count += 1

@@ -74,6 +74,7 @@ TOKEN_ENCODING = "7.1.4"
 SPACE_FILLING = "7.1.6"
 DETECTOR_LEVELS = "7.1.10"
 MORPHOLOGICAL_EMBEDDINGS = "7.1.12"
+UNKNOWN_WORDS = "7.1.13.3"
 NEURAL_INTEGRATION = "9.3"
 
 # Продолжение статьи — docs/DAMP_continuation.md («Кодирование признаков и их положения в иерархической модели

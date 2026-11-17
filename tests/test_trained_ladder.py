@@ -118,11 +118,43 @@ class TrainedLadderTest(unittest.TestCase):
                     self.assertTrue(np.all(level.lit_value > 0))
                     self.assertTrue(set(np.unique(level.fired_keyhole).tolist()) <= set(np.unique(level.lit_keyhole).tolist()))
 
+    def test_memory_votes_read_the_lit_points(self) -> None:
+        """Голоса памяти (§2.2.5, §7.1.13.3): по уровню на каждый пройденный, из зажжённых точек; вердикт — по ним."""
+        memory = self.ladder.memory
+        self.assertEqual(len(memory.thresholds), len(self.runner.levels))
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in memory.thresholds))
+        for sight in self.sights.values():
+            self.assertEqual([votes.number for votes in sight.votes], [level.number for level in sight.levels])
+            for level, votes in zip(sight.levels, sight.votes):
+                with self.subTest(level=level.number):
+                    expected = memory.level(level.number, level.keyhole_centre.shape[0], level.lit_keyhole, level.lit_point, level.lit_value)
+                    self.assertTrue(np.array_equal(votes.votes, expected.votes))
+                    self.assertEqual(votes.knowledge, expected.knowledge)
+                    self.assertEqual(votes.keyholes, level.keyhole_centre.shape[0])
+                    self.assertEqual(votes.voted, np.unique(level.lit_keyhole).shape[0])
+            self.assertEqual(sight.verdict, memory.verdict(sight.votes))
+            self.assertIn(sight.verdict.kind, (memory.WHOLE, memory.PARTS, memory.UNKNOWN))
+
+    def test_training_picture_knows_itself_unless_left_out(self) -> None:
+        """Обучающая картинка находит в памяти саму себя; мерка порога знания считает её без своих точек памяти."""
+        atoms = self.runner.groups.atoms
+        first, _ = self.runner.groups.ranges["train"]
+        higher = 0
+        for picture in range(first, first + 5):
+            whole = self.ladder._see(atoms.images[picture])
+            left_out = self.ladder._see(atoms.images[picture], own=int(atoms.index[picture]))
+            for with_own, without in zip(whole.votes, left_out.votes):
+                self.assertGreaterEqual(with_own.knowledge, without.knowledge)
+                higher += int(with_own.knowledge > without.knowledge)
+        self.assertGreater(higher, 0)
+
     def test_empty_picture_has_no_answer(self) -> None:
         sight = self.ladder.see(np.zeros((28, 28), dtype=np.uint8))
         self.assertEqual(sight.levels, ())
         self.assertEqual(sight.answer, -1)
         self.assertFalse(sight.probabilities.any())
+        self.assertEqual(sight.votes, ())
+        self.assertEqual((sight.verdict.kind, sight.verdict.digit), (self.ladder.memory.UNKNOWN, -1))
 
 
 if __name__ == "__main__":

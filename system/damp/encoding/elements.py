@@ -84,13 +84,19 @@ class StickCoder:
     """Уровень 0 цикла: элемент — углопозиция, «что» — код её направления детекторами угла (§4.4).
 
     Место углопозиции на картинке в код не входит: его записывает окно внимания в своих координатах (П.4).
+
+    У штрихов по середине линии (MNIST_STROKE_MIDLINE) направление без стрелки: угол повторяется через 180°, и круг
+    угла — 0…180° вместо 0…360° (0° и 180° — одна и та же линия).
     """
 
     def __init__(self) -> None:
+        # Период угла: у штриха края — MNIST_ANGLE_MAX (360°), у штриха середины линии — половина.
+        axial = bool(settings.MNIST_STROKE_DETECTORS) and bool(settings.MNIST_STROKE_MIDLINE)
+        span = float(settings.MNIST_ANGLE_MAX) - float(settings.MNIST_ANGLE_MIN)
         self.encoder = Encoder(
             ClosedDimension(
                 "Angle",
-                (settings.MNIST_ANGLE_MIN, settings.MNIST_ANGLE_MAX),
+                (settings.MNIST_ANGLE_MIN, float(settings.MNIST_ANGLE_MIN) + (span / 2.0 if axial else span)),
                 geometric_detector_layers(
                     layers_count=settings.LADDER_ANGLE_LAYERS,
                     widest_detectors=settings.LADDER_ANGLE_WIDEST_DETECTORS,

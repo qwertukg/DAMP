@@ -33,7 +33,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._system import system
-from .reports import LevelMap, Picture, Sight, SightLevel, Stimulus, TrainingSticks
+from .reports import LevelMap, LevelVotes, Picture, Sight, SightLevel, Stimulus, TrainingSticks
 
 
 class Session:
@@ -488,15 +488,21 @@ class TrainedLadder(_Part):
         """Штраф L2 линейного читателя (§9.3)."""
         return float(self._ladder.decay)
 
+    @property
+    def knowledge_thresholds(self) -> tuple[float, ...]:
+        """Пороги знания по уровням (§7.1.13.3): ниже порога уровень картинку «не знает» (`RECOGNITION_KNOWLEDGE_QUANTILE`)."""
+        return tuple(float(value) for value in (self._ladder.memory.thresholds or ()))
+
     def see(self, image, *, log: bool = False) -> Sight:  # noqa: ANN001
-        """Путь картинки через все уровни и ответ линейного читателя (§6.5, §9.3; П.1–П.5).
+        """Путь картинки через все уровни и её класс: голоса памяти и линейный читатель (§6.5, §7.1.13.3, §9.3; П.1–П.5).
 
         Args:
             image: картинка 28×28: numpy uint8 0…255 либо float в [0, 1], белая цифра на чёрном, как в MNIST.
             log: записать итог в журнал событием `dashboard.see` (у дашборда — по окончании штриха).
 
         Returns:
-            `Sight`: углопозиции, уровни (кусочки, зажжённые точки, сработавшие детекторы, детали) и вероятности цифр.
+            `Sight`: углопозиции, уровни (кусочки, зажжённые точки, сработавшие детекторы, детали), голоса памяти по
+            уровням с вердиктом «знаю целиком / по частям / не знаю» и вероятности цифр по линейному читателю.
 
         Raises:
             ValueError: картинка не 28×28.
@@ -504,9 +510,11 @@ class TrainedLadder(_Part):
         Example:
             >>> sight = ladder.see(np.zeros((28, 28), dtype=np.uint8))
             >>> sight.digit, sight.levels                # пустая картинка: (-1, ())
+            >>> sight.verdict, sight.memory_digit        # пустая картинка: ("unknown", -1)
         """
         with self._session.active():
             found = self._ladder.see(np.asarray(image), log=log)
+        thresholds = self._ladder.memory.thresholds
         return Sight(
             stick_angle=found.stick_angle,
             stick_y=found.stick_y,
@@ -526,6 +534,20 @@ class TrainedLadder(_Part):
             probabilities=tuple(float(value) for value in found.probabilities),
             digit=int(found.answer),
             seconds=float(found.seconds),
+            votes=tuple(
+                LevelVotes(
+                    number=int(level.number), votes=tuple(float(value) for value in level.votes), digit=int(level.digit),
+                    share=float(level.share), knowledge=float(level.knowledge),
+                    threshold=float(thresholds[level.number - 1]) if thresholds else 0.0,
+                    knows=bool(level.voted and level.knowledge >= (thresholds[level.number - 1] if thresholds else 0.0)),
+                    keyholes=int(level.keyholes), voted=int(level.voted),
+                )
+                for level in found.votes
+            ),
+            verdict=str(found.verdict.kind),
+            memory_digit=int(found.verdict.digit),
+            memory_level=int(found.verdict.level),
+            memory_share=float(found.verdict.share),
         )
 
     def maps(self) -> tuple[LevelMap, ...]:
