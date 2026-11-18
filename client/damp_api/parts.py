@@ -228,6 +228,11 @@ class Keyholes(_Part):
         return float(self._keyholes.sight)
 
     @property
+    def keyhole_radius(self) -> float:
+        """Средний радиус окна обучающих картинок, клеток: круг, в котором окно собирает элементы уровня."""
+        return float(self._keyholes.radius)
+
+    @property
     def picture_seen(self) -> float:
         """Какую долю углопозиций своей картинки видит окно, в среднем."""
         return float(self._keyholes.seen)
@@ -320,6 +325,16 @@ class Memory(_Part):
     def same_label(self) -> float:
         """Доля соседних точек карты с одной цифрой (4 соседа); у случайной карты — около 0.1."""
         return float(self._memory.quality["same_label"])
+
+    @property
+    def merge(self) -> dict[str, float]:
+        """Чистота слияния (мерка, вне статьи): одной ли цифры картинки, чьи окна слились в одну точку карты.
+
+        Ключи: `merge_pictures_per_point` — картинок на точку; `merge_shared_points` — доля точек с окнами двух и
+        более картинок; `merge_purity` — доля картинок таких точек, чья цифра — главная цифра точки;
+        `merge_purity_random` — она же при перемешанных цифрах; `merge_pure_points` — доля общих точек одной цифры.
+        """
+        return {key: float(value) for key, value in self._memory.quality.items() if key.startswith("merge_")}
 
     def release(self) -> None:
         """Освободить память видеокарты под картой (после работы с её детекторами)."""
@@ -585,6 +600,7 @@ class TrainedLadder(_Part):
                     layer_thresholds=tuple(float(value) for value in detectors.layer_thresholds),
                     activation_threshold=float(detectors.activation_lambda),
                     field_half=int(max(abs(value) for value in level.field.box)),
+                    merge={key: float(value) for key, value in level.memory.quality.items() if key.startswith("merge_")},
                 )
             )
         return tuple(found)

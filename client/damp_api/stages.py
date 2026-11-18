@@ -499,7 +499,10 @@ class Cycle(_Stage):
     def keyholes(self, elements: Elements) -> Keyholes:
         """Кубик. Окна внимания следующего уровня: окно на каждом элементе, радиус — по кластеру похожих соседей.
 
-        Радиус — по §6.4.1–§6.4.3 и П.2; окно растёт от уровня к уровню (П.3).
+        Радиус — по §6.4.1–§6.4.3 и П.2; окно растёт от уровня к уровню (П.3). Перед окнами — пятна (П.3,
+        `LADDER_INHIBITION_RADIUS`, `LADDER_INHIBITION_SIMILARITY`): из соседних деталей с похожим кодом остаётся
+        сильнейшая, поэтому `keyholes.elements` может быть короче `elements`. Картинка, где деталей меньше, чем нужно
+        кластеру, без окон не остаётся: окно видит её целиком (`LADDER_KEYHOLE_WHOLE_PICTURE`).
 
         Args:
             elements: элементы уровня `n` (штрихи или детали).
@@ -512,7 +515,12 @@ class Cycle(_Stage):
         """
         number = elements.level + 1
         with self._session.active():
-            keyholes = self._step(elements.digits).keyholes(elements._elements, number)
+            step = self._step(elements.digits)
+            # Пятна — как в готовом прогоне (MnistLadderRunner._ladder): один и тот же шаг CycleStep.thin.
+            thinned = step.thin(elements._elements, number)
+            if thinned is not elements._elements:
+                elements = Elements(self._session, thinned, elements.digits, level=elements.level)
+            keyholes = step.keyholes(elements._elements, number)
             if keyholes.taught < system.settings.LADDER_MAP_MIN_POINTS:
                 raise LevelFailed(f"уровень {number}: окон на обучающих картинках — {keyholes.taught}")
         return Keyholes(self._session, keyholes, elements)

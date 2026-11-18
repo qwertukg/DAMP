@@ -75,9 +75,15 @@ class PlaneFieldBuilder:
         name: str = "fields",
         concepts: int | None = None,
         radius_floor: float | None = None,
+        whole_picture: bool = False,
     ) -> None:
         # True — окно на каждом элементе, без вытеснения перекрывающихся полей (продолжение статьи, П.2).
         self._dense = bool(dense)
+        # True — картинка без окон не остаётся (верх цикла, §6.6; вне статьи): если на ней не нашлось ни одного
+        # кластера из min_points точек (§6.4.3) — в частности, когда элементов меньше min_points, — окно каждого её
+        # элемента — вся картинка (_whole_fields). Только для плотной расстановки.
+        self._whole_picture = bool(whole_picture) and self._dense
+        self._whole_pictures = 0  # сколько картинок последнего build получили такие окна (в журнал)
         # П.7: окно объединяет около 5–7 понятий — радиус окна не больше расстояния до concepts-го ближайшего
         # элемента (считая сам элемент). None — без ограничения (радиус только по §6.4.3).
         if concepts is not None and int(concepts) < 1:
@@ -140,9 +146,9 @@ class PlaneFieldBuilder:
         """Поля одной картинки по всем слоям: (центр y, центр x, радиус, n_d); positions — (n, 2), bits — (n, L)."""
         positions = np.asarray(positions, dtype=np.float64)
         bits = np.asarray(bits, dtype=np.float32)
-        if positions.shape[0] < self._min_points:
-            return []
         ones = bits.sum(axis=1)
+        if positions.shape[0] < self._min_points:
+            return self._whole_fields(positions, ones) if self._whole_picture else []
         similarity = (bits @ bits.T) / np.sqrt(np.maximum(ones[:, None] * ones[None, :], 1.0))
         distance = np.hypot(positions[:, None, 0] - positions[None, :, 0], positions[:, None, 1] - positions[None, :, 1])
         if self._dense:
@@ -153,6 +159,8 @@ class PlaneFieldBuilder:
                     held = best.get((y, x))
                     if held is None or points / radius > held[3] / held[2]:
                         best[(y, x)] = (y, x, radius, points)
+            if not best and self._whole_picture:
+                return self._whole_fields(positions, ones)
             return [best[key] for key in sorted(best)]
         chosen: list[tuple[float, float, float, int]] = []
         seen: set[tuple[float, float, float]] = set()
@@ -164,6 +172,32 @@ class PlaneFieldBuilder:
                     seen.add(key)
                     chosen.append(field)
         return chosen
+
+    def _whole_fields(self, positions: "np.ndarray", ones: "np.ndarray") -> list[tuple[float, float, float, int]]:
+        """Окна картинки, на которой кластер из min_points точек не нашёлся (верх цикла, §6.6; вне статьи).
+
+        §6.4.3 требует в поле не меньше min_points точек кластера. Когда деталей на картинке осталось меньше, правило
+        невыполнимо, и картинка осталась бы без окон: её детали потерялись бы, а не объединились в более крупные.
+        Поэтому окно каждого элемента такой картинки — вся картинка: центр — сам элемент (П.2), радиус — до самого
+        дальнего её элемента, но не меньше нижнего предела радиуса. Энергия точек и сходство кодов не спрашиваются.
+        Окно стоит только на элементе с непустым кодом (ones > 0), как и окно по кластеру: деталь, на окне которой
+        не сработал ни один детектор, молчит.
+        """
+        count = positions.shape[0]
+        distance = np.hypot(positions[:, None, 0] - positions[None, :, 0], positions[:, None, 1] - positions[None, :, 1])
+        radius = np.maximum(self._radius_floor, distance.max(axis=1))
+        if self._concepts is not None and count > self._concepts:
+            # П.7: в окне не больше concepts понятий — как у окон по кластеру.
+            nearest = np.sort(distance, axis=1)[:, self._concepts - 1]
+            radius = np.minimum(radius, np.maximum(nearest, self._radius_floor))
+        points = (distance <= radius[:, None]).sum(axis=1)
+        best: dict[tuple[float, float], tuple[float, float, float, int]] = {}
+        for row in np.flatnonzero(np.asarray(ones) > 0):
+            y, x = round(float(positions[row, 0]), 6), round(float(positions[row, 1]), 6)
+            best[(y, x)] = (y, x, round(float(radius[row]), 6), int(points[row]))
+        if best:
+            self._whole_pictures += 1
+        return [best[key] for key in sorted(best)]
 
     def _activated(
         self, ones: "np.ndarray", similarity: "np.ndarray", distance: "np.ndarray", thresholds: "np.ndarray"
@@ -311,6 +345,7 @@ class PlaneFieldBuilder:
         members: list["np.ndarray"] = []
         shifts: list["np.ndarray"] = []
         covered = np.zeros(picture.shape[0], dtype=bool)
+        self._whole_pictures = 0
         for number, first, last in zip(pictures, bounds[:-1], bounds[1:]):
             own = position[first:last]
             for centre_y, centre_x, radius, inside in self.picture_fields(own, table[index[first:last]]):
@@ -385,10 +420,12 @@ class PlaneFieldBuilder:
                     "name": self._name,
                     "keyholes": fields.count,
                     "keyholes_per_element": float(fields.count) / max(1, int(picture.shape[0])),
+                    "whole_pictures": int(self._whole_pictures),
                     "points_mean": float(fields.points.mean()) if fields.count else 0.0,
                     "note": "окна внимания миниколонок (П.2): окно на каждом элементе, центр — сам элемент, радиус — "
                     "по кластеру его похожих соседей (§6.4.3); поля соседних миниколонок сильно перекрываются, "
-                    "вытеснения §6.4.5 нет",
+                    "вытеснения §6.4.5 нет; whole_pictures — картинки, где кластера из min_points точек не нашлось: "
+                    "окно каждого их элемента — вся картинка (верх цикла, §6.6; вне статьи)",
                 },
             )
             return fields

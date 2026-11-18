@@ -61,6 +61,7 @@ class LevelKeyholes:
     sight: float  # среднее поле окна обучающих картинок, клеток
     step: float  # мера плоскости уровня: что видит одна деталь, но не меньше шага между соседями
     taught: int  # окон на обучающих картинках
+    radius: float = 0.0  # средний радиус окна обучающих картинок, клеток (круг, в котором окно собирает элементы)
     thresholds: tuple[float, ...] = ()  # пороги слоёв построения окон — квантили сходства соседей обучающих (§6.4)
 
     @property
@@ -107,6 +108,7 @@ class KeyholeBuilder:
             "seen": keyholes.seen, "sight": keyholes.sight, "step": keyholes.step, "taught": keyholes.taught,
             "number": field.number, "unit": field.unit, "box": list(field.box), "inner": list(field.inner),
             "thresholds": [float(value) for value in keyholes.thresholds],
+            "radius": float(keyholes.radius),
         }
 
     @staticmethod
@@ -122,6 +124,7 @@ class KeyholeBuilder:
             field=field, pieces=pieces, extent=found["extent"], seen=float(found["seen"]), sight=float(found["sight"]),
             step=float(found["step"]), taught=int(found["taught"]),
             thresholds=tuple(float(value) for value in found.get("thresholds", ())),
+            radius=float(found.get("radius", 0.0)),
         )
 
     @staticmethod
@@ -142,6 +145,8 @@ class KeyholeBuilder:
             concepts=settings.LADDER_KEYHOLE_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
             # Нижний предел радиуса окна — доля того, что видит одна деталь уровня: от неё зависит рост поля за уровень.
             radius_floor=settings.LADDER_KEYHOLE_RADIUS_SHARE * step,
+            # Картинка без окон не остаётся: деталей меньше, чем нужно кластеру, — окно видит её целиком (§6.6).
+            whole_picture=settings.LADDER_KEYHOLE_WHOLE_PICTURE,
         )
 
     @staticmethod
@@ -216,6 +221,7 @@ class KeyholeBuilder:
         )
         seen = self._picture_seen(pieces, extent, train_pictures)
         sight = float(extent[pieces.picture < train_pictures].mean())
+        radius = float(fields.radius[pieces.picture < train_pictures].mean())
         LOGGER.event(
             "ladder.keyhole",
             section=CONTINUATION_SPATIAL_CODES,
@@ -236,7 +242,7 @@ class KeyholeBuilder:
             },
         )
         return LevelKeyholes(field=field, pieces=pieces, extent=extent, seen=seen, sight=sight, step=step, taught=taught_fields,
-                             thresholds=thresholds)
+                             thresholds=thresholds, radius=radius)
 
     def _picture_seen(self, pieces: KeyholePieces, extent: "np.ndarray", pictures: int) -> float:
         """Какую долю углопозиций своей картинки видит окно, в среднем по окнам первых pictures картинок."""

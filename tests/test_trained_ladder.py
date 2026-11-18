@@ -73,7 +73,6 @@ class TrainedLadderTest(unittest.TestCase):
     def test_every_level_repeats_the_run(self) -> None:
         groups = self.runner.groups
         for picture, sight in self.sights.items():
-            previous = None  # первое окно картинки на прошлом уровне: его деталь — элемент 0 этого уровня
             for index, trace in enumerate(self.traces.levels):
                 rows = np.flatnonzero(trace.keyhole_picture == picture)
                 with self.subTest(picture=picture, level=trace.number):
@@ -88,7 +87,11 @@ class TrainedLadderTest(unittest.TestCase):
                     self.assertTrue(np.array_equal(level.keyhole_extent, trace.keyhole_extent[rows]))
                     entries = np.isin(trace.entry_keyhole, rows)
                     self.assertTrue(np.array_equal(level.entry_keyhole, trace.entry_keyhole[entries] - base))
-                    shift = groups.sticks(picture)[0] if previous is None else previous
+                    # Элементы уровня — штрихи либо детали прошлого уровня после пятен (П.3): в пути одной картинки
+                    # они считаются от её первого элемента.
+                    shift = int(np.flatnonzero(trace.element_picture == picture)[0])
+                    if index == 0:
+                        self.assertEqual(shift, groups.sticks(picture)[0])
                     self.assertTrue(np.array_equal(level.entry_element, trace.entry_element[entries] - shift))
                     fired = np.isin(trace.fired_keyhole, rows)
                     self.assertTrue(np.array_equal(level.fired_keyhole, trace.fired_keyhole[fired] - base))
@@ -98,7 +101,6 @@ class TrainedLadderTest(unittest.TestCase):
                     self.assertEqual(level.detail_length, trace.detail_length)
                     self.assertTrue(np.array_equal(level.strength, trace.detail_strength[rows]))
                     self.assertTrue(np.array_equal(level.peak, self.runner.level_peaks[index][picture]))
-                    previous = base
 
     def test_reader_answer_is_that_of_the_run(self) -> None:
         features = np.concatenate(self.runner.level_peaks, axis=1)

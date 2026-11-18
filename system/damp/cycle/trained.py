@@ -23,9 +23,8 @@ from damp import settings
 from damp.activation.details import DetailCoder
 from damp.article_refs import NEURAL_ANALOGY, STIMULUS_DETECTION
 from damp.cycle.keyholes import KeyholeBuilder
-from damp.cycle.lateral_inhibition import LateralInhibition
 from damp.cycle.primary import PrimaryLevel, PrimarySight
-from damp.cycle.step import LadderLevelDegenerate, TrainedLevel
+from damp.cycle.step import CycleStep, LadderLevelDegenerate, TrainedLevel
 from damp.decode.level_recognition import LevelRecognition
 from damp.decode.linear_reader import LinearReader
 from damp.decode.memory_votes import LevelVotes, MemoryVerdict, MemoryVotes
@@ -211,14 +210,10 @@ class TrainedLadder:
             for trained in self.levels:
                 if elements is None or elements.count == 0:
                     break
-                if trained.number > 1 and settings.LADDER_INHIBITION_RADIUS is not None:
-                    # Торможение соседей — как в прогоне (MnistLadderRunner._ladder): оно внутри своей картинки.
-                    elements = elements.only(
-                        LateralInhibition(radius_share=float(settings.LADDER_INHIBITION_RADIUS), name=f"details{trained.number - 1}")
-                        .survivors(elements.picture, elements.y, elements.x, elements.power(), elements.reach())
-                    )
-                    if elements.count == 0:
-                        break
+                # Пятна — как в прогоне (MnistLadderRunner._ladder): они внутри своей картинки.
+                elements = CycleStep.thin(elements, trained.number)
+                if elements.count == 0:
+                    break
                 level, elements = self._level(trained, elements)
                 if level is None:
                     break

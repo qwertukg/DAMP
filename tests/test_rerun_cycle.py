@@ -70,6 +70,14 @@ class CycleRerunViewTest(unittest.TestCase):
         levels = [report.number for report in runner.reports]
         self.assertTrue(levels)
         paths = {path for path, _, _ in first.records}
+        # Вкладка «Детекторы»: вместе с картой уровня стираются слои — на новой карте не видно кругов прошлого уровня,
+        # пока детекторы этого уровня строятся (баг, найденный автором 2026-11-18).
+        layers = int(settings.LADDER_HIERARCHY_LAYERS)
+        for number in levels:
+            with self.subTest(level=number, check="слои стираются вместе с картой"):
+                order = [path for path, _, level in first.records if level == number]
+                start = order.index(f"{DETECTORS}/map")
+                self.assertEqual(order[start + 1 : start + 1 + layers], [f"{DETECTORS}/layers/l{k}" for k in range(layers)])
         for stage in (OVERVIEW, STIMULI, CODING, LAYOUT, DETECTORS, EMBEDDINGS, CYCLE, RECOGNITION):
             with self.subTest(stage=stage):
                 self.assertTrue(any(path.startswith(stage) for path in paths), stage)

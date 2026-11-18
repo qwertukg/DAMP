@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import numpy as np
@@ -16,6 +16,8 @@ from damp import settings
 from damp.activation.details import DetailCoder
 from damp.activation.level_detectors import Firing, LevelDetectors
 from damp.cycle.keyholes import KeyholeBuilder, LadderField, LevelKeyholes
+from damp.cycle.lateral_inhibition import LateralInhibition
+from damp.decode.merge_purity import MergePurity
 from damp.encoding.elements import LadderElements
 from damp.encoding.position_binding import KeyholeCodes
 from damp.encoding.keyhole_code import KeyholeCoder
@@ -116,6 +118,15 @@ class CycleStep:
         """Предел числа точек карты уровня; без предела — заведомо больше числа кодов."""
         return self.map_max_points if self.map_max_points is not None else settings.LADDER_DICTIONARY_MAX
 
+    @staticmethod
+    def thin(elements: LadderElements, number: int) -> LadderElements:
+        """Элементы уровня number после пятен (П.3): из соседних деталей с похожим кодом остаётся сильнейшая
+        (LADDER_INHIBITION_RADIUS, LADDER_INHIBITION_SIMILARITY). Штрихи (уровень 1) и выключенные пятна — те же
+        элементы. Один вход для прогона цикла, кубиков фреймворка и пути одной картинки."""
+        if int(number) <= 1 or settings.LADDER_INHIBITION_RADIUS is None:
+            return elements
+        return LateralInhibition.thin(elements, f"details{int(number) - 1}")
+
     def keyholes(self, elements: LadderElements, number: int) -> LevelKeyholes:
         """Окна внимания уровня number (П.2, П.3)."""
         return self.attention.build(elements, number)
@@ -149,7 +160,13 @@ class CycleStep:
                 "коды слились"
             )
         rows = train_rows[dictionary.rows]
-        return self.memory.remember(dictionary, rows, self.groups.labels[picture[rows]], f"level{number}")
+        memory = self.memory.remember(dictionary, rows, self.groups.labels[picture[rows]], f"level{number}")
+        # Мерка (вне статьи): одной ли цифры картинки, чьи окна слились в одну точку карты.
+        merge = MergePurity(seed=settings.LADDER_RANDOM_SEED + number).measure(
+            codes.packed[train_rows], codes.code_length, picture[train_rows], self.groups.labels[picture[train_rows]],
+            dictionary, name=f"level{number}",
+        )
+        return replace(memory, quality={**memory.quality, **merge})
 
     @staticmethod
     def detect(memory: LevelMemory) -> LevelDetectors:

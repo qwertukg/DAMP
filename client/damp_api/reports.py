@@ -413,6 +413,8 @@ class LevelMap:
         layer: слой каждого детектора; 0 — самый низкий порог λ_d, самые широкие поля (§7.1.10), (D,).
         layer_thresholds: пороги λ_d слоёв по возрастанию.
         activation_threshold: порог зажигания точки λ_a (§6.1, §7.1.11).
+        merge: чистота слияния (мерка, вне статьи; словарь с ключами `merge_*`): одной ли цифры картинки, чьи окна
+            слились в одну точку карты; `None` — не мерена.
         field_half: половина поля зрения уровня в клетках картинки — ячейка рисунка содержимого.
     """
 
@@ -430,6 +432,7 @@ class LevelMap:
     layer_thresholds: tuple[float, ...]
     activation_threshold: float
     field_half: int
+    merge: object = None
 
 
 @dataclass(frozen=True)

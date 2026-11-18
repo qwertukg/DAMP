@@ -317,6 +317,11 @@ class CycleRerunView(LadderObserver):
             self._log(f"{LAYOUT}/live/quality", rr.BarChart(values, abscissa=np.arange(1, values.shape[0] + 1, dtype=np.float64)),
                       number, live=True)
 
+    @staticmethod
+    def _layer_count(layer: int = 0) -> int:
+        """Сколько слоёв детекторов стирать и рисовать: по настройкам, но не меньше слоя layer + 1."""
+        return max(int(settings.LADDER_HIERARCHY_LAYERS), len(settings.LADDER_HIERARCHY_THRESHOLDS or ()), layer + 1)
+
     def _detector_layer(self, layer: int, selected, built, done: bool) -> None:  # noqa: ANN001
         """Слои детекторов заполняются (§6.4): детекторы текущего слоя по ходу, готовые слои остаются; цвет — слой."""
         import rerun as rr
@@ -324,7 +329,7 @@ class CycleRerunView(LadderObserver):
         number, stage = self._stage
         if stage != 4:
             return
-        layers = max(int(settings.LADDER_HIERARCHY_LAYERS), len(settings.LADDER_HIERARCHY_THRESHOLDS or ()), layer + 1)
+        layers = self._layer_count(layer)
         if self._live_level != number:
             # Первый кадр уровня: слои прошлого уровня убираются, иначе они стояли бы до конца построения.
             self._live_level = number
@@ -523,6 +528,11 @@ class CycleRerunView(LadderObserver):
         self._log_quality(n)
         # Этап 4 начинается на этой карте: серый фон под слоями детекторов.
         self._log(f"{DETECTORS}/map", rr.Points2D(positions, colors=np.full((cells.shape[0], 3), 60, dtype=np.uint8), radii=0.42), n)
+        # Слои детекторов прошлого уровня на новой карте не к месту: пока детекторы этого уровня строятся (минуты на
+        # больших картах), на шкале уровня n виднелись бы круги уровня n−1 — другой карты, другого размера. Стираем их
+        # сейчас, вместе с картой; слои уровня n появятся кадрами по ходу счёта либо готовыми (_show_detectors).
+        for k in range(self._layer_count()):
+            self._log(f"{DETECTORS}/layers/l{k}", rr.LineStrips2D([]), n)
 
     @staticmethod
     def _similarity_of(t, bits: np.ndarray) -> np.ndarray:  # noqa: ANN001

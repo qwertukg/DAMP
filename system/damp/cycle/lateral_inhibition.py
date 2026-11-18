@@ -10,6 +10,13 @@
 Здесь то же для выходов миниколонок уровня: деталь остаётся, если в круге торможения вокруг неё нет уже оставшейся
 более сильной детали. Сила детали — её уровень активации (П.1). Радиус круга — доля того, что видит сама деталь.
 Отбор идёт по убыванию силы, поэтому не зависит от места картинки в кадре.
+
+Пятна (similarity). Соседние миниколонки «часто распознают похожие элементы», и пятна активации образуют кластеры
+(П.2, П.3): несколько соседних окон предъявляют одно и то же понятие. С порогом similarity более сильная деталь гасит
+соседку, только если их коды похожи не меньше порога — из пятна остаётся одна деталь, а непохожие соседи остаются
+все. Без порога гасится любая соседка (прежнее торможение: оно убирало и разные понятия — уровень терял цифру).
+В зрительной коре так же: окружение подавляет ответ сильнее всего, когда в нём тот же признак (iso-orientation
+surround suppression, Knierim & van Essen 1992).
 """
 from __future__ import annotations
 
@@ -22,11 +29,28 @@ from damp.logging import LOGGER
 class LateralInhibition:
     """Отбор деталей уровня: в круге торможения остаётся самая сильная."""
 
-    def __init__(self, *, radius_share: float, name: str = "details") -> None:
+    def __init__(self, *, radius_share: float, similarity: float | None = None, name: str = "details") -> None:
         if radius_share <= 0:
             raise ValueError("radius_share must be positive")
+        if similarity is not None and not 0.0 < similarity <= 1.0:
+            raise ValueError("similarity must be in (0, 1]")
         self._share = float(radius_share)
+        self._similarity = None if similarity is None else float(similarity)
         self._name = str(name)
+
+    @classmethod
+    def thin(cls, elements, name: str):  # noqa: ANN001, ANN206
+        """Элементы уровня после торможения по настройкам (LADDER_INHIBITION_RADIUS, LADDER_INHIBITION_SIMILARITY);
+        без торможения — те же элементы. Один вход для прогона цикла и для пути одной картинки."""
+        from damp import settings
+
+        if settings.LADDER_INHIBITION_RADIUS is None:
+            return elements
+        similarity = settings.LADDER_INHIBITION_SIMILARITY
+        chooser = cls(radius_share=float(settings.LADDER_INHIBITION_RADIUS),
+                      similarity=None if similarity is None else float(similarity), name=name)
+        codes = None if similarity is None else (elements.codes(), int(elements.what_length))
+        return elements.only(chooser.survivors(elements.picture, elements.y, elements.x, elements.power(), elements.reach(), codes=codes))
 
     def survivors(
         self,
@@ -35,12 +59,17 @@ class LateralInhibition:
         x: "np.ndarray",
         strength: "np.ndarray",
         sight: "np.ndarray",
+        *,
+        codes: "tuple[np.ndarray, int] | None" = None,
     ) -> "np.ndarray":
         """Маска оставшихся деталей.
 
         picture — номер картинки каждой детали (по возрастанию), y, x — её место, strength — уровень активации,
         sight — сколько клеток от своего места она видит. Радиус торможения детали — radius_share · sight.
+        codes — (упакованные коды деталей, длина кода): нужны при пороге similarity — гасит только похожая соседка.
         """
+        if self._similarity is not None and codes is None:
+            raise ValueError("codes are required when similarity is set")
         picture = np.asarray(picture, dtype=np.int64)
         position = np.stack([np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)], axis=1)
         strength = np.asarray(strength, dtype=np.float64)
@@ -54,6 +83,11 @@ class LateralInhibition:
         bounds = np.append(starts, picture.shape[0])
         for first, last in zip(bounds[:-1], bounds[1:]):
             own = position[first:last]
+            alike = None
+            if self._similarity is not None:
+                bits = np.unpackbits(np.asarray(codes[0][first:last], dtype=np.uint8), axis=1, count=int(codes[1])).astype(np.float32)
+                ones = bits.sum(axis=1)
+                alike = (bits @ bits.T) / np.sqrt(np.maximum(ones[:, None] * ones[None, :], 1.0)) >= self._similarity
             # От сильных к слабым; при равной силе — по месту (сверху вниз, слева направо): порядок не зависит
             # от того, как детали пронумерованы.
             order = np.lexsort((own[:, 1], own[:, 0], -strength[first:last]))
@@ -64,7 +98,8 @@ class LateralInhibition:
                 if kept:
                     held = np.asarray(kept)
                     distance = np.hypot(own[held, 0] - own[index, 0], own[held, 1] - own[index, 1])
-                    if np.any(distance <= radius[first + index]):
+                    near = distance <= radius[first + index]
+                    if np.any(near if alike is None else near & alike[index, held]):
                         continue
                 kept.append(int(index))
             keep[first + np.asarray(kept, dtype=np.int64)] = True
@@ -82,6 +117,7 @@ class LateralInhibition:
                 "details_per_picture": float(picture.shape[0]) / count,
                 "kept_per_picture": float(np.count_nonzero(keep)) / count,
                 "radius_share": self._share,
+                "similarity": 0.0 if self._similarity is None else self._similarity,
                 "radius_mean": float(radius.mean()) if radius.size else 0.0,
                 "note": "торможение соседей: деталь остаётся, если в круге radius_share · (что она видит) нет уже "
                 "оставшейся более сильной; близко к вставке детекторов §6.4.5 (при перекрытии остаётся более "

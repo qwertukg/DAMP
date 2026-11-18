@@ -19,7 +19,6 @@ import numpy as np
 from damp import settings
 from damp.article_refs import FUZZY_SEARCH, NEURAL_ANALOGY, OUTSIDE_ARTICLE
 from damp.cycle.ladder_trace import LEVEL_PARTS, LadderLevelTrace, LadderObserver, LadderObservers, LadderRunTrace, LadderTopTrace
-from damp.cycle.lateral_inhibition import LateralInhibition
 from damp.cycle.step import CycleStep, LadderLevelDegenerate, LevelPass
 from damp.cycle.keyholes import LadderField
 from damp.decode.level_recognition import LevelRecognition
@@ -282,6 +281,7 @@ class MnistLadderRunner:
         return {
             "unit": float(keyholes.field.unit),
             "seen": float(keyholes.seen),
+            "keyhole_radius": float(keyholes.radius),  # средний радиус окна обучающих картинок, клеток
             "keyhole_picture": pieces.picture,
             "keyhole_centre": pieces.centre,
             "keyhole_extent": np.asarray(keyholes.extent, dtype=np.float64),
@@ -336,7 +336,8 @@ class MnistLadderRunner:
         return watch
 
     def _ladder(self, elements: LadderElements, responses: list["np.ndarray"]) -> tuple[LadderElements, LadderField | None]:
-        """Уровни один за другим (проход — CycleStep), пока поле зрения не увидит картинку целиком."""
+        """Уровни один за другим (проход — CycleStep), пока поле зрения не увидит картинку целиком: последний уровень
+        — первый, в окно которого цифра помещается вся (слово автора 2026-11-18: «редуцируемся, пока всё не влезет»)."""
         groups = self._groups
         atoms = groups.atoms
         step = CycleStep(groups, map_max_points=self._map_max_points)
@@ -349,14 +350,9 @@ class MnistLadderRunner:
         first_stick, last_stick = groups.sticks(figure)
         middle = (float(atoms.y[first_stick:last_stick].mean()), float(atoms.x[first_stick:last_stick].mean()))
         for number in range(1, int(settings.LADDER_CLUSTER_LEVELS) + 1):
-            if number > 1 and settings.LADDER_INHIBITION_RADIUS is not None:
-                # Торможение соседей: детали, стоящие ближе доли своего поля, повторяют друг друга — на следующий
-                # уровень идёт самая сильная из них.
-                elements = elements.only(
-                    LateralInhibition(radius_share=float(settings.LADDER_INHIBITION_RADIUS), name=f"details{number - 1}").survivors(
-                        elements.picture, elements.y, elements.x, elements.power(), elements.reach()
-                    )
-                )
+            # Пятна (П.3): детали, стоящие ближе доли своего поля и похожие кодом, повторяют друг друга — на
+            # следующий уровень идёт самая сильная из них.
+            elements = step.thin(elements, number)
             LOGGER.set_cycle(number)
             self._cycle_mark("begin", number, "↻ начало цикла: элементы уровня идут на этап 2 — окна и их коды")
             self._observer.begin(number)
