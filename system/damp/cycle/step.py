@@ -139,8 +139,9 @@ class CycleStep:
         taught = int(np.count_nonzero(pieces.picture < self.groups.train_pictures))
         return self.coder.encode(elements, pieces, number=keyholes.number, unit=keyholes.field.unit, taught=taught)
 
-    def remember(self, codes: KeyholeCodes, keyholes: LevelKeyholes) -> LevelMemory:
-        """Память уровня из кодов окон обучающих картинок (§5); с пределом карты окна обходятся вразброс."""
+    def remember(self, codes: KeyholeCodes, keyholes: LevelKeyholes, *, merge_similarity: float | None = None) -> LevelMemory:
+        """Память уровня из кодов окон обучающих картинок (§5); с пределом карты окна обходятся вразброс.
+        merge_similarity — порог слияния кодов к образцу; None — LADDER_MERGE_SIMILARITY (уровень 0 берёт свой)."""
         number = keyholes.number
         picture = keyholes.pieces.picture
         # Коды окон почти все различны, и с пределом карты образцами стали бы окна первых картинок: окна
@@ -150,7 +151,7 @@ class CycleStep:
             codes.code_length,
             picture,
             self.groups.train_pictures,
-            merge_similarity=float(settings.LADDER_MERGE_SIMILARITY),
+            merge_similarity=float(settings.LADDER_MERGE_SIMILARITY if merge_similarity is None else merge_similarity),
             max_points=self.map_limit(),
             shuffle_seed=None if self.map_max_points is None else settings.LADDER_RANDOM_SEED + number,
         )

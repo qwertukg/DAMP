@@ -478,11 +478,13 @@ class Embeddings(_Stage):
 class Cycle(_Stage):
     """Этап 6. Цикл (§6.2, §6.6; П.2, П.3, П.9): детали уровня снова идут на этап 2 (↺), пока окно не увидит цифру целиком.
 
-    Кубики: `keyholes`, `step`, `covers`, `trained` (обученный цикл для новых картинок — дашборд). Готовый прогон —
-    `run` (команда `ladder`).
+    Кубики: `level0` (уровень 0 — первичная раскладка штрихов, `LADDER_LEVEL0`), `keyholes`, `step`, `covers`,
+    `trained` (обученный цикл для новых картинок — дашборд). Готовый прогон — `run` (команда `ladder`).
 
     Example:
         >>> elements = damp.coding.sticks(damp.stimuli.digits(train=100, test=500))
+        >>> if damp.settings["LADDER_LEVEL0"]:
+        ...     elements = damp.cycle.level0(elements)
         >>> while True:
         ...     level = damp.cycle.step(elements)
         ...     elements = level.details
@@ -495,6 +497,42 @@ class Cycle(_Stage):
     def __init__(self, session: Session, stages: dict[str, _Stage]) -> None:
         super().__init__(session)
         self._stages = stages
+
+    def level0(self, elements: Elements, *, map_points: int | None = None) -> Elements:
+        """Кубик. Уровень 0 цикла — первичная раскладка штрихов (`LADDER_LEVEL0`; §6.5, §7.1.12; П.4).
+
+        Тот же проход, что у уровней: окно на каждом штрихе (кусок — один штрих, атом), затем память, детекторы и код
+        штриха — его сильнейшие детекторы. Что лежит в окне — `LADDER_LEVEL0_PLACE`: `"stroke"` — общий подход: точки,
+        из которых детектор собрал штрих (§6.4.3), с местами от центра штриха (П.4), код — форма штриха внутри поля;
+        `"digit"` — штрих один, место — от центра цифры (вариант 3; центр — доработка). Возвращает те же штрихи с
+        выученными кодами: с ними, а не с готовым кодом наклона, штрихи идут в окна уровня 1 — как в готовом прогоне.
+
+        Args:
+            elements: штрихи (`Coding.sticks`).
+            map_points: предел точек карты; `None` — `LADDER_MAP_MAX_POINTS`.
+
+        Returns:
+            `Elements` уровня 0: место, поле и сила штрихов прежние, «что» — выученный код.
+
+        Raises:
+            LevelFailed: штрихов на обучающих картинках меньше `LADDER_MAP_MIN_POINTS`.
+
+        Example:
+            >>> sticks = damp.coding.sticks(damp.stimuli.digits(train=100, test=500))
+            >>> elements = damp.cycle.level0(sticks)   # дальше — damp.cycle.step(elements)
+        """
+        if elements.level != 0:
+            raise ValueError("уровень 0 строится над штрихами (Coding.sticks)")
+        limit = system.settings.LADDER_MAP_MAX_POINTS if map_points is None else map_points
+        with self._session.active():
+            try:
+                level, learned = system.stroke_level().train(
+                    elements.digits._groups, elements._elements, map_max_points=None if limit is None else int(limit)
+                )
+            except system.level_failed as error:
+                raise LevelFailed(str(error)) from error
+            level.release()  # карта на видеокарте больше не нужна: коды штрихов уже выучены
+        return Elements(self._session, learned, elements.digits, level=0)
 
     def keyholes(self, elements: Elements) -> Keyholes:
         """Кубик. Окна внимания следующего уровня: окно на каждом элементе, радиус — по кластеру похожих соседей.

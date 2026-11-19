@@ -128,15 +128,25 @@ class KeyholeBuilder:
         )
 
     @staticmethod
-    def fields(step: float, thresholds: "tuple[float, ...] | list[float]", name: str) -> PlaneFieldBuilder:
-        """Построитель окон уровня по его мере плоскости step и порогам слоёв (§6.4.1–§6.4.3): окрестность кластера,
-        радиус активации и наименьший радиус окна заданы в мере «что видит одна деталь уровня»."""
+    def min_points(number: int) -> int:
+        """Сколько похожих соседей нужно окну уровня number (§6.4.3): LADDER_CLUSTER_MIN_POINTS — число на все уровни
+        либо список по уровням 1, 2, … (последнее значение — на всех уровнях выше). Своё число у уровня 1 — по слову
+        автора 2026-11-18: с уровнем 0 штрихи несут выученные коды, и окну уровня 1 может хватать меньше соседей."""
+        value = settings.LADDER_CLUSTER_MIN_POINTS
+        if isinstance(value, (list, tuple)):
+            return int(value[min(max(int(number), 1), len(value)) - 1])
+        return int(value)
+
+    @classmethod
+    def fields(cls, step: float, thresholds: "tuple[float, ...] | list[float]", name: str, number: int = 1) -> PlaneFieldBuilder:
+        """Построитель окон уровня number по его мере плоскости step и порогам слоёв (§6.4.1–§6.4.3): окрестность
+        кластера, радиус активации и наименьший радиус окна заданы в мере «что видит одна деталь уровня»."""
         return PlaneFieldBuilder(
             lambda_thresholds=thresholds,
             activation_radius=settings.LADDER_CLUSTER_ACTIVATION_RADIUS * step,
             eps=settings.LADDER_CLUSTER_EPS * step,
             min_samples=settings.LADDER_CLUSTER_MIN_SAMPLES,
-            min_points=settings.LADDER_CLUSTER_MIN_POINTS,
+            min_points=cls.min_points(number),
             radius_min=settings.LADDER_CLUSTER_RADIUS_MIN * step,
             energy_radius=settings.LADDER_CLUSTER_ENERGY_RADIUS * step,
             energy_threshold=settings.ACTIVATION_ENERGY_THRESHOLD,
@@ -167,7 +177,7 @@ class KeyholeBuilder:
         """Окна новой картинки на обученном уровне number (П.2): мера плоскости step и пороги слоёв thresholds — те,
         что сняты с обучающих картинок, заново не меряются. Окна картинки строятся независимо от других картинок,
         поэтому у картинки прогона здесь те же окна, что в прогоне. Возвращает куски и поле каждого окна."""
-        built = cls.fields(step, thresholds, f"level{number}").build(
+        built = cls.fields(step, thresholds, f"level{number}", number).build(
             elements.picture, elements.y, elements.x, elements.what_packed, elements.what_index, elements.what_length
         )
         return built.pieces, cls.extent(elements, built.pieces)
@@ -198,7 +208,7 @@ class KeyholeBuilder:
         # окно на карте равно полю своей детали. У углопозиций мера — одна клетка, и значения совпадают с
         # настройками детекторов над раскладкой.
         step = max(neighbour_step, float(np.median(elements.reach()[taught])))
-        fields = self.fields(step, thresholds, name).build(
+        fields = self.fields(step, thresholds, name, number).build(
             elements.picture, elements.y, elements.x, elements.what_packed, elements.what_index, elements.what_length
         )
         pieces = fields.pieces

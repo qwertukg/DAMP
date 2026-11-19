@@ -125,6 +125,10 @@ class CycleBlocksTest(unittest.TestCase):
         # Виды обучающих (§7.1.4) у кубиков — те же, что у готового прогона (LADDER_TRAIN_VIEWS).
         self.assertEqual(digits._groups.ranges, runner.groups.ranges)
         elements = damp.coding.sticks(digits)
+        if damp.settings["LADDER_LEVEL0"]:
+            # Уровень 0 — первичная раскладка штрихов: тот же StrokeLevel, что в готовом прогоне; штрихи — с выученными кодами.
+            elements = damp.cycle.level0(elements)
+            self.assertIsNotNone(runner.primary)  # дальше коды окон уровня 1 сверяются с прогоном — значит, и коды штрихов те же
         firings = []
         for trace in traces.levels:
             with self.subTest(level=trace.number):
@@ -157,6 +161,7 @@ class TrainedLadderPartTest(unittest.TestCase):
     tests/test_trained_ladder.py."""
 
     def test_part_maps_sight_and_dashboard_answers(self) -> None:
+        import base64
         import json
 
         from torchvision.datasets import MNIST
@@ -186,10 +191,34 @@ class TrainedLadderPartTest(unittest.TestCase):
             self.assertTrue(np.all(np.asarray(level.lit_point) < np.asarray(built.labels).shape[0]))
             self.assertTrue(np.all(np.asarray(level.fired_detector) < np.asarray(built.layer).shape[0]))
             self.assertTrue(np.all(np.asarray(level.fired_keyhole) < keyholes))
-        self.assertTrue(json.dumps(DashboardData.model(ladder, maps, sticks, damp.settings)))
+        model = DashboardData.model(ladder, maps, sticks, damp.settings)
+        self.assertTrue(json.dumps(model))
         answer = DashboardData.sight(sight, maps, 40)
         self.assertEqual(len(answer["levels"]), len(sight.levels))
         self.assertEqual(len(answer["probabilities"]), 10)
+        # Уровень 0 в цикле (LADDER_LEVEL0): у каждого штриха — его деталь уровня 0, сильнейшая зажжённая им точка
+        # первичной карты, и сила детали; страница рисует их на картинке уровня 1, как детали уровней выше.
+        primary = ladder.primary_map()
+        self.assertIsNotNone(primary)
+        self.assertEqual(model["primary"]["inCycle"], bool(damp.settings["LADDER_LEVEL0"]))
+        count = answer["sticks"]["count"]
+        stick_point = np.frombuffer(base64.b64decode(answer["primary"]["stickPoint"]), dtype="<i4")
+        stick_strength = np.frombuffer(base64.b64decode(answer["primary"]["stickStrength"]), dtype="<f4")
+        self.assertEqual(stick_point.shape, (count,))
+        self.assertEqual(stick_strength.shape, (count,))
+        self.assertTrue(np.all((stick_point >= -1) & (stick_point < model["primary"]["points"])))
+        lit_stick, lit_point = np.asarray(sight.primary.lit_stick), np.asarray(sight.primary.lit_point)
+        lit_value = np.asarray(sight.primary.lit_value)
+        for stick in range(count):
+            mine = lit_stick == stick
+            if not np.any(mine):
+                self.assertEqual(stick_point[stick], -1)
+                continue
+            self.assertAlmostEqual(float(lit_value[mine][lit_point[mine] == stick_point[stick]].max()), float(lit_value[mine].max()), places=6)
+        fired_stick, fired_level = np.asarray(sight.primary.fired_stick), np.asarray(sight.primary.fired_level)
+        expected = np.zeros(count, dtype=np.float32)
+        np.maximum.at(expected, fired_stick, fired_level.astype(np.float32))
+        np.testing.assert_array_equal(stick_strength, expected)
 
 
 class DigitGroupNamesTest(unittest.TestCase):

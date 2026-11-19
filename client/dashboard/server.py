@@ -11,7 +11,7 @@
 | `GET /api/model` | один раз: первичная карта («уровень 0»: точки с углом и местом штриха, детекторы), карты уровней (точки, их окна, детекторы по слоям), углопозиции обучающих картинок, кисть |
 | `GET /api/example` | пример: случайная пятёрка из первых `DASHBOARD_EXAMPLES` картинок MNIST t10k и её номер в MNIST |
 | `GET /api/status` | сколько рабочих процессов готово считать рисунки (страница шлёт столько запросов сразу) |
-| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали; класс — ответ памяти (среднее долей голосов кусочков по уровням и согласие уровней, §7.1.13.3), голоса по уровням и вероятности линейного читателя (§9.3); с выбранной точкой карты — ещё и её кусочки |
+| `POST /api/see` | рисунок 28×28 → путь по уровням: кусочки, зажжённые точки, сработавшие детекторы, детали (у штриха — его деталь уровня 0: сильнейшая точка первичной карты и сила); класс — ответ памяти (среднее долей голосов кусочков по уровням и согласие уровней, §7.1.13.3), голоса по уровням и вероятности линейного читателя (§9.3); с выбранной точкой карты — ещё и её кусочки |
 | `POST /api/point` | рисунок и выбранная точка карты → все кусочки рисунка, которые её зажгли, по убыванию активации |
 
 Рисунки считают рабочие процессы (`DASHBOARD_WORKERS`): у каждого свой обученный цикл, поэтому несколько рисунков
@@ -64,22 +64,33 @@ class DashboardData:
             "detectors": packed(primary.detectors, "<f4"), "count": int(np.asarray(primary.layer).shape[0]),
             "layer": packed(primary.layer, "u1"), "layerThresholds": list(primary.layer_thresholds),
             "activation": primary.activation_threshold,
+            # Уровень 0 в цикле: элементы уровня 1 — его детали, страница рисует их, как детали уровней выше.
+            "inCycle": bool(primary.in_cycle),
         }
 
     @staticmethod
     def primary_sight(found: "PrimarySight | None", sticks: int) -> "dict | None":
         """Отклик первичной карты на рисунок: у точки — её сильнейшая активация и сколько штрихов её зажгли, у
-        детектора — сильнейший уровень и сколько штрихов в него набилось."""
+        детектора — сильнейший уровень и сколько штрихов в него набилось. У штриха — деталь уровня 0 (П.1): точка
+        карты, которую он зажёг сильнее всего (−1 — ни одной), и уровень активации детали — сильнейший из сработавших
+        на нём детекторов (§6.5); так же страница рисует детали уровней выше."""
         if found is None:
             return None
+        lit_stick = np.asarray(found.lit_stick, dtype=np.int64)
         lit_point, lit_value = np.asarray(found.lit_point), np.asarray(found.lit_value, dtype=np.float32)
         rising = np.argsort(lit_value, kind="stable")
         activation = np.zeros(found.points, dtype=np.float32)
         activation[lit_point[rising]] = lit_value[rising]
+        # Пары идут от слабых к сильным: у штриха остаётся последняя запись — сильнейшая зажжённая им точка.
+        stick_point = np.full(int(sticks), -1, dtype=np.int32)
+        stick_point[lit_stick[rising]] = lit_point[rising]
+        fired_stick = np.asarray(found.fired_stick, dtype=np.int64)
         fired_detector, fired_level = np.asarray(found.fired_detector), np.asarray(found.fired_level, dtype=np.float32)
         rising = np.argsort(fired_level, kind="stable")
         strongest = np.zeros(found.detectors, dtype=np.float32)
         strongest[fired_detector[rising]] = fired_level[rising]
+        stick_strength = np.zeros(int(sticks), dtype=np.float32)
+        stick_strength[fired_stick[rising]] = fired_level[rising]
         return {
             "sticks": int(sticks),
             "pointActivation": packed(activation, "<f4"),
@@ -87,6 +98,7 @@ class DashboardData:
             "litPairs": int(lit_point.shape[0]), "fired": int(fired_detector.shape[0]),
             "detectorCount": packed(np.minimum(np.bincount(fired_detector, minlength=found.detectors), 65535), "<u2"),
             "detectorLevel": packed(strongest, "<f4"),
+            "stickPoint": packed(stick_point, "<i4"), "stickStrength": packed(stick_strength, "<f4"),
         }
 
     @staticmethod

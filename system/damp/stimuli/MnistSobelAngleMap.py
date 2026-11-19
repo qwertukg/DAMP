@@ -601,6 +601,60 @@ class MnistSobelAngleMap:
         )
         return out
 
+    def stroke_points(self, image: Union[np.ndarray, "np.typing.ArrayLike"]) -> dict[str, np.ndarray]:
+        """Штрихи картинки вместе с точками, из которых они собраны, — вход уровня 0 по общему подходу
+        (LADDER_LEVEL0_PLACE = "stroke"; доработка): атом — штрих, его элементы — точки его поля (§6.4.3).
+
+        Те же штрихи, что у extract(with_magnitude=True), в том же порядке. Места — в участках, как у штрихов.
+
+        Returns:
+            strokes — (S, 5): угол, x, y, сила, полудлина поля (как у extract); point_y, point_x — места точек;
+            point_angle — направление точки в тех же единицах, что угол штриха (у середины линии — без стрелки);
+            point_strength — сила точки, доля сильнейшей на картинке; entry_stroke, entry_point — пары
+            «номер штриха — номер точки его поля», штрихи по возрастанию.
+
+        Raises:
+            ValueError: штрихи не детекторами (нужны MNIST_CONTOUR_ONLY и MNIST_STROKE_DETECTORS).
+        """
+        if not (self.contour_only and self.stroke_detectors is not None):
+            raise ValueError("точки штрихов есть только у штрихов-детекторов (MNIST_CONTOUR_ONLY, MNIST_STROKE_DETECTORS)")
+        img, _ = self._normalized(image)
+        if self.upscaled is not None:
+            work, gx, gy = self.upscaled.apply(img, self.KX, self.KY)
+        else:
+            work = img
+            gx, gy = self._sobel_field(img)
+        if self.stroke_midline is not None:
+            y, x, vx, vy = self.stroke_midline.points(work)
+        else:
+            y, x, vx, vy = self.stroke_detectors._edge_points(self._contour_mask_of(work), gx, gy)
+        found, fields = self.stroke_detectors.strokes_with_fields(y, x, vx, vy)
+        p = float(self.work_patch)
+        y, x = np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)
+        vx, vy = np.asarray(vx, dtype=np.float64), np.asarray(vy, dtype=np.float64)
+        magnitude = np.hypot(vx, vy)
+        # Направление точки — как угол штриха из одной этой точки: без стрелки — 0…180° (удвоенный угол), иначе — угол вектора.
+        raw = np.mod(np.arctan2(vy, vx), np.pi) if self.stroke_detectors.axial else np.arctan2(vy, vx)
+        strokes = np.asarray(
+            [
+                (float(np.degrees(s.angle)) if self.angle_in_degrees else float(s.angle), s.x / p - 0.5, s.y / p - 0.5,
+                 s.strength, s.half_length / p)
+                for s in found
+            ],
+            dtype=np.float64,
+        ).reshape(-1, 5)
+        entry_stroke = np.concatenate([np.full(f.shape[0], i, dtype=np.int64) for i, f in enumerate(fields)]) if fields else np.zeros(0, np.int64)
+        entry_point = np.concatenate(fields).astype(np.int64) if fields else np.zeros(0, np.int64)
+        return {
+            "strokes": strokes,
+            "point_y": y / p - 0.5,
+            "point_x": x / p - 0.5,
+            "point_angle": np.degrees(raw) if self.angle_in_degrees else raw,
+            "point_strength": magnitude / float(magnitude.max()) if magnitude.size else magnitude,
+            "entry_stroke": entry_stroke,
+            "entry_point": entry_point,
+        }
+
     def _contour_angles(self, work: np.ndarray, gx: np.ndarray, gy: np.ndarray) -> List[AngleTriplet]:
         """Углопозиции только по контуру: одна на участок, угол — средний градиент края в пикселях контура."""
         out: List[AngleTriplet] = []

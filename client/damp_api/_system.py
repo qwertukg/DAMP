@@ -130,6 +130,12 @@ class System:
 
         return StickCoder()
 
+    def stroke_level(self):  # noqa: ANN201
+        """Уровень 0 цикла — первичная раскладка штрихов (StrokeLevel, LADDER_LEVEL0; §6.5, §7.1.12; П.4)."""
+        from damp.cycle.primary import StrokeLevel
+
+        return StrokeLevel
+
     # ------------------------------------------------------------------ этапы 3–5: проход без цикла
     def first_level(self, **options):  # noqa: ANN201
         """Раскладка всех углопозиций, детекторы и база эмбеддингов (команда layout)."""

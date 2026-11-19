@@ -44,6 +44,40 @@ class JsonlLogTest(unittest.TestCase):
         self.assertEqual(files, ["damp.jsonl", "damp.jsonl.1", "damp.jsonl.2"])
         self.assertEqual(last["data"]["number"], 39)
 
+    def test_busy_file_is_not_rotated_and_records_keep_coming(self) -> None:
+        """Файл держит другой процесс (пары прогонов подбора): перенос на Windows падает — запись идёт в тот же файл,
+        без ошибок на каждой записи, перенос — после паузы."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "damp.jsonl"
+            log = JsonlLog(str(path), max_bytes=200, backups=2, array_limit=10)
+            handler = log._logger.handlers[0]
+            with mock.patch.object(handler, "rotate", side_effect=PermissionError("занят")), \
+                    mock.patch.object(handler, "handleError") as failed:
+                for number in range(20):
+                    log.write("figure.save", "вне статьи", {"number": number}, f"figure.save number={number}")
+            lines = path.read_text(encoding="utf-8").splitlines()
+            log.close()
+        failed.assert_not_called()
+        self.assertEqual(json.loads(lines[-1])["data"]["number"], 19)
+
+    def test_log_opens_later_when_the_file_is_busy_at_start(self) -> None:
+        """В миг старта файл переносит другой процесс: журнал не падает, а открывает файл при следующей записи."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "damp.jsonl"
+            log = JsonlLog(str(path), max_bytes=10_000, backups=2, array_limit=10)
+            handler = log._logger.handlers[0]
+            real_open = handler._open
+            with mock.patch.object(handler, "_open", side_effect=[PermissionError("занят"), real_open()]):
+                log.write("figure.save", "вне статьи", {"number": 1}, "первая — файл занят")
+                log.write("figure.save", "вне статьи", {"number": 2}, "вторая — файл свободен")
+            lines = path.read_text(encoding="utf-8").splitlines()
+            log.close()
+        self.assertEqual([json.loads(line)["data"]["number"] for line in lines], [2])
+
 
 class LoggerNotMutedTest(unittest.TestCase):
     """Тесты не глушат журнал: прогоны тестов видны в окне Rerun (RERUN=on), подписки хода счёта работают."""

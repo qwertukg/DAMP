@@ -170,6 +170,8 @@ class MnistLadderRunner:
         # прогона не влияет; карта и детекторы уровня остаются в памяти, видеокарта под ними освобождается как обычно.
         self._keep_levels = bool(keep_levels)
         self.levels: list = []  # TrainedLevel по уровням (при keep_levels)
+        # Уровень 0 — первичная раскладка штрихов (LADDER_LEVEL0): штрихи идут в уровень 1 с выученными кодами.
+        self.primary = None
 
     def run(self) -> dict[int, float] | None:
         """Вся лестница; возвращает узнавание по склейке кодов картинки от всех уровней (None — без проверки)."""
@@ -235,6 +237,18 @@ class MnistLadderRunner:
         self.level_responses = responses
         self.level_peaks = []
         self.levels = []
+        self.primary = None
+        if settings.LADDER_LEVEL0:
+            # Уровень 0 (вариант 3 автора, 2026-11-18): первичная раскладка штрихов с местом от центра цифры; код штриха —
+            # его сильнейшие детекторы (§6.5, §7.1.12). С ним, а не с готовым кодом наклона, штрих идёт в уровень 1.
+            from damp.cycle.primary import StrokeLevel
+
+            self.primary, elements = StrokeLevel.train(groups, elements, map_max_points=self._map_max_points)
+            # Видеопамять уровня 0 — как у уровней (LevelPass.release): освобождается сразу после обучения и при
+            # keep_levels тоже; детекторы пересобираются при первой новой картинке (LevelDetectors.detection). Иначе
+            # карта уровня 0 (30 тыс. точек на 500 цифрах) держит видеокарту всё обучение уровней 1–3, и раскладка
+            # следующей карты упирается в память (прогон 446, 2026-11-19).
+            self.primary.release()
         elements, reached = self._ladder(elements, responses)
         if reached is None:
             raise RuntimeError("лестница не построила ни одного уровня")

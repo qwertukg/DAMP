@@ -42,7 +42,8 @@ class TrainedLadderTest(unittest.TestCase):
                 file_prefix=str(Path(folder) / "ladder"), observer=cls.traces, keep_levels=True,
             )
             cls.runner.run()
-            cls.ladder = TrainedLadder(cls.runner.groups, cls.runner.levels, cls.runner.level_peaks, decay=1e-7)
+            # Уровень 0 (LADDER_LEVEL0) — из прогона, как в TrainedLadder.train: штрихи рисунка проходят через него.
+            cls.ladder = TrainedLadder(cls.runner.groups, cls.runner.levels, cls.runner.level_peaks, decay=1e-7, primary=cls.runner.primary)
             groups = cls.runner.groups
             first, last = groups.ranges["test"]
             mnist = MNIST(root="./data", train=False, download=True)

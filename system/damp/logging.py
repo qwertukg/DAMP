@@ -11,6 +11,7 @@ import json
 import logging
 import logging.handlers
 import os
+import time
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,42 @@ from typing import Any, Callable, Mapping, Sequence
 import rerun as rr
 
 LOG_PATH = "damp/log"
+
+
+class SharedRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Файл журнала с переносом по размеру, в который пишут несколько процессов сразу (пары прогонов подбора).
+
+    На Windows перенос файла, который держит другой процесс, падает с отказом в доступе — тогда файл не переносится,
+    запись продолжается в тот же файл, а следующий перенос пробуется через ROLLOVER_PAUSE секунд (иначе ошибка
+    печаталась бы на каждой записи).
+    """
+
+    ROLLOVER_PAUSE = 60.0
+
+    def shouldRollover(self, record: logging.LogRecord) -> int:  # noqa: N802 — имя из logging
+        if time.time() < getattr(self, "_paused_until", 0.0):
+            return 0
+        return super().shouldRollover(record)
+
+    def doRollover(self) -> None:  # noqa: N802 — имя из logging
+        try:
+            super().doRollover()
+        except PermissionError:
+            self._paused_until = time.time() + self.ROLLOVER_PAUSE
+            if self.stream is None:
+                try:
+                    self.stream = self._open()
+                except PermissionError:
+                    self.stream = None  # откроется при следующей записи
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Запись; файл, который в этот миг переносит другой процесс, открывается при следующей записи."""
+        if self.stream is None:
+            try:
+                self.stream = self._open()
+            except PermissionError:
+                return
+        super().emit(record)
 
 
 class JsonlLog:
@@ -34,7 +71,9 @@ class JsonlLog:
         self._logger = logging.getLogger(f"damp.jsonl.{self._run}")
         self._logger.propagate = False
         self._logger.setLevel(logging.INFO)
-        handler = logging.handlers.RotatingFileHandler(self.path, maxBytes=int(max_bytes), backupCount=int(backups), encoding="utf-8")
+        # delay: файл открывается при первой записи — если в этот миг его переносит другой процесс, запись повторится,
+        # а прогон не упадёт (пары прогонов подбора пишут в один журнал).
+        handler = SharedRotatingFileHandler(self.path, maxBytes=int(max_bytes), backupCount=int(backups), encoding="utf-8", delay=True)
         handler.setFormatter(logging.Formatter("%(message)s"))
         self._logger.addHandler(handler)
 

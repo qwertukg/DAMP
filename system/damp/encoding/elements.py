@@ -132,29 +132,59 @@ class StickCoder:
             strength=np.asarray(atoms.strength, dtype=np.float64) if settings.LADDER_STROKE_STRENGTH else None,
         )
 
-    def _codes(self, atoms: "DigitAtoms") -> tuple["np.ndarray", "np.ndarray"]:
-        """Различные коды направлений и номер кода у каждой углопозиции."""
+    def points(self, picture: "np.ndarray", y: "np.ndarray", x: "np.ndarray", angle: "np.ndarray",
+               strength: "np.ndarray") -> LadderElements:
+        """Элементы уровня 0 по общему подходу (LADDER_LEVEL0_PLACE = "stroke"; доработка): точки, из которых собраны
+        штрихи, и коды их направлений — теми же детекторами угла, что у штрихов (§4.4). Место — в клетках, как у
+        штрихов; сила — сила точки, доля сильнейшей на картинке (при LADDER_STROKE_STRENGTH). Коды — из кеша шагов."""
+        from damp.cache import CACHE
+
+        angle = np.asarray(angle, dtype=np.float64)
+
+        def compute() -> dict[str, object]:
+            what, index, _ = self._angle_codes(angle)
+            return {"what": what, "index": index}
+
+        found = CACHE.run("coding.points", {"angle": angle}, compute, modules=("damp.encoding.elements",))
+        return LadderElements(
+            picture=np.asarray(picture, dtype=np.int64),
+            y=np.asarray(y, dtype=np.float64),
+            x=np.asarray(x, dtype=np.float64),
+            what_packed=found["what"],
+            what_length=self.encoder.code_length,
+            what_index=found["index"],
+            strength=np.asarray(strength, dtype=np.float64) if settings.LADDER_STROKE_STRENGTH else None,
+        )
+
+    def _angle_codes(self, angle: "np.ndarray") -> tuple["np.ndarray", "np.ndarray", int]:
+        """Различные коды направлений, номер кода у каждого угла и число различных углов."""
         encoder = self.encoder
-        angles, angle_index = np.unique(atoms.angle, return_inverse=True)
+        angles, angle_index = np.unique(angle, return_inverse=True)
         # Углы кодируются порциями: матрица «углы × биты» целиком не создаётся.
         packed = np.concatenate(
             [
                 LayoutCodeTable.pack_bits(encoder.encode_matrix(angles[start : start + 8192].reshape(-1, 1)))
                 for start in range(0, angles.shape[0], 8192)
             ]
-        )
+        ) if angles.shape[0] else np.zeros((0, -(-int(encoder.code_length) // 8)), dtype=np.uint8)
         what, index = distinct_codes(packed)
+        return what, index[angle_index.reshape(-1)], int(angles.shape[0])
+
+    def _codes(self, atoms: "DigitAtoms") -> tuple["np.ndarray", "np.ndarray"]:
+        """Различные коды направлений и номер кода у каждой углопозиции."""
+        encoder = self.encoder
+        what, codes, angles_count = self._angle_codes(atoms.angle)
         LOGGER.event(
             "ladder.sticks",
             section=OUTSIDE_ARTICLE,
             data={
                 "sticks": int(atoms.picture.shape[0]),
                 "pictures": atoms.pictures,
-                "angles": int(angles.shape[0]),
+                "angles": angles_count,
                 "angle_codes": int(what.shape[0]),
                 "code_length": encoder.code_length,
                 "note": "уровень 0: элемент — углопозиция, «что» — код её направления; место на картинке в код "
                 "не входит",
             },
         )
-        return what, index[angle_index.reshape(-1)]
+        return what, codes

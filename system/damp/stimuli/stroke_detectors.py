@@ -161,11 +161,19 @@ class StrokeDetectors:
         Точки края — направление перепада яркости; точки середины линии (axial) — направление поперёк линии, без
         стрелки. Длина вектора — сила точки.
         """
+        return self.strokes_with_fields(y, x, vx, vy)[0]
+
+    def strokes_with_fields(
+        self, y: "np.ndarray", x: "np.ndarray", vx: "np.ndarray", vy: "np.ndarray"
+    ) -> tuple[list[Stroke], list["np.ndarray"]]:
+        """Штрихи (как strokes_of) и точки поля каждого: номера входных точек, из которых собран штрих (§6.4.3: точки
+        кластера не дальше шага от точки-центра). По ним центр штриха — их взвешенное среднее (§6.4.2); для уровня 0
+        по общему подходу они — элементы окна-штриха (LADDER_LEVEL0_PLACE = "stroke")."""
         y, x = np.asarray(y, dtype=np.float64), np.asarray(x, dtype=np.float64)
         vx, vy = np.asarray(vx, dtype=np.float64), np.asarray(vy, dtype=np.float64)
         count = int(y.shape[0])
         if count == 0:
-            return []
+            return [], []
         magnitude = np.hypot(vx, vy)
         ux, uy = vx / magnitude, vy / magnitude
         distance = np.hypot(y[:, None] - y[None, :], x[:, None] - x[None, :])
@@ -182,7 +190,7 @@ class StrokeDetectors:
         total = weight.sum(axis=1)
         valid = (points >= int(self.min_points)) & (total > 0.0)
         if not bool(valid.any()):
-            return []
+            return [], []
         safe = np.where(total > 0.0, total, 1.0)
         centre_y, centre_x = (weight @ y) / safe, (weight @ x) / safe
         # Угол — по куску края длиннее шага: сумма градиентов точек кластера (весь кластер лежит в пределах куска).
@@ -195,9 +203,11 @@ class StrokeDetectors:
             angle = np.arctan2(span @ vy, span @ vx)
         chosen = self._insert(y, x, centre_y, centre_x, points, valid, angle)
         found = []
+        fields = []
         for i in chosen:
             # Длина поля вдоль края: расстояние от центра до самой дальней точки поля (r(p), §6.4.3).
             inside = field[i]
+            fields.append(np.flatnonzero(inside))
             half_length = float(np.hypot(y[inside] - centre_y[i], x[inside] - centre_x[i]).max())
             found.append(
                 Stroke(
@@ -223,7 +233,7 @@ class StrokeDetectors:
                 "шага (§6.4.5), угол — по куску края длиннее шага",
             },
         )
-        return found
+        return found, fields
 
     def _insert(
         self, y: "np.ndarray", x: "np.ndarray", centre_y: "np.ndarray", centre_x: "np.ndarray", points: "np.ndarray",

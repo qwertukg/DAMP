@@ -830,9 +830,9 @@ class DetectorHierarchyBuilder:
         # Таблица общих бит всех пар кодов карты: считается один раз при первом обращении (_common_table).
         self._common: "np.ndarray | None" = None
         self._common_ready = False
-        # Кластеры всех центров каждого слоя, посчитанные разом (_prepare_clusters): по слою — упакованные маски
-        # «центр × точка» и число активированных точек каждого центра.
-        self._layer_clusters: dict[int, tuple["np.ndarray", "np.ndarray"]] = {}
+        # Кандидаты в детекторы всех центров каждого слоя, построенные по кластерам, посчитанным разом
+        # (_prepare_clusters): по слою — список длиной в число точек, у центра — кандидат либо None.
+        self._layer_candidates: dict[int, list["DetectorCandidate | None"]] = {}
         self._clusters_ready = False
         LOGGER.event(
             "activation.detector.builder.init",
@@ -1000,56 +1000,76 @@ class DetectorHierarchyBuilder:
         center_index: int,
         layer: DetectorLayerConfig,
     ) -> DetectorCandidate | None:
+        prepared = self._layer_candidates.get(id(layer))
+        if prepared is not None:
+            # Кандидат построен по кластеру, найденному вместе с кластерами всех центров слоя (§6.4.1): тот же,
+            # что дал бы поштучный счёт ниже.
+            return prepared[center_index]
         lambda_value = layer.lambda_threshold
         if self._energies[center_index] < self._energy_threshold:
             return None
         center_y = self._layout._pos_y[center_index]
         center_x = self._layout._pos_x[center_index]
         seed = (center_y, center_x)
-        prepared = self._layer_clusters.get(id(layer))
-        if prepared is not None:
-            # Кластер центра уже найден вместе с кластерами всех центров слоя (§6.4.1); точки — по возрастанию
-            # номера, как в поштучном счёте, поэтому веса и суммы ниже те же.
-            cluster_indices = np.flatnonzero(np.unpackbits(prepared[0][center_index], count=len(self._energies)))
-            if cluster_indices.size == 0:
-                LOGGER.event(
-                    "activation.detector.cluster.noise",
-                    section=DETECTOR_CLUSTERING,
-                    data={"seed": seed, "eps": self._clusterer.eps, "min_samples": self._clusterer.min_samples},
-                )
-                return None
-            cluster_count = int(cluster_indices.size)
-            if cluster_count < layer.min_points:
-                return None
-            activated_count = int(prepared[1][center_index])
-            cluster_activation = self._threshold_similarity_np(
-                self._similarity_row(center_index, cluster_indices), lambda_value
+        # §6.4.1: активация A_λd(c̃, r_a) кодом центра в радиусе r_a; точки с e < μ не участвуют.
+        disc = self._indices_in_radius_np(center_y, center_x, layer.activation_radius)
+        disc = disc[self._energies_np[disc] >= self._energy_threshold]
+        activation = self._threshold_similarity_np(self._similarity_row(center_index, disc), lambda_value)
+        active_mask = activation > 0.0
+        active_indices = disc[active_mask]
+        # §6.4.2: вес точки — произведение активации и энергии.
+        weights = activation[active_mask] * self._energies_np[active_indices]
+        active_y = self._pos_y_np[active_indices].astype(np.int64)
+        active_x = self._pos_x_np[active_indices].astype(np.int64)
+        if not np.any((active_y == center_y) & (active_x == center_x)):
+            return None
+        cluster_mask = self._clusterer.cluster_mask(active_y, active_x, seed)
+        cluster_count = int(cluster_mask.sum())
+        if cluster_count < layer.min_points:
+            return None
+        activated_count = int(active_indices.size)
+        cluster_w = weights[cluster_mask]
+        cluster_y = active_y[cluster_mask].astype(np.float64)
+        cluster_x = active_x[cluster_mask].astype(np.float64)
+        return self._finish_candidate(layer, seed, cluster_count, activated_count, cluster_w, cluster_y, cluster_x)
+
+    def _cluster_candidate(
+        self, center_index: int, layer: DetectorLayerConfig, cluster_indices: "np.ndarray", activated_count: int
+    ) -> DetectorCandidate | None:
+        """Кандидат по кластеру центра, найденному пакетным счётом (_prepare_clusters) — те же действия, что у
+        поштучного счёта в _make_candidate: точки кластера — по возрастанию номера, поэтому веса и суммы те же."""
+        if self._energies[center_index] < self._energy_threshold:
+            return None
+        seed = (self._layout._pos_y[center_index], self._layout._pos_x[center_index])
+        if cluster_indices.size == 0:
+            LOGGER.event(
+                "activation.detector.cluster.noise",
+                section=DETECTOR_CLUSTERING,
+                data={"seed": seed, "eps": self._clusterer.eps, "min_samples": self._clusterer.min_samples},
             )
-            # §6.4.2: вес точки — произведение активации и энергии.
-            cluster_w = cluster_activation * self._energies_np[cluster_indices]
-            cluster_y = self._pos_y_np[cluster_indices].astype(np.int64).astype(np.float64)
-            cluster_x = self._pos_x_np[cluster_indices].astype(np.int64).astype(np.float64)
-        else:
-            # §6.4.1: активация A_λd(c̃, r_a) кодом центра в радиусе r_a; точки с e < μ не участвуют.
-            disc = self._indices_in_radius_np(center_y, center_x, layer.activation_radius)
-            disc = disc[self._energies_np[disc] >= self._energy_threshold]
-            activation = self._threshold_similarity_np(self._similarity_row(center_index, disc), lambda_value)
-            active_mask = activation > 0.0
-            active_indices = disc[active_mask]
-            # §6.4.2: вес точки — произведение активации и энергии.
-            weights = activation[active_mask] * self._energies_np[active_indices]
-            active_y = self._pos_y_np[active_indices].astype(np.int64)
-            active_x = self._pos_x_np[active_indices].astype(np.int64)
-            if not np.any((active_y == center_y) & (active_x == center_x)):
-                return None
-            cluster_mask = self._clusterer.cluster_mask(active_y, active_x, seed)
-            cluster_count = int(cluster_mask.sum())
-            if cluster_count < layer.min_points:
-                return None
-            activated_count = int(active_indices.size)
-            cluster_w = weights[cluster_mask]
-            cluster_y = active_y[cluster_mask].astype(np.float64)
-            cluster_x = active_x[cluster_mask].astype(np.float64)
+            return None
+        cluster_count = int(cluster_indices.size)
+        if cluster_count < layer.min_points:
+            return None
+        cluster_activation = self._threshold_similarity_np(self._similarity_row(center_index, cluster_indices), layer.lambda_threshold)
+        # §6.4.2: вес точки — произведение активации и энергии.
+        cluster_w = cluster_activation * self._energies_np[cluster_indices]
+        cluster_y = self._pos_y_np[cluster_indices].astype(np.int64).astype(np.float64)
+        cluster_x = self._pos_x_np[cluster_indices].astype(np.int64).astype(np.float64)
+        return self._finish_candidate(layer, seed, cluster_count, int(activated_count), cluster_w, cluster_y, cluster_x)
+
+    def _finish_candidate(
+        self,
+        layer: DetectorLayerConfig,
+        seed: tuple,
+        cluster_count: int,
+        activated_count: int,
+        cluster_w: "np.ndarray",
+        cluster_y: "np.ndarray",
+        cluster_x: "np.ndarray",
+    ) -> DetectorCandidate | None:
+        """Кандидат по кластеру (§6.4.2–§6.4.5): взвешенный центр, радиус по наибольшему заполнению, поле и энергия."""
+        lambda_value = layer.lambda_threshold
         LOGGER.event(
             "activation.detector.cluster",
             section=DETECTOR_CLUSTERING,
@@ -1132,8 +1152,14 @@ class DetectorHierarchyBuilder:
             insertion_density=points_count / best_radius,
         )
 
-    # Центров за один проход пакетной кластеризации слоя.
+    # Центров за один проход пакетной кластеризации слоя — не больше CLUSTER_ROWS и не больше CLUSTER_CELLS пар
+    # «центр × точка» (память блока линейна по числу точек карты); на результат размер блока не влияет.
     CLUSTER_ROWS = 1024
+    CLUSTER_CELLS = 40_000_000
+    # Пакетный счёт кластеров (видеокарта); False — только поштучный счёт (эталон в тестах).
+    BATCHED = True
+    # Точек кодов за одно матричное произведение общих бит блока на видеокарте (без таблицы общих бит).
+    COMMON_CHUNK = 16384
 
     def _prepare_clusters(self) -> None:
         """Кластеры §6.4.1 всех центров всех слоёв разом; результат тот же, что у поштучного счёта в _make_candidate.
@@ -1143,14 +1169,21 @@ class DetectorHierarchyBuilder:
         всеми точками считаются один раз на все слои теми же действиями, что в _similarity_row, принадлежность
         диску — той же функцией расстояния. Связные области ищутся на видеокарте: активированные точки каждого
         центра кладутся в свою сетку карты, ядра находятся свёрткой 3×3, область растёт от центра шагами «соседи
-        ядер». Нужны: видеокарта, таблица общих бит, соседство DBSCAN из восьми ячеек (eps от √2 до 2) и целые
-        координаты точек; иначе кластеры считаются поштучно, как раньше.
+        ядер». Нужны: видеокарта, соседство DBSCAN из восьми ячеек (eps от √2 до 2) и целые координаты точек; иначе
+        кластеры считаются поштучно, как раньше.
+
+        Общие биты блока — строки таблицы общих бит, а без неё (карта больше COMMON_TABLE_POINTS) — матричное
+        произведение кодов на видеокарте: те же целые числа. Из кластера центра сразу строится кандидат в детекторы
+        (_cluster_candidate) — хранятся только кандидаты, поэтому память не растёт как квадрат числа точек.
         """
         if self._clusters_ready:
             return
         self._clusters_ready = True
+        if not self.BATCHED:
+            return
         layout = self._layout
         table = self._common_table()
+        code_matrix = getattr(layout, "_code_matrix", None)
         ones_array = getattr(layout, "_ones_array", None)
         offsets = self._clusterer._offsets()
         eight = len(offsets) == 9 and all(abs(dy) <= 1 and abs(dx) <= 1 for dy, dx in offsets)
@@ -1159,7 +1192,7 @@ class DetectorHierarchyBuilder:
         except ImportError:  # pragma: no cover
             return
         whole = bool(np.all(self._pos_y_np == np.floor(self._pos_y_np)) and np.all(self._pos_x_np == np.floor(self._pos_x_np)))
-        if table is None or ones_array is None or not eight or not whole or not torch.cuda.is_available():
+        if (table is None and code_matrix is None) or ones_array is None or not eight or not whole or not torch.cuda.is_available():
             return
         count = len(self._energies)
         pos_y = self._pos_y_np.astype(np.int64)
@@ -1176,19 +1209,30 @@ class DetectorHierarchyBuilder:
         reach = np.hypot(np.arange(height, dtype=np.float64)[:, None], np.arange(width, dtype=np.float64)[None, :])
         layers = list(self._layer_configs)
         within = [reach <= float(layer.activation_radius) for layer in layers]
-        packed = [np.zeros((count, (count + 7) // 8), dtype=np.uint8) for _ in layers]
+        candidates: list[list["DetectorCandidate | None"]] = [[None] * count for _ in layers]
         activated = [np.zeros(count, dtype=np.int64) for _ in layers]
         device = torch.device("cuda")
+        # Без таблицы общие биты считаются по кодам на видеокарте: коды — байтами, в float32 — кусками по COMMON_CHUNK
+        # точек (значения целые и меньше 2^24 — произведение точное).
+        codes_gpu = None if table is not None else torch.as_tensor(np.asarray(code_matrix, dtype=np.uint8), device=device)
+        block_rows = max(1, min(self.CLUSTER_ROWS, int(self.CLUSTER_CELLS // max(1, count))))
         cell_t = torch.as_tensor(cell, device=device)
         kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
         steps = [dy * (width + 2) + dx for dy, dx in offsets if (dy, dx) != (0, 0)]
         pool = torch.nn.functional.max_pool2d
         with torch.no_grad():
-            for first in range(0, count, self.CLUSTER_ROWS):
-                rows = np.arange(first, min(count, first + self.CLUSTER_ROWS))
+            for first in range(0, count, block_rows):
+                rows = np.arange(first, min(count, first + block_rows))
                 block = rows.size
                 # Сходство центров блока со всеми точками — те же действия, что в _similarity_row.
-                common = table[rows]
+                if table is not None:
+                    common = table[rows]
+                else:
+                    centres = codes_gpu[torch.as_tensor(rows, device=device)].to(torch.float32)
+                    common = np.empty((block, count), dtype=np.int64)
+                    for start in range(0, count, self.COMMON_CHUNK):
+                        part = codes_gpu[start : start + self.COMMON_CHUNK].to(torch.float32)
+                        common[:, start : start + part.shape[0]] = (centres @ part.T).to(torch.int64).cpu().numpy()
                 ones_center = ones[rows][:, None]
                 ones_points = ones[None, :]
                 if layout._similarity == "cosine":
@@ -1235,24 +1279,33 @@ class DetectorHierarchyBuilder:
                     # Кластер — ядра связной области и активированные точки, соседние с ними; центр входит в свой кластер.
                     member = (pool(component, 3, stride=1, padding=1) * grid).view(block, cells)
                     member[lines[valid], centre[valid]] = 1.0
-                    packed[number][rows] = np.packbits((member[:, cell_t] > 0).cpu().numpy(), axis=1)
+                    inside = (member[:, cell_t] > 0).cpu().numpy()
+                    for line, centre_index in enumerate(rows.tolist()):
+                        candidates[number][centre_index] = self._cluster_candidate(
+                            centre_index, layer, np.flatnonzero(inside[line]), int(activated[number][centre_index])
+                        )
         for number, layer in enumerate(layers):
-            self._layer_clusters[id(layer)] = (packed[number], activated[number])
+            self._layer_candidates[id(layer)] = candidates[number]
         LOGGER.event(
             "activation.detector.clusters",
             section=DETECTOR_CLUSTERING,
             data={
                 "layers": len(layers),
                 "centres": count,
+                "block_rows": int(block_rows),
+                "common_table": table is not None,
                 "activated_mean": [float(item.mean()) for item in activated],
                 "note": "кластеры DBSCAN всех центров всех слоёв посчитаны разом (§6.4.1): ядра — свёрткой по сетке "
-                "карты, связная область — ростом от центра; результат тот же, что при счёте по одному центру",
+                "карты, связная область — ростом от центра; по кластеру сразу строится кандидат в детекторы; "
+                "результат тот же, что при счёте по одному центру",
             },
         )
 
-    # Карта не больше стольких точек получает таблицу общих бит всех пар кодов (int16: N² · 2 байта, 800 МБ на
-    # 20 000 точек); COMMON_TABLE_ROWS — строк таблицы за одно матричное произведение.
-    COMMON_TABLE_POINTS = 20000
+    # Карта не больше стольких точек получает таблицу общих бит всех пар кодов (int16: N² · 2 байта, 3.2 ГБ на
+    # 40 000 точек); COMMON_TABLE_ROWS — строк таблицы за одно матричное произведение. Карта больше — общие биты блоками
+    # на видеокарте (_prepare_clusters) и по месту (_similarity_row): тот же результат, но в 2–3 раза дольше. Было
+    # 20 000; поднято 2026-11-18: карта уровня 1 на 500 цифрах с уровнем 0 — 22 734 точки.
+    COMMON_TABLE_POINTS = 40000
     COMMON_TABLE_ROWS = 2048
 
     def _common_table(self) -> "np.ndarray | None":

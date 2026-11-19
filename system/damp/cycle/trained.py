@@ -23,7 +23,7 @@ from damp import settings
 from damp.activation.details import DetailCoder
 from damp.article_refs import NEURAL_ANALOGY, STIMULUS_DETECTION
 from damp.cycle.keyholes import KeyholeBuilder
-from damp.cycle.primary import PrimaryLevel, PrimarySight
+from damp.cycle.primary import PrimaryLevel, PrimarySight, StrokeLevel
 from damp.cycle.step import CycleStep, LadderLevelDegenerate, TrainedLevel
 from damp.decode.level_recognition import LevelRecognition
 from damp.decode.linear_reader import LinearReader
@@ -87,11 +87,12 @@ class TrainedLadder:
     (TrainedLevel); peaks — пики срабатываний всех картинок прогона по уровням (строки ranges["train"] — обучение
     читателя); decay — штраф L2 читателя. memory — голоса памяти (MemoryVotes) с порогами знания уровней: пороги
     меряются здесь же, по обучающим картинкам без своих точек памяти. primary — уровень 0: первичная карта
-    углопозиций (PrimaryLevel); None — без неё.
+    углопозиций (PrimaryLevel, только для показа) либо уровень 0 цикла (StrokeLevel, LADDER_LEVEL0: штрихи рисунка
+    получают в нём выученные коды); None — без неё.
     """
 
     def __init__(self, groups: DigitGroups, levels: list[TrainedLevel], peaks: list["np.ndarray"], *, decay: float,
-                 primary: PrimaryLevel | None = None) -> None:
+                 primary: "PrimaryLevel | StrokeLevel | None" = None) -> None:
         if not levels:
             raise ValueError("нет ни одного обученного уровня")
         if len(peaks) != len(levels):
@@ -134,13 +135,15 @@ class TrainedLadder:
                 observer=observer, keep_levels=True,
             )
             runner.run()
-            # Уровень 0 — первичная карта углопозиций (этапы 2–3): в счёте уровней не участвует, поэтому строится
-            # после цикла; предел точек — тот же, что у карт уровней.
-            try:
-                primary = PrimaryLevel.build(runner.groups, max_points=map_points)
-            except LadderLevelDegenerate as stop:
-                primary = None
-                LOGGER.event("primary.map.warning", section=NEURAL_ANALOGY, data={"reason": str(stop)})
+            primary = runner.primary  # уровень 0 цикла (LADDER_LEVEL0): построен прогоном, штрихи прошли через него
+            if primary is None:
+                # Без LADDER_LEVEL0 уровень 0 — первичная карта углопозиций (этапы 2–3) только для показа: в счёте
+                # уровней не участвует, поэтому строится после цикла; предел точек — тот же, что у карт уровней.
+                try:
+                    primary = PrimaryLevel.build(runner.groups, max_points=map_points)
+                except LadderLevelDegenerate as stop:
+                    primary = None
+                    LOGGER.event("primary.map.warning", section=NEURAL_ANALOGY, data={"reason": str(stop)})
         ladder = cls(runner.groups, runner.levels, runner.level_peaks, decay=decay, primary=primary)
         LOGGER.event(
             "dashboard.ladder",
@@ -204,8 +207,13 @@ class TrainedLadder:
                 [-1], [np.clip(np.rint(pixels * 255.0), 0, 255).astype(np.uint8)], [-1],
             )
             elements = self._sticks.encode(atoms) if values.shape[0] else None
-            if self.primary is not None and own < 0:
-                # Уровень 0: штрихи рисунка на первичной карте (мерке порогов знания он не нужен).
+            if isinstance(self.primary, StrokeLevel):
+                # Уровень 0 цикла (LADDER_LEVEL0): штрихи получают выученные коды — как в прогоне (MnistLadderRunner._run).
+                if elements is not None:
+                    seen, elements = self.primary.embed(elements, pixels=pixels)
+                    primary = seen if own < 0 else None
+            elif self.primary is not None and own < 0:
+                # Уровень 0 только для показа: штрихи рисунка на первичной карте (мерке порогов знания он не нужен).
                 primary = self.primary.see(atoms.angle, atoms.y, atoms.x)
             for trained in self.levels:
                 if elements is None or elements.count == 0:

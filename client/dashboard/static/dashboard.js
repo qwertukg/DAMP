@@ -64,6 +64,8 @@ function prepareModel(raw) {
       height: P.height, width: P.width, points: P.points, count: P.count, period: P.period, activation: P.activation,
       cells: dec(P.cells, Int16Array), angle: dec(P.angle, Float32Array), y: dec(P.y, Float32Array), x: dec(P.x, Float32Array),
       labels: dec(P.labels, Uint8Array), det: dec(P.detectors, Float32Array), layer: dec(P.layer, Uint8Array),
+      // Уровень 0 в цикле (LADDER_LEVEL0): элементы уровня 1 — детали уровня 0, а не сами углопозиции.
+      inCycle: Boolean(P.inCycle),
     };
     primary.index = new Int32Array(primary.width * primary.height).fill(-1);
     for (let i = 0; i < primary.points; i++) primary.index[primary.cells[2 * i] * primary.width + primary.cells[2 * i + 1]] = i;
@@ -129,6 +131,9 @@ function prepareSight(raw) {
       sticks: Q.sticks, litPairs: Q.litPairs, firedTotal: Q.fired,
       pointAct: dec(Q.pointActivation, Float32Array), pointCount: dec(Q.pointCount, Uint16Array),
       detCount: dec(Q.detectorCount, Uint16Array), detLevel: dec(Q.detectorLevel, Float32Array),
+      // Деталь уровня 0 у каждого штриха (П.1): сильнейшая зажжённая им точка карты (−1 — ни одной) и сила детали.
+      stickPoint: Q.stickPoint ? dec(Q.stickPoint, Int32Array) : null,
+      stickStrength: Q.stickStrength ? dec(Q.stickStrength, Float32Array) : null,
     };
     primary.actHigh = 0; primary.litPoints = 0;
     for (let p = 0; p < M.points; p++) { if (primary.pointAct[p] > 0) primary.litPoints++; primary.actHigh = Math.max(primary.actHigh, primary.pointAct[p]); }
@@ -813,11 +818,29 @@ function drawPieces(item) {
   const V = sight.levels[item.n];
   const marks = highlights();
   // Штрихи — главное на рисунке: рисуются последними, поверх полей, точек кусочков и подсветки (автор 2026-11-17:
-  // «штрихи поверх всего, а точки уменьши»). На уровне 1 это углопозиции, выше — детали уровня ниже.
+  // «штрихи поверх всего, а точки уменьши»). Элементы уровня — детали уровня ниже (П.1, §6.6); на уровне 1 с уровнем 0
+  // в цикле это детали уровня 0, без него — сами углопозиции.
   // Картинка уровня выше первого собрана из деталей уровня ниже (П.1, §6.6): элементы её окон — детали, прошедшие
   // торможение. Каждая деталь — штрихи окна памяти, на которое её кусочек больше всего похож, на месте кусочка;
   // цвет — цифра этого окна, яркость — сила детали. Когда выбран путь, детали вне его гаснут.
   const strokes = () => {
+    if (item.n === 0 && levelZeroDetails(sight)) {
+      // Деталь уровня 0 — штрих памяти уровня 0, который штрих рисунка зажёг сильнее всего: его наклон на месте штриха
+      // рисунка; цвет — цифра его картинки, яркость — сила детали. Так же, как детали уровней выше; вне пути гаснут.
+      const st = sight.sticks, M0 = S.model.primary, Q = sight.primary, focus = marks.size > 0;
+      const path = focus ? levelOnePath(marks) : null, cellPx = unit * S.model.cell;
+      let strongest = 0;
+      for (let i = 0; i < st.count; i++) strongest = Math.max(strongest, Q.stickStrength[i]);
+      const order = Array.from({length: st.count}, (_, i) => i).sort((a, b) => Q.stickStrength[a] - Q.stickStrength[b]);
+      for (const i of order) {
+        if (focus && !path.has(i)) continue;
+        const p = Q.stickPoint[i];
+        if (p < 0) { stick(ctx, px(st.x[i]), px(st.y[i]), cellPx, st.angle[i], 0.25, "#555", 0); continue; }
+        const weight = strongest > 0 ? Math.pow(Q.stickStrength[i] / strongest, 2.5) : 0;
+        stick(ctx, px(st.x[i]), px(st.y[i]), cellPx, M0.angle[p], 0.03 + 0.92 * weight, CLASS[M0.labels[p]], 0);
+      }
+      return;
+    }
     if (item.n === 0) {
       const st = sight.sticks;
       for (let i = 0; i < st.count; i++) stick(ctx, px(st.x[i]), px(st.y[i]), unit * S.model.cell, st.angle[i], 0.85, null, st.span[i]);
@@ -883,8 +906,8 @@ function drawPieces(item) {
     }
   }
   strokes();
-  // Углопозиции выбранного кусочка уровня 1.
-  if (item.n === 0 && levelMarks) {
+  // Углопозиции выбранного кусочка уровня 1 (без уровня 0 в цикле; с ним путь показывают сами детали уровня 0).
+  if (item.n === 0 && levelMarks && !levelZeroDetails(sight)) {
     for (const [k, kind] of levelMarks) {
       if (kind === "member") continue;
       for (let j = V.entries.start[k]; j < V.entries.start[k + 1]; j++) {
@@ -893,6 +916,19 @@ function drawPieces(item) {
       }
     }
   }
+}
+
+// Есть ли у рисунка детали уровня 0: уровень 0 в цикле, и сервер прислал у штрихов их точки карты.
+function levelZeroDetails(sight) {
+  return Boolean(S.model.primary && S.model.primary.inCycle && sight && sight.primary && sight.primary.stickPoint);
+}
+
+// Штрихи на пути выбранного: элементы отмеченных кусочков уровня 1 (выбранного, под курсором и их состава).
+function levelOnePath(marks) {
+  const V = S.sight.levels[0], path = new Set(), level = marks.get(0);
+  if (!V || !level) return path;
+  for (const k of level.keys()) for (let j = V.entries.start[k]; j < V.entries.start[k + 1]; j++) path.add(V.entryElement[V.entries.order[j]]);
+  return path;
 }
 
 // Подсветка кусочков по уровням: выбранный (pin), под курсором (hover), его состав ниже и куда он вошёл выше.
@@ -1513,7 +1549,7 @@ function renderStatus() {
   const maxLayers = Math.max(...m.levels.map(L => L.thresholds.length));
   $("legend").innerHTML = Array.from({length: maxLayers}, (_, k) => `<span><i style="border-color:${LAYER[k % LAYER.length]}"></i>слой ${k}</span>`).join("") +
     `<span>□ зажжённая точка</span><span style="color:${PIN}">● выбранное (кусочек, кластер, точка)</span><span style="color:${MEMBER}">● его путь</span>` +
-    `<span>цветные штрихи на уровне 2+ — детали уровня ниже, цвет — цифра</span>`;
+    `<span>цветные штрихи на уровне ${m.primary && m.primary.inCycle ? "1+" : "2+"} — детали уровня ниже, цвет — цифра</span>`;
 }
 
 // Частота обновления за последнюю секунду и рабочие процессы сервера.

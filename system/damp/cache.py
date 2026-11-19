@@ -281,6 +281,24 @@ class StepCache:
             )
             return None
 
+    @staticmethod
+    def _place(temporary: Path, target: Path) -> bool:
+        """Подменить target готовым файлом temporary. Два процесса могут посчитать один и тот же шаг одновременно (пары
+        прогонов подбора): на Windows подмена файла, который держит другой процесс, падает с отказом в доступе. Тогда
+        тот же шаг уже записан соседом — блоб назван по содержимому, запись шага — по ключу входа, — и своя копия не
+        нужна. False — запись оставлена соседу."""
+        for attempt in range(5):
+            try:
+                os.replace(temporary, target)
+                return True
+            except PermissionError:
+                if target.exists():
+                    temporary.unlink(missing_ok=True)
+                    return False
+                time.sleep(0.2 * (attempt + 1))
+        os.replace(temporary, target)
+        return True
+
     def _write(self, path: Path, parts: dict[str, object], outputs: Mapping[str, object], seconds: float) -> int:
         stored: dict[str, object] = {}
         size = 0
@@ -293,8 +311,8 @@ class StepCache:
                     blob.parent.mkdir(parents=True, exist_ok=True)
                     temporary = blob.with_name(f"{blob.stem}.{os.getpid()}.tmp.npy")
                     np.save(temporary, array, allow_pickle=False)
-                    os.replace(temporary, blob)
-                    size += blob.stat().st_size
+                    if self._place(temporary, blob):
+                        size += blob.stat().st_size
                 stored[name] = {"blob": digest, "dtype": str(array.dtype), "shape": list(array.shape)}
             else:
                 stored[name] = {"value": _plain(value)}
@@ -302,7 +320,7 @@ class StepCache:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f"{path.stem}.{os.getpid()}.tmp")
         temporary.write_text(json.dumps(entry, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(temporary, path)
+        self._place(temporary, path)
         size += path.stat().st_size
         if self._size is not None and self._size_root == self.root:
             self._size += size

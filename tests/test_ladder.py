@@ -719,9 +719,11 @@ class SameResultFasterTest(unittest.TestCase):
             self.assertEqual(sorted(zip(kept_rows.tolist(), kept_columns.tolist())), expected, f"σ = {saturation}")
 
     def test_hierarchy_is_the_same_with_and_without_the_table_of_common_bits(self) -> None:
+        """Пакетный счёт кластеров с таблицей общих бит, без неё (общие биты блоками на видеокарте — так строятся карты
+        больше COMMON_TABLE_POINTS) и поштучный счёт от каждого центра дают одни и те же детекторы."""
         from damp.activation import DbscanClusterer, DetectorHierarchyBuilder, DetectorLayerConfig
 
-        def build(table_points: int):
+        def build(table_points: int, batched: bool = True, cells: int | None = None):
             layout = _clustered_layout()
             builder = DetectorHierarchyBuilder(
                 layout=layout,
@@ -739,21 +741,28 @@ class SameResultFasterTest(unittest.TestCase):
                 clusterer=DbscanClusterer(eps=1.5, min_samples=3),
             )
             builder.COMMON_TABLE_POINTS = table_points
+            builder.BATCHED = batched
+            if cells is not None:
+                builder.CLUSTER_CELLS = cells  # маленькие блоки: границы блоков проходят внутри карты
             detectors = builder.build()
             return [(d.center, d.radius, d.lambda_threshold, d.energy, d.points_count) for d in detectors], builder
 
         with_table, fast = build(20000)
-        without_table, plain = build(0)
+        blocks, large = build(0, cells=500)
+        single, plain = build(0, batched=False)
         self.assertIsNotNone(fast._common)
+        self.assertIsNone(large._common)
         self.assertIsNone(plain._common)
-        # Без таблицы кластеры считаются по одному центру; с таблицей и видеокартой — разом для всех центров слоя.
-        self.assertEqual(plain._layer_clusters, {})
+        # Поштучный счёт — эталон: кластер каждого центра от него самого; пакетный — разом для всех центров слоя.
+        self.assertEqual(plain._layer_candidates, {})
         import torch
 
         if torch.cuda.is_available():
-            self.assertEqual(len(fast._layer_clusters), 2)
+            self.assertEqual(len(fast._layer_candidates), 2)
+            self.assertEqual(len(large._layer_candidates), 2)
         self.assertGreater(len(with_table), 1)
-        self.assertEqual(with_table, without_table)
+        self.assertEqual(with_table, single)
+        self.assertEqual(blocks, single)
 
 
 class LateralInhibitionTest(unittest.TestCase):

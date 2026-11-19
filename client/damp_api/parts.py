@@ -639,6 +639,8 @@ class TrainedLadder(_Part):
             layer=np.asarray(detectors.layer_index, dtype=np.int64),
             layer_thresholds=tuple(float(value) for value in detectors.layer_thresholds),
             activation_threshold=float(detectors.activation_lambda),
+            # Уровень 0 цикла (StrokeLevel): штрихи идут в окна уровня 1 с кодами его деталей (§6.5, §7.1.12).
+            in_cycle=isinstance(level, system.stroke_level()),
         )
 
     def sticks(self) -> TrainingSticks:

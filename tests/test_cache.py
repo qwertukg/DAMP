@@ -110,10 +110,52 @@ class StepCacheTest(unittest.TestCase):
             # Массивы без записей удалены: остались только те, на которые ссылается уцелевшая запись.
             self.assertLessEqual(len(list(Path(self.folder.name, "blobs").glob("*/*.npy"))), len(cache.entries()))
 
+    def test_neighbour_process_writing_the_same_step_is_not_an_error(self) -> None:
+        """Два процесса считают один и тот же шаг (пары прогонов подбора): на Windows подмена файла, который держит
+        другой процесс, падает с отказом в доступе — тогда файл уже записан соседом, своя копия не нужна."""
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as folder:
+            target, temporary = Path(folder) / "blob.npy", Path(folder) / "blob.1.tmp.npy"
+            target.write_bytes(b"written by neighbour")
+            temporary.write_bytes(b"own copy")
+            with mock.patch("damp.cache.os.replace", side_effect=PermissionError("занят")):
+                self.assertFalse(StepCache._place(temporary, target))
+            self.assertEqual(target.read_bytes(), b"written by neighbour")
+            self.assertFalse(temporary.exists())
+            # Без соседа подмена идёт как обычно.
+            temporary.write_bytes(b"own copy")
+            self.assertTrue(StepCache._place(temporary, target))
+            self.assertEqual(target.read_bytes(), b"own copy")
+
     def test_fingerprint_sees_dtype_and_shape(self) -> None:
         self.assertNotEqual(fingerprint(np.zeros(4, dtype=np.int32)), fingerprint(np.zeros(4, dtype=np.int64)))
         self.assertNotEqual(fingerprint(np.zeros((2, 2))), fingerprint(np.zeros(4)))
         self.assertEqual(fingerprint((1, 2)), fingerprint((1, 2)))
+
+
+class StrokePointsCacheTest(unittest.TestCase):
+    """Точки штрихов уровня 0 (stimuli.stroke_points, LADDER_LEVEL0_PLACE = "stroke"): из кеша — то же, что заново."""
+
+    def test_cached_points_repeat_direct_points(self) -> None:
+        from damp.cycle.primary import StrokePoints
+        from damp.encoding.elements import StickCoder
+        from damp.stimuli.digits import MnistDigits
+
+        if not (settings.MNIST_CONTOUR_ONLY and settings.MNIST_STROKE_DETECTORS):
+            self.skipTest("точки штрихов есть только у штрихов-детекторов")
+        atoms = MnistDigits().load(train=False, count=3)
+        sticks = StickCoder().encode(atoms)
+        direct = StrokePoints.of_images(atoms.images, sticks)  # тесты по умолчанию — без кеша
+        with tempfile.TemporaryDirectory() as folder, cache_in(folder):
+            filled = StrokePoints.of_images(atoms.images, sticks)
+            again = StrokePoints.of_images(atoms.images, sticks)
+            self.assertEqual(len(CACHE.entries()), 1)
+        for name in ("picture", "y", "x", "angle", "strength", "entry_stroke", "entry_point"):
+            with self.subTest(field=name):
+                for other in (filled, again):
+                    self.assertEqual(getattr(direct, name).dtype, getattr(other, name).dtype)
+                    self.assertTrue(np.array_equal(getattr(direct, name), getattr(other, name)))
 
 
 class CycleCacheTest(unittest.TestCase):
