@@ -243,7 +243,17 @@ class MnistLadderRunner:
             # его сильнейшие детекторы (§6.5, §7.1.12). С ним, а не с готовым кодом наклона, штрих идёт в уровень 1.
             from damp.cycle.primary import StrokeLevel
 
-            self.primary, elements = StrokeLevel.train(groups, elements, map_max_points=self._map_max_points)
+            # Уровень 0 — тот же проход, что у уровней: наблюдатель (рисунки README, вкладки Rerun) видит его части по
+            # ходу счёта под номером 0. Показ на счёт не влияет.
+            self._cycle_mark("begin", 0, "↻ начало цикла: уровень 0 — окно на каждом штрихе, место от центра цифры")
+            self._observer.begin(0)
+            self._observer.stage(0, LEVEL_PARTS["keyholes"])
+            self._values = {}
+            self.primary, elements = StrokeLevel.train(
+                groups, elements, map_max_points=self._map_max_points, watch=self._level0_watch(groups)
+            )
+            self._observer.level(self._level0_trace(groups))
+            self._cycle_mark("end", 0, "↺ конец прохода: штрихи с выученными кодами идут на уровень 1")
             # Видеопамять уровня 0 — как у уровней (LevelPass.release): освобождается сразу после обучения и при
             # keep_levels тоже; детекторы пересобираются при первой новой картинке (LevelDetectors.detection). Иначе
             # карта уровня 0 (30 тыс. точек на 500 цифрах) держит видеокарту всё обучение уровней 1–3, и раскладка
@@ -307,15 +317,17 @@ class MnistLadderRunner:
             "element_x": elements.x,
         }
 
-    def _watch(self, number: int):  # noqa: ANN202
-        """Смотритель прохода CycleStep.run: каждый готовый шаг — часть уровня, затем начинается следующий этап."""
+    def _watch(self, number: int, *, recognition: bool = True, place: "Encoder | None" = None):  # noqa: ANN202
+        """Смотритель прохода CycleStep.run: каждый готовый шаг — часть уровня, затем начинается следующий этап.
+        recognition — после деталей идёт узнавание по уровню (этап 7); у уровня 0 его нет. place — кодер места окон
+        (None — кодер прохода уровней)."""
 
         def watch(name: str, value: object) -> None:
             if name == "codes":
                 self._part(number, "codes", {
                     "keyhole_codes": value.packed, "code_length": int(value.code_length),
                     "place_length": int(value.place_length), "content_length": int(value.content_length),
-                    "place_encoder": self._step.coder.place,
+                    "place_encoder": self._step.coder.place if place is None else place,
                 })
                 self._observer.stage(number, LEVEL_PARTS["memory"])
             elif name == "memory":
@@ -345,9 +357,65 @@ class MnistLadderRunner:
             elif name == "details":
                 details, length, strength, _ = value
                 self._part(number, "details", {"detail_codes": details, "detail_length": int(length), "detail_strength": strength})
-                self._observer.stage(number, LEVEL_PARTS["recognition"])
+                if recognition:
+                    self._observer.stage(number, LEVEL_PARTS["recognition"])
 
         return watch
+
+    def _level0_watch(self, groups: DigitGroups):  # noqa: ANN202
+        """Смотритель прохода уровня 0 (StrokeLevel.train): те же части, что у уровней, под номером 0; на счёт не влияет.
+
+        Окно уровня 0 держит один штрих, центр окна — центр цифры. На показе радиус окна — до самого дальнего штриха
+        цифры (StrokeLevel.digit_radius), доля цифры в окне — один штрих из штрихов своей картинки. Карта уровня 0
+        рисуется рисунками штрихов (LADDER_SAVE_MAPS); отклик картинок — для рисунков, в узнавание он не идёт.
+        """
+        from damp.cycle.primary import StrokeLevel
+        from damp.encoding.keyhole_code import KeyholeCoder
+
+        levels = self._watch(0, recognition=False, place=KeyholeCoder().place)
+        state: dict[str, object] = {}
+
+        def watch(name: str, value: object) -> None:
+            if name == "keyholes":
+                keyholes, sticks = value
+                pieces = keyholes.pieces
+                radius = StrokeLevel.digit_radius(sticks)
+                picture = np.asarray(pieces.picture, dtype=np.int64)
+                trained = picture < int(groups.train_pictures)
+                strokes = np.bincount(picture)[picture[trained]]
+                part = self._keyholes_part(keyholes, sticks)
+                part.update(
+                    keyhole_extent=radius,
+                    seen=float(np.mean(1.0 / strokes)) if strokes.size else 0.0,
+                    keyhole_radius=float(radius[trained].mean()) if trained.any() else 0.0,
+                )
+                state.update(pieces=pieces, radius=radius)
+                self._part(0, "keyholes", part)
+                self._observer.stage(0, LEVEL_PARTS["codes"])
+                return
+            if name == "memory" and settings.LADDER_SAVE_MAPS:
+                self._export(value.layout, value.name, value.energies)
+                self._stroke_glyphs(value.layout, value.dictionary, state["pieces"], value.rows, state["radius"])
+            elif name == "detectors":
+                state["built"] = int(value.built)
+            elif name == "firing":
+                response, _ = LevelRecognition.responses(
+                    state["pieces"].picture, value.rows, value.columns, value.levels, int(groups.labels.shape[0]), int(state["built"])
+                )
+                self._values["response"] = response
+            levels(name, value)
+
+        return watch
+
+    def _level0_trace(self, groups: DigitGroups) -> LadderLevelTrace:
+        """Итог прохода уровня 0 для наблюдателя: части, собранные по ходу счёта, и секунды шагов (StrokeLevel.seconds)."""
+        trace_fields = {item.name for item in dataclass_fields(LadderLevelTrace)}
+        return LadderLevelTrace(
+            number=0,
+            labels=groups.labels,
+            seconds=dict(self.primary.seconds),
+            **{name: value for name, value in self._values.items() if name in trace_fields},
+        )
 
     def _ladder(self, elements: LadderElements, responses: list["np.ndarray"]) -> tuple[LadderElements, LadderField | None]:
         """Уровни один за другим (проход — CycleStep), пока поле зрения не увидит картинку целиком: последний уровень
@@ -723,25 +791,11 @@ class MnistLadderRunner:
 
     @classmethod
     def _draw_stick(cls, draw, px: float, py: float, unit: float, angle: float, *, dim: float = 1.0) -> None:  # noqa: ANN001
-        """Углопозиция стрелкой в точке (px, py); unit — пикселей на клетку, dim — доля яркости."""
-        # Угол углопозиции — направление перепада яркости, оно поперёк линии цифры. Отрезок рисуется
-        # вдоль края (поворот на 90°) стрелкой: так глаз видит саму линию.
-        along = math.radians(angle + 90.0)
-        half = unit * 0.45
-        # Угол отсчитан с осью Y вверх (ядро Собеля по Y — верх минус низ), на картинке ось Y вниз:
-        # вертикальная составляющая берётся с обратным знаком.
-        ux, uy = math.cos(along) * half, -math.sin(along) * half
-        colour = tuple(int(channel * dim) for channel in cls._hue_colour(angle))
-        width = 2 if unit >= 5 else 1
-        draw.line((px - ux, py - uy, px + ux, py + uy), fill=colour, width=width)
-        if half >= 4:  # наконечник различим только на достаточно длинной стрелке
-            for turn in (150.0, -150.0):
-                side = along + math.radians(turn)
-                draw.line(
-                    (px + ux + math.cos(side) * half * 0.7, py + uy - math.sin(side) * half * 0.7, px + ux, py + uy),
-                    fill=colour,
-                    width=width,
-                )
+        """Штрих в точке (px, py) так же, как на рисунках README (StickPainter): отрезок вдоль линии; у штриха края —
+        стрелка, у штриха середины линии — без наконечника. unit — пикселей на клетку, dim — доля яркости."""
+        from damp.figures.style import StickPainter
+
+        StickPainter.draw(draw, px, py, unit, angle, dim=dim)
 
     def _cluster_figure(self, atoms: DigitAtoms, picture: int, circles: Sequence[tuple[int, float, float, float]]) -> None:
         """Картинка с найденными полями зрения одной цифры: окружность — поле, цвет и номер — уровень."""
@@ -820,6 +874,29 @@ class MnistLadderRunner:
             f"тускло — соседние углопозиции; ячейка {field.height}×{field.width} клеток, рамка — класс цифры",
         )
 
+    def _stroke_glyphs(
+        self, layout: Layout, dictionary: CodeDictionary, pieces, rows: "np.ndarray", radius: "np.ndarray"  # noqa: ANN001
+    ) -> None:
+        """Карта уровня 0 рисунками: в ячейке точки — её цифра вокруг центра цифры; ярко — штрих этой точки (окно
+        уровня 0 держит один штрих, место — от центра цифры), тускло — остальные штрихи цифры. radius — радиус окна
+        уровня 0 у каждого штриха: до самого дальнего штриха его цифры (StrokeLevel.digit_radius)."""
+        reach = int(math.ceil(float(np.max(radius)))) if np.asarray(radius).size else 1
+        field = LadderField(number=0, unit=float(settings.LADDER_CLUSTER_PLACE_UNIT), box=(-reach, reach, -reach, reach),
+                            inner=(0, 0, 0, 0))
+        self._field_glyphs(
+            layout,
+            dictionary,
+            pieces.picture[rows],
+            pieces.centre[rows, 0],
+            pieces.centre[rows, 1],
+            field,
+            np.asarray(radius)[rows],
+            path=f"{self.FILE_PREFIX}-level0-keyholes-{self.count}.glyphs.png",
+            title=f"Уровень 0: карта штрихов, {dictionary.count} точек; ярко — штрих точки, тускло — остальные штрихи "
+            "цифры; середина ячейки — центр цифры, рамка — класс цифры",
+            bright=pieces.element[rows],
+        )
+
     def _detail_glyphs(
         self, layout: Layout, dictionary: CodeDictionary, details: LadderElements, rows: "np.ndarray", field: LadderField
     ) -> None:
@@ -848,11 +925,13 @@ class MnistLadderRunner:
         *,
         path: str,
         title: str,
+        bright: "np.ndarray | None" = None,
     ) -> None:
-        """Карта рисунками: в ячейке точки — углопозиции её картинки вокруг центра окна, рамка — класс.
+        """Карта рисунками: в ячейке точки — штрихи её картинки вокруг центра окна, рамка — класс.
 
-        sight — сколько клеток от своего центра видит окно каждой точки: эти углопозиции рисуются ярко, остальные
-        углопозиции ячейки — тускло. Ячейка у всех точек одна (среднее поле уровня), а окна разного размера.
+        sight — сколько клеток от своего центра видит окно каждой точки: эти штрихи рисуются ярко, остальные
+        штрихи ячейки — тускло. Ячейка у всех точек одна (среднее поле уровня), а окна разного размера.
+        bright — у окна уровня 0 (один штрих в окне): номер штриха точки; ярко рисуется только он.
         """
         atoms = self._groups.atoms
         middle_y, middle_x = field.middle
@@ -867,16 +946,14 @@ class MnistLadderRunner:
                 dy, dx = atoms.y[index] - node_y[sample], atoms.x[index] - node_x[sample]
                 if not field.sees(dy, dx):
                     continue
-                # Углопозиция видит свою клетку: она в окне, если её клетка задета кругом окна.
-                inside = math.hypot(dy, dx) <= float(sight[sample]) + 1e-9
-                self._draw_stick(
-                    draw,
-                    left + size / 2.0 + (dx - middle_x) * scale,
-                    top + size / 2.0 + (dy - middle_y) * scale,
-                    scale,
-                    float(atoms.angle[index]),
-                    dim=1.0 if inside else 0.22,
-                )
+                # Штрих видит свою клетку: он в окне, если его клетка задета кругом окна.
+                inside = math.hypot(dy, dx) <= float(sight[sample]) + 1e-9 if bright is None else index == int(bright[sample])
+                px, py = left + size / 2.0 + (dx - middle_x) * scale, top + size / 2.0 + (dy - middle_y) * scale
+                self._draw_stick(draw, px, py, scale, float(atoms.angle[index]), dim=1.0 if inside else 0.22)
+                if bright is not None and inside:
+                    # Окно уровня 0 держит один штрих: в мелкой ячейке он заметен только с кольцом.
+                    ring = max(2.0, 1.1 * scale)
+                    draw.ellipse((px - ring, py - ring, px + ring, py + ring), outline=(255, 255, 255))
 
         from pathlib import Path
 
@@ -897,7 +974,10 @@ class MnistLadderRunner:
             "box": field.box, "atom_picture": atoms.picture, "atom_angle": atoms.angle, "atom_y": atoms.y, "atom_x": atoms.x,
             "labels": atoms.labels, "title": title,
         }
-        found = CACHE.run("figures.map_glyphs", inputs, compute, modules=("damp.cycle.ladder",))
+        if bright is not None:
+            inputs["bright"] = np.asarray(bright)
+        # Штрих рисует StickPainter (figures/style.py): от его текста тоже зависит картинка.
+        found = CACHE.run("figures.map_glyphs", inputs, compute, modules=("damp.cycle.ladder", "damp.figures.style"))
         if not drawn:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             Path(path).write_bytes(np.asarray(found["png"], dtype=np.uint8).tobytes())

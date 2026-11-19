@@ -217,18 +217,30 @@ class DigitView:
         self.draw.ellipse(box, fill=fill, outline=outline, width=2 if outline else 1)
 
 
+def axial_sticks() -> bool:
+    """Штрихи по середине линии — без стрелки (MNIST_STROKE_DETECTORS и MNIST_STROKE_MIDLINE): угол 0…180°,
+    0° и 180° — одна линия. Цвет такого штриха идёт по кругу за 180° (как на дашборде), наконечника нет."""
+    return bool(settings.MNIST_STROKE_DETECTORS) and bool(settings.MNIST_STROKE_MIDLINE)
+
+
+def stick_hue(angle: float) -> float:
+    """Тон цвета штриха по его углу: у штриха без стрелки круг цветов проходится за 180°."""
+    return 2.0 * float(angle) if axial_sticks() else float(angle)
+
+
 class StickPainter:
-    """Углопозиция стрелкой: отрезок вдоль края длиной почти в клетку, цвет — направление перепада."""
+    """Штрих отрезком вдоль линии длиной почти в клетку, цвет — направление. У штриха края — стрелка (направление
+    перепада яркости), у штриха середины линии — отрезок без наконечника (axial_sticks)."""
 
     @staticmethod
     def draw(draw: ImageDraw.ImageDraw, px: float, py: float, unit: float, angle: float, *, dim: float = 1.0) -> None:
         along = math.radians(float(angle) + 90.0)
         half = unit * 0.45
         ux, uy = math.cos(along) * half, -math.sin(along) * half
-        colour = tuple(int(channel * dim) for channel in hue_colour(angle))
+        colour = tuple(int(channel * dim) for channel in hue_colour(stick_hue(angle)))
         width = 2 if unit >= 5 else 1
         draw.line((px - ux, py - uy, px + ux, py + uy), fill=colour, width=width)
-        if half >= 4:
+        if half >= 4 and not axial_sticks():
             for turn in (150.0, -150.0):
                 side = along + math.radians(turn)
                 draw.line(

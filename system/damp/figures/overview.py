@@ -37,15 +37,19 @@ class PipelineOverview:
 
         Петля идёт от плитки loop_from вниз и обратно вверх к плитке loop_to.
         """
-        style, side, gap, margin, thumb = self.style, self.side, self.gap, self.margin, self.thumb
+        style, side, gap, margin = self.style, self.side, self.gap, self.margin
         width = len(tiles) * side + (len(tiles) - 1) * gap + 2 * margin
+        lefts = [margin + number * (side + gap) for number in range(len(tiles))]
+        # Миниатюры уровней — внутри петли: чем больше уровней, тем они мельче (между ними — не меньше 24 px).
+        inside = lefts[loop_from] - lefts[loop_to] - 36
+        thumb = max(60, min(self.thumb, (inside - 24 * max(0, len(levels) - 1)) // max(1, len(levels))))
+        lines = max([1] + [len(note.split("\n")) for _, note, _ in levels])
         row_top = margin + 48
         loop_top = row_top + side
         thumbs_top = loop_top + 52
-        loop_bottom = thumbs_top + thumb + 54
+        loop_bottom = thumbs_top + thumb + 36 + 17 * lines
         strip = Image.new("RGB", (width, loop_bottom + margin + 4), style.background)
         draw = ImageDraw.Draw(strip)
-        lefts = [margin + number * (side + gap) for number in range(len(tiles))]
         for number, (title, note, picture) in enumerate(tiles):
             left = lefts[number]
             draw.text((left, margin - 4), title, fill=style.ink, font=style.font(18, bold=True))
@@ -66,7 +70,8 @@ class PipelineOverview:
             strip.paste(picture.resize((thumb, thumb), Image.LANCZOS), (left, thumbs_top))
             draw.rectangle((left - 1, thumbs_top - 1, left + thumb, thumbs_top + thumb), outline=style.grid)
             draw.text((left, thumbs_top + thumb + 6), title, fill=style.ink, font=style.font(13, bold=True))
-            draw.text((left, thumbs_top + thumb + 24), note, fill=style.second, font=style.font(13))
+            for row, text in enumerate(note.split("\n")):
+                draw.text((left, thumbs_top + thumb + 24 + 17 * row), text, fill=style.second, font=style.font(12))
             if number:
                 self._arrow(draw, left - step // 2, thumbs_top + thumb // 2, style.green)
         before, after = loop_notes

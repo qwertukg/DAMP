@@ -21,21 +21,27 @@ class KeyholeCoder:
 
     @property
     def place(self) -> Encoder:
-        """Кодер места: круги на плоскости окна, от широких к узким (§4.3)."""
+        """Кодер места — как кодер угла (§4.2, §4.3, §4.5): круги на плоскости окна слоями от широких к узким, число
+        кругов по стороне растёт геометрически от LADDER_BINDING_PLACE_WIDEST до LADDER_BINDING_PLACE_NARROWEST, у
+        каждого слоя своя цветовая полоса бит (§3.2, §4.2.1). Слои, перекрытие и длина кода подобраны под плотность
+        кода угла (автор 2026-11-19)."""
         if self._place is None:
             extent = float(settings.LADDER_PLACE_EXTENT)
+            overlap = float(settings.LADDER_BINDING_PLACE_OVERLAP)
+            # Радиус круга слоя из n кругов по стороне — 1 / (2 · n · (1 − перекрытие)) стороны (plane_detector_layers).
+            radius = lambda count: 1.0 / (2.0 * float(count) * (1.0 - overlap))  # noqa: E731
             self._place = Encoder(
                 PlaneDimension(
                     "Place",
                     ((-extent, extent), (-extent, extent)),
                     plane_detector_layers(
                         layers_count=settings.LADDER_BINDING_PLACE_LAYERS,
-                        widest_radius=settings.LADDER_BINDING_PLACE_RADIUS_MAX / (2.0 * extent),
-                        narrowest_radius=settings.LADDER_BINDING_PLACE_RADIUS_MIN / (2.0 * extent),
-                        overlap=settings.LADDER_BINDING_PLACE_OVERLAP,
+                        widest_radius=radius(settings.LADDER_BINDING_PLACE_WIDEST),
+                        narrowest_radius=radius(settings.LADDER_BINDING_PLACE_NARROWEST),
+                        overlap=overlap,
                     ),
                     code_length=settings.LADDER_BINDING_PLACE_CODE_LENGTH,
-                    layer_bands=False,
+                    layer_bands=True,
                 ),
                 random_seed=settings.LADDER_RANDOM_SEED,
                 layer_phase=settings.ENCODER_LAYER_PHASE,

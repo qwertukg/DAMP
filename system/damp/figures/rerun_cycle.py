@@ -13,7 +13,8 @@
 
 Схема данных устойчива — на неё опирается будущий свой UI (читать .rrd: rerun.dataframe):
 
-    шкала cycle: 0 — стимулы, 1…N — уровни цикла; верхний уровень несёт и распознавание
+    шкала cycle: 0 — стимулы и уровень 0 (первичная раскладка штрихов, LADDER_LEVEL0), 1…N — уровни цикла;
+                 верхний уровень несёт и распознавание
     /pipeline                         цвета и подписи цифр 0–9 (AnnotationContext)
     /pipeline/overview/...            сводка прогона (пока он идёт — что считается сейчас), секунды шагов
     /pipeline/s1_stimuli/...          этап 1: цифра-пример и её штрихи, цифры 0–9, штрихов на картинку
@@ -52,6 +53,7 @@ PLACE, CONTENT, DETAIL, OFF = (247, 150, 70), (90, 160, 250), (70, 210, 200), (4
 KEYHOLE, LIT_LOW, LIT_HIGH, FIRED, STRONG = (90, 220, 120), (40, 96, 170), (170, 215, 255), (110, 62, 40), (247, 150, 70)
 KEYHOLE_FAINT, FIVE = (50, 120, 70), (255, 255, 255)
 LEVEL_COLOURS = ((90, 220, 120), (247, 150, 70), (190, 120, 250), (90, 160, 250), (240, 90, 90), (70, 210, 200))
+LEVEL0_COLOUR = (200, 200, 200)  # окно уровня 0: вокруг центра цифры, в нём один штрих
 
 
 def hue_colour(hue: float, value: float = 1.0) -> tuple[int, int, int]:
@@ -145,6 +147,7 @@ class CycleRerunView(LadderObserver):
         self._quality_of: tuple[int, int] | None = None
         self._labels: tuple[tuple[int, int] | None, np.ndarray | None] = (None, None)
         self._live_level: int | None = None
+        self._level0 = False  # начался ли уровень 0 (LADDER_LEVEL0): на шкале cycle он стоит на отметке 0
 
     # ------------------------------------------------------------------ общее
     def _log(self, path: str, data: object, level: int | None = None, *, live: bool = False) -> None:
@@ -176,8 +179,11 @@ class CycleRerunView(LadderObserver):
         self._log(path, rr.Image(np.repeat(grey[:, :, None], 3, axis=2)), level)
 
     def _sticks(self, path: str, picture: int, level: int | None = None, *, dim: np.ndarray | None = None) -> None:
-        """Штрихи картинки стрелками вдоль края; цвет — направление перепада (как на рисунках README)."""
+        """Штрихи картинки отрезками вдоль линии; цвет — направление (как на рисунках README). Штрих края — стрелка,
+        штрих середины линии — отрезок без наконечника, его цвет идёт по кругу за 180° (axial_sticks)."""
         import rerun as rr
+
+        from damp.figures.style import axial_sticks, stick_hue
 
         first, last = int(self.starts[picture]), int(self.starts[picture + 1])
         y, x = self.run.stick_y[first:last], self.run.stick_x[first:last]
@@ -187,13 +193,14 @@ class CycleRerunView(LadderObserver):
         ux, uy = np.cos(along) * half, -np.sin(along) * half
         centre = np.stack([self._px(x), self._px(y)], axis=1)
         shade = np.ones(angle.shape[0]) if dim is None else dim
-        colours = np.asarray([hue_colour(a, v) for a, v in zip(angle, shade)], dtype=np.uint8)
-        self._log(
-            path,
-            rr.Arrows2D(origins=centre - np.stack([ux, uy], axis=1), vectors=np.stack([2 * ux, 2 * uy], axis=1), colors=colours,
-                        radii=max(0.6, 0.06 * self.unit)),
-            level,
-        )
+        colours = np.asarray([hue_colour(stick_hue(a), v) for a, v in zip(angle, shade)], dtype=np.uint8)
+        start = centre - np.stack([ux, uy], axis=1)
+        radii = max(0.6, 0.06 * self.unit)
+        if axial_sticks():
+            strips = np.stack([start, centre + np.stack([ux, uy], axis=1)], axis=1)
+            self._log(path, rr.LineStrips2D(strips, colors=colours, radii=radii), level)
+            return
+        self._log(path, rr.Arrows2D(origins=start, vectors=np.stack([2 * ux, 2 * uy], axis=1), colors=colours, radii=radii), level)
 
     # ------------------------------------------------------------------ ход счёта
     # Этапы уровня в порядке счёта (LEVEL_PARTS): окна (6) → коды (2) → карта (3) → детекторы (4) → детали (5) → точность (7).
@@ -243,23 +250,25 @@ class CycleRerunView(LadderObserver):
     def _progress(self, number: int, stage: int) -> str:
         """Сводка, пока идёт прогон: какой этап идёт сейчас и что уже готово на уровне; готовые уровни — с числами."""
         tabs = CycleBlueprint.TABS
-        if number == 0:
-            done = set(range(1, stage))
+        level = number > 0 or self._level0  # уровень 0 (LADDER_LEVEL0) идёт тем же проходом, что уровни, без узнавания
+        if not level:
+            done, total = set(range(1, stage)), 2
         else:
-            done = {1, *self.LEVEL_ORDER[: self.LEVEL_ORDER.index(stage)]}
+            order = self.LEVEL_ORDER if number else self.LEVEL_ORDER[:-1]
+            done = {1, *order[: order.index(stage)]} if stage in order else {1}
+            total = len(order)
         rows = []
         for value in range(1, 8):
             if value == stage:
                 rows.append(f"| **▶ {tabs[value]}** | **идёт** — {self.STAGE_WORK[value]} |")
             else:
                 rows.append(f"| {tabs[value]} | {'✓ готово' if value in done else 'ждёт'} |")
-        where = "до первого уровня" if number == 0 else f"уровень {number}"
-        total = len(self.LEVEL_ORDER) if number else 2
+        where = f"уровень {number}" if level else "до первого уровня"
         text = (
             f"## ▶ Идёт этап {tabs[stage]} · {where}\n\n{self.STAGE_WORK[stage].capitalize()}. Этап начат через "
             f"{self._minutes(time.monotonic() - self._started)} от начала прогона; картинки этапа — на его вкладке.\n\n"
             f"| Этап | {where.capitalize()} |\n|---|---|\n" + "\n".join(rows) +
-            f"\n| **Итого** | готово {len(done - {1}) if number else len(done)} из {total} этапов {'уровня' if number else 'до уровней'} |\n"
+            f"\n| **Итого** | готово {len(done - {1}) if level else len(done)} из {total} этапов {'уровня' if level else 'до уровней'} |\n"
         )
         finished = [n for n in sorted(self.levels) if "seconds" in self.levels[n]]
         if finished:
@@ -386,22 +395,36 @@ class CycleRerunView(LadderObserver):
             originals = views[0] - train_first
             taught = (f"{originals} цифр и их сдвинутые виды, {(views[1] - views[0]) // max(1, originals)} на цифру "
                       f"(§7.1.4): всего {train_last - train_first}")
-        self._text(
-            f"{STIMULI}/about",
-            f"### Этап 1. Стимулы: углопозиции MNIST\n\nКартинка распадается на штрихи контура: где край и куда он смотрит. "
-            f"Стрелка идёт вдоль края, цвет — направление перепада яркости (0–360°).\n\n"
-            f"| | |\n|---|---|\n| цифра-пример | пятёрка № {self.main_index} в MNIST (в каждом прогоне другая, среди пятёрок со штрихами; как на рисунках README этого прогона) |\n| штрихов у неё | {sticks} |\n"
-            f"| обучающих картинок | {taught} |\n| штрихов на картинку, в среднем | {per_picture.mean():.1f} |\n"
-            f"| сетка | 24×24 клетки, окно Собеля {int(self.unit)} px |\n"
-            f"| место штриха | {'дробное: где край проходит внутри клетки' if settings.MNIST_SUBCELL_POSITION else 'середина клетки'} |\n"
-            f"| **Итого** | пятёрка № {self.main_index} — {sticks} штрихов; дальше весь путь показан на ней |\n\n"
-            "Внизу — по одной проверочной цифре каждого класса. Источник: вне статьи (извлечение стимулов).",
-        )
+        self._text(f"{STIMULI}/about", self._stimuli_about(sticks, taught, float(per_picture.mean()) if per_picture.size else 0.0))
         # Этап 2: детекторы угла штриха (статично: кодер один на прогон).
         self._detectors_picture(f"{CODING}/angle_detectors", trace.angle_encoder, (45.0,))
         # Этап 6: цифра-пример, на которую ложатся окна уровней.
         self._digit(f"{CYCLE}/keyholes/image", self.main, brightness=0.45)
         self._sticks(f"{CYCLE}/keyholes/sticks", self.main, dim=np.full(int(self.starts[self.main + 1] - self.starts[self.main]), 0.7))
+
+    def _stimuli_about(self, sticks: int, taught: str, mean: float) -> str:
+        """«Что видно» этапа 1: как из картинки получаются штрихи (по настройкам MNIST_STROKE_*)."""
+        if settings.MNIST_STROKE_DETECTORS:
+            source = "середины линии (гребень расстояния до края)" if settings.MNIST_STROKE_MIDLINE else "края линии"
+            how = (
+                f"Штрих — детектор над точками {source}: кластер соседних точек с похожим направлением, место — его "
+                f"взвешенный центр, центры не ближе шага (§6.4 на плоскости картинки — доработка). "
+                + ("Отрезок идёт вдоль линии, цвет — направление (0–180°: у середины линии нет «внутри» и «снаружи»)."
+                   if settings.MNIST_STROKE_MIDLINE else "Стрелка идёт вдоль края, цвет — направление перепада яркости (0–360°).")
+            )
+            grid = f"| шаг штрихов | {int(settings.MNIST_STROKE_STEP)} px рабочей картинки 224×224; место — дробное, в клетках по {int(self.unit)} px |\n"
+        else:
+            how = "Штрих — углопозиция окна сетки 24×24. Стрелка идёт вдоль края, цвет — направление перепада яркости (0–360°)."
+            grid = f"| сетка | 24×24 клетки, окно Собеля {int(self.unit)} px |\n"
+        return (
+            f"### Этап 1. Стимулы: штрихи MNIST\n\nКартинка распадается на штрихи: где линия и куда она идёт. {how}\n\n"
+            f"| | |\n|---|---|\n| цифра-пример | пятёрка № {self.main_index} в MNIST (в каждом прогоне другая, среди пятёрок со штрихами; как на рисунках README этого прогона) |\n| штрихов у неё | {sticks} |\n"
+            f"| обучающих картинок | {taught} |\n| штрихов на картинку, в среднем | {mean:.1f} |\n"
+            + grid
+            + f"| **Итого** | пятёрка № {self.main_index} — {sticks} штрихов; дальше весь путь показан на ней |\n\n"
+            "Внизу — по одной проверочной цифре каждого класса. Источник: вне статьи (извлечение стимулов; штрихи "
+            "детекторами — перенос §6.4 на картинку)."
+        )
 
     def _detectors_picture(self, path: str, encoder, values) -> None:  # noqa: ANN001
         """Картинка детекторов кодера (кольца угла, круги места) — та же, что рисует README (§4.1–§4.4)."""
@@ -422,7 +445,10 @@ class CycleRerunView(LadderObserver):
     def begin(self, number: int) -> None:
         import rerun as rr
 
-        self._log(f"{CYCLE}/marks", rr.TextLog(f"↻ уровень {number}: начало цикла — элементы идут на этап 2", level="INFO"), number)
+        if number == 0:
+            self._level0 = True
+        what = "штрихи идут на этап 2: окно на каждом штрихе, место — от центра цифры" if number == 0 else "элементы идут на этап 2"
+        self._log(f"{CYCLE}/marks", rr.TextLog(f"↻ уровень {number}: начало цикла — {what}", level="INFO"), number)
 
     def part(self, number: int, name: str, values: dict) -> None:
         """Часть прохода уровня готова — её вкладка заполняется сразу (LEVEL_PARTS)."""
@@ -443,6 +469,10 @@ class CycleRerunView(LadderObserver):
         if previous is None:
             first, last = int(self.starts[self.main]), int(self.starts[self.main + 1])
             previous = (float(self.run.stick_y[first:last].mean()), float(self.run.stick_x[first:last].mean()))
+        if n == 0:
+            # Уровень 0: у всех окон цифры один центр — центр цифры; пример — окно штриха, ближайшего к середине.
+            centre = np.stack([trace.element_y[mine], trace.element_x[mine]], axis=1).astype(np.float64)
+            return int(mine[int(np.argmin(np.hypot(centre[:, 0] - previous[0], centre[:, 1] - previous[1])))])
         centre = trace.keyhole_centre[mine].astype(np.float64)
         return int(mine[int(np.argmin(np.hypot(centre[:, 0] - previous[0], centre[:, 1] - previous[1])))])
 
@@ -458,7 +488,7 @@ class CycleRerunView(LadderObserver):
         own = np.flatnonzero(t.keyhole_picture == self.main)
         s.update(centre=(wy, wx), radius=radius, keyhole=keyhole, members=int(members.shape[0]), five_keyholes=int(own.shape[0]))
         self._digit(f"{CODING}/keyhole/image", self.main, n, brightness=0.4)
-        if n == 1:
+        if n <= 1:  # элементы уровней 0 и 1 — штрихи (у уровня 1 с кодами уровня 0)
             first, last = int(self.starts[self.main]), int(self.starts[self.main + 1])
             dim = np.full(last - first, 0.3)
             inside = members - first
@@ -477,8 +507,8 @@ class CycleRerunView(LadderObserver):
             colors=[KEYHOLE_FAINT], radii=0.04 * self.unit), n)
         self._log(f"{CODING}/keyhole/circle", rr.LineStrips2D([circle(self._px(wy), self._px(wx), radius * self.unit)], colors=[KEYHOLE],
                                                              radii=0.12 * self.unit, labels=[f"окно уровня {n}"]), n)
-        # Этап 6: окно уровня на цифре — круги растут от уровня к уровню (П.3).
-        colour = LEVEL_COLOURS[(n - 1) % len(LEVEL_COLOURS)]
+        # Этап 6: окно уровня на цифре — круги растут от уровня к уровню (П.3); окно уровня 0 — вокруг центра цифры.
+        colour = LEVEL0_COLOUR if n == 0 else LEVEL_COLOURS[(n - 1) % len(LEVEL_COLOURS)]
         self._log(f"{CYCLE}/keyholes/level", rr.LineStrips2D([circle(self._px(wy), self._px(wx), radius * self.unit)], colors=[colour],
                                                              radii=0.14 * self.unit, labels=[f"{n}"]), n)
         self._log(f"{CYCLE}/keyholes/centre", rr.Points2D([[self._px(wx), self._px(wy)]], colors=[colour], radii=0.25 * self.unit), n)
@@ -500,7 +530,7 @@ class CycleRerunView(LadderObserver):
                  place_length=int(t.place_length), content_length=int(t.content_length), ones_mean=float(ones.mean()))
         self._scalar(f"{CODING}/stats/ones", float(ones.mean()), n, "единиц в коде окна")
         self._scalar(f"{CODING}/stats/density", float(ones.mean()) / max(1, int(t.code_length)), n, "плотность кода окна")
-        if n == 1 and t.place_encoder is not None:
+        if n <= 1 and t.place_encoder is not None:
             self._detectors_picture(f"{CODING}/place_detectors", t.place_encoder, ((0.0, 0.0),))
 
     def _show_memory(self, n: int, t) -> None:  # noqa: ANN001
@@ -563,15 +593,20 @@ class CycleRerunView(LadderObserver):
         if similarity is None:
             similarity = self._similarity_of(t, self._example_bits[n])
             self._similarity[n] = similarity
+        from damp.figures.cycle import CycleFigures
+
         low, high = float(t.activation_lambda), float(similarity.max())
         lit = (similarity >= low) | (similarity >= high)  # самая похожая точка зажигается всегда (как в прогоне)
-        level_share = np.clip((similarity[lit] - low) / max(1e-12, high - low), 0.0, 1.0)
+        # В детекторы идут только зажжённые точки с зажжёнными соседями — энергия активации (как в прогоне).
+        kept = CycleFigures.local_energy(cells, np.where(lit, similarity, 0.0)) > 0.0
+        level_share = np.clip((similarity[kept] - low) / max(1e-12, high - low), 0.0, 1.0)
         lit_colours = (np.asarray(LIT_LOW) + level_share[:, None] * (np.asarray(LIT_HIGH) - np.asarray(LIT_LOW))).astype(np.uint8)
         grey = np.full((cells.shape[0], 3), 60, dtype=np.uint8)
+        grey[lit & ~kept] = 100  # зажглись, но погасли: соседи не горят
         self._log(f"{DETECTORS}/activation/map", rr.Points2D(positions, colors=grey, radii=0.42), n)
-        self._log(f"{DETECTORS}/activation/lit", rr.Points2D(positions[lit], colors=lit_colours, radii=0.5), n)
+        self._log(f"{DETECTORS}/activation/lit", rr.Points2D(positions[kept], colors=lit_colours, radii=0.5), n)
         s.update(detectors=int(detectors.shape[0]), layers=[int(v) for v in np.bincount(layers, minlength=len(thresholds))],
-                 thresholds=thresholds, activation_lambda=low, lit=int(lit.sum()))
+                 thresholds=thresholds, activation_lambda=low, lit=int(lit.sum()), kept=int(kept.sum()))
         self._scalar(f"{DETECTORS}/stats/detectors", float(detectors.shape[0]), n, "детекторов")
 
     def _show_firing(self, n: int, t) -> None:  # noqa: ANN001
@@ -599,14 +634,16 @@ class CycleRerunView(LadderObserver):
         """Этап 5: код детали окна-примера (§6.5, §7.1.12) и детали пятёрки — центры её окон (П.1)."""
         import rerun as rr
 
+        from damp.figures.cycle import CycleFigures
+
         s = self.levels.setdefault(n, {})
         keyhole = s["keyhole"]
-        wy, wx = s["centre"]
         detail = np.unpackbits(np.ascontiguousarray(t.detail_codes[keyhole]), count=int(t.detail_length))
         self._log(f"{EMBEDDINGS}/code", rr.Image(bits_image(detail, 32, DETAIL, cell=12)), n)
         self._digit(f"{EMBEDDINGS}/details/image", self.main, n, brightness=0.3)
         own = np.flatnonzero(t.keyhole_picture == self.main)
-        centres = t.keyhole_centre[own].astype(np.float64)
+        # Деталь встаёт в центр окна; у уровня 0 — на место своего штриха (центр окна там — центр цифры).
+        centres, (wy, wx) = CycleFigures.detail_places(t, own, keyhole)
         self._log(f"{EMBEDDINGS}/details/all", rr.Points2D(np.stack([self._px(centres[:, 1]), self._px(centres[:, 0])], axis=1),
                                                             colors=[DETAIL], radii=0.16 * self.unit), n)
         self._log(f"{EMBEDDINGS}/details/main", rr.Points2D([[self._px(wx), self._px(wy)]], colors=[(255, 255, 255)], radii=0.4 * self.unit,
@@ -645,6 +682,7 @@ class CycleRerunView(LadderObserver):
         for name, seconds in trace.seconds.items():
             self._scalar(f"{OVERVIEW}/seconds/{name}", float(seconds), n, f"{name}, с")
         self._log(f"{CYCLE}/marks", rr.TextLog(
+            "↺ уровень 0: у штрихов выученные коды (детали уровня 0) — штрихи идут в окна уровня 1" if n == 0 else
             f"↺ уровень {n}: детали готовы (радиус окна {float(np.mean(trace.keyhole_extent)):.1f} клетки, доля цифры {trace.seen:.0%}) — "
             "снова этап 2, если окно ещё не видит цифру целиком", level="INFO"), n)
         self._abouts(n, s)
@@ -735,10 +773,18 @@ class CycleRerunView(LadderObserver):
         seconds = s.get("seconds", {})
         length, ones = s.get("code_length"), s.get("ones_mean")
         density = None if not length or ones is None else ones / length
+        intro = (
+            "Уровень 0 — первичная раскладка штрихов: окно стоит на каждом штрихе и держит его одного; центр окна — центр "
+            "цифры (середина её штрихов), радиус — до самого дальнего штриха (доработка). Код окна — **место** штриха "
+            "от центра цифры (биты кругов места, П.4) и **содержание** — код направления штриха под маской своего круга "
+            "(П.5). Все окна пятёрки — один круг вокруг центра цифры; яркий штрих — штрих окна-примера."
+            if n == 0 else
+            "Окно-скважина стоит на каждом элементе (П.2): тонкие круги — все окна пятёрки, яркий — окно-пример. Его "
+            "содержимое — один код «что и где» (П.4–П.7): **место** — биты сработавших кругов места (OR), **содержание** "
+            "— коды элементов, переставленные маской своего круга."
+        )
         self._text(f"{CODING}/about", (
-            f"### Этап 2. Первичное кодирование — уровень {n}\n\nОкно-скважина стоит на каждом элементе (П.2): тонкие круги — "
-            f"все окна пятёрки, яркий — окно-пример. Его содержимое — один код «что и где» (П.4–П.7): **место** — биты "
-            f"сработавших кругов места (OR), **содержание** — коды элементов, переставленные маской своего круга.\n\n"
+            f"### Этап 2. Первичное кодирование — уровень {n}\n\n{intro}\n\n"
             f"| | |\n|---|---|\n| окон у пятёрки | {_num(s.get('five_keyholes'))} |\n| элементов в окне-примере | {_num(s.get('members'))} |\n"
             f"| код окна | {_num(length)} бит: место {_num(s.get('place_length'))} + содержание {_num(s.get('content_length'))} |\n"
             f"| единиц у примера | место {_num(s.get('place_bits'))}, содержание {_num(s.get('content_bits'))} |\n"
@@ -764,9 +810,12 @@ class CycleRerunView(LadderObserver):
         self._text(f"{DETECTORS}/about", (
             f"### Этап 4. Детекторы и активации — уровень {n}\n\nНад кластерами похожих точек — круги детекторов, по слоям порогов "
             f"λ_d (§6.4, §7.1.10); пока они строятся, слои заполняются один за другим. Код окна-примера **зажигает** точки со "
-            f"сходством не ниже λ_a (§6.1), по ним **срабатывают** детекторы (§6.5); оранжевые — сильнейшие.\n\n"
+            f"сходством не ниже λ_a (§6.1); в детекторы идут только те, вокруг которых тоже горит (энергия активации ≥ "
+            f"{float(settings.ACTIVATION_LOCAL_ENERGY_THRESHOLD):.2f}, расширение статьи; погасшие — светло-серые). По ним "
+            f"**срабатывают** детекторы (§6.5); оранжевые — сильнейшие.\n\n"
             f"| | |\n|---|---|\n| детекторов | {_num(s.get('detectors'))} (по слоям {_num(s.get('layers'))}) |\n"
-            f"| λ_a | {_num(s.get('activation_lambda'), '.3f')} |\n| зажглось точек у примера | {_num(s.get('lit'))} из {_num(s.get('points'))} |\n"
+            f"| λ_a | {_num(s.get('activation_lambda'), '.3f')} |\n| зажглось точек у примера | {_num(s.get('lit'))} из {_num(s.get('points'))}; "
+            f"в детекторы идут {_num(s.get('kept'))} |\n"
             f"| сработало у примера | {_num(s.get('fired'))} |\n"
             f"| сработало на окно, в среднем | {_num(s.get('fired_mean'), '.1f')}; окон без срабатываний {_num(s.get('silent'), '.1%')} |\n"
             f"| секунд: детекторы / срабатывания | {_num(seconds.get('detectors'), '.1f')} / {_num(seconds.get('firing'), '.1f')} |\n"
@@ -787,9 +836,16 @@ class CycleRerunView(LadderObserver):
         seen = s.get("picture_seen", s.get("seen"))
         verdict = "—" if seen is None else ("окно видит цифру целиком — цикл закончен" if seen >= float(settings.LADDER_TOP_COVERAGE)
                                             else f"детали идут на уровень {n + 1}")
+        cycle_intro = (
+            "Уровень 0: у каждого штриха теперь выученный код — его сильнейшие детекторы карты уровня 0 (§6.5, §7.1.12). "
+            "С этим кодом штрих идёт в окна уровня 1; место, поле и сила штриха прежние. Серый круг — окно уровня 0: "
+            "вокруг центра цифры, в нём один штрих; доля цифры в окне — один штрих из штрихов картинки."
+            if n == 0 else
+            "Детали уровня снова идут на этап 2; окно следующего уровня охватывает большую область (П.3). Круги — окна "
+            "уровней вокруг одного места пятёрки; шкала cycle внизу добавляет уровни."
+        )
         self._text(f"{CYCLE}/about", (
-            f"### Этап 6. Цикл — уровень {n}\n\nДетали уровня снова идут на этап 2; окно следующего уровня охватывает большую "
-            f"область (П.3). Круги — окна уровней вокруг одного места пятёрки; шкала cycle внизу добавляет уровни.\n\n"
+            f"### Этап 6. Цикл — уровень {n}\n\n{cycle_intro}\n\n"
             f"| | |\n|---|---|\n| радиус окна | {_num(s.get('field_radius', s.get('radius')), '.1f')} клетки |\n"
             f"| доля цифры в окне | {_num(seen, '.0%')} |\n"
             f"| окон на картинку | {_num(s.get('keyholes'), '.0f')} |\n| элементов в окне | {_num(s.get('elements'), '.1f')} |\n"
@@ -813,6 +869,13 @@ class CycleRerunView(LadderObserver):
     def _summary(self, reports: list, accuracy: dict | None) -> None:
         rows = []
         total_seconds = 0.0
+        first = self.levels.get(0, {}) if self._level0 else {}
+        if "seconds" in first:
+            # Уровень 0 узнавания не считает: его строка — окно, карта и детекторы.
+            seconds = sum(first["seconds"].values())
+            total_seconds += seconds
+            rows.append(f"| 0 (штрихи) | {_num(first.get('radius'), '.1f')} | {_num(first.get('seen'), '.0%')} | {_num(first.get('points'))} | "
+                        f"{_num(first.get('detectors'))} | — | — | {seconds:.1f} |")
         for report in reports:
             s = self.levels.get(int(report.number), {})
             seconds = sum(s.get("seconds", {}).values())
@@ -826,7 +889,8 @@ class CycleRerunView(LadderObserver):
         top = self.top_numbers
         self._text(f"{OVERVIEW}/summary", (
             "### Прогон цикла\n\nЭтапы: 1 стимулы → 2 кодирование (↻ начало цикла) → 3 раскладка → 4 детекторы → 5 эмбеддинги → "
-            "6 цикл (↺ конец) → 7 распознавание. Шкала **cycle** внизу — уровень: 0 — стимулы, дальше уровни.\n\n"
+            "6 цикл (↺ конец) → 7 распознавание. Шкала **cycle** внизу — уровень: 0 — стимулы и уровень 0 (первичная "
+            "раскладка штрихов), дальше уровни.\n\n"
             "| уровень | радиус окна | доля цифры | точек карты | детекторов | соседи одной цифры | по отклику, k=1 | секунд |\n"
             "|---|---|---|---|---|---|---|---|\n" + "\n".join(rows) +
             f"\n| **Итого** | | | | | | голосование: {vote} | {total_seconds:.1f} |\n\n"

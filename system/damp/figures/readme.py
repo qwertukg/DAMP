@@ -88,6 +88,9 @@ class ReadmeFigures:
         )
         figures.stimuli(self.doc("stage1-sticks.png"), self.doc("stage1-digits.png"))
         figures.primary_coding(self.doc("stage2-detectors.png"), self.views)
+        if 0 in glyphs:
+            # Уровень 0 (LADDER_LEVEL0): первичная раскладка штрихов — место штриха от центра цифры.
+            figures.layout_crop(glyphs[0], self.doc("stage3-layout-level0.png"), columns=20, rows=8, number=0)
         figures.layout_crop(glyphs[1], self.doc("stage3-layout.png"), columns=26, rows=12)
         self.pinwheel(self.doc("stage3-pinwheel.png"))
         figures.hierarchy(self.doc("stage4-detectors.png"))
@@ -182,16 +185,17 @@ class ReadmeFigures:
         votes.paste(recognition.crop((436, 112, 736, 302)), (0, 55))
         tiles = [
             ("Картинка", "цифра 28×28", Image.fromarray(figures.run.images[picture]).convert("RGB")),
-            ("1. Стимулы", "углопозиции контура", sticks.image),
+            ("1. Стимулы", "штрихи по середине линии", sticks.image),
             ("2. Код", "детекторы → биты", ring),
             ("3. Раскладка", "похожие коды рядом", layout),
             ("4. Детекторы", "и активации карты", panels["fired"]),
             ("5. Эмбеддинг", "код детали и её место", panels["detail"]),
             ("7. Распознавание", "голоса верхних деталей", votes),
         ]
-        about = {1: "обрывки контура", 2: "части цифр", 3: "цифры целиком"}
+        about = {0: "штрихи", 1: "обрывки контура", 2: "части цифр", 3: "цифры целиком"}
         levels = [
-            (f"уровень {number}: {about.get(number, '')}", f"окно видит {100 * seen:.0f} % цифры", thumb)
+            (f"уровень {number}",
+             f"{about.get(number, '')}\n" + ("место от центра цифры" if number == 0 else f"окно видит {100 * seen:.0f} % цифры"), thumb)
             for number, seen, thumb in figures.loop_thumbnails(glyphs, 150)
         ]
         PipelineOverview(self.style).save(

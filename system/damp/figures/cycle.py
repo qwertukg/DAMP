@@ -27,6 +27,7 @@ from damp.article_refs import (
     OUTSIDE_ARTICLE,
     STIMULUS_DETECTION,
 )
+from damp import settings
 from damp.figures.recorder import LadderRecorder
 from damp.figures.style import DigitView, FigureStyle, Sheet, bits_raster, crop_cells, plural
 from damp.cycle.ladder_trace import LadderLevelTrace
@@ -67,6 +68,28 @@ class CycleFigures:
         else:
             found = np.flatnonzero(self.run.labels[train_first:train_last] == self.digit) + train_first
             self.picture = int(found[min(int(digit_index or 0), found.shape[0] - 1)]) if found.size else train_first
+        # Рисунки идут по одной цифре через все уровни. Если у пятёрки прогона на каком-то уровне нет ни одного окна
+        # (окно на всю картинку выключено — LADDER_KEYHOLE_WHOLE_PICTURE), берётся первая обучающая пятёрка, у которой
+        # окна есть на всех уровнях; замена пишется в журнал.
+        if not self._has_keyholes(self.picture):
+            chosen = next(
+                (int(p) for p in np.flatnonzero(self.run.labels[train_first:train_last] == self.digit) + train_first
+                 if self._has_keyholes(int(p))),
+                None,
+            )
+            if chosen is None:
+                raise ValueError(f"нет обучающей цифры {self.digit} с окнами на всех уровнях")
+            LOGGER.event(
+                "figures.example.replaced",
+                section=OUTSIDE_ARTICLE,
+                data={
+                    "picture": self.picture, "replacement": chosen,
+                    "levels_without_keyholes": [lv.number for lv in recorder.levels if not np.any(lv.keyhole_picture == self.picture)],
+                    "note": "у пятёрки прогона нет окон на одном из уровней (окно на всю картинку выключено) — рисунки идут по "
+                    "другой обучающей пятёрке, у которой окна есть на всех уровнях",
+                },
+            )
+            self.picture = chosen
         # Окно-пример каждого уровня: ближайшее к середине цифры, дальше — к окну прошлого уровня.
         y, x, _ = self.sticks(self.picture)
         anchor = (float(y.mean()), float(x.mean()))
@@ -74,12 +97,21 @@ class CycleFigures:
         for level in self.recorder.levels:
             mine = np.flatnonzero(level.keyhole_picture == self.picture)
             centre = level.keyhole_centre[mine].astype(np.float64)
-            chosen = int(mine[int(np.argmin(np.hypot(centre[:, 0] - anchor[0], centre[:, 1] - anchor[1])))])
+            if level.number == 0:
+                # Уровень 0: у всех окон цифры один центр — центр цифры; пример — окно штриха, ближайшего к середине.
+                where = np.stack([level.element_y[mine], level.element_x[mine]], axis=1).astype(np.float64)
+            else:
+                where = centre
+            chosen = int(mine[int(np.argmin(np.hypot(where[:, 0] - anchor[0], where[:, 1] - anchor[1])))])
             self.example[level.number] = chosen
             anchor = (float(level.keyhole_centre[chosen, 0]), float(level.keyhole_centre[chosen, 1]))
         self._panels: dict[int, dict] = {}
 
     # ------------------------------------------------------------------ общие части
+    def _has_keyholes(self, picture: int) -> bool:
+        """Есть ли у картинки окна на каждом записанном уровне."""
+        return all(np.any(level.keyhole_picture == picture) for level in self.recorder.levels)
+
     def sticks(self, picture: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         first, last = int(self.starts[picture]), int(self.starts[picture + 1])
         return (
@@ -102,31 +134,52 @@ class CycleFigures:
 
     # ------------------------------------------------------------------ этап 1
     def stimuli(self, path_digit: str, path_digits: str) -> None:
-        """Цифра-образец и её углопозиции; цифры 0…9 из одних углопозиций."""
+        """Цифра-образец, точки, из которых собраны штрихи, и сами штрихи; цифры 0…9 из одних штрихов."""
+        from damp import settings
+        from damp.figures.style import hue_colour, stick_hue
+
         style, size = self.style, self.panel
         picture = self.picture
         y, x, angle = self.sticks(picture)
         plain = Image.fromarray(self.run.images[picture]).resize((size, size), Image.BILINEAR).convert("RGB")
         lines = self.view(size, picture, backdrop=0.25)
-        for k in range(int(math.ceil(self.side_cells)) + 1):
-            edge = k - 0.5
-            lines.draw.line((lines.px(edge), lines.py(-0.5), lines.px(edge), lines.py(self.side_cells - 0.5)), fill=(30, 30, 29))
-            lines.draw.line((lines.px(-0.5), lines.py(edge), lines.px(self.side_cells - 0.5), lines.py(edge)), fill=(30, 30, 29))
+        tiles = [("Картинка MNIST 28×28", "линии ищутся на картинке, увеличенной в 8 раз (224×224)", plain)]
+        detectors = bool(settings.MNIST_STROKE_DETECTORS)
+        midline = detectors and bool(settings.MNIST_STROKE_MIDLINE)
+        points = 0
+        if detectors:
+            # Точки, над которыми детекторы собирают штрихи (§6.4 на плоскости картинки): середина линии или край.
+            from damp.stimuli.mnist import _build_extractor
+
+            found = _build_extractor().stroke_points(self.run.images[picture].astype(np.float32) / np.float32(255.0))
+            dots = self.view(size, picture, backdrop=0.25)
+            for py, px, pa in zip(found["point_y"], found["point_x"], found["point_angle"]):
+                dots.dot(float(py), float(px), 1.6, hue_colour(stick_hue(float(pa))))
+            points = int(found["point_y"].shape[0])
+            tiles.append((
+                f"{points} {plural(points, 'точка', 'точки', 'точек')} " + ("середины линии" if midline else "края"),
+                ("гребень расстояния до края: одна середина вместо двух краёв; цвет — направление поперёк линии"
+                 if midline else "пиксели контура; цвет — направление перепада яркости"),
+                dots.image,
+            ))
+        else:
+            for k in range(int(math.ceil(self.side_cells)) + 1):
+                edge = k - 0.5
+                lines.draw.line((lines.px(edge), lines.py(-0.5), lines.px(edge), lines.py(self.side_cells - 0.5)), fill=(30, 30, 29))
+                lines.draw.line((lines.px(-0.5), lines.py(edge), lines.px(self.side_cells - 0.5), lines.py(edge)), fill=(30, 30, 29))
         for row in range(y.shape[0]):
             lines.stick(y[row], x[row], angle[row])
-        sheet = Sheet(style, 2 * size + 3 * 20, f"Этап 1. Цифра {self.digit} и её углопозиции")
-        bottom = sheet.grid(
-            [
-                ("Картинка MNIST 28×28", "края ищутся на картинке, увеличенной в 8 раз", plain),
-                (
-                    f"{y.shape[0]} {plural(y.shape[0], 'углопозиция', 'углопозиции', 'углопозиций')}",
-                    "сетка 24×24 окна; окно на контуре даёт стрелку вдоль края, цвет — направление перепада яркости",
-                    lines.image,
-                ),
-            ],
-            columns=2,
-        )
-        sheet.save(path_digit, bottom, note="стимулы — углопозиции контура", data={"sticks": int(y.shape[0])})
+        tiles.append((
+            f"{y.shape[0]} {plural(y.shape[0], 'штрих', 'штриха', 'штрихов')}",
+            (f"штрих — детектор над точками: соседние точки с похожим направлением, центр — место штриха, центры не ближе "
+             f"{int(settings.MNIST_STROKE_STEP)} px (§6.4 на картинке); "
+             + ("отрезок вдоль линии, цвет — направление 0…180°" if midline else "стрелка вдоль края, цвет — направление перепада"))
+            if detectors else "сетка 24×24 окна; окно на контуре даёт стрелку вдоль края, цвет — направление перепада яркости",
+            lines.image,
+        ))
+        sheet = Sheet(style, len(tiles) * size + (len(tiles) + 1) * 20, f"Этап 1. Цифра {self.digit} и её штрихи")
+        bottom = sheet.grid(tiles, columns=len(tiles))
+        sheet.save(path_digit, bottom, note="стимулы — штрихи", data={"sticks": int(y.shape[0]), "points": points})
         tile = 240
         train_first, train_last = self.run.ranges["train"]
         tiles = []
@@ -139,27 +192,50 @@ class CycleFigures:
             view = self.view(tile, index, backdrop=0.0)
             for row in range(dy.shape[0]):
                 view.stick(dy[row], dx[row], da[row])
-            tiles.append((f"{digit}", f"{dy.shape[0]} углопозиций", view.image))
-        sheet = Sheet(style, 5 * tile + 6 * 20, "Цифры 0…9 из одних углопозиций")
+            tiles.append((f"{digit}", f"{dy.shape[0]} {plural(dy.shape[0], 'штрих', 'штриха', 'штрихов')}", view.image))
+        sheet = Sheet(style, 5 * tile + 6 * 20, "Цифры 0…9 из одних штрихов")
         bottom = sheet.grid(tiles, columns=5)
-        sheet.save(path_digits, bottom, note="форма цифры читается по одним углопозициям")
+        sheet.save(path_digits, bottom, note="форма цифры читается по одним штрихам")
 
     # ------------------------------------------------------------------ этап 2
+    @property
+    def first(self) -> int:
+        """Первый уровень прогона: 0 — с уровнем 0 (LADDER_LEVEL0), иначе 1. На нём в окно входит код угла штриха."""
+        return min(self.example)
+
     def primary_coding(self, path: str, views: Callable[[object], object]) -> None:
-        """Детекторы угла штриха и детекторы места в окне, код угла и код окна (§4.1–§4.4, §4.3, П.5)."""
-        level = self.recorder.level_trace(1)
-        keyhole = self.example[1]
+        """Этап 2: первичные детекторы угла и места устроены одинаково (§4.2, §4.3, §4.5) — слои от широких к узким,
+        значение в каждом слое накрывают около трёх детекторов, по случайному биту на детектор в полосе своего слоя
+        (§4.2.1). Разница одна: угол — замкнутая координата (§4.4), место — относительно центра окна (на уровне 0 —
+        центра цифры, в долях расстояния до самого дальнего штриха). Рисунок — две одинаковые строки и код окна (П.5)."""
+        number = self.first
+        level = self.recorder.level_trace(number)
+        keyhole = self.example[number]
+        if number == 0:
+            # На уровне 0 в окне один штрих, место — от центра цифры: для рисунка берётся штрих, заметно удалённый от
+            # центра (около 0.65 R), чтобы смещение было видно.
+            own = np.flatnonzero(level.keyhole_picture == self.picture)
+            entry = np.asarray([np.flatnonzero(level.entry_keyhole == k)[0] for k in own])
+            shift = np.hypot(level.entry_offset[entry, 0], level.entry_offset[entry, 1])
+            keyhole = int(own[int(np.argmin(np.abs(shift - 0.65)))])
         rows = self.members(level, keyhole)
         elements = level.entry_element[rows]
         points = level.entry_offset[rows].astype(np.float64) / float(level.unit)
         angles = self.run.stick_angle[elements].astype(np.float64)
-        angle = self.example_angle()
+        angle = float(angles[0]) if number == 0 else self.example_angle()
         angle_view = views(self.run.angle_encoder)
         place_view = views(level.place_encoder)
-        ring = angle_view.ring(0, angle)
+        angle_dim = self.run.angle_encoder.dimensions[0]
+        place_dim = level.place_encoder.dimensions[0]
+        angle_detectors = list(self.run.angle_encoder.detectors)
+        circles = list(level.place_encoder.detectors)
+        layer_count = len(angle_dim.detector_layers)
+        place_layer_count = len(place_dim.detector_layers)
+        angle_by_layer = [sum(1 for w in angle_detectors if w.layer_index == k and w.is_active(angle)) for k in range(layer_count)]
+        place_by_layer = [
+            sum(1 for w in circles if w.layer_index == k and any(w.is_active(p) for p in points)) for k in range(place_layer_count)
+        ]
         angle_code, angle_stats = angle_view.code((angle,))
-        wide = place_view.plane(0, 0, points, angles)
-        narrow = place_view.plane(0, 1, points, angles)
         bits = self.unpack(level.keyhole_codes[keyhole], level.code_length)
         place_bits = np.flatnonzero(bits[: level.place_length])
         place_code, place_stats = place_view.code(None, bits=place_bits)
@@ -168,63 +244,79 @@ class CycleFigures:
         for point in points:
             expected.update(level.place_encoder.dimension_bits(0, point))
         content = bits[level.place_length :]
-        content_picture = bits_raster(content, 64, 6, self.style.blue, self.style.off)
-        layers = level.place_encoder.dimensions[0].detector_layers
-        sheet = Sheet(self.style, 3 * self.panel + 4 * 20, "Этап 2. Первичные детекторы угла и места и код окна")
-        circles = [w for w in level.place_encoder.detectors]
-        wide_count = sum(1 for w in circles if w.layer_index == 0)
-        narrow_count = sum(1 for w in circles if w.layer_index == 1)
+        saturated = content.mean() >= float(settings.LADDER_BINDING_SATURATION) - 1e-9
+        # Окно на цифре: центр и радиус (у уровня 0 — центр цифры и расстояние до самого дальнего штриха).
+        wy, wx = (float(v) for v in level.keyhole_centre[keyhole])
+        reach = float(level.keyhole_extent[keyhole])
+        span = float(level.unit) * reach  # клеток картинки на единицу плоскости кругов места
+        stroke = (float(level.element_y[elements[0]]), float(level.element_x[elements[0]]))
+        big, mini = 300, 112
+        ring = angle_view.ring(0, angle).resize((big, big), Image.LANCZOS)
+        origin_view = self.place_origin(big, (wy, wx), reach, stroke, float(angles[0]), place_view, points, span)
+        angle_strip = self.layer_strip(
+            mini,
+            [self.angle_layer(angle_view, angle_dim, k, angle, mini) for k in range(layer_count)],
+            [f"слой {k + 1}: {sum(1 for w in angle_detectors if w.layer_index == k)}|горят {angle_by_layer[k]}" for k in range(layer_count)],
+        )
+        place_strip = self.layer_strip(
+            mini,
+            [self.place_layer(place_view, k, points, angles, (wy, wx), span, reach, mini) for k in range(place_layer_count)],
+            [f"слой {k + 1}: {self.per_side(circles, k)}×{self.per_side(circles, k)}|горят {place_by_layer[k]}"
+             for k in range(place_layer_count)],
+        )
+        origin = "центра цифры" if number == 0 else "центра окна"
+        width = big + angle_strip.width + angle_code.width + 2 * 20 + 2 * 20
+        sheet = Sheet(self.style, width, "Этап 2. Угол и место кодируются одинаково: слоями, по биту на детектор")
         top = sheet.grid(
             [
-                (
-                    f"Угол штриха: {angle:.0f}°",
-                    f"детекторы угла — дуги, слой — кольцо (внутри широкие, снаружи узкие); сработало {angle_stats['ones']} "
-                    f"{plural(angle_stats['ones'], 'детектор', 'детектора', 'детекторов')}, яркие",
-                    ring,
-                ),
-                (
-                    "Место в окне: широкие круги",
-                    f"X и Y штриха от центра окна; {wide_count} {plural(wide_count, 'круг', 'круга', 'кругов')}, "
-                    f"сработавшие залиты; в окне {points.shape[0]} штрихов",
-                    wide,
-                ),
-                (
-                    "Место в окне: узкие круги",
-                    f"{narrow_count} кругов; узкие точнее отличают соседние места (слоёв {len(layers)}, §4.3)",
-                    narrow,
-                ),
+                (f"Угол {angle:.0f}° — замкнутый", f"замкнутая координата: круг {angle_dim.period:.0f}° (у штриха середины линии "
+                 f"нет стрелки); все {layer_count} слоёв кольцами: внутри широкие, снаружи узкие", ring),
+                (f"Угол: {layer_count} слоёв, {len(angle_detectors)} детекторов", f"в каждом слое угол накрывают 2–4 детектора; "
+                 f"сработавшие — цветом своего бита, остальные серые; всего горят {sum(angle_by_layer)}", angle_strip),
+                (f"Код угла: {angle_stats['length']} бит", f"по случайному биту на сработавший детектор, полоса бит — слой "
+                 f"(широкие красные, узкие фиолетовые); единиц {angle_stats['ones']} ({angle_stats['density']:.1%})", angle_code),
             ],
             columns=3,
         )
-        bottom = sheet.grid(
+        middle = sheet.grid(
             [
-                (
-                    f"Код угла: {angle_stats['length']} бит",
-                    f"по случайному биту на сработавший детектор, цвет бита — его слой; единиц {angle_stats['ones']} "
-                    f"({angle_stats['density']:.0%})",
-                    angle_code,
-                ),
-                (
-                    f"Код окна, место: {place_stats['length']} бит",
-                    f"биты сработавших кругов места (OR); единиц {place_stats['ones']} ({place_stats['density']:.0%})",
-                    place_code,
-                ),
-                (
-                    f"Код окна, содержание: {content.shape[0]} бит",
-                    f"код угла каждого штриха, переставленный маской каждого сработавшего круга; единиц {int(content.sum())} "
-                    f"({content.mean():.0%})",
-                    content_picture,
-                ),
+                (f"Место — от {origin}", f"смещение штриха от {origin} (белая линия) в долях R = {reach:.1f} клетки (серый "
+                 f"круг); все {sum(place_by_layer)} сработавших кругов {place_layer_count} слоёв — цветом своего бита", origin_view),
+                (f"Место: {place_layer_count} слоёв, {len(circles)} кругов", f"в каждом слое место накрывают 3–5 кругов; "
+                 f"сработавшие — цветом своего бита, остальные серые; всего горят {sum(place_by_layer)}", place_strip),
+                (f"Код места: {place_stats['length']} бит", f"так же: по случайному биту на сработавший круг, полоса бит — слой; "
+                 f"единиц {place_stats['ones']} ({place_stats['density']:.1%})", place_code),
             ],
             columns=3,
             top=top,
         )
+        content_picture = bits_raster(content, 128, 4, self.style.blue, self.style.off)
+        bottom = sheet.grid(
+            [
+                (
+                    f"Код окна: место {place_stats['length']} + содержание {content.shape[0]} бит",
+                    f"место — код места (OR); содержание — код угла штриха под маской каждого из {sum(place_by_layer)} сработавших "
+                    f"кругов (П.5): единиц {int(content.sum())} ({content.mean():.0%})"
+                    + (f" — упёрлось в предел {float(settings.LADDER_BINDING_SATURATION):.0%}, лишние биты сброшены слиянием "
+                       "цветов (§3.3)" if saturated else ""),
+                    content_picture,
+                ),
+            ],
+            columns=1,
+            top=middle,
+        )
         sheet.save(
             path,
             bottom,
-            note="первичное кодирование: детекторы угла (§4.4), детекторы места — круги (§4.3), код окна (П.5)",
+            note="первичное кодирование: угол (§4.4) и место (§4.3) одинаково, слоями; код окна (П.5)",
             section=CONTINUATION_LOCAL_DETECTOR,
             data={
+                "level": number,
+                "place_circles": len(circles),
+                "place_fired": int(sum(place_by_layer)),
+                "place_by_layer": place_by_layer,
+                "angle_by_layer": angle_by_layer,
+                "content_saturated": bool(saturated),
                 "angle": angle,
                 "angle_ones": angle_stats["ones"],
                 "place_ones": place_stats["ones"],
@@ -233,13 +325,137 @@ class CycleFigures:
             },
         )
 
+    @staticmethod
+    def per_side(circles: list, layer: int) -> int:
+        """Кругов по стороне у слоя layer."""
+        return int(round(math.sqrt(sum(1 for w in circles if w.layer_index == layer))))
+
+    def layer_strip(self, side: int, pictures: list, labels: list) -> Image.Image:
+        """Слои в ряд по пять, под каждым — подпись."""
+        per_row, gap, label = 5, 10, 34
+        rows = -(-len(pictures) // per_row)
+        width = per_row * side + (per_row - 1) * gap
+        strip = Image.new("RGB", (width, rows * (side + label) + (rows - 1) * gap), self.style.background)
+        draw = ImageDraw.Draw(strip)
+        font = self.style.font(12)
+        for index, (picture, text) in enumerate(zip(pictures, labels)):
+            row, column = divmod(index, per_row)
+            left, top = column * (side + gap), row * (side + label + gap)
+            strip.paste(picture, (left, top))
+            for line, part in enumerate(text.split("|")):  # подпись в две строки: «|» — перенос
+                draw.text((left, top + side + 2 + 15 * line), part, fill=self.style.second, font=font)
+        return strip
+
+    def angle_layer(self, view, dim, layer: int, angle: float, side: int) -> Image.Image:  # noqa: ANN001
+        """Один слой детекторов угла: детектор — дуга своего поля на круге, сработавшие — цветом бита, остальные серые."""
+        picture = Image.new("RGB", (side, side), self.style.background)
+        draw = ImageDraw.Draw(picture)
+        centre, outer = side / 2.0, side * 0.46
+        windows = sorted((w for w in view._windows(0) if w.layer_index == layer), key=lambda w: w.center)
+        lanes = view.layer_lanes(0, layer)
+        thick = max(2.0, side * 0.14 / lanes)
+        for position, window in enumerate(windows):
+            active = window.is_active(float(angle))
+            radius = outer - (position % lanes) * thick
+            box = (centre - radius, centre - radius, centre + radius, centre + radius)
+            fill = view.bit_colour(window.bit) if active else (78, 78, 74)
+            width = 3 if active else 1
+            if 2.0 * window.half_width >= dim.period:
+                draw.ellipse(box, outline=fill, width=width)
+                continue
+            middle = view._degrees(dim, window.center)
+            arc = 360.0 * window.half_width / dim.period
+            draw.arc(box, -(middle + arc), -(middle - arc), fill=fill, width=width)
+        ray = math.radians(view._degrees(dim, float(angle)))
+        draw.line((centre, centre, centre + outer * math.cos(ray), centre - outer * math.sin(ray)), fill=self.style.ink, width=1)
+        return picture
+
+    def place_layer(self, view, layer: int, points: np.ndarray, angles: np.ndarray, centre: tuple, span: float,  # noqa: ANN001
+                    reach: float, side: int) -> Image.Image:
+        """Один слой кругов места прямо на цифре: круги стоят вокруг центра окна (у уровня 0 — центра цифры);
+        сработавшие — цветом бита, остальные серые."""
+        digit = self.view(side, self.picture, scale=side / (2.0 * 1.55 * reach), centre=centre, backdrop=0.75)
+        draw = ImageDraw.Draw(digit.image, "RGBA")
+        cy, cx = centre
+        windows = [w for w in view._windows(0) if w.layer_index == layer]
+        active = [any(w.is_active(p) for p in points) for w in windows]
+        for window, on in sorted(zip(windows, active), key=lambda item: item[1]):
+            y, x = cy + window.center_y * span, cx + window.center_x * span
+            r = window.radius * span * digit.scale
+            box = (digit.px(x) - r, digit.py(y) - r, digit.px(x) + r, digit.py(y) + r)
+            if on:
+                colour = view.bit_colour(window.bit)
+                draw.ellipse(box, fill=colour + (28,), outline=colour + (255,), width=1)
+            else:
+                draw.ellipse(box, outline=(90, 90, 86, 150), width=1)
+        for (dy, dx), a in zip(points, angles):
+            digit.stick(cy + dy * span, cx + dx * span, float(a))
+        digit.dot(cy, cx, 2, self.style.ink)
+        return digit.image
+
+    def place_origin(self, side: int, centre: tuple, reach: float, stroke: tuple, angle: float, view, points: np.ndarray,  # noqa: ANN001
+                     span: float) -> Image.Image:
+        """Место как смещение, все слои сразу (как кольца угла): цифра, её центр (центр окна), круг радиуса R, линия от
+        центра к штриху и все сработавшие круги места всех слоёв — цветом своего бита, широкие снизу, узкие сверху."""
+        y, x, a = self.sticks(self.picture)
+        digit = self.view(side, self.picture, scale=side / (2.0 * 1.6 * reach), centre=centre, backdrop=0.85)
+        for row in range(y.shape[0]):
+            digit.stick(y[row], x[row], a[row], dim=0.5)
+        cy, cx = centre
+        draw = ImageDraw.Draw(digit.image, "RGBA")
+        fired = [w for w in view._windows(0) if any(w.is_active(p) for p in points)]
+        for window in sorted(fired, key=lambda w: (w.layer_index, w.bit)):
+            colour = view.bit_colour(window.bit)
+            r = window.radius * span * digit.scale
+            px, py = digit.px(cx + window.center_x * span), digit.py(cy + window.center_y * span)
+            draw.ellipse((px - r, py - r, px + r, py + r), outline=colour + (230,), width=1)
+        digit.circle(cy, cx, reach, (150, 150, 145), width=1)
+        digit.draw.line((digit.px(cx), digit.py(cy), digit.px(stroke[1]), digit.py(stroke[0])), fill=self.style.ink, width=1)
+        digit.stick(stroke[0], stroke[1], angle)
+        digit.circle(stroke[0], stroke[1], 0.8, self.style.orange, width=2)
+        digit.dot(cy, cx, 4, self.style.ink)
+        return digit.image
+
     def example_angle(self) -> float:
-        """Угол штриха в центре окна-примера первого уровня."""
-        level = self.recorder.level_trace(1)
-        rows = self.members(level, self.example[1])
+        """Угол штриха в центре окна-примера первого уровня прогона (с уровнем 0 — штрих его окна)."""
+        level = self.recorder.level_trace(self.first)
+        rows = self.members(level, self.example[self.first])
         offsets = level.entry_offset[rows].astype(np.float64)
         centre = int(np.argmin(np.hypot(offsets[:, 0], offsets[:, 1])))
         return float(self.run.stick_angle[level.entry_element[rows][centre]])
+
+    @staticmethod
+    def local_energy(cells: np.ndarray, activation: np.ndarray) -> np.ndarray:
+        """Активация после энергии активации (ACTIVATION_LOCAL_ENERGY_THRESHOLD; расширение статьи, §5.7 на активации):
+        точка гаснет, если Σ a_v / d(j, v) по соседям в радиусе ACTIVATION_POINT_ENERGY_RADIUS меньше доли μ_a от
+        наибольшей по карте. Тот же счёт, что HierarchyDetection._local, на процессоре."""
+        from damp import settings
+
+        threshold = float(settings.ACTIVATION_LOCAL_ENERGY_THRESHOLD or 0.0)
+        if threshold <= 0.0 or cells.shape[0] == 0:
+            return activation
+        from scipy.spatial import cKDTree
+
+        pairs = cKDTree(cells).query_pairs(r=float(settings.ACTIVATION_POINT_ENERGY_RADIUS), output_type="ndarray")
+        first = np.concatenate([pairs[:, 0], pairs[:, 1]]).astype(np.int64)
+        second = np.concatenate([pairs[:, 1], pairs[:, 0]]).astype(np.int64)
+        weight = 1.0 / np.hypot(cells[first, 0] - cells[second, 0], cells[first, 1] - cells[second, 1])
+        energy = np.zeros(cells.shape[0], dtype=np.float64)
+        np.add.at(energy, first, weight * activation[second])
+        top = float(energy.max())
+        relative = energy / top if top > 0.0 else np.zeros_like(energy)
+        return np.where(relative >= threshold, activation, 0.0)
+
+    @staticmethod
+    def detail_places(level: LadderLevelTrace, keyholes: np.ndarray, keyhole: int) -> tuple[np.ndarray, tuple[float, float]]:
+        """Где стоят детали окон keyholes и деталь окна keyhole. Деталь уровня встаёт в центр своего окна; у уровня 0 с
+        местом от центра цифры (окно держит один штрих, центр окна — центр цифры) деталь — сам штрих, на его месте."""
+        if level.number == 0 and level.entry_keyhole.shape[0] == level.keyhole_picture.shape[0]:
+            places = np.stack([level.element_y, level.element_x], axis=1).astype(np.float64)
+            first = level.entry_element[np.argsort(level.entry_keyhole, kind="stable")]  # штрих каждого окна
+            return places[first[keyholes]], (float(places[first[keyhole], 0]), float(places[first[keyhole], 1]))
+        centre = level.keyhole_centre.astype(np.float64)
+        return centre[keyholes], (float(centre[keyhole, 0]), float(centre[keyhole, 1]))
 
     # ------------------------------------------------------------------ этапы 3–6: панели окна
     def keyhole_panels(self, number: int) -> dict:
@@ -259,11 +475,15 @@ class CycleFigures:
         view = self.view(size, picture, scale=scale, centre=None if scale >= size / 26.0 else (wy, wx))
         y, x, angle = self.sticks(picture)
         seen = np.hypot(y - wy, x - wx) <= radius
-        if number == 1:
+        if number <= 1:  # элементы уровней 0 и 1 — штрихи (у уровня 1 с кодами уровня 0)
             inside = np.zeros(y.shape[0], dtype=bool)
             inside[local - int(self.starts[picture])] = True
             for row in range(y.shape[0]):
                 view.stick(y[row], x[row], angle[row], dim=1.0 if inside[row] else 0.3)
+            if number == 0:
+                # Окно уровня 0 держит один штрих: кольцо показывает, какой.
+                for row in np.flatnonzero(inside):
+                    view.circle(y[row], x[row], 1.2, style.orange, width=3)
         else:
             for row in range(y.shape[0]):
                 view.stick(y[row], x[row], angle[row], dim=0.75 if seen[row] else 0.22)
@@ -293,6 +513,11 @@ class CycleFigures:
         lit = (similarity >= level.activation_lambda) | (similarity >= similarity.max())
         activation = np.where(lit, similarity, 0.0)
         cells, detectors = level.map_cells.astype(np.float64), level.detectors
+        # Энергия активации (расширение статьи, как в прогоне — HierarchyDetection._local): Ê_a(j) = Σ a_v / d(j, v) по
+        # соседям в радиусе r_e, делённая на наибольшую по карте; точки с Ê_a < μ_a гаснут и в детекторы не идут.
+        lit_all = int(lit.sum())
+        activation = self.local_energy(cells, activation)
+        lit = activation > 0.0
         weights = np.where(level.energies >= level.energy_threshold, level.energies, 0.0)
         inside = np.hypot(cells[:, None, 0] - detectors[None, :, 0], cells[:, None, 1] - detectors[None, :, 1]) <= detectors[None, :, 2]
         strength = ((activation * weights) @ inside) / detectors[:, 4]
@@ -346,9 +571,10 @@ class CycleFigures:
         for row in range(y.shape[0]):
             details.stick(y[row], x[row], angle[row], dim=0.25)
         own_keyholes = np.flatnonzero(level.keyhole_picture == picture)
-        for index in own_keyholes:
-            details.dot(level.keyhole_centre[index, 0], level.keyhole_centre[index, 1], 3.0, style.aqua)
-        details.dot(wy, wx, 6.5, style.aqua, outline=style.ink)
+        spots, spot = self.detail_places(level, own_keyholes, keyhole)
+        for sy, sx in spots:
+            details.dot(sy, sx, 3.0, style.aqua)
+        details.dot(spot[0], spot[1], 6.5, style.aqua, outline=style.ink)
         box = Image.new("RGB", (size, size), style.background)
         box.paste(band, ((size - band.width) // 2, 0))
         box.paste(details.image, ((size - details.size) // 2, band.height + 14))
@@ -366,6 +592,7 @@ class CycleFigures:
             shown=int(min(shown, content.shape[0])),
             points=int(cells.shape[0]),
             lit=int(lit.sum()),
+            lit_all=lit_all,
             low=low,
             fired=int(recorded.shape[0]),
             detectors=int(detectors.shape[0]),
@@ -392,7 +619,12 @@ class CycleFigures:
         """Шаг уровня на цифре-образце: окно, код окна, память уровня, деталь."""
         panels = self.keyhole_panels(number)
         s = panels["stats"]
-        what = "штрихи" if number == 1 else f"детали уровня {number - 1} (голубые точки)"
+        if number == 0:
+            what = "штрих; центр окна — центр цифры, радиус — до самого дальнего штриха"
+        elif number == 1:
+            what = "штрихи" + (" с кодами уровня 0" if self.first == 0 else "")
+        else:
+            what = f"детали уровня {number - 1} (голубые точки)"
         last = number == max(self.example)
         sheet = Sheet(self.style, 2 * self.panel + 3 * 20, f"Уровень {number}: шаг на цифре {self.digit}")
         bottom = sheet.grid(
@@ -400,7 +632,7 @@ class CycleFigures:
                 (
                     "1. Окно на цифре",
                     f"радиус поля {s['radius']:.1f} клетки; в окне {s['members']} {plural(s['members'], 'элемент', 'элемента', 'элементов')} — {what}"
-                    + ("" if number == 1 else f"; на картинке окно видит {s['seen']} из {s['sticks']} штрихов"),
+                    + ("" if number <= 1 else f"; на картинке окно видит {s['seen']} из {s['sticks']} штрихов"),
                     panels["keyhole"],
                 ),
                 (
@@ -411,16 +643,18 @@ class CycleFigures:
                 ),
                 (
                     "3. Память уровня",
-                    f"карта из {s['points']} кодов окон обучающих цифр; код окна зажёг {s['lit']} "
-                    f"{plural(s['lit'], 'точку', 'точки', 'точек')} (синие; сходство не ниже {s['low']:.2f}); сработало {s['fired']} из "
+                    f"карта из {s['points']} кодов окон обучающих цифр; код окна зажёг {s['lit_all']} "
+                    f"{plural(s['lit_all'], 'точку', 'точки', 'точек')} (сходство не ниже {s['low']:.2f}), в детекторы идут "
+                    f"{s['lit']} с соседями (синие; энергия активации); сработало {s['fired']} из "
                     f"{s['detectors']} детекторов, {s['strongest']} сильнейших — яркие круги",
                     panels["fired"],
                 ),
                 (
                     "4. Деталь",
                     f"код детали {s['detail_length']} бит, единиц {s['detail_ones']} — по биту на сильнейший детектор; уровень "
-                    f"активации {s['detail_strength']:.1f}; деталь стоит в центре окна (обведена), всего на цифре {s['details']} "
-                    f"{plural(s['details'], 'деталь', 'детали', 'деталей')} — "
+                    f"активации {s['detail_strength']:.1f}; "
+                    + ("деталь — сам штрих с выученным кодом (обведён)" if number == 0 else "деталь стоит в центре окна (обведена)")
+                    + f", всего на цифре {s['details']} {plural(s['details'], 'деталь', 'детали', 'деталей')} — "
                     + ("по ним голосуется класс" if last else "элементы следующего уровня"),
                     panels["detail"],
                 ),
@@ -429,26 +663,24 @@ class CycleFigures:
         )
         sheet.save(path, bottom, note="шаг уровня цикла (§6.6)", section=STIMULUS_DETECTION, data={"level": number, "same": s["same"]})
 
-    def layout_crop(self, glyph_path: str, path: str, *, columns: int, rows: int) -> None:
-        """Этап 3: вырезка из середины карты памяти первого уровня с рисунками окон в ячейках."""
-        level = self.recorder.level_trace(1)
+    def layout_crop(self, glyph_path: str, path: str, *, columns: int, rows: int, number: int = 1) -> None:
+        """Этап 3: вырезка из середины карты памяти уровня number с рисунками окон в ячейках."""
+        level = self.recorder.level_trace(number)
         image = Image.open(glyph_path).convert("RGB")
         tile = image.width // int(level.map_size[1])
         top_skip = image.height - int(level.map_size[0]) * tile
         crop = crop_cells(image, columns * tile, rows * tile, tile=tile, top_skip=top_skip)
-        sheet = Sheet(self.style, crop.width + 40, "Этап 3. Раскладка: память первого уровня")
-        bottom = sheet.grid(
-            [
-                (
-                    f"Вырезка из середины карты ({level.map_cells.shape[0]} точек)",
-                    "в ячейке — что видит окно этой точки памяти (ярко) на фоне соседних углопозиций (тускло); "
-                    "цвет рамки — цифра; рядом легли похожие обрывки контура",
-                    crop,
-                )
-            ],
-            columns=1,
-        )
-        sheet.save(path, bottom, note="раскладка кодов окон первого уровня", section=LAID_OUT_STRUCTURE)
+        if number == 0:
+            title = "Этап 3. Раскладка: память уровня 0 — карта штрихов"
+            note = ("в ячейке — цифра точки памяти, середина ячейки — центр цифры; ярко — штрих этой точки, тускло — "
+                    "остальные; цвет рамки — цифра; рядом легли штрихи с похожим наклоном и местом в цифре")
+        else:
+            title = f"Этап 3. Раскладка: память уровня {number}"
+            note = ("в ячейке — что видит окно этой точки памяти (ярко) на фоне соседних штрихов (тускло); "
+                    "цвет рамки — цифра; рядом легли похожие обрывки контура")
+        sheet = Sheet(self.style, crop.width + 40, title)
+        bottom = sheet.grid([(f"Вырезка из середины карты ({level.map_cells.shape[0]} точек)", note, crop)], columns=1)
+        sheet.save(path, bottom, note=f"раскладка кодов окон уровня {number}", section=LAID_OUT_STRUCTURE)
 
     # ------------------------------------------------------------------ этап 4
     def hierarchy(self, path: str) -> None:
@@ -490,10 +722,11 @@ class CycleFigures:
         sheet = Sheet(self.style, 3 * self.panel + 4 * 20, "Этап 4. Активация: код окна → точки памяти → детекторы")
         bottom = sheet.grid(
             [
-                ("Окно на цифре", f"в окне {s['members']} штрихов; его код — стимул (этап 2)", panels["keyhole"]),
+                ("Окно на цифре", f"окно уровня 1, в нём {s['members']} штрихов; его код — стимул (этап 2)", panels["keyhole"]),
                 (
                     "Зажглись точки памяти",
-                    f"{s['lit']} из {s['points']}: сходство кода окна с кодом точки не ниже λ_a = {s['low']:.2f} (§6.1); ярче — похожее",
+                    f"{s['lit_all']} из {s['points']}: сходство кода окна с кодом точки не ниже λ_a = {s['low']:.2f} (§6.1); "
+                    f"синие — {s['lit']}, у которых зажжены и соседи (энергия активации ≥ 0.5): только они идут в детекторы; ярче — похожее",
                     panels["lit"],
                 ),
                 (
@@ -536,13 +769,15 @@ class CycleFigures:
     def level_maps(self, glyph_paths: dict[int, str], path: str, *, columns: int, rows: int) -> None:
         """Вырезки из середины карт памяти всех уровней."""
         panels = []
-        about = {1: "обрывки контура", 2: "части цифр", 3: "цифры почти целиком"}
+        about = {0: "штрихи и их место в цифре", 1: "обрывки контура", 2: "части цифр", 3: "цифры почти целиком"}
         for level in self.recorder.levels:
             image = Image.open(glyph_paths[level.number]).convert("RGB")
             tile = image.width // int(level.map_size[1])
             top_skip = image.height - int(level.map_size[0]) * tile
             crop = crop_cells(image, columns * tile, rows * tile, tile=tile, top_skip=top_skip)
-            panels.append((f"Уровень {level.number}: {about.get(level.number, '')}", f"окно видит в среднем {level.seen:.0%} углопозиций цифры", crop))
+            note = ("в окне один штрих (ярко); середина ячейки — центр цифры, тускло — остальные штрихи" if level.number == 0
+                    else f"окно видит в среднем {level.seen:.0%} штрихов цифры")
+            panels.append((f"Уровень {level.number}: {about.get(level.number, '')}", note, crop))
         width = max(panel.width for _, _, panel in panels) + 40
         sheet = Sheet(self.style, width, "Карты памяти уровней (вырезки из середины)")
         bottom = sheet.grid(panels, columns=1)

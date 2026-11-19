@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 
@@ -335,6 +337,7 @@ class StrokeLevel:
         self.point_angle = np.asarray(point_angle, dtype=np.float64)
         self.point_y = np.asarray(point_y, dtype=np.float64)
         self.point_x = np.asarray(point_x, dtype=np.float64)
+        self.seconds: dict[str, float] = {}  # секунды шагов обучения (train): окна, коды, память, детекторы, срабатывания, детали
         self._coder = KeyholeCoder()
 
     @staticmethod
@@ -343,16 +346,10 @@ class StrokeLevel:
         return PrimaryLevel.axial()
 
     @staticmethod
-    def pieces(sticks: LadderElements) -> KeyholePieces:
-        """Окна уровня 0: окно на каждом штрихе, в окне — он один; центр окна — середина штрихов своей картинки,
-        смещение штриха — в долях расстояния до самого дальнего штриха картинки (как у окон уровней: место — доля
-        радиуса окна, PlaneFieldBuilder.OFFSET_STEP)."""
+    def _digit_frame(sticks: LadderElements) -> "tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+        """Окно уровня 0 у каждого штриха: номер картинки среди картинок со штрихами, центр цифры (середина её
+        штрихов; y, x), смещение штриха от него (dy, dx) и R — расстояние до самого дальнего штриха (по картинке)."""
         picture = np.asarray(sticks.picture, dtype=np.int64)
-        count = int(picture.shape[0])
-        if count == 0:
-            nothing = np.zeros(0, dtype=np.int64)
-            return KeyholePieces(offsets=np.zeros((0, 2), dtype=np.float64), picture=nothing, centre=np.zeros((0, 2), dtype=np.float64),
-                                 piece=nothing, element=nothing, offset=nothing)
         y, x = np.asarray(sticks.y, dtype=np.float64), np.asarray(sticks.x, dtype=np.float64)
         _, inverse = np.unique(picture, return_inverse=True)
         inverse = inverse.reshape(-1)
@@ -362,6 +359,28 @@ class StrokeLevel:
         radius = np.zeros(sizes.shape[0], dtype=np.float64)
         np.maximum.at(radius, inverse, np.hypot(dy, dx))
         radius = np.where(radius > 0.0, radius, 1.0)
+        return inverse, centre_y, centre_x, dy, dx, radius
+
+    @classmethod
+    def digit_radius(cls, sticks: LadderElements) -> "np.ndarray":
+        """Радиус окна уровня 0 у каждого штриха, клеток: от центра цифры до самого дальнего её штриха (для показа)."""
+        if int(sticks.count) == 0:
+            return np.zeros(0, dtype=np.float64)
+        inverse, _, _, _, _, radius = cls._digit_frame(sticks)
+        return radius[inverse]
+
+    @classmethod
+    def pieces(cls, sticks: LadderElements) -> KeyholePieces:
+        """Окна уровня 0: окно на каждом штрихе, в окне — он один; центр окна — середина штрихов своей картинки,
+        смещение штриха — в долях расстояния до самого дальнего штриха картинки (как у окон уровней: место — доля
+        радиуса окна, PlaneFieldBuilder.OFFSET_STEP)."""
+        picture = np.asarray(sticks.picture, dtype=np.int64)
+        count = int(picture.shape[0])
+        if count == 0:
+            nothing = np.zeros(0, dtype=np.int64)
+            return KeyholePieces(offsets=np.zeros((0, 2), dtype=np.float64), picture=nothing, centre=np.zeros((0, 2), dtype=np.float64),
+                                 piece=nothing, element=nothing, offset=nothing)
+        inverse, centre_y, centre_x, dy, dx, radius = cls._digit_frame(sticks)
         step = PlaneFieldBuilder.OFFSET_STEP
         shift = np.round(np.stack([dy, dx], axis=1) / radius[inverse][:, None] / step) * step
         offsets, offset = np.unique(shift, axis=0, return_inverse=True)
@@ -431,9 +450,27 @@ class StrokeLevel:
         )
 
     @classmethod
-    def train(cls, groups: DigitGroups, sticks: LadderElements, *, map_max_points: int | None) -> "tuple[StrokeLevel, LadderElements]":
+    def train(
+        cls, groups: DigitGroups, sticks: LadderElements, *, map_max_points: int | None,
+        watch: "Callable[[str, object], None] | None" = None,
+    ) -> "tuple[StrokeLevel, LadderElements]":
         """Уровень 0 по штрихам всех картинок прогона (память и подбор — только по обучающим) и штрихи с выученными
-        кодами — вход уровня 1. Шаги — те же, что у прохода уровня (CycleStep), и из кеша шагов."""
+        кодами — вход уровня 1. Шаги — те же, что у прохода уровня (CycleStep), и из кеша шагов.
+
+        watch(имя, итог) — сразу после каждого шага, как у CycleStep.run: «keyholes» (окна и их элементы), «codes»,
+        «memory», «detectors», «firing», «details» (коды, длина, уровни активации, None). Только смотрит: показ прохода
+        по ходу счёта (вне статьи); на счёт не влияет, время показа в секунды шагов (seconds) не входит.
+        """
+        seconds: dict[str, float] = {}
+        clock = time.perf_counter()
+
+        def lap(name: str, value: "Callable[[], object]") -> None:
+            nonlocal clock
+            seconds[name] = time.perf_counter() - clock
+            if watch is not None:
+                watch(name, value())
+            clock = time.perf_counter()
+
         step = CycleStep(groups, map_max_points=map_max_points)
         place = str(settings.LADDER_LEVEL0_PLACE)
         elements, pieces, point_count = cls.inputs(sticks, place, images=groups.atoms.images)
@@ -442,15 +479,21 @@ class StrokeLevel:
         if taught < settings.LADDER_MAP_MIN_POINTS:
             raise LadderLevelDegenerate(f"уровень 0: штрихов на обучающих картинках — {taught}")
         unit = float(settings.LADDER_CLUSTER_PLACE_UNIT)
-        codes = step.coder.encode(elements, pieces, number=cls.NUMBER, unit=unit, taught=taught)
         field = LadderField(number=cls.NUMBER, unit=unit, box=(0, 0, 0, 0), inner=(0, 0, 0, 0))
         keyholes = LevelKeyholes(field=field, pieces=pieces, extent=np.asarray(sticks.reach(), dtype=np.float64), seen=0.0, sight=0.0,
                                  step=1.0, taught=taught)
+        lap("keyholes", lambda: (keyholes, elements))
+        codes = step.coder.encode(elements, pieces, number=cls.NUMBER, unit=unit, taught=taught)
+        lap("codes", lambda: codes)
         # Первичные коды соседних штрихов похожи сильнее кодов окон: порог слияния — свой, как у первичной карты.
         memory = step.remember(codes, keyholes, merge_similarity=float(settings.LADDER_PRIMARY_MERGE_SIMILARITY))
+        lap("memory", lambda: memory)
         detectors = step.detect(memory)
+        lap("detectors", lambda: detectors)
         firing = step.fire(detectors, codes, trained)
+        lap("firing", lambda: firing)
         details, length = DetailCoder(cls.NUMBER).encode(firing, detectors.layer_index, detectors.built, trained)
+        lap("details", lambda: (details, int(length), firing.strength(), None))
         from damp.layout.glyph_map import LayoutGlyphMap
 
         # Точка карты — образец словаря: штрих с тем же кодом (окно уровня 0 — один штрих).
@@ -463,6 +506,7 @@ class StrokeLevel:
             point_angle=np.asarray(atoms.angle)[stick], point_y=np.asarray(sticks.y)[stick], point_x=np.asarray(sticks.x)[stick],
             place=place,
         )
+        level.seconds = seconds
         learned = cls.learned(sticks, details, length)
         silent = np.ones(codes.count, dtype=bool)
         silent[np.asarray(firing.rows, dtype=np.int64)] = False
