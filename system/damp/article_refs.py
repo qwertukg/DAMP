@@ -1,0 +1,94 @@
+"""Paragraph references from docs/DAMP_extracted.txt."""
+
+ENCODING_SYSTEM = "1.2.1"
+LAYOUT_SYSTEM = "1.2.2"
+
+SPARSE_BIT_VECTORS = "2"
+POPULATION_CODING = "2.0.1"
+CODES_SIMILARITY = "2.1"
+SIMILARITY_DEFINITION = "2.1.1"
+CONJUNCTION = "2.2.1"
+INTERSECTION = "2.2.2"
+CONCATENATION = "2.2.3"
+SIMILARITY_MEASURES = "2.2.4"
+FUZZY_SEARCH = "2.2.5"
+
+CHROMODYNAMICS = "3"
+COLOR_ENCODING = "3.2"
+COLOR_MERGE = "3.3"
+
+WIDE_DETECTORS = "4.1"
+ONE_DIM_CODES = "4.2"
+INTEGER_ENCODING = "4.2.1"
+TWO_DIM_CODES = "4.3"
+CYCLIC_COORDS = "4.4"
+SLIDING_WINDOW = "4.4.1"
+GEOMETRIC_METHOD = "4.4.2"
+COMPONENT_ASSIGNMENT = "4.4.3"
+SHORT_LONG_ORDER = "4.5"
+MULTI_DIM_CODES = "4.6"
+
+LAYOUT_PROBLEM = "5.1"
+LAYOUT_BIO_MOTIVATION = "5.1.1"
+LAYOUT_DISCRETE = "5.1.2"
+LAYOUT_COMPACTNESS = "5.1.3"
+LAYOUT_LOCALITY = "5.1.4"
+LAYOUT_ALGORITHM = "5.2"
+PAIR_SELECTION = "5.3"
+SIMILARITY_THRESHOLD = "5.4"
+LAYOUT_PARAMETERS = "7.1.7"
+ENERGY_CALC = "5.5"
+ENERGY_LONG = "5.5.1"
+ENERGY_SHORT = "5.5.2"
+ENERGIES = "5.5.3"
+POINT_EXCHANGE = "5.6"
+POINT_ENERGY = "5.7"
+QUALITY_ASSESS = "5.8"
+OPTIM_PAIR_SELECTION = "5.9.1"
+OPTIM_ENERGY = "5.9.2"
+OPTIM_FIRST_POINT = "5.9.3"
+OPTIM_SUBSET = "5.9.4"
+OPTIM_SIM_MATRIX = "5.9.5"
+PARALLEL_PROCESSING = "5.10"
+COMPLEXITY = "5.11"
+GPU_IMPLEMENTATION = "5.12"
+CODE_REQUIREMENTS = "5.13"
+LONG_RANGE_IMPORTANCE = "5.13.1"
+MAPPING_CONTINUITY = "5.13.2"
+LAID_OUT_STRUCTURE = "5.14"
+
+DETECTION = "6"
+CODE_SPACE_ACTIVATION = "6.1"
+DETECTOR_HIERARCHY = "6.2"
+DETECTOR_PARAMS = "6.3"
+DETECTOR_CONSTRUCTION = "6.4"
+DETECTOR_CLUSTERING = "6.4.1"
+DETECTOR_CENTER = "6.4.2"
+DETECTOR_RADIUS = "6.4.3"
+DETECTOR_STATISTICAL_SHAPE = "6.4.4"
+DETECTOR_INSERTION = "6.4.5"
+STIMULUS_DETECTION = "6.5"
+NEURAL_ANALOGY = "6.6"
+PRACTICE = "7"
+TOKEN_ENCODING = "7.1.4"
+SPACE_FILLING = "7.1.6"
+DETECTOR_LEVELS = "7.1.10"
+MORPHOLOGICAL_EMBEDDINGS = "7.1.12"
+UNKNOWN_WORDS = "7.1.13.3"
+NEURAL_INTEGRATION = "9.3"
+
+# Продолжение статьи — docs/DAMP_continuation.md («Кодирование признаков и их положения в иерархической модели
+# зрения»). В нём разделы без номеров; номера здесь — по порядку заголовков, с буквой «П» (продолжение).
+CONTINUATION_ACTIVATION_MAP = "П.1"  # Карта активации как носитель кодов
+CONTINUATION_MINICOLUMNS = "П.2"  # Миниколонки и общая память
+CONTINUATION_SPATIAL_CODES = "П.3"  # Пространственная организация кодов
+CONTINUATION_BINDING = "П.4"  # Связывание признака с позицией
+CONTINUATION_LOCAL_DETECTOR = "П.5"  # Две составляющие локального детектора
+CONTINUATION_SAME_FEATURE = "П.6"  # Один признак в разных частях окна
+CONTINUATION_MERGING = "П.7"  # Объединение кодов и формирование понятий
+CONTINUATION_BIOLOGY = "П.8"  # Возможная биологическая интерпретация
+CONTINUATION_FIELD_EXPANSION = "П.9"  # Расширение поля зрения
+
+# События инфраструктуры (файлы, кеш, чекпоинты, бэкенды, извлечение стимулов MNIST, оценка точности):
+# в статье нет соответствующего параграфа, поэтому номер не ставится, чтобы не вводить в заблуждение.
+OUTSIDE_ARTICLE = "вне статьи"

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DAMP — живой дашборд</title>
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+<header>
+  <h1>DAMP <span>живой дашборд</span></h1>
+  <span id="status" class="muted">загружаю обученный цикл…</span>
+  <span class="grow"></span>
+  <span id="legend"></span>
+</header>
+<main>
+  <aside id="left">
+    <section class="card" id="padCard">
+      <h2>Рисунок <span class="muted">кисть как штрих MNIST</span></h2>
+      <canvas id="pad" width="560" height="560"></canvas>
+      <div class="tools">
+        <button id="undo" title="Убрать последний штрих">↶ штрих</button>
+        <button id="clear" title="Очистить холст">очистить</button>
+        <button id="example" title="Случайная пятёрка MNIST t10k, каждый раз другая">пример: 5</button>
+        <button id="moveTool" title="Двигать рисунок мышью или пером; ещё — правой кнопкой, Shift + мышь или стрелками">✋ двигать</button>
+        <button id="home" title="Вернуть рисунок на место">↺ на место</button>
+      </div>
+      <label class="check"><input id="centre" type="checkbox" checked> ставить по центру масс, как MNIST</label>
+      <p id="moveNote" class="note"></p>
+      <p id="padNote" class="note"></p>
+    </section>
+    <section class="card" id="answerCard">
+      <h2>Ответ <span class="muted">память: среднее голосов уровней, §7.1.13.3</span></h2>
+      <div id="memory">
+        <div id="memoryDigit">—</div>
+        <div><div id="memoryKind"></div><div id="memoryWhy" class="note"></div></div>
+      </div>
+      <div id="voteRows"></div>
+      <h2 class="second">Читатель <span class="muted">линейный слой, §9.3 — мерка для целых цифр</span></h2>
+      <div id="answer"><div id="digit">—</div><div id="bars"></div></div>
+      <p id="answerNote" class="note"></p>
+    </section>
+  </aside>
+  <section id="levels"></section>
+</main>
+<footer id="trace">
+  <h2>Путь <span class="muted">щёлкните по точке на карте уровня (или по кусочку на рисунке) — какие кусочки рисунка её зажгли и из каких кусочков они собраны, по уровням</span></h2>
+  <div id="traceBody"></div>
+</footer>
+<div id="tip" hidden></div>
+<script src="/static/dashboard.js"></script>
+</body>
+</html>
