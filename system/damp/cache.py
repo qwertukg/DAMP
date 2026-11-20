@@ -359,15 +359,28 @@ class StepCache:
             self._size, self._size_root = self.size(), self.root
         if self._size <= limit:
             return
-        removed = 0
-        for step, path, _, _ in sorted(self.entries(), key=lambda row: row[3]):
-            path.unlink(missing_ok=True)
-            removed += 1
-            self._size = None
-            if self.size() <= int(limit * 0.9):
+        # Старые записи удаляются за один проход: размер записи (с её массивами, entries()) вычитается из счётчика, а
+        # массивы без ссылок убираются после прохода (collect) — диск пересчитывается один раз. Прежде после каждой
+        # удалённой записи кеш обходился заново, а её массивы ещё лежали на диске: размер не падал, и проход стирал
+        # записи одну за другой по секунде на каждую (2026-11-20: подбор стоял часами в _evict). Массивы, общие с
+        # оставшимися записями, не освобождаются, поэтому проход повторяется, пока размер не опустится до 90 % предела.
+        removed = freed = 0
+        target = int(limit * 0.9)
+        for _ in range(8):
+            rows = sorted(self.entries(), key=lambda row: row[3])
+            if not rows:
                 break
-        freed = self.collect()
-        self._size = self.size()
+            estimate = self._size
+            for _, path, size, _ in rows:
+                path.unlink(missing_ok=True)
+                removed += 1
+                estimate -= size
+                if estimate <= target:
+                    break
+            freed += self.collect()
+            self._size = self.size()
+            if self._size <= target:
+                break
         LOGGER.event(
             "cache.evict",
             section=OUTSIDE_ARTICLE,

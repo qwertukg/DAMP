@@ -1884,6 +1884,9 @@ class Layout:
         self._row_occupied_sets: list[set[int]] = [set() for _ in range(self.height)]
         self._radius_offsets_cache: dict[int, list[tuple[int, int]]] = {}
         self._short_energy_weights: list[float] | None = None
+        # Накопленные веса первой точки пары дальней фазы P(p) ∝ −ln Ê (§5.9.3); None — первая точка равновероятна.
+        self._long_weights_cdf: "np.ndarray | None" = None
+        self._long_weighted_first = False
         self._short_energy_last_step: int = -1
         self._short_energy_radius: int | None = None
         self._short_energy_eps: float = 1e-6
@@ -2181,9 +2184,15 @@ class Layout:
         adaptive_params: AdaptiveLayoutConfig | None = None,
         short_optim: ShortLayoutOptimConfig | None = None,
         save_on_stop_path: str | None = None,
+        long_weighted_first: bool = False,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
+        if long_weighted_first and (mode != "long" or energy_every is None):
+            raise ValueError("long_weighted_first needs mode 'long' and energy_every: weights come from Ê of all points (§5.9.3)")
+        # §5.9.3 в дальней фазе: веса первой точки берутся из энергий, которые считаются для Ē раз в energy_every шагов.
+        self._long_weighted_first = bool(long_weighted_first)
+        self._long_weights_cdf = None
         if pairs_per_step <= 0:
             raise ValueError("pairs_per_step must be positive")
         if pair_radius is not None and pair_radius <= 0:
@@ -2487,6 +2496,8 @@ class Layout:
                 self._last_energy_value = energy_value
                 self._last_energy_step = step + step_offset
                 self._last_energy_progress = energy_value
+                if mode == "long" and self._long_weighted_first:
+                    self._refresh_long_weights(effective_energy_radius, step + step_offset)
             if mode == "long" and energy_value is not None:
                 # §5.8: Ē — качество раскладки, при упорядочивании растёт; прирост за период оценки.
                 energy_gain = (
@@ -3332,7 +3343,18 @@ class Layout:
             self._compiled_sampler = None
 
     def _sample_pairs_long_np(self, count: int, radius: int | None) -> "np.ndarray":
-        """Пары дальней фазы (§5.3): первая точка — любая, вторая — ячейка в радиусе r; массив count × 4."""
+        """Пары дальней фазы (§5.3): первая точка — любая, вторая — ячейка в радиусе r; массив count × 4.
+
+        С весами −ln Ê (§5.9.3, LAYOUT_LONG_WEIGHTED_FIRST) первая точка выбирается по ним, вторая — как обычно.
+        """
+        cdf = self._long_weights_cdf
+        if cdf is not None:
+            draws = self._np_rng.random(count) * cdf[-1]
+            idx_a = np.minimum(np.searchsorted(cdf, draws, side="right"), self._point_count - 1)
+            y1 = self._pos_np[idx_a, 0]
+            x1 = self._pos_np[idx_a, 1]
+            y2, x2 = self._sample_nearby_np(y1, x1, radius, None)
+            return np.stack([y1, x1, y2, x2], axis=1)
         sampler = self._compiled_sampler
         if sampler is None:
             return self._sample_pairs_long_numpy(count, radius)
@@ -5037,6 +5059,35 @@ class Layout:
             },
         )
         return normalized
+
+    def _refresh_long_weights(self, radius: int, step: int) -> None:
+        """Веса первой точки дальней фазы P(p) ∝ −ln Ê(p, r) по энергиям всех точек (§5.9.3).
+
+        «As the code space is laid out, we can periodically calculate the energies of all points and use this
+        information to select points» — пока карта не упорядочена, Ê ≈ 0 и выбор почти равновероятен; по мере
+        раскладки вероятность смещается к плохо уложенным точкам (одиночкам вдали от своих).
+        """
+        energies = np.asarray(self._compute_point_energies(int(radius)), dtype=np.float64)
+        emax = float(energies.max()) if energies.size else 0.0
+        if emax > 0.0:
+            weights = np.maximum(0.0, -np.log(np.maximum(energies / emax, 1e-6)))
+        else:
+            weights = np.zeros_like(energies)
+        total = float(weights.sum())
+        self._long_weights_cdf = np.cumsum(weights) if total > 0.0 else None
+        LOGGER.event(
+            "layout.long.energy_weights",
+            section=OPTIM_FIRST_POINT,
+            data={
+                "energy_radius": int(radius),
+                "points": self._point_count,
+                "step": int(step),
+                "weighted": self._long_weights_cdf is not None,
+                "weight_mean": float(weights.mean()) if weights.size else 0.0,
+                "weight_max": float(weights.max()) if weights.size else 0.0,
+                "note": "дальняя фаза: первая точка пары с вероятностью P(p) ∝ −ln Ê по энергиям для Ē (§5.9.3)",
+            },
+        )
 
     def _ensure_short_energy_weights(
         self, *, step_index: int | None, config: ShortLayoutOptimConfig

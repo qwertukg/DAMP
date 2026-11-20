@@ -12,25 +12,35 @@ from damp.encoding.position_binding import PositionBindingEncoder, KeyholeCodes
 class KeyholeCoder:
     """Коды окон уровня: биты места через OR и код содержания под маской своего места (П.4–П.7).
 
-    Детекторы позиции — круги на плоскости окна одного на все уровни кодера места (§4.3); у каждого уровня
-    свои случайные маски (зерно — номер уровня).
+    Детекторы позиции — круги на плоскости окна, одни и те же на всех уровнях (§4.3); длина сегмента места — своя у
+    уровня (LADDER_BINDING_PLACE_CODE_LENGTH), у каждого уровня свои случайные маски (зерно — номер уровня).
     """
 
     def __init__(self) -> None:
-        self._place: Encoder | None = None
+        self._places: dict[int, Encoder] = {}
 
-    @property
-    def place(self) -> Encoder:
-        """Кодер места — как кодер угла (§4.2, §4.3, §4.5): круги на плоскости окна слоями от широких к узким, число
-        кругов по стороне растёт геометрически от LADDER_BINDING_PLACE_WIDEST до LADDER_BINDING_PLACE_NARROWEST, у
-        каждого слоя своя цветовая полоса бит (§3.2, §4.2.1). Слои, перекрытие и длина кода подобраны под плотность
-        кода угла (автор 2026-11-19)."""
-        if self._place is None:
+    @staticmethod
+    def place_length(number: int) -> int:
+        """Длина сегмента места окна уровня number: LADDER_BINDING_PLACE_CODE_LENGTH — число на все уровни либо список
+        по уровням 0, 1, 2, … (последнее значение — на всех уровнях выше). Биты места всех элементов окна входят в код
+        через OR (П.5), поэтому чем больше элементов в окне, тем длиннее сегмент при той же плотности (§2)."""
+        value = settings.LADDER_BINDING_PLACE_CODE_LENGTH
+        if isinstance(value, (list, tuple)):
+            return int(value[min(max(int(number), 0), len(value) - 1)])
+        return int(value)
+
+    def place(self, number: int) -> Encoder:
+        """Кодер места окон уровня number — как кодер угла (§4.2, §4.3, §4.5): круги на плоскости окна слоями от
+        широких к узким, число кругов по стороне растёт геометрически от LADDER_BINDING_PLACE_WIDEST до
+        LADDER_BINDING_PLACE_NARROWEST, у каждого слоя своя цветовая полоса бит (§3.2, §4.2.1). Слои и перекрытие
+        подобраны под плотность кода угла (автор 2026-11-19), длина — под плотность кода окна уровня (§2)."""
+        length = self.place_length(number)
+        if length not in self._places:
             extent = float(settings.LADDER_PLACE_EXTENT)
             overlap = float(settings.LADDER_BINDING_PLACE_OVERLAP)
             # Радиус круга слоя из n кругов по стороне — 1 / (2 · n · (1 − перекрытие)) стороны (plane_detector_layers).
             radius = lambda count: 1.0 / (2.0 * float(count) * (1.0 - overlap))  # noqa: E731
-            self._place = Encoder(
+            self._places[length] = Encoder(
                 PlaneDimension(
                     "Place",
                     ((-extent, extent), (-extent, extent)),
@@ -40,18 +50,18 @@ class KeyholeCoder:
                         narrowest_radius=radius(settings.LADDER_BINDING_PLACE_NARROWEST),
                         overlap=overlap,
                     ),
-                    code_length=settings.LADDER_BINDING_PLACE_CODE_LENGTH,
+                    code_length=length,
                     layer_bands=True,
                 ),
                 random_seed=settings.LADDER_RANDOM_SEED,
                 layer_phase=settings.ENCODER_LAYER_PHASE,
             )
-        return self._place
+        return self._places[length]
 
     def encoder(self, number: int) -> PositionBindingEncoder:
         """Кодер окон уровня number (П.5)."""
         return PositionBindingEncoder(
-            self.place,
+            self.place(number),
             pooling=settings.LADDER_BINDING_POOLING,
             mask=settings.LADDER_BINDING_MASK,
             mask_bits=settings.LADDER_BINDING_MASK_BITS,
@@ -62,7 +72,18 @@ class KeyholeCoder:
             use_gpu=settings.ACTIVATION_USE_GPU,
             name=f"level{number}",
             concepts=settings.LADDER_BINDING_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
+            place_bits=self.place_bits(number),
         )
+
+    @staticmethod
+    def place_bits(number: int) -> int:
+        """Бит места на круг у окон уровня number: LADDER_BINDING_PLACE_BITS — число на все уровни либо список по уровням
+        0, 1, 2, … (последнее — на всех выше). Чем больше, тем весомее место в коде окна против содержания."""
+        # Прямое обращение settings.ИМЯ нужно кешу шагов: по нему настройка входит в ключ шага «коды окон».
+        value = settings.LADDER_BINDING_PLACE_BITS if hasattr(settings, "LADDER_BINDING_PLACE_BITS") else 1
+        if isinstance(value, (list, tuple)):
+            return int(value[min(max(int(number), 0), len(value) - 1)])
+        return int(value)
 
     def encode(
         self, elements: LadderElements, pieces: KeyholePieces, *, number: int, unit: float, taught: int,

@@ -137,6 +137,16 @@ class KeyholeBuilder:
             return int(value[min(max(int(number), 1), len(value)) - 1])
         return int(value)
 
+    @staticmethod
+    def radius_share(number: int) -> float:
+        """Нижний предел радиуса окна уровня number в мерах уровня (что видит одна деталь): LADDER_KEYHOLE_RADIUS_SHARE —
+        число на все уровни либо список по уровням 1, 2, … (последнее значение — на всех уровнях выше). От него зависит,
+        какую долю цифры видит окно уровня: выше уровня 1 окно почти всегда упирается в этот предел."""
+        value = settings.LADDER_KEYHOLE_RADIUS_SHARE
+        if isinstance(value, (list, tuple)):
+            return float(value[min(max(int(number), 1), len(value)) - 1])
+        return float(value)
+
     @classmethod
     def fields(cls, step: float, thresholds: "tuple[float, ...] | list[float]", name: str, number: int = 1) -> PlaneFieldBuilder:
         """Построитель окон уровня number по его мере плоскости step и порогам слоёв (§6.4.1–§6.4.3): окрестность
@@ -154,7 +164,7 @@ class KeyholeBuilder:
             name=name,
             concepts=settings.LADDER_KEYHOLE_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
             # Нижний предел радиуса окна — доля того, что видит одна деталь уровня: от неё зависит рост поля за уровень.
-            radius_floor=settings.LADDER_KEYHOLE_RADIUS_SHARE * step,
+            radius_floor=cls.radius_share(number) * step,
             # Картинка без окон не остаётся: деталей меньше, чем нужно кластеру, — окно видит её целиком (§6.6).
             whole_picture=settings.LADDER_KEYHOLE_WHOLE_PICTURE,
         )

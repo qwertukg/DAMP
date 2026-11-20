@@ -40,6 +40,7 @@ class DetailCoder:
             details, length = DetectorEmbeddings(
                 detectors=int(detectors),
                 saturation_limit=settings.LADDER_SATURATION,
+                saturation_share=float(settings.ACTIVATION_SATURATION_SHARE),
                 target_density=settings.LADDER_TARGET_DENSITY,
                 min_length=settings.LADDER_CODE_LENGTH_MIN,
                 max_length=settings.LADDER_CODE_LENGTH_MAX,

@@ -786,9 +786,16 @@ class DetectorHierarchyBuilder:
         attempts_without_change: int,
         seed: int,
         clusterer: DbscanClusterer,
+        fill_cell: float = 0.0,
+        radius_mode: str = "fill",
     ) -> None:
         if radius_min <= 0:
             raise ValueError("radius_min must be positive")
+        if fill_cell < 0:
+            raise ValueError("fill_cell must be >= 0")
+        if radius_mode not in ("fill", "gyration"):
+            raise ValueError("radius_mode must be 'fill' (§6.4.3) or 'gyration' (§6.4.4)")
+        self._radius_mode = str(radius_mode)
         if output_bits <= 0:
             raise ValueError("output_bits must be positive")
         if len(energies) != len(layout.positions()):
@@ -805,6 +812,8 @@ class DetectorHierarchyBuilder:
         self._energies = [float(value) for value in energies]
         self._layer_configs = tuple(layer_configs)
         self._radius_min = int(radius_min)
+        # Поправка заполнения на клетку сетки (вне статьи): f = n / (π (r + fill_cell)²); 0 — формула §6.4.3 как есть.
+        self._fill_cell = float(fill_cell)
         self._output_bits = int(output_bits)
         self._energy_threshold = float(energy_threshold)
         self._eta = None if eta is None else float(eta)
@@ -1097,10 +1106,27 @@ class DetectorHierarchyBuilder:
         allowed = (candidate_radii <= layer.activation_radius) & (counts >= layer.min_points)
         if not allowed.any():
             return None
-        fill = np.where(allowed, counts / (math.pi * candidate_radii * candidate_radii), -np.inf)
+        # На сетке точка занимает клетку: n(r) / (π r²) при малых r всегда выше плотности (r = 1 — 5 / π ≈ 1.6),
+        # и максимум уходит к самому малому радиусу, где набран минимум точек слоя. С поправкой на клетку
+        # (fill_cell = 0.5) у сплошного круга f ≈ плотность при любом r и падает за краем кластера (§6.4.3).
+        cell_radii = candidate_radii + self._fill_cell
+        fill = np.where(allowed, counts / (math.pi * cell_radii * cell_radii), -np.inf)
         best_index = int(np.argmax(fill))
         best_fill = float(fill[best_index])
         best_radius = float(candidate_radii[best_index])
+        if self._radius_mode == "gyration":
+            # §6.4.4 (статистический метод вместо круга §6.4.3): «in complex cases, the principal component analysis
+            # and the Mahalanobis statistical distance can be used to calculate the parameters of a circumscribed
+            # ellipse». Здесь — круг того же второго момента: r_g² = Σ w·d² / Σ w (след ковариации, веса — активация ×
+            # энергия, §6.4.2), r_d = √2 · r_g — радиус сплошного круга с тем же моментом; выбросы с малым весом
+            # радиус почти не раздувают. Предел — радиус активации слоя r_a.
+            squared = (cluster_y - centroid_y) ** 2 + (cluster_x - centroid_x) ** 2
+            gyration = math.sqrt(float((cluster_w * squared).sum() / weight_sum))
+            best_radius = min(float(layer.activation_radius), max(float(self._radius_min), math.sqrt(2.0) * gyration))
+            inside = int(np.count_nonzero(distances <= best_radius))
+            if inside < layer.min_points:
+                return None
+            best_fill = inside / (math.pi * best_radius * best_radius)
         if best_radius <= 0.0:
             return None
         # §6.3, §6.4.5: после c_d и r_d поле A_λd(c_d, r_d) активируется кодом из центра детектора

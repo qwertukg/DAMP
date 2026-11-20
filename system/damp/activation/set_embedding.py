@@ -86,9 +86,12 @@ class DetectorEmbeddings:
         max_length: int,
         seed: int,
         name: str = "sets",
+        saturation_share: float = 0.0,
     ) -> None:
         if detectors <= 0:
             raise ValueError("detectors must be positive")
+        if not 0.0 <= saturation_share <= 1.0:
+            raise ValueError("saturation_share must be in [0, 1] (0 — σ задан числом)")
         if saturation_limit < 0:
             raise ValueError("saturation_limit must be non-negative (0 — без ограничения)")
         if not 0.0 < target_density < 1.0:
@@ -97,6 +100,9 @@ class DetectorEmbeddings:
             raise ValueError("code length bounds must satisfy 0 < min_length <= max_length")
         self._detectors = int(detectors)
         self._saturation = int(saturation_limit)
+        # σ долей от сработавших в наборе (вне статьи; разметка автора 2026-11-20 «середина плато»): берётся
+        # round(share · сработавших), не меньше 1 и не больше saturation_limit (если он задан); 0 — σ числом.
+        self._share = float(saturation_share)
         self._target = float(target_density)
         self._min_steps = -(-int(min_length) // self.LENGTH_STEP)
         self._max_steps = max(self._min_steps, int(max_length) // self.LENGTH_STEP)
@@ -109,6 +115,8 @@ class DetectorEmbeddings:
         """Пары (набор, детектор), оставшиеся после порога μ_c: σ самых сильных детекторов набора (§7.1.12)."""
         rows = np.asarray(rows, dtype=np.int64)
         columns = np.asarray(columns, dtype=np.int64)
+        if self._share > 0.0 and rows.size:
+            return self._strongest_share(rows, columns, np.asarray(levels, dtype=np.float64))
         if self._saturation == 0 or rows.size == 0:
             return rows, columns
         levels = np.asarray(levels)
@@ -123,6 +131,25 @@ class DetectorEmbeddings:
             if _strongest_compiled(starts, np.ascontiguousarray(columns), np.ascontiguousarray(levels), self._saturation, kept):
                 return rows[kept], columns[kept]
         return self._strongest_dense(rows, columns, levels)
+
+    def _strongest_share(
+        self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """σ долей: в каждом наборе — round(share · сработавших) сильнейших (не меньше 1; не больше saturation_limit,
+        если он задан). Разметка автора 2026-11-20: σ — середина «плато» уровней; по всем окнам она около половины
+        сработавших (§7.1.12, пример статьи — 30 из 80). При равных уровнях раньше идёт меньший номер детектора."""
+        order = np.lexsort((columns, -levels, rows))
+        sorted_rows = rows[order]
+        sets = int(sorted_rows[-1]) + 1
+        starts = np.searchsorted(sorted_rows, np.arange(sets + 1))
+        counts = np.diff(starts)
+        take = np.maximum(1, np.rint(self._share * counts)).astype(np.int64)
+        if self._saturation > 0:
+            take = np.minimum(take, self._saturation)
+        rank = np.arange(sorted_rows.size, dtype=np.int64) - starts[sorted_rows]
+        kept = np.zeros(rows.size, dtype=bool)
+        kept[order[rank < take[sorted_rows]]] = True
+        return rows[kept], columns[kept]
 
     def _strongest_dense(
         self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"

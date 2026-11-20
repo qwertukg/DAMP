@@ -194,6 +194,11 @@ class MnistLadderRunner:
     def _run(self) -> dict[int, float] | None:
         # Группы картинок: обучающие, проверочные и проверочные со сдвигом (первая картинка, после последней).
         self._observer.stage(0, 1)
+        chosen = settings.LADDER_TRAIN_DIGITS if hasattr(settings, "LADDER_TRAIN_DIGITS") else "all"
+        if self._numbers["train"] is None and chosen != "all":
+            # Обучение только на заданных цифрах (вне статьи; автор 2026-11-20: «просто возьми из мниста первые 100
+            # двоек»): первые count картинок MNIST train с этими метками, начиная с train_start.
+            self._numbers["train"] = self._first_train_numbers(self.count, settings.LADDER_TRAIN_DIGITS, self._train_start)
         groups = DigitGroups.load(
             self._digits,
             train=self.count,
@@ -269,6 +274,24 @@ class MnistLadderRunner:
         self._observer.stage(reached.number, 0)
         return self.reports[-1].glued if self.reports else None
 
+    def _first_train_numbers(self, count: int, digits: Sequence[int], start: int) -> tuple[int, ...]:
+        """Номера первых count картинок MNIST train с меткой из digits, начиная с номера start (LADDER_TRAIN_DIGITS)."""
+        from torchvision.datasets import MNIST
+
+        root = getattr(self._digits, "_root", "./data")
+        targets = np.asarray(MNIST(root=root, train=True, download=True).targets)
+        wanted = np.flatnonzero(np.isin(targets, np.asarray([int(digit) for digit in digits])))
+        numbers = wanted[wanted >= int(start)][: int(count)]
+        if numbers.shape[0] < int(count):
+            raise ValueError(f"в MNIST train только {numbers.shape[0]} картинок цифр {list(digits)} с номера {start}")
+        LOGGER.event(
+            "ladder.train_digits",
+            section=OUTSIDE_ARTICLE,
+            data={"digits": [int(digit) for digit in digits], "count": int(count), "first": int(numbers[0]),
+                  "last": int(numbers[-1]), "note": "обучение только на этих цифрах: первые картинки MNIST train с их метками"},
+        )
+        return tuple(int(number) for number in numbers)
+
     def _glyph_file(self, name: str) -> str | None:
         """Рисунок карты name («level2», «classes») этого прогона, если он нарисован (LADDER_SAVE_MAPS)."""
         path = f"{self.FILE_PREFIX}-{name}-keyholes-{self.count}.glyphs.png" if name.startswith("level") else f"{self.FILE_PREFIX}-{name}-{self.count}.glyphs.png"
@@ -317,17 +340,19 @@ class MnistLadderRunner:
             "element_x": elements.x,
         }
 
-    def _watch(self, number: int, *, recognition: bool = True, place: "Encoder | None" = None):  # noqa: ANN202
+    def _watch(self, number: int, *, recognition: bool = True, place: "Encoder | None" = None,
+               memory_extra: "Callable[[object], dict] | None" = None):  # noqa: ANN202
         """Смотритель прохода CycleStep.run: каждый готовый шаг — часть уровня, затем начинается следующий этап.
         recognition — после деталей идёт узнавание по уровню (этап 7); у уровня 0 его нет. place — кодер места окон
-        (None — кодер прохода уровней)."""
+        (None — кодер прохода уровней). memory_extra(память) — добавка к части «memory» (у уровня 0 — угол штриха
+        каждой точки карты, для показа пинвила)."""
 
         def watch(name: str, value: object) -> None:
             if name == "codes":
                 self._part(number, "codes", {
                     "keyhole_codes": value.packed, "code_length": int(value.code_length),
                     "place_length": int(value.place_length), "content_length": int(value.content_length),
-                    "place_encoder": self._step.coder.place if place is None else place,
+                    "place_encoder": self._step.coder.place(number) if place is None else place,
                 })
                 self._observer.stage(number, LEVEL_PARTS["memory"])
             elif name == "memory":
@@ -339,6 +364,7 @@ class MnistLadderRunner:
                     "map_labels": np.asarray([int(label) for label in table.labels()], dtype=np.int64),
                     "energies": np.asarray(value.energies, dtype=np.float64),
                     "energy_threshold": float(settings.ACTIVATION_ENERGY_THRESHOLD),
+                    **({} if memory_extra is None else memory_extra(value)),
                 })
                 self._observer.stage(number, LEVEL_PARTS["detectors"])
             elif name == "detectors":
@@ -372,7 +398,16 @@ class MnistLadderRunner:
         from damp.cycle.primary import StrokeLevel
         from damp.encoding.keyhole_code import KeyholeCoder
 
-        levels = self._watch(0, recognition=False, place=KeyholeCoder().place)
+        def pinwheel(memory) -> dict:  # noqa: ANN001
+            # Угол штриха каждой точки карты (точка — образец словаря, как в StrokeLevel.train): по нему карта уровня 0
+            # показывается пинвилом (§5.13.2; автор 2026-11-20: «пинвил 0 уровня» в Rerun).
+            from damp.layout.glyph_map import LayoutGlyphMap
+
+            sample = LayoutGlyphMap(memory.layout, memory.dictionary.packed).rows
+            stick = np.asarray(memory.rows, dtype=np.int64)[np.maximum(sample, 0)]
+            return {"map_angle": np.asarray(groups.atoms.angle, dtype=np.float64)[stick]}
+
+        levels = self._watch(0, recognition=False, place=KeyholeCoder().place(0), memory_extra=pinwheel)
         state: dict[str, object] = {}
 
         def watch(name: str, value: object) -> None:

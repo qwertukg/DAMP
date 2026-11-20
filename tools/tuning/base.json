@@ -1,0 +1,19 @@
+{
+  "ACTIVATION_SATURATION_LIMIT": 15,
+  "LADDER_KEYHOLE_RADIUS_SHARE": [
+    1.15,
+    0.5,
+    2.0
+  ],
+  "LADDER_CLUSTER_MIN_POINTS": [
+    10,
+    3,
+    14
+  ],
+  "LADDER_BINDING_PLACE_BITS": [
+    39,
+    1
+  ],
+  "LADDER_TARGET_DENSITY": 0.1,
+  "LADDER_KEYHOLE_WHOLE_PICTURE": true
+}

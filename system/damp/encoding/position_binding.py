@@ -99,6 +99,7 @@ class PositionBindingEncoder:
         use_gpu: bool = True,
         name: str = "keyholes",
         concepts: int | None = None,
+        place_bits: int = 1,
     ) -> None:
         if concepts is not None and int(concepts) < 1:
             raise ValueError("concepts must be positive or None")
@@ -140,7 +141,26 @@ class PositionBindingEncoder:
             except ImportError:  # pragma: no cover - без torch всё считается на numpy
                 pass
         self._layers = np.asarray(place.detector_layer_indices(), dtype=np.int64)
-        self._place_bits = np.asarray(place.detector_bits(), dtype=np.int64)
+        # Бит места на круг (автор 2026-11-20: «биты позиции должны перевешивать биты угла»): сегмент места — place_bits
+        # копий кода кругов подряд; в копии j у круга свой случайный бит той же цветовой полосы (перестановка полосы,
+        # своя у копии). Плотность каждой копии та же, что у одного кода места (§2), а вес места в сходстве кодов окон
+        # растёт в place_bits раз. Копия 0 — сам код кругов (place.detector_bits()).
+        if int(place_bits) < 1:
+            raise ValueError("place_bits must be positive")
+        self._place_copies = int(place_bits)
+        base = np.asarray(place.detector_bits(), dtype=np.int64)
+        copies = [base]
+        dimension = place.dimensions[0]
+        for copy in range(1, self._place_copies):
+            rng = np.random.default_rng([self._seed, 3, copy])
+            moved = base.copy()
+            for layer in range(len(dimension.detector_layers)):
+                start, length = dimension.layer_band(layer)
+                permutation = rng.permutation(int(length))
+                inside = (base >= start) & (base < start + length)
+                moved[inside] = start + permutation[base[inside] - start]
+            copies.append(moved + copy * int(place.code_length))
+        self._place_bits = np.stack(copies, axis=1)  # (круги, копии)
         if int(self._layers.max()) >= self._UNSET:
             raise ValueError("too many detector layers")
         # Маска адреса у детектора одна на все длины кода: от неё берутся младшие биты.
@@ -156,6 +176,7 @@ class PositionBindingEncoder:
                 "detectors": int(self._layers.shape[0]),
                 "detectors_per_layer": np.bincount(self._layers).tolist(),
                 "place_length": self.place_length,
+                "place_bits": self._place_copies,
                 "pooling": self._pooling,
                 "mask": self._mask,
                 "mask_bits": self._mask_bits,
@@ -171,7 +192,8 @@ class PositionBindingEncoder:
 
     @property
     def place_length(self) -> int:
-        return int(self._place.code_length)
+        """Длина сегмента места: код кругов места × бит места на круг (копий)."""
+        return int(self._place.code_length) * self._place_copies
 
     @property
     def content_length(self) -> int:
@@ -261,7 +283,7 @@ class PositionBindingEncoder:
         keyhole = source["groups"][entry] - first
         stats["members"] = int(entry.shape[0])
         # Позиция: бит сработавшего детектора входит в код окна операцией OR (§2.2.1).
-        place[keyhole, self._place_bits[detector]] = 1
+        place[keyhole[:, None], self._place_bits[detector]] = 1
         pair = keyhole * detectors + detector
         active = np.unique(pair)
         stats["pairs"] = int(active.shape[0])

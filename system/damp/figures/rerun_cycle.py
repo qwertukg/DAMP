@@ -19,7 +19,7 @@
     /pipeline/overview/...            сводка прогона (пока он идёт — что считается сейчас), секунды шагов
     /pipeline/s1_stimuli/...          этап 1: цифра-пример и её штрихи, цифры 0–9, штрихов на картинку
     /pipeline/s2_coding/...           этап 2: детекторы угла и места, окна пятёрки, окно-пример и его код «место | содержание»
-    /pipeline/s3_layout/...           этап 3: карта памяти уровня (по ходу раскладки, затем итог; цвет — цифра), окно-пример
+    /pipeline/s3_layout/...           этап 3: карта памяти уровня (по ходу раскладки, затем итог; цвет — цифра, у итога уровня 0 — угол штриха), окно-пример
                                       на карте (map/five), энергия точек, карта окон, качество Ē по ходу раскладки (live/quality)
     /pipeline/s4_detectors/...        этап 4: детекторы по слоям (заполняются по ходу); окно зажигает точки, срабатывают детекторы
     /pipeline/s5_embeddings/...       этап 5: код детали окна-примера, детали картинки, уровни срабатываний
@@ -540,7 +540,15 @@ class CycleRerunView(LadderObserver):
         s = self.levels.setdefault(n, {})
         cells = t.map_cells.astype(np.float64)
         positions = np.stack([cells[:, 1], cells[:, 0]], axis=1)
-        self._log(f"{LAYOUT}/map", rr.Points2D(positions, class_ids=t.map_labels.astype(np.uint16), radii=0.45), n)
+        angle = getattr(t, "map_angle", None)
+        if n == 0 and angle is not None:
+            # Уровень 0 — карта штрихов: цвет — угол штриха, как у штрихов этапа 1; так виден пинвил (§5.13.2).
+            from damp.figures.style import stick_hue
+
+            colours = np.asarray([hue_colour(stick_hue(a)) for a in np.asarray(angle, dtype=np.float64)], dtype=np.uint8)
+            self._log(f"{LAYOUT}/map", rr.Points2D(positions, colors=colours, radii=0.45), n)
+        else:
+            self._log(f"{LAYOUT}/map", rr.Points2D(positions, class_ids=t.map_labels.astype(np.uint16), radii=0.45), n)
         energy = np.asarray(t.energies, dtype=np.float64)
         share = (energy - energy.min()) / max(1e-12, float(np.ptp(energy)))
         energy_colours = (np.asarray(OFF) + share[:, None] * (np.asarray((250, 230, 120)) - np.asarray(OFF))).astype(np.uint8)
@@ -967,7 +975,7 @@ class CycleBlueprint:
             column_shares=[3, 3, 2], name="2. Кодирование ↻",
         )
         layout = rrb.Horizontal(
-            rrb.Tabs(spatial(f"{LAYOUT}/map", f"Карта памяти: по ходу раскладки и итог; цвет — цифра, кольцо — окно пятёрки · {cells}"),
+            rrb.Tabs(spatial(f"{LAYOUT}/map", f"Карта памяти: по ходу раскладки и итог; цвет — цифра (итог уровня 0 — угол штриха, пинвил), кольцо — окно пятёрки · {cells}"),
                      spatial(f"{LAYOUT}/energy", f"Энергия точек (§5.7): ярче — выше · {cells}"),
                      spatial(f"{LAYOUT}/glyphs", "Карта окон: в ячейке — что видит окно · X, Y — пиксели рисунка")),
             rrb.Vertical(text(f"{LAYOUT}/about"), bars(f"{LAYOUT}/live/quality", f"Качество Ē (§5.8) по ходу раскладки · X: оценка, "

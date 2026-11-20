@@ -826,6 +826,7 @@ def _run_long_phase(
         log_visuals=settings.LAYOUT_LOG_VISUALS,
         adaptive_params=adaptive_long,
         save_on_stop_path=layout_path,
+        long_weighted_first=bool(settings.LAYOUT_LONG_WEIGHTED_FIRST),
     )
 
 
