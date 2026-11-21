@@ -353,6 +353,23 @@ class PositionBindingTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._encoder(concepts=0)
 
+    def test_coarse_binding_keeps_every_place_bit_and_only_wide_circles_in_content(self) -> None:
+        """Грубое связывание (стратегия v3, Б4): содержание кладут только круги слоёв 0…N−1, биты места — все круги."""
+        ones = [1, 5, 9, 20, 33, 47, 60]
+        full = self._encode(self._encoder(), self._features([ones]), [[(0, 4)]])
+        coarse_encoder = self._encoder(content_layers=1)
+        coarse = self._encode(coarse_encoder, self._features([ones]), [[(0, 4)]])
+        place_full, _ = self._segments(full)
+        place_coarse, content = self._segments(coarse)
+        np.testing.assert_array_equal(place_coarse, place_full)  # место — от всех кругов
+        layers = np.asarray(coarse_encoder.place.detector_layer_indices())
+        wide = [int(d) for d in self._active(coarse_encoder, 4) if layers[d] < 1]
+        masks = coarse_encoder.address_masks(coarse.content_length)
+        expected = {bit ^ int(masks[d]) for d in wide for bit in ones}
+        self.assertEqual(set(np.flatnonzero(content[0]).tolist()), expected)  # содержание — только от широкого слоя
+        with self.assertRaises(ValueError):
+            self._encoder(content_layers=0)
+
     def test_same_feature_in_two_places_differs_in_place_bits_and_in_content(self) -> None:
         encoder = self._encoder()
         # Одна и та же вертикальная линия в левом верхнем и в правом нижнем углу окна.
@@ -723,7 +740,7 @@ class SameResultFasterTest(unittest.TestCase):
         больше COMMON_TABLE_POINTS) и поштучный счёт от каждого центра дают одни и те же детекторы."""
         from damp.activation import DbscanClusterer, DetectorHierarchyBuilder, DetectorLayerConfig
 
-        def build(table_points: int, batched: bool = True, cells: int | None = None):
+        def build(table_points: int, batched: bool = True, cells: int | None = None, windowed: bool = True):
             layout = _clustered_layout()
             builder = DetectorHierarchyBuilder(
                 layout=layout,
@@ -742,14 +759,19 @@ class SameResultFasterTest(unittest.TestCase):
             )
             builder.COMMON_TABLE_POINTS = table_points
             builder.BATCHED = batched
+            builder.WINDOWED = windowed
+            builder.WINDOW_ROWS = 7  # маленькие блоки окна: границы блоков проходят внутри карты
+            builder.WINDOW_MAX_SHARE = 100.0  # окно и на маленькой карте теста
             if cells is not None:
                 builder.CLUSTER_CELLS = cells  # маленькие блоки: границы блоков проходят внутри карты
             detectors = builder.build()
             return [(d.center, d.radius, d.lambda_threshold, d.energy, d.points_count) for d in detectors], builder
 
         with_table, fast = build(20000)
+        whole_map, _ = build(20000, windowed=False)  # с таблицей, но по всей карте, как до окна вокруг диска
         blocks, large = build(0, cells=500)
         single, plain = build(0, batched=False)
+        self.assertEqual(with_table, whole_map)
         self.assertIsNotNone(fast._common)
         self.assertIsNone(large._common)
         self.assertIsNone(plain._common)

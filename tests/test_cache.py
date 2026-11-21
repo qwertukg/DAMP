@@ -104,6 +104,7 @@ class StepCacheTest(unittest.TestCase):
     def test_size_limit_evicts_old_entries(self) -> None:
         with cache_in(self.folder.name, CACHE_MAX_BYTES=1):
             cache = StepCache()
+            cache.COLLECT_GRACE_SECONDS = 0  # один процесс: свежие массивы без записей можно удалять сразу
             for value in range(3):
                 self.run_step(np.full(5, value), cache)
             self.assertLessEqual(len(cache.entries()), 1)

@@ -875,6 +875,11 @@ class TorchPairEnergyEngine:
                         sig2 = 2.0 * kernel_width * kernel_width * radius_sq[start:stop, None]
                         w1 = torch.exp(-d1_sq / sig2)
                         w2 = torch.exp(-d2_sq / sig2)
+                        from damp.layout.far_force import far_alpha
+                        if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                            rr = torch.sqrt(radius_sq[start:stop, None])
+                            w1 = w1 - far_alpha() * torch.sqrt(d1_sq) / rr
+                            w2 = w2 - far_alpha() * torch.sqrt(d2_sq) / rr
                     else:
                         d1 = torch.sqrt(d1_sq) if euclidean else d1_sq
                         d2 = torch.sqrt(d2_sq) if euclidean else d2_sq
@@ -984,6 +989,11 @@ class TorchPairEnergyEngine:
                 sig2 = 2.0 * kernel_width * kernel_width * radius_sq[start:stop, None]
                 w1 = torch.exp(-d1_sq / sig2)
                 w2 = torch.exp(-d2_sq / sig2)
+                from damp.layout.far_force import far_alpha
+                if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                    rr = torch.sqrt(radius_sq[start:stop, None])
+                    w1 = w1 - far_alpha() * torch.sqrt(d1_sq) / rr
+                    w2 = w2 - far_alpha() * torch.sqrt(d2_sq) / rr
             else:
                 d1 = torch.sqrt(d1_sq) if euclidean else d1_sq
                 d2 = torch.sqrt(d2_sq) if euclidean else d2_sq

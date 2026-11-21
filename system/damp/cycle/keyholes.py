@@ -167,6 +167,8 @@ class KeyholeBuilder:
             radius_floor=cls.radius_share(number) * step,
             # Картинка без окон не остаётся: деталей меньше, чем нужно кластеру, — окно видит её целиком (§6.6).
             whole_picture=settings.LADDER_KEYHOLE_WHOLE_PICTURE,
+            # Б3 стратегии v3: с уровня LADDER_KEYHOLE_ONE_FROM — одно окно на картинку в середине её деталей (0 — нет).
+            one_window=0 < int(settings.LADDER_KEYHOLE_ONE_FROM) <= int(number),
         )
 
     @staticmethod

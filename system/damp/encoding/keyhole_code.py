@@ -62,7 +62,8 @@ class KeyholeCoder:
         """Кодер окон уровня number (П.5)."""
         return PositionBindingEncoder(
             self.place(number),
-            pooling=settings.LADDER_BINDING_POOLING,
+            # Перечисляющий пулинг с уровня LADDER_BINDING_ENUMERATE_FROM (П.5, задача #17); 0 — LADDER_BINDING_POOLING.
+            pooling="enumerate" if 0 < int(settings.LADDER_BINDING_ENUMERATE_FROM) <= int(number) else settings.LADDER_BINDING_POOLING,
             mask=settings.LADDER_BINDING_MASK,
             mask_bits=settings.LADDER_BINDING_MASK_BITS,
             target_density=settings.LADDER_BINDING_TARGET_DENSITY,
@@ -73,7 +74,18 @@ class KeyholeCoder:
             name=f"level{number}",
             concepts=settings.LADDER_BINDING_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
             place_bits=self.place_bits(number),
+            content_layers=self.content_layers(number),
         )
+
+    @staticmethod
+    def content_layers(number: int) -> int | None:
+        """Сколько широких слоёв кругов места кладут содержание у окон уровня number (Б4 стратегии v3): LADDER_BINDING_CONTENT_LAYERS —
+        число на все уровни либо список по уровням 0, 1, 2, … (последнее — на всех выше); 0 — все слои."""
+        # Прямое обращение settings.ИМЯ нужно кешу шагов: по нему настройка входит в ключ шага «коды окон».
+        value = settings.LADDER_BINDING_CONTENT_LAYERS if hasattr(settings, "LADDER_BINDING_CONTENT_LAYERS") else 0
+        if isinstance(value, (list, tuple)):
+            value = value[min(max(int(number), 0), len(value) - 1)]
+        return None if int(value) <= 0 else int(value)
 
     @staticmethod
     def place_bits(number: int) -> int:

@@ -1,14 +1,21 @@
-﻿# Окно для автора: прогоны подбора окон одновременно (обычно пара), на 100 обучающих и 100 проверочных цифрах.
+# Стенд подбора: прогоны одновременно (пара от прогонщика доски), на Count обучающих и Tests проверочных цифрах.
 # Каждый номер — файл tune2-<номер>.json (label, changes) рядом. Вывод — tune2-<номер>.out; итог — строка «ИТОГ».
-# Если «ИТОГ» уже есть, а процесс висит на выходе (Rerun держит его), через минуту он останавливается.
+# Если «ИТОГ» уже есть, а процесс висит на выходе, через минуту он останавливается. Готовые номера — в tune_pair.done.
+# Пути не зашиты: репозиторий — три уровня выше этой папки (tools/tuning/stand); Python — DAMP_PYTHON из окружения
+# или .env, иначе python из PATH (docs/HARNESS.md).
 param([string]$List, [int]$Count = 100, [int]$Tests = 100)
 $Numbers = @($List -split '[ ,;]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
-$repo = 'c:\Users\danii\AppData\Local\Temp\claude\90c048c3c2430e10\50fe34b5-999a-4743-bfe4-e4327ebbf623\scratchpad\damp-second-level'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = 'D:\Projects\DAMP\.venv\Scripts\python.exe'
+$repo = (Resolve-Path (Join-Path $here '..\..\..')).Path
+$python = $env:DAMP_PYTHON
+if (-not $python -and (Test-Path (Join-Path $repo '.env'))) {
+    $line = Get-Content (Join-Path $repo '.env') -Encoding utf8 | Where-Object { $_ -match '^\s*DAMP_PYTHON\s*=' } | Select-Object -First 1
+    if ($line) { $python = ($line -split '=', 2)[1].Trim() }
+}
+if (-not $python) { $python = (Get-Command python -ErrorAction Stop).Source }
 Set-Location $repo
-$Host.UI.RawUI.WindowTitle = "DAMP: подбор окон уровней 2–3, прогоны $($Numbers -join ', ') на $Count цифрах"
-$env:RERUN = 'on'  # автор 2026-11-20: «если rerun не сильно влияет на память, запускай его» (окно ~350 МБ)
+$Host.UI.RawUI.WindowTitle = "DAMP: стенд, прогоны $($Numbers -join ', ') на $Count цифрах"
+$env:RERUN = 'off'  # автор 2026-11-21: «ты все ресурсы сожрал» — окно Rerun держало 1.5 ГБ; стенд — без Rerun
 $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUNBUFFERED = '1'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8

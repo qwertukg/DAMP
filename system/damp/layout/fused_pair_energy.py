@@ -509,7 +509,7 @@ class FusedPairEnergy:
         )
         cells = int(window[0].numel())
         if kernel == "gauss":
-            weight, scale = "gauss", 2.0 * kernel_width * kernel_width
+            weight, scale = __import__("damp.layout.far_force", fromlist=["gauss_weight"]).gauss_weight(), 2.0 * kernel_width * kernel_width
         else:
             weight, scale = "inverse", float(distance_eps)
         terms_kernel = self._terms_kernel(
@@ -660,11 +660,18 @@ class FusedPairEnergy:
   valid = valid && (__fadd_rn(__fmul_rn(dyc, dyc), __fmul_rn(dxc, dxc)) <= rsq);
 """
         metric = ("sqrtf(d1)", "sqrtf(d2)") if euclidean else ("d1", "d2")
-        if weight == "gauss":
+        if weight.startswith("gauss"):
             weights = neighbourhood + """
   float sig2 = __fmul_rn((float)kernel_scale, rsq);
   float w1 = ::exp(__fdiv_rn(-d1, sig2));
   float w2 = ::exp(__fdiv_rn(-d2, sig2));
+"""
+            if weight != "gauss":  # смешанное ядро (Р2, far_force.py): − α·d / r; α вписан в имя веса и в ключ кеша
+                alpha = float(weight.split("+", 1)[1])
+                weights += f"""
+  float rr = sqrtf(rsq);
+  w1 = w1 - {alpha!r}f * sqrtf(d1) / rr;
+  w2 = w2 - {alpha!r}f * sqrtf(d2) / rr;
 """
         elif weight == "inverse":
             weights = neighbourhood + f"""
@@ -925,7 +932,7 @@ template <typename T> T damp_popcount(T a0, T a1, T a2, T a3, T v0, T v1, T v2, 
         if not neighbourhood:
             weight, scale = "distance", 0.0
         elif kernel == "gauss":
-            weight, scale = "gauss", 2.0 * kernel_width * kernel_width
+            weight, scale = __import__("damp.layout.far_force", fromlist=["gauss_weight"]).gauss_weight(), 2.0 * kernel_width * kernel_width
         else:
             weight, scale = "inverse", float(distance_eps)
         terms_kernel = self._terms_kernel(

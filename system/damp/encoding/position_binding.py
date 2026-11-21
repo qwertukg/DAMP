@@ -77,7 +77,7 @@ class PositionBindingEncoder:
     один кодер места служит всем уровням.
     """
 
-    POOLINGS = ("max", "min", "strongest")
+    POOLINGS = ("max", "min", "strongest", "enumerate")
     MASKS = ("address", "bits")
     # Ячеек плотной матрицы «окна × биты» за один проход.
     CHUNK_CELLS = 8_000_000
@@ -100,6 +100,7 @@ class PositionBindingEncoder:
         name: str = "keyholes",
         concepts: int | None = None,
         place_bits: int = 1,
+        content_layers: int | None = None,
     ) -> None:
         if concepts is not None and int(concepts) < 1:
             raise ValueError("concepts must be positive or None")
@@ -147,6 +148,13 @@ class PositionBindingEncoder:
         # растёт в place_bits раз. Копия 0 — сам код кругов (place.detector_bits()).
         if int(place_bits) < 1:
             raise ValueError("place_bits must be positive")
+        # Грубое связывание (стратегия v3, 2026-11-21, docs/CLUSTERS.md, Б4): содержание кладут только круги места слоёв
+        # 0…content_layers−1 (широкие); биты места — от всех слоёв. На окнах во всю цифру узкие круги различают почерк, а не
+        # цифру: §3.3.2 «if the goal is… a description that makes sense as a whole, the short-wavelength bits can be
+        # discarded»; П.7 — мелкие детали уступают место. None — все слои.
+        if content_layers is not None and int(content_layers) < 1:
+            raise ValueError("content_layers must be positive or None")
+        self._content_layers = None if content_layers is None else int(content_layers)
         self._place_copies = int(place_bits)
         base = np.asarray(place.detector_bits(), dtype=np.int64)
         copies = [base]
@@ -177,6 +185,7 @@ class PositionBindingEncoder:
                 "detectors_per_layer": np.bincount(self._layers).tolist(),
                 "place_length": self.place_length,
                 "place_bits": self._place_copies,
+                "content_layers": self._content_layers,
                 "pooling": self._pooling,
                 "mask": self._mask,
                 "mask_bits": self._mask_bits,
@@ -287,6 +296,9 @@ class PositionBindingEncoder:
         pair = keyhole * detectors + detector
         active = np.unique(pair)
         stats["pairs"] = int(active.shape[0])
+        if self._content_layers is not None:
+            coarse = self._layers[detector] < self._content_layers
+            entry, detector, keyhole, pair = entry[coarse], detector[coarse], keyhole[coarse], pair[coarse]
         if self._concepts is not None:
             # П.7: окно объединяет около 5–7 понятий. В содержание идут только самые сильные элементы окна, коды
             # остальных отбрасываются целиком («отбрасывать … целые коды»); их биты места уже выставлены выше.
@@ -298,6 +310,9 @@ class PositionBindingEncoder:
             head = np.ones(order.shape[0], dtype=bool)
             head[1:] = pair[order][1:] != pair[order][:-1]
             entry, detector, keyhole, pair = entry[order][head], detector[order][head], keyhole[order][head], pair[order][head]
+        elif self._pooling == "enumerate":
+            pick = self._enumerate(entry, detector, keyhole, pair, source["strength"])
+            entry, detector, keyhole, pair = entry[pick], detector[pick], keyhole[pick], pair[pick]
         # Единичные биты кодов признаков, попавших в область детектора.
         rows, spot = self._expand(source["what_index"][entry], source["bit_starts"])
         bit = source["bit_flat"][spot]
@@ -310,6 +325,37 @@ class PositionBindingEncoder:
         else:
             pair = pair[rows]
         return place, pair, bit, active, stats
+
+    def _enumerate(self, entry: "np.ndarray", detector: "np.ndarray", keyhole: "np.ndarray", pair: "np.ndarray",
+                   strength: "np.ndarray") -> "np.ndarray":
+        """Перечисление выбранных (П.5; задача #17): в каждом окне и слое круги места по очереди — от круга с самым
+        сильным элементом области к слабым — берут сильнейший элемент своей области, ещё не взятый другим кругом этого
+        слоя; если все взяты — свой сильнейший (как «strongest»). Возвращает номера выбранных вхождений (по одному на
+        круг). Ничьи — по номеру вхождения, порядок полностью определён."""
+        if entry.size == 0:
+            return np.zeros(0, dtype=np.int64)
+        level = strength[entry]
+        layer = self._layers[detector]
+        # Кандидаты каждого круга — по убыванию силы; круги группы (окно, слой) — по силе своего лучшего кандидата.
+        order = np.lexsort((entry, -level, pair))
+        head = np.ones(order.shape[0], dtype=bool)
+        head[1:] = pair[order][1:] != pair[order][:-1]
+        starts = np.flatnonzero(head)
+        ends = np.append(starts[1:], order.shape[0])
+        best = level[order][starts]
+        groups = keyhole[order][starts].astype(np.int64) * (int(layer.max()) + 1) + layer[order][starts]
+        circles = np.lexsort((pair[order][starts], -best, groups))
+        picks = np.empty(starts.shape[0], dtype=np.int64)
+        taken: set = set()
+        group = None
+        for index in circles:
+            if groups[index] != group:
+                group, taken = groups[index], set()
+            span = order[starts[index]:ends[index]]
+            choice = next((row for row in span if int(entry[row]) not in taken), span[0])
+            taken.add(int(entry[choice]))
+            picks[index] = choice
+        return np.sort(picks)
 
     def _strongest_entries(self, source: dict, entry: "np.ndarray", first: int) -> "np.ndarray":
         """Вхождения-понятия окна (П.7): в каждом окне — self._concepts самых сильных элементов (ничья — по номеру
@@ -480,8 +526,8 @@ class PositionBindingEncoder:
             raise ValueError("no elements")
         if np.any(np.diff(groups) < 0) or groups[0] < 0 or groups[-1] >= group_count:
             raise ValueError("groups must be ascending keyhole numbers below group_count")
-        if self._pooling == "strongest" and strength is None:
-            raise ValueError("pooling 'strongest' needs the activation level of every element")
+        if self._pooling in ("strongest", "enumerate") and strength is None:
+            raise ValueError(f"pooling '{self._pooling}' needs the activation level of every element")
         offsets = np.asarray(offsets, dtype=np.float64).reshape(-1, 2)
         bit_starts, bit_flat = self._code_bits(what_packed, int(what_length))
         place_starts, place_flat = self._place_detectors(offsets, offset_index, float(unit))

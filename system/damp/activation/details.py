@@ -18,6 +18,15 @@ class DetailCoder:
     def __init__(self, number: int) -> None:
         self.number = int(number)
 
+    def density(self) -> float:
+        """Плотность кода деталей этого уровня (§6.6, шаг 3): LADDER_TARGET_DENSITY_LEVELS — список по уровням (последнее —
+        на всех выше; Б5, задача #21), иначе LADDER_TARGET_DENSITY."""
+        levels = settings.LADDER_TARGET_DENSITY_LEVELS
+        if levels is None:
+            return float(settings.LADDER_TARGET_DENSITY)
+        levels = list(levels) if isinstance(levels, (list, tuple)) else [levels]
+        return float(levels[min(self.number, len(levels) - 1)])
+
     def encode(
         self, firing: Firing, layer_index: "np.ndarray", detectors: int, trained: "np.ndarray", *, length: int | None = None
     ) -> tuple["np.ndarray", int]:
@@ -32,6 +41,10 @@ class DetailCoder:
         trained = np.asarray(trained, dtype=bool)
         fixed = None if length is None else int(length)
 
+        # Отбор σ по цвету (§6.5, §3.3.2) с уровня LADDER_EMBEDDING_COLOUR_FROM: цвет детектора — его слой λ_d.
+        colour_from = int(settings.LADDER_EMBEDDING_COLOUR_FROM)
+        colour = layer_index if 0 < colour_from <= self.number else None
+
         def compute() -> dict[str, object]:
             coded = slice(None)
             if settings.LADDER_EMBEDDING_LAYERS is not None:
@@ -41,17 +54,19 @@ class DetailCoder:
                 detectors=int(detectors),
                 saturation_limit=settings.LADDER_SATURATION,
                 saturation_share=float(settings.ACTIVATION_SATURATION_SHARE),
-                target_density=settings.LADDER_TARGET_DENSITY,
+                target_density=self.density(),
                 min_length=settings.LADDER_CODE_LENGTH_MIN,
                 max_length=settings.LADDER_CODE_LENGTH_MAX,
                 seed=settings.LADDER_RANDOM_SEED + self.number,
                 name=f"details{self.number}",
+                colour=colour,
             ).encode(rows[coded], columns[coded], levels[coded], firing.sets, calibration=trained, length=fixed)
             return {"details": details, "length": int(length)}
 
         inputs = {
             "rows": rows, "columns": columns, "levels": levels, "sets": int(firing.sets), "layer_index": layer_index,
             "detectors": int(detectors), "number": self.number, "trained": trained, "length": 0 if fixed is None else fixed,
+            "colour": colour is not None,
         }
         found = CACHE.run("embeddings.details", inputs, compute, modules=("damp.activation.details", "damp.activation.set_embedding"))
         return found["details"], int(found["length"])

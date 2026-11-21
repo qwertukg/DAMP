@@ -161,7 +161,16 @@ class CycleStep:
                 "коды слились"
             )
         rows = train_rows[dictionary.rows]
-        memory = self.memory.remember(dictionary, rows, self.groups.labels[picture[rows]], f"level{number}")
+        # Карты уровней с номера LADDER_LAYOUT_ARTICLE_FROM — в режиме статьи (§5.5.1: φ = Σ s·d по всей карте, η = ∞, без
+        # отжига), даже если нижние раскладываются сглаживанием: ограниченное гауссово ядро сглаживания не тянет друг к
+        # другу далёкие куски одного класса, и верх рвётся на пятна (разбор 2026-11-21, docs/CLUSTERS.md). Ключ кеша
+        # раскладки видит режим: настройки раскладки входят в него значениями.
+        article = 0 < int(settings.LADDER_LAYOUT_ARTICLE_FROM) <= int(number) and bool(settings.LAYOUT_SMOOTH_PINWHEELS)
+        # Свои настройки раскладки верхних карт (LADDER_LAYOUT_UPPER_CHANGES с уровня LADDER_LAYOUT_UPPER_FROM): рычаги раскладки
+        # верха пробуются, не трогая пинвилы нижних уровней (стратегия v3, docs/CLUSTERS.md).
+        upper = dict(settings.LADDER_LAYOUT_UPPER_CHANGES) if 0 < int(settings.LADDER_LAYOUT_UPPER_FROM) <= int(number) else {}
+        with settings.overridden({**({"LAYOUT_SMOOTH_PINWHEELS": False} if article else {}), **upper}):
+            memory = self.memory.remember(dictionary, rows, self.groups.labels[picture[rows]], f"level{number}")
         # Мерка (вне статьи): одной ли цифры картинки, чьи окна слились в одну точку карты.
         merge = MergePurity(seed=settings.LADDER_RANDOM_SEED + number).measure(
             codes.packed[train_rows], codes.code_length, picture[train_rows], self.groups.labels[picture[train_rows]],

@@ -48,7 +48,7 @@ class MemoryMap:
     порог λ берутся с диска, Layout восстанавливается по ячейкам точек.
     """
 
-    MODULES = ("damp.layout.level_memory",)
+    MODULES = ("damp.layout.level_memory", "damp.layout.far_force")  # far_force: α смешанного ядра (Р2) — в ключ кеша
 
     def __init__(self) -> None:
         self._colorizer = None
@@ -112,9 +112,50 @@ class MemoryMap:
         )
 
     def lay_out(self, bits: "np.ndarray", labels: "np.ndarray", name: str) -> Layout:
-        """Раскладка кодов тем же Layout и с той же настройкой, что первая; цвет точки — класс цифры."""
+        """Раскладка кодов тем же Layout и с той же настройкой, что первая; цвет точки — класс цифры.
+
+        Р5 (задача #20, вне статьи по способу, по статье по мере): с уровня LADDER_LAYOUT_BEST_OF_FROM карта раскладывается
+        LADDER_LAYOUT_BEST_OF раз с разными зёрнами, остаётся раскладка с наименьшей дальней энергией статьи
+        φ = Σ s·d по парам с s ≥ λ (§5.5.1: «penalises strongly correlated points that are distant») — без меток цифр."""
         table = self._table(bits, labels)
-        return _layout_from_codes(table, self._tuner().tune(table.count), self.colorizer, lambda_schedule=self.lambda_schedule(bits, name))
+        params, schedule = self._tuner().tune(table.count), self.lambda_schedule(bits, name)
+        level = int(name[5:]) if name.startswith("level") and name[5:].isdigit() else 0
+        tries = int(settings.LADDER_LAYOUT_BEST_OF) if 0 < int(settings.LADDER_LAYOUT_BEST_OF_FROM) <= level else 1
+        if tries <= 1:
+            return _layout_from_codes(table, params, self.colorizer, lambda_schedule=schedule)
+        best, best_energy, energies = None, None, []
+        for attempt in range(tries):
+            with settings.overridden({"LAYOUT_RANDOM_SEED": int(settings.LAYOUT_RANDOM_SEED) + 1009 * attempt}):
+                layout = _layout_from_codes(table, params, self.colorizer, lambda_schedule=schedule)
+            energy = self.far_energy(table.bits(), layout.cells_array(), float(layout.lambda_threshold))
+            energies.append(round(energy, 4))
+            if best_energy is None or energy < best_energy:
+                if best is not None:
+                    best.release_device()
+                best, best_energy = layout, energy
+            else:
+                layout.release_device()
+        LOGGER.event("layout.best_of", section=OUTSIDE_ARTICLE,
+                     data={"name": name, "tries": tries, "energies": energies, "chosen": energies.index(round(best_energy, 4)),
+                           "note": "лучшая из K раскладок по дальней энергии статьи φ = Σ s·d (§5.5.1), без меток"})
+        return best
+
+    @staticmethod
+    def far_energy(bits: "np.ndarray", cells: "np.ndarray", threshold: float) -> float:
+        """Дальняя энергия статьи на готовой карте: φ = Σ s·d по парам со сходством s ≥ λ (косинус кодов), делённая на
+        число таких пар (§5.5.1). Меньше — похожие точки ближе друг к другу."""
+        codes = np.asarray(bits, dtype=np.float32)
+        norms = np.sqrt(np.maximum(codes.sum(axis=1), 1e-9))
+        cells = np.asarray(cells, dtype=np.float32)
+        total, pairs, step = 0.0, 0, 512
+        for start in range(0, codes.shape[0], step):
+            sim = (codes[start:start + step] @ codes.T) / (norms[start:start + step, None] * norms[None, :])
+            dist = np.sqrt(((cells[start:start + step, None, :] - cells[None, :, :]) ** 2).sum(axis=2))
+            keep = sim >= threshold
+            keep[np.arange(keep.shape[0]), np.arange(start, start + keep.shape[0])] = False
+            total += float((sim[keep] * dist[keep]).sum())
+            pairs += int(keep.sum())
+        return total / max(1, pairs)
 
     def restore(self, bits: "np.ndarray", labels: "np.ndarray", cells: "np.ndarray", width: int, lambda_threshold: float,
                 pair_radius: int | None) -> Layout:

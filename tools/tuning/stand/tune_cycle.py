@@ -63,7 +63,8 @@ def memoize_heavy_steps() -> None:
     MergePurity.measure = remembered_measure
 
 
-memoize_heavy_steps()
+# memoize_heavy_steps() — выключено 2026-11-21 (анализ ускорения): второго прохода больше нет, а запоминание держало
+# срабатывания в ОЗУ и хешировало большие массивы на каждом вызове.
 
 
 LEVELS: dict = {}  # числа окон по уровням — собирает наблюдатель прогона по ходу обучения
@@ -200,6 +201,152 @@ def level0_retinotopy(cells, y, x, picture) -> dict:  # noqa: ANN001
     return {"retino_step": round(float(np.mean(np.concatenate(steps))), 3), "retino_spearman": round(spearman, 3)}
 
 
+EIGHT = np.ones((3, 3), dtype=bool)
+POPCOUNT = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(axis=1).astype(np.int64)
+
+
+def class_gathering(cells, labels, height: int, width: int) -> dict:  # noqa: ANN001
+    """М1 — собранность классов (план v2; §8.2: «determine cluster dominance, assess the layout»): пятно цифры — куски её
+    клеток, связные по 8 соседям, причём пустая клетка рядом с цифрой пятно не рвёт (пустых клеток ~15 %, прежняя мерка
+    по 4 соседям рвала пятна на них). m1_main — доля точек карты в самом большом пятне своей цифры (идеал 1.0),
+    m1_patches — пятен от 5 точек на всех цифрах (идеал 10)."""
+    from scipy import ndimage
+
+    cells, labels = np.asarray(cells, dtype=np.int64).reshape(-1, 2), np.asarray(labels, dtype=np.int64)
+    grid = np.full((int(height), int(width)), -1, dtype=np.int64)
+    grid[cells[:, 0], cells[:, 1]] = labels
+    empty = grid < 0
+    main = patches = 0
+    pair_share = 0.0
+    for digit in np.unique(labels):
+        mask = grid == digit
+        joined = mask | (empty & ndimage.binary_dilation(mask, structure=EIGHT))
+        parts, _ = ndimage.label(joined, structure=EIGHT)
+        sizes = np.bincount(parts[mask])[1:]
+        main += int(sizes.max()) if sizes.size else 0
+        patches += int(np.count_nonzero(sizes >= 5))
+        # М1² (анализ 2026-11-21: шум на 24 % ниже М1, связь с М1 r = 0.96): вероятность, что две точки цифры лежат в одном
+        # пятне, — Σ s² / n² по пятнам цифры; среднее по точкам карты (вес цифры — её n).
+        count = int(mask.sum())
+        pair_share += float((sizes.astype(np.float64) ** 2).sum()) / max(1, count)
+    return {"m1_main": main / max(1, labels.shape[0]), "m1_patches": patches, "m1_sq": pair_share / max(1, labels.shape[0])}
+
+
+def class_by_digit(cells, labels, pictures, height: int, width: int, train_labels) -> dict:  # noqa: ANN001
+    """Стратегия v3 (docs/CLUSTERS.md, автор 2026-11-21: «все классы — свои кластеры»): М1 каждой цифры, покрытие — доля её
+    обучающих картинок, дошедших до верха, М1ц — среднее по цифрам без веса от М1 × покрытие (главная мерка), целых цифр —
+    сколько цифр с М1 ≥ 0.9."""
+    from scipy import ndimage
+
+    cells, labels, pictures = (np.asarray(v, dtype=np.int64) for v in (cells, labels, pictures))
+    train_labels = np.asarray(train_labels, dtype=np.int64)
+    grid = np.full((int(height), int(width)), -1, dtype=np.int64)
+    grid[cells[:, 0], cells[:, 1]] = labels
+    empty = grid < 0
+    m1, cover = [], []
+    for digit in range(10):
+        mask = grid == digit
+        total = int((train_labels == digit).sum())
+        if not mask.any() or total == 0:
+            m1.append(0.0)
+            cover.append(0.0)
+            continue
+        joined = mask | (empty & ndimage.binary_dilation(mask, structure=EIGHT))
+        parts, _ = ndimage.label(joined, structure=EIGHT)
+        sizes = np.bincount(parts[mask])[1:]
+        m1.append(float(sizes.max() / mask.sum()))
+        cover.append(min(1.0, np.unique(pictures[(labels == digit) & (pictures >= 0)]).size / total))
+    m1c = float(np.mean([a * b for a, b in zip(m1, cover)]))
+    return {"m1_digits": [round(v, 3) for v in m1], "cover_digits": [round(v, 3) for v in cover], "m1u": round(float(np.mean(m1)), 4),
+            "m1c": round(m1c, 4), "whole": int(sum(v >= 0.9 for v in m1))}
+
+
+def class_radiality(cells, labels) -> dict:  # noqa: ANN001
+    """М2 — радиальность классов, «пинвил классов» (план v2; §5.14: «pinwheels have a radial, often cyclically closed
+    substructure»; автор 2026-11-20: классы наверху — секторы вокруг центра). Для центра c: у каждой цифры — длина
+    среднего единичного вектора направлений её точек из c (1 — цифра в узком секторе, 0 — вокруг всего центра); R —
+    среднее по точкам. Из R вычитается то же у всех точек вместе R₀ (из центра у края все точки лежат в полуплоскости,
+    и R велико при любых метках): m2 = (R − R₀) / (1 − R₀) — 0 у случайных меток, 1 — каждая цифра в своём узком
+    секторе. Центр — лучший из сетки 9 × 9 внутри средних 60 % карты; m2_chance — то же при перемешанных метках."""
+    cells, labels = np.asarray(cells, dtype=np.float64).reshape(-1, 2), np.asarray(labels, dtype=np.int64)
+    if labels.shape[0] < 10:
+        return {"m2": 0.0, "m2_chance": 0.0}
+    y, x = cells[:, 0], cells[:, 1]
+    digits = np.unique(labels)
+    index = np.searchsorted(digits, labels)
+    centres = [(cy, cx) for cy in np.linspace(*np.quantile(y, (0.2, 0.8)), 9) for cx in np.linspace(*np.quantile(x, (0.2, 0.8)), 9)]
+
+    def best(order) -> float:  # noqa: ANN001
+        found = 0.0
+        for cy, cx in centres:
+            theta = np.arctan2(y - cy, x - cx)
+            cos, sin = np.cos(theta), np.sin(theta)
+            c = np.bincount(order, cos, minlength=digits.shape[0])
+            s = np.bincount(order, sin, minlength=digits.shape[0])
+            whole = float(np.hypot(cos.mean(), sin.mean()))
+            found = max(found, (float(np.hypot(c, s).sum() / labels.shape[0]) - whole) / max(1e-9, 1.0 - whole))
+        return found
+
+    return {"m2": best(index), "m2_chance": best(np.random.default_rng(0).permutation(index))}
+
+
+def code_structure(layout, energies, threshold: float) -> dict:  # noqa: ANN001
+    """Мерки карты без меток (план v2), по кодам точек (строки code_table идут в порядке layout.cells_array()).
+
+    М3 — нити и мосты (§5.14: «bridges or threads, usually look like thin lines… in a well laid out space, the number of
+    bridges is minimal»; «unorganised areas… rubbish codes»): у клетки — сколько из 8 соседей похожи на неё не меньше
+    λ_a (порог нижнего слоя детекторов, §7.1.11). 0 похожих — «мусор», 1–2 — нить, от 3 — плотная область. m3_threads —
+    доля клеток-нитей, m3_bridges — нитей из 3+ клеток (8-связных), m3_rubbish — доля «мусора».
+    М4 — Ē, средняя энергия точек (§5.8).
+    М5 — «свечение» (§7.1.8.5: «λ < 0.6 caused the space to glow… at λ = 0.45 a clear structure is visible»): какая доля
+    точек в среднем похожа на точку не меньше λ (до 4000 случайных точек, сама точка не в счёт).
+    М6 — разрешение кода (§5.13.2.3: «out of 10 000… could only encode 3 926. In the worst case, 43 points are mapped to
+    the same bit vector»): разных кодов, точек на код и самая большая группа одинаковых кодов."""
+    from scipy import ndimage
+
+    table = layout.code_table
+    packed = np.ascontiguousarray(np.asarray(table.packed, dtype=np.uint8))
+    count = packed.shape[0]
+    cells = np.asarray(layout.cells_array(), dtype=np.int64).reshape(-1, 2)
+    ones = POPCOUNT[packed].sum(axis=1)
+    index = np.full((int(layout.height), int(layout.width)), -1, dtype=np.int64)
+    index[cells[:, 0], cells[:, 1]] = np.arange(count)
+    degree = np.zeros(count, dtype=np.int64)
+    height, width = index.shape
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        # Пары (y, x) — (y + dy, x + dx), dy ≥ 0: a — первая клетка пары, b — вторая.
+        a = index[0:height - dy, max(0, -dx):width - max(0, dx)]
+        b = index[dy:height, max(0, dx):width - max(0, -dx)]
+        held = (a >= 0) & (b >= 0)
+        first, second = a[held], b[held]
+        for start in range(0, first.shape[0], 20000):
+            i, j = first[start:start + 20000], second[start:start + 20000]
+            common = POPCOUNT[packed[i] & packed[j]].sum(axis=1)
+            similar = common / np.sqrt(np.maximum(ones[i] * ones[j], 1)) >= threshold
+            np.add.at(degree, i[similar], 1)
+            np.add.at(degree, j[similar], 1)
+    thread = (degree >= 1) & (degree <= 2)
+    thread_grid = np.zeros(index.shape, dtype=bool)
+    thread_grid[cells[thread, 0], cells[thread, 1]] = True
+    parts, found = ndimage.label(thread_grid, structure=EIGHT)
+    bridges = int(np.count_nonzero(np.bincount(parts.reshape(-1))[1:] >= 3)) if found else 0
+    rng = np.random.default_rng(0)
+    sample = np.sort(rng.choice(count, size=min(count, 4000), replace=False))
+    bits = np.unpackbits(packed[sample], axis=1, count=int(table.code_length)).astype(np.float32)
+    norm = np.maximum(bits.sum(axis=1), 1.0)
+    similarity = (bits @ bits.T) / np.sqrt(norm[:, None] * norm[None, :])
+    np.fill_diagonal(similarity, -1.0)
+    others = max(1, sample.shape[0] - 1)
+    _, groups = np.unique(packed, axis=0, return_counts=True)
+    return {
+        "m3_threads": float(thread.mean()), "m3_bridges": bridges, "m3_rubbish": float((degree == 0).mean()),
+        "m3_lambda": round(float(threshold), 3),
+        "energy": float(np.asarray(energies, dtype=np.float64).mean()) if energies is not None and len(energies) else float("nan"),
+        **{f"glow{int(round(100 * lam))}": float((similarity >= lam).sum(axis=1).mean() / others) for lam in (0.45, 0.6, 0.7, 0.8)},
+        "m6_codes": int(groups.shape[0]), "m6_per_code": round(count / max(1, groups.shape[0]), 3), "m6_largest": int(groups.max()),
+    }
+
+
 def main() -> None:
     number, changes_path = int(sys.argv[1]), sys.argv[2]
     count = int(sys.argv[3]) if len(sys.argv) > 3 else 100
@@ -208,7 +355,11 @@ def main() -> None:
     label, changes = spec["label"], dict(spec["changes"])
     here = os.path.dirname(os.path.abspath(__file__))
 
-    damp = Damp(changes={**changes, "DASHBOARD_FILE_PREFIX": "data/tune/ladder"})
+    # Ресурсы машины автора (2026-11-21: «оставляй ресурсы для работы системы»): без Rerun картинки раскладки не нужны,
+    # потоков на прогон — 4 у кодера и 2 у детекторов (пара — около 8 из 12). TUNE_FULL_RESOURCES=1 — как раньше.
+    light = {} if os.environ.get("TUNE_FULL_RESOURCES") == "1" else {
+        "LAYOUT_LOG_VISUALS": False, "ENCODING_WORKERS": 4, "ACTIVATION_PARALLEL_WORKERS": 2, "LADDER_CLASS_MAP": False}
+    damp = Damp(changes={**changes, **light, "DASHBOARD_FILE_PREFIX": "data/tune/ladder"})
     started = time.perf_counter()
     ladder = damp.cycle.trained(count)  # предел карты — DASHBOARD_MAP_POINTS (его можно задать и в changes)
     maps = ladder.maps()
@@ -255,7 +406,8 @@ def main() -> None:
                 lonely += int(all(value != digit for value in present))
         return {"points": int(labels.shape[0]), "plain": same / max(1, pairs), "honest": other_same / max(1, other),
                 "other_pairs_share": other / max(1, pairs), "pictures": int(np.unique(picture).shape[0]),
-                "in_main": in_main / max(1, labels.shape[0]), "patches": patches, "lonely": lonely / max(1, counted)}
+                "in_main": in_main / max(1, labels.shape[0]), "patches": patches, "lonely": lonely / max(1, counted),
+                **class_gathering(cells, labels, int(level.height), int(level.width)), **class_radiality(cells, labels)}
 
 
     levels = [convergence(level) for level in maps]
@@ -300,6 +452,12 @@ def main() -> None:
         place_ones = bits[:, :place_length].sum(axis=1)
         content_ones = bits[:, place_length:].sum(axis=1)
         share = place_ones / np.maximum(1, place_ones + content_ones)
+        # М6 по коду угла (§5.13.2.3 мерит разрешение кода самого признака): весь код уровня 0 уникален из-за места,
+        # поэтому разрешение считается по части содержания — сколько разных кодов угла у штрихов и самая большая группа.
+        _, angle_groups = np.unique(np.packbits(bits[:, place_length:].astype(np.uint8), axis=1), axis=0, return_counts=True)
+        zero_found["m6_angle_codes"] = int(angle_groups.shape[0])
+        zero_found["m6_angle_per_code"] = round(bits.shape[0] / max(1, angle_groups.shape[0]), 3)
+        zero_found["m6_angle_largest"] = int(angle_groups.max())
         zero_found["place_share"] = {"place_length": int(place_length), "code_length": int(table.code_length),
                                      "place_ones": round(float(place_ones.mean()), 1), "content_ones": round(float(content_ones.mean()), 1),
                                      "mean": round(float(share.mean()), 4), "min": round(float(share.min()), 4),
@@ -318,21 +476,19 @@ def main() -> None:
                             period=float(primary.angle_period))
 
     def glow(trained, level) -> dict:  # noqa: ANN001
-        """Мерки уровня без меток (статья): «свечение» карты (§7.1.8.5: «λ < 0.6 caused the space to glow, as all points
-        were treated as similar… at λ = 0.45 a clear structure is visible») — какая доля точек карты в среднем похожа на
-        точку не меньше λ (косинус кодов, сама точка не в счёт); Ē — средняя энергия точек (§5.8); детекторов (§6.4)."""
-        table = trained.memory.layout.code_table
-        bits = np.unpackbits(np.asarray(table.packed), axis=1, count=int(table.code_length)).astype(np.float32)
-        ones = np.maximum(bits.sum(axis=1), 1.0)
-        similarity = (bits @ bits.T) / np.sqrt(ones[:, None] * ones[None, :])
-        np.fill_diagonal(similarity, -1.0)
-        count = max(1, bits.shape[0] - 1)
-        return {"glow45": float((similarity >= 0.45).sum(axis=1).mean() / count),
-                "glow60": float((similarity >= 0.60).sum(axis=1).mean() / count),
-                "energy": float(np.asarray(level.energies, dtype=np.float64).mean()),
+        """Мерки уровня без меток (план v2: М3–М6, см. code_structure) и число детекторов (§6.4)."""
+        return {**code_structure(trained.memory.layout, level.energies, float(level.activation_threshold)),
                 "detectors": int(np.asarray(level.detectors).shape[0])}
 
     unlabelled = [glow(trained, level) for trained, level in zip(ladder._ladder.levels, maps)]
+    if zero is not None:
+        primary_level = ladder._ladder.primary
+        zero_found.update(code_structure(primary_level.memory.layout, getattr(primary_level.memory, "energies", None),
+                                         float(primary.activation_threshold)))
+        zero_found["detectors"] = int(np.asarray(primary.detectors).shape[0])
+        print(f"  уровень 0: нитей {zero_found['m3_threads']:.3f} (мостов {zero_found['m3_bridges']}), мусора "
+              f"{zero_found['m3_rubbish']:.3f}; разных кодов {zero_found['m6_codes']} из {zero_found['points']}, "
+              f"больше всего одинаковых {zero_found['m6_largest']}; Ē {zero_found['energy']:.3f}")
 
     # Побочно: ответы на 200 проверочных цифрах (в обучении их нет).
     # Отбор без проверочных картинок (tests = 0): мерки — только по картам обучения.
@@ -379,7 +535,11 @@ def main() -> None:
         labels = np.asarray(level.labels, dtype=np.int64)
         unit = side / max(int(level.height), int(level.width))
         draw.text((left, 38), f"Уровень {number_of_level}: {found['points']} точек", fill="white", font=small)
-        draw.text((left, 55), f"честная {found['honest']:.3f} · прежняя {found['plain']:.3f}", fill=(200, 200, 200), font=small)
+        # Под заголовком — главные мерки плана v2: у уровня 0 — гладкость и ретинотопия (М7) и нити (М3), у уровней
+        # цикла — собранность (М1) и радиальность (М2) классов, честная сходимость — страж.
+        said = (f"гладк. {found.get('smooth_deg', 0)}° · ретино {found.get('retino_spearman', 0)} · нитей {found.get('m3_threads', 0):.2f}"
+                if number_of_level == 0 else f"М1 {found['m1_main']:.2f} · М2 {found['m2']:.2f} · честная {found['honest']:.3f}")
+        draw.text((left, 55), said, fill=(200, 200, 200), font=small)
         # Уровень 0 — в цветах пинвила, по углу штриха (автор 2026-11-20); уровни цикла — по цифре.
         fills = [pinwheel(angle) for angle in level.angle] if number_of_level == 0 else [colours[int(digit)] for digit in labels]
         for (y, x), fill in zip(cells, fills):
@@ -397,8 +557,45 @@ def main() -> None:
         draw.rectangle((legend_left + d * 56, top + side + 16, legend_left + d * 56 + 14, top + side + 30), fill=colours[d])
         draw.text((legend_left + d * 56 + 20, top + side + 15), str(d), fill="white", font=small)
     os.makedirs("data/maps", exist_ok=True)
+    # Карта верха для разборов задним числом (анализ 2026-11-21: по картам считали новые мерки): клетки, цифра, картинка.
+    top = maps[-1]
+    np.savez_compressed(f"data/maps/tune2-{number}-top.npz", cells=np.asarray(top.cells, dtype=np.int64), labels=np.asarray(top.labels, dtype=np.int64),
+                        picture=np.asarray(top.point_picture, dtype=np.int64), height=int(top.height), width=int(top.width))
     image_path = f"data/maps/tune2-{number}.png"
     sheet.save(image_path)
+    groups = ladder._ladder.groups
+    first, last = groups.ranges["train"]
+    digits = class_by_digit(top.cells, top.labels, top.point_picture, int(top.height), int(top.width), np.asarray(groups.labels)[first:last])
+    # Стратегия v3 (2026-11-21, docs/CLUSTERS.md): М1ц без удачи раскладки. Верх раскладывается ещё TUNE_RELAYOUTS раз на ТЕХ ЖЕ
+    # кодах с другими зёрнами раскладки (тем же режимом, что в прогоне); М1ц — среднее по всем раскладкам. Разброс одной
+    # раскладки ±0.05 (12 раскладок кодов 648) сравним с эффектами осей. На детекторы, точность и карты прогона не влияет.
+    relayouts = int(os.environ.get("TUNE_RELAYOUTS", "2"))
+    m1c_runs, m1_runs = [digits["m1c"]], [digits["m1_digits"]]
+    if relayouts > 0:
+        from damp import settings as live
+        from damp.layout.level_memory import MemoryMap
+
+        top_layout = ladder._ladder.levels[-1].memory.layout
+        top_number = int(ladder._ladder.levels[-1].number)
+        top_bits = np.asarray(top_layout.code_table.bits(), dtype=np.uint8)
+        top_labels = np.asarray([int(v) for v in top_layout.code_table.labels()], dtype=np.int64)
+        run_settings = {key: value for key, value in {**changes, **light}.items() if key != "DASHBOARD_FILE_PREFIX"}
+        with live.overridden(run_settings):  # настройки прогона: Damp держит их только внутри своих вызовов
+            article_from = int(getattr(live, "LADDER_LAYOUT_ARTICLE_FROM", 0))
+            mode = {"LAYOUT_SMOOTH_PINWHEELS": False} if 0 < article_from <= top_number and bool(live.LAYOUT_SMOOTH_PINWHEELS) else {}
+            if 0 < int(getattr(live, "LADDER_LAYOUT_UPPER_FROM", 0)) <= top_number:
+                mode = {**mode, **dict(live.LADDER_LAYOUT_UPPER_CHANGES)}  # свои настройки раскладки верха — как в прогоне
+            base_seed = int(live.LAYOUT_RANDOM_SEED)
+        for k in range(relayouts):
+            with live.overridden({**run_settings, **mode, "LAYOUT_RANDOM_SEED": base_seed + 101 + k}):
+                fresh = MemoryMap().lay_out(top_bits, top_labels, f"tune-relayout-{k}")
+            got = np.asarray([int(v) for v in fresh.code_table.labels()], dtype=np.int64)
+            again = class_by_digit(fresh.cells_array(), got, np.full(got.size, -1), int(fresh.height), int(fresh.width), np.asarray(groups.labels)[first:last])
+            m1_runs.append(again["m1_digits"])
+            m1c_runs.append(round(float(np.mean([a * b for a, b in zip(again["m1_digits"], digits["cover_digits"])])), 4))
+    mean_digits = np.mean(np.asarray(m1_runs, dtype=np.float64), axis=0)
+    digits.update({"m1c_mean": round(float(np.mean(m1c_runs)), 4), "m1c_runs": m1c_runs, "m1_digits_mean": [round(float(v), 3) for v in mean_digits],
+                   "whole_mean": round(float(np.mean([sum(v >= 0.9 for v in run) for run in m1_runs])), 2)})
 
     entry = {"run": number, "label": label, "changes": changes, "count": count, "levels": len(maps),
              "detector_shapes": shapes,
@@ -412,6 +609,16 @@ def main() -> None:
              "in_main": [round(found["in_main"], 3) for found in levels], "patches": [int(found["patches"]) for found in levels],
              "glow45": [round(found["glow45"], 4) for found in unlabelled], "glow60": [round(found["glow60"], 4) for found in unlabelled],
              "energy": [round(found["energy"], 4) for found in unlabelled], "detectors": [found["detectors"] for found in unlabelled],
+             # План v2 (2026-11-20): М1 собранность, М2 радиальность классов — по уровням и у верха; М3 нити, М5 свечение,
+             # М6 разрешение кода — по уровням (у уровня 0 — в "level0").
+             "m1_main": [round(found["m1_main"], 4) for found in levels], "m1_patches": [found["m1_patches"] for found in levels],
+             "m2": [round(found["m2"], 4) for found in levels], "m2_chance": [round(found["m2_chance"], 4) for found in levels],
+             "top_m1_main": round(levels[-1]["m1_main"], 4), "top_m1_patches": int(levels[-1]["m1_patches"]),
+             "top_m1_sq": round(levels[-1]["m1_sq"], 4), "m1_sq": [round(found["m1_sq"], 4) for found in levels],
+             "top_m2": round(levels[-1]["m2"], 4), "top_m2_chance": round(levels[-1]["m2_chance"], 4),
+             **digits,
+             **{key: [round(found[key], 4) if isinstance(found[key], float) else found[key] for found in unlabelled]
+                for key in ("glow70", "glow80", "m3_threads", "m3_bridges", "m3_rubbish", "m3_lambda", "m6_codes", "m6_per_code", "m6_largest")},
              "accuracy200": round(accuracy, 3), "memory200": memory, "train_seconds": round(trained_seconds, 1), "image": image_path, "test_count": tests,
              "date": time.strftime("%Y-%m-%d %H:%M"),
              "merge": [{key: round(float(value), 4) for key, value in (level.merge or {}).items()} for level in maps]}
@@ -440,10 +647,16 @@ def main() -> None:
              "|---|---|---|---|---|---|---|"]
     rows = [row for row in entry.get("funnel", []) if "failed" not in row]
     for index, row in enumerate(rows):
-        honest = entry["honest"][index] if index < len(entry["honest"]) else float("nan")
+        # Строки идут по номеру уровня, с уровня 0: сходимость уровня 0 — из его мерок, уровня k ≥ 1 — honest[k − 1].
+        level_number = int(row["level"])
+        if level_number == 0:
+            honest = zero_found["honest"] if zero_found is not None else float("nan")
+        else:
+            honest = entry["honest"][level_number - 1] if level_number - 1 < len(entry["honest"]) else float("nan")
         united = index > 0 and rows[index - 1].get("united")
-        inside = (f"все {rows[index - 1]['windows_per_picture']} деталей уровня {index} (объединение)" if united
-                  else f"{row['elements_per_window']} {names[min(index, len(names) - 1)]}")
+        inside = (f"все {rows[index - 1]['windows_per_picture']} деталей уровня {level_number - 1} (объединение)" if united
+                  else f"{row['elements_per_window']} " + ("штрих" if level_number == 0 else
+                                                           "штрихов (деталей уровня 0)" if level_number == 1 else f"деталей уровня {level_number - 1}"))
         radius = "вся картинка" if united else row.get("window_radius", "—")
         vote = x_votes.get(int(row["level"]))
         said = "не дошёл" if vote is None else ("молчит" if vote[0] < 0 else f"«{vote[0]}» {100 * vote[1]:.0f} %")
@@ -494,6 +707,14 @@ def main() -> None:
     print(f"  верх: пятен от 5 точек {entry['top_patches']} (идеал 10); в главном пятне своей цифры {entry['top_in_main']:.3f} (идеал 1.0)")
     print(f"  по уровням: пятен {entry['patches']}; в главном пятне {entry['in_main']}")
     print(f"  без меток: свечение λ0.45 {entry['glow45']}; λ0.60 {entry['glow60']}; Ē {entry['energy']}; детекторов {entry['detectors']}")
+    print(f"  М1 верха: в главном пятне {entry['top_m1_main']:.3f}, пятен {entry['top_m1_patches']}; М2 верха {entry['top_m2']:.3f} "
+          f"(случай {entry['top_m2_chance']:.3f}); по уровням М1 {entry['m1_main']}, М2 {entry['m2']}")
+    print(f"  М1ц {entry['m1c']:.3f} (без веса {entry['m1u']:.3f}), целых цифр {entry['whole']}; М1 по цифрам {entry['m1_digits']}; "
+          f"покрытие {entry['cover_digits']}")
+    print(f"  М1ц по {len(entry['m1c_runs'])} раскладкам верха {entry['m1c_mean']:.3f} {entry['m1c_runs']}; целых в среднем {entry['whole_mean']}; "
+          f"М1 по цифрам в среднем {entry['m1_digits_mean']}")
+    print(f"  М3 нитей {entry['m3_threads']}, мостов {entry['m3_bridges']}; М5 свечение λ0.7 {entry['glow70']}, λ0.8 {entry['glow80']}; "
+          f"М6 точек на код {entry['m6_per_code']}, больше всего одинаковых {entry['m6_largest']}")
     print(f"  окно видит по уровням {[row['window_sees'] for row in entry['funnel']]}; деталей в окне {[row['elements_per_window'] for row in entry['funnel']]}")
     print(f"  точек {entry['points']}; доля пар с разных картинок {entry['other_pairs']}; ответ на 200 проверочных: читатель {accuracy:.3f}, память {memory}; обучение {trained_seconds:.0f} с")
 

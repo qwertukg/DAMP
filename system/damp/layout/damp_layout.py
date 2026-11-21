@@ -263,6 +263,7 @@ class _GpuLayoutEngine:
         uniform int euclidean_distance;
         uniform int kernel_mode;
         uniform float kernel_width;
+        uniform float far_alpha;
         out vec4 frag;
 
         float apply_lambda(float sim) {
@@ -354,6 +355,12 @@ class _GpuLayoutEngine:
                         float sig2 = 2.0 * kernel_width * kernel_width * radius_sq;
                         w1 = exp(-d1sq / sig2);
                         w2 = exp(-d2sq / sig2);
+                        if (far_alpha > 0.0) {
+                            // Смешанное ядро (Р2, far_force.py): − α·d / r, сила не убывает с расстоянием.
+                            float rr = sqrt(radius_sq);
+                            w1 -= far_alpha * sqrt(d1sq) / rr;
+                            w2 -= far_alpha * sqrt(d2sq) / rr;
+                        }
                     } else {
                         w1 = 1.0 / (d1 + distance_eps);
                         w2 = 1.0 / (d2 + distance_eps);
@@ -675,6 +682,11 @@ class _GpuLayoutEngine:
         self._pair_prog["euclidean_distance"].value = 1 if euclidean else 0
         self._pair_prog["kernel_mode"].value = {"inverse": 0, "gauss": 1}[kernel]
         self._pair_prog["kernel_width"].value = float(kernel_width)
+        try:  # смешанное ядро (Р2): uniform есть в шейдере пар; 0 — чистое гауссово
+            from damp.layout.far_force import far_alpha
+            self._pair_prog["far_alpha"].value = far_alpha() if kernel == "gauss" else 0.0
+        except KeyError:
+            pass
 
         self._pair_fbo.use()
         self._ctx.viewport = (0, 0, pair_count, 1)
@@ -1225,6 +1237,11 @@ class _TensorLayoutEngine:
                 sig2 = 2.0 * kernel_width * kernel_width * radius_sq
                 w1 = torch.exp(-dist1 / sig2)
                 w2 = torch.exp(-dist2 / sig2)
+                from damp.layout.far_force import far_alpha
+                if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                    rr = torch.sqrt(radius_sq)
+                    w1 = w1 - far_alpha() * torch.sqrt(dist1) / rr
+                    w2 = w2 - far_alpha() * torch.sqrt(dist2) / rr
             else:
                 if euclidean:
                     # §5.5.2: φ = Σ(s1/d1 + s2/d2) с евклидовыми d; иначе d² (§5.9.2).
@@ -6127,6 +6144,11 @@ class Layout:
                     sig2 = 2.0 * self._long_kernel_width ** 2 * radius_sq
                     w1 = math.exp(-d1 / sig2)
                     w2 = math.exp(-d2 / sig2)
+                    from damp.layout.far_force import far_alpha
+                    if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                        rr = math.sqrt(radius_sq)
+                        w1 -= far_alpha() * math.sqrt(d1) / rr
+                        w2 -= far_alpha() * math.sqrt(d2) / rr
                 else:
                     if self._short_distance == "euclidean":
                         # §5.5.2: φ = Σ(s1/d1 + s2/d2) с евклидовыми d; иначе d² (§5.9.2).

@@ -199,6 +199,9 @@ class MnistLadderRunner:
             # Обучение только на заданных цифрах (вне статьи; автор 2026-11-20: «просто возьми из мниста первые 100
             # двоек»): первые count картинок MNIST train с этими метками, начиная с train_start.
             self._numbers["train"] = self._first_train_numbers(self.count, settings.LADDER_TRAIN_DIGITS, self._train_start)
+        if self._numbers["train"] is None and settings.LADDER_TRAIN_SAMPLE_SEED is not None:
+            # Проверка опоры на других картинках (задача #15): случайные count картинок пула BENCH_TRAIN_POOL с этим зерном.
+            self._numbers["train"] = self._sample_train_numbers(self.count, int(settings.LADDER_TRAIN_SAMPLE_SEED))
         groups = DigitGroups.load(
             self._digits,
             train=self.count,
@@ -268,11 +271,21 @@ class MnistLadderRunner:
         if reached is None:
             raise RuntimeError("лестница не построила ни одного уровня")
         self.top_details = elements
-        self._class_map(elements, groups.labels, reached)
+        if settings.LADDER_CLASS_MAP:
+            self._class_map(elements, groups.labels, reached)
         self._log_summary()
         self._observer.finish(self.reports, self.top_accuracy)
         self._observer.stage(reached.number, 0)
         return self.reports[-1].glued if self.reports else None
+
+    def _sample_train_numbers(self, count: int, seed: int) -> tuple[int, ...]:
+        """Случайные count номеров MNIST train из пула BENCH_TRAIN_POOL (зерно seed), по возрастанию (вне статьи)."""
+        low, high = (int(value) for value in settings.BENCH_TRAIN_POOL)
+        numbers = np.sort(np.random.default_rng(int(seed)).choice(np.arange(low, high), size=int(count), replace=False))
+        LOGGER.event("ladder.train_sample", section=OUTSIDE_ARTICLE,
+                     data={"seed": int(seed), "count": int(count), "pool": [low, high],
+                           "note": "обучение на случайной выборке MNIST train вместо первых картинок (проверка опоры)"})
+        return tuple(int(number) for number in numbers)
 
     def _first_train_numbers(self, count: int, digits: Sequence[int], start: int) -> tuple[int, ...]:
         """Номера первых count картинок MNIST train с меткой из digits, начиная с номера start (LADDER_TRAIN_DIGITS)."""

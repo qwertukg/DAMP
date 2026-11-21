@@ -885,4 +885,6 @@ def _run_short_phase(
         step_offset=step_offset,
         adaptive_params=adaptive_short,
         short_optim=short_optim,
+        # Картинки и цвета карты — только для журнала и Rerun (анализ 2026-11-21: ближняя фаза рисовала их и без Rerun).
+        log_visuals=settings.LAYOUT_LOG_VISUALS,
     )

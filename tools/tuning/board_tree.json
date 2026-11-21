@@ -1,0 +1,618 @@
+{
+ "plan": "v3",
+ "base": "778",
+ "nodes": [
+  {
+   "key": "664",
+   "runs": [
+    664,
+    665,
+    666,
+    667,
+    684,
+    685
+   ],
+   "card": "Опора: 4 уровня — М1u 0.505",
+   "parent": null,
+   "status": "good",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhP0"
+  },
+  {
+   "key": "660",
+   "runs": [
+    660,
+    661
+   ],
+   "card": "А1: верх в режиме статьи",
+   "parent": "664",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhSE"
+  },
+  {
+   "key": "662",
+   "runs": [
+    662,
+    663,
+    668,
+    669,
+    670,
+    671
+   ],
+   "card": "Б1: плотность эмбеддинга 0.07",
+   "parent": "664",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhVU",
+   "name": "[0.1] → [0.07] плотность кода детали (4 уровня)",
+   "name_fixed": true
+  },
+  {
+   "key": "672",
+   "runs": [
+    672,
+    673
+   ],
+   "card": "Б4: грубое связывание наверху",
+   "parent": "664",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhaU"
+  },
+  {
+   "key": "674",
+   "runs": [
+    674,
+    675
+   ],
+   "card": "Б2: детекторы мельче (поправка радиуса 0)",
+   "parent": "664",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhWc"
+  },
+  {
+   "key": "676",
+   "runs": [
+    676,
+    677
+   ],
+   "card": "Б2′: детекторы крупнее (поправка 1.0)",
+   "parent": "664",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhXo",
+   "name": "[0.5] → [1.0] детекторы крупнее (4 уровня)",
+   "name_fixed": true
+  },
+  {
+   "key": "678",
+   "runs": [
+    678,
+    679
+   ],
+   "card": "А4: верх без отжига",
+   "parent": "664",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhTI"
+  },
+  {
+   "key": "680",
+   "runs": [
+    680,
+    681,
+    682,
+    683,
+    686,
+    687
+   ],
+   "card": "Б9: 5 уровней",
+   "parent": "664",
+   "status": "good",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhRQ"
+  },
+  {
+   "key": "688",
+   "runs": [
+    688,
+    689
+   ],
+   "card": "Б3: одно окно на картинку наверху",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhZY"
+  },
+  {
+   "key": "690",
+   "runs": [
+    690,
+    691,
+    696,
+    697
+   ],
+   "card": "Б1: плотность эмбеддинга 0.07",
+   "parent": "680",
+   "status": "bad",
+   "name": "[0.1] → [0.07] плотность кода детали (5 уровней)",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhVU",
+   "name_fixed": true
+  },
+  {
+   "key": "692",
+   "runs": [
+    692,
+    693
+   ],
+   "card": "6 уровней",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhfk"
+  },
+  {
+   "key": "694",
+   "runs": [
+    694,
+    695
+   ],
+   "card": "Б2′: детекторы крупнее (поправка 1.0)",
+   "parent": "680",
+   "status": "bad",
+   "name": "[0.5] → [1.0] детекторы крупнее (5 уровней)",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhXo",
+   "name_fixed": true
+  },
+  {
+   "key": "698",
+   "runs": [
+    698,
+    699
+   ],
+   "card": "Б6: σ 10 → 8",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhbs"
+  },
+  {
+   "key": "700",
+   "runs": [
+    700,
+    701
+   ],
+   "card": "Б7: код детали без самого узкого слоя",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhdE"
+  },
+  {
+   "key": "702",
+   "runs": [
+    702,
+    703,
+    704,
+    705,
+    710,
+    711
+   ],
+   "card": "Б8: уровень 3 видит части цифры",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhec"
+  },
+  {
+   "key": "706",
+   "runs": [
+    706,
+    707
+   ],
+   "card": "Сочетание трёх «почти»",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhhw"
+  },
+  {
+   "key": "708",
+   "runs": [
+    708,
+    709,
+    712,
+    713
+   ],
+   "card": "Окна уровня 2 крупнее",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqhg4"
+  },
+  {
+   "key": "716",
+   "runs": [
+    716,
+    717
+   ],
+   "card": "4 слоя детекторов (без самого узкого)",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqogw"
+  },
+  {
+   "key": "718",
+   "runs": [
+    718,
+    719
+   ],
+   "card": "Окна верхних уровней из 10 соседей",
+   "parent": "680",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqoiU"
+  },
+  {
+   "key": "720",
+   "runs": [
+    720,
+    721,
+    722,
+    723
+   ],
+   "card": "Слияние окон мягче: 0.8 → 0.9",
+   "parent": "680",
+   "status": "good",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqoks"
+  },
+  {
+   "key": "726",
+   "runs": [
+    726,
+    727,
+    728,
+    729
+   ],
+   "card": "λ верхних карт 0.82 → 0.9",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKqofQ"
+  },
+  {
+   "key": "730",
+   "runs": [
+    730,
+    731
+   ],
+   "card": "Опора: слияние 0.9 на зёрнах 4/5",
+   "parent": "720",
+   "status": "base",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKq__4"
+  },
+  {
+   "key": "732",
+   "runs": [
+    732,
+    733
+   ],
+   "card": "Слияние окон 1.0: только совпадающие коды",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrABY"
+  },
+  {
+   "key": "734",
+   "runs": [
+    734,
+    735
+   ],
+   "card": "6 уровней на слиянии 0.9",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrADk"
+  },
+  {
+   "key": "736",
+   "runs": [
+    736,
+    737
+   ],
+   "card": "обратно: layout_lambda_quantile 0.82 → 0.74",
+   "parent": "726",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrPgo"
+  },
+  {
+   "key": "738",
+   "runs": [
+    738,
+    739,
+    740,
+    741
+   ],
+   "card": "полшага: merge_similarity 0.9 → 0.95",
+   "parent": "732",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrPhU"
+  },
+  {
+   "key": "742",
+   "runs": [
+    742,
+    743,
+    748,
+    749
+   ],
+   "card": "Окна верхних уровней из 10 соседей на слиянии 0.9",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrbWU"
+  },
+  {
+   "key": "744",
+   "runs": [
+    744,
+    745
+   ],
+   "card": "Плотность эмбеддинга 0.07 на слиянии 0.9",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrbXI"
+  },
+  {
+   "key": "746",
+   "runs": [
+    746,
+    747
+   ],
+   "card": "Детекторы крупнее (поправка 1.0) на слиянии 0.9",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrbYE"
+  },
+  {
+   "key": "750",
+   "runs": [
+    750,
+    751
+   ],
+   "card": "полшага: cluster_min_points [10, 3, 14] → [10, 3, 12]",
+   "parent": "742",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrec4"
+  },
+  {
+   "key": "752",
+   "runs": [
+    752,
+    753
+   ],
+   "card": "полшага: target_density 0.1 → 0.085",
+   "parent": "744",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKriNE"
+  },
+  {
+   "key": "754",
+   "runs": [
+    754,
+    755
+   ],
+   "card": "обратно: cluster_min_points [10, 3, 14] → [10, 3, 18]",
+   "parent": "742",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrohM"
+  },
+  {
+   "key": "756",
+   "runs": [
+    756,
+    757
+   ],
+   "card": "Опора на зёрнах 6/7: шум опоры",
+   "parent": "720",
+   "status": "base",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKrybA"
+  },
+  {
+   "key": "758",
+   "runs": [
+    758,
+    759
+   ],
+   "card": "Б8 на слиянии 0.9: уровень 3 видит части цифры",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKryck"
+  },
+  {
+   "key": "760",
+   "runs": [
+    760,
+    761
+   ],
+   "card": "Опора на зёрнах 8/9",
+   "parent": "720",
+   "status": "base",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4gk"
+  },
+  {
+   "key": "762",
+   "runs": [
+    762,
+    763
+   ],
+   "card": "Опора на зёрнах 10/11",
+   "parent": "720",
+   "status": "base",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4hk"
+  },
+  {
+   "key": "764",
+   "runs": [
+    764,
+    765
+   ],
+   "card": "Р1: ядро статьи на уровнях 4–5 без роста λ",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4iw"
+  },
+  {
+   "key": "766",
+   "runs": [
+    766,
+    767,
+    768,
+    769
+   ],
+   "card": "Плотность 0.07: по слабым цифрам",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4jo"
+  },
+  {
+   "key": "770",
+   "runs": [
+    770,
+    771
+   ],
+   "card": "Р1′: ядро статьи с уровня 3",
+   "parent": "720",
+   "status": "bad",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4kY"
+  },
+  {
+   "key": "772",
+   "runs": [
+    772,
+    773
+   ],
+   "card": "λ 0.82 ---> λ 0.9, порог λ только для раскладки верха",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4l4",
+   "parent": "720",
+   "status": "bad"
+  },
+  {
+   "key": "774",
+   "runs": [
+    774,
+    775
+   ],
+   "card": "[1.15, 0.5, 2.0] ---> [1.15, 0.5, 2.0, 3.0], плоскость места верхнего окна шире",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4mY",
+   "parent": "720",
+   "status": "bad"
+  },
+  {
+   "key": "776",
+   "runs": [
+    776,
+    777
+   ],
+   "card": "по силе ---> по цвету, в код детали — сначала широкие слои детекторов",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4nQ",
+   "parent": "720",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKr4nQ",
+    "PVTI_lAHOAENbFs4BslBdzhKsfss"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKr4nQ"
+  },
+  {
+   "key": "778",
+   "runs": [
+    778,
+    779,
+    780,
+    781,
+    782,
+    783
+   ],
+   "card": "[сильнейшая] → [все по очереди] в код окна — все детали, а не одна сильнейшая",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKr4oY",
+   "parent": "720",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKr4oY",
+    "PVTI_lAHOAENbFs4BslBdzhKs92E",
+    "PVTI_lAHOAENbFs4BslBdzhKtBzc",
+    "PVTI_lAHOAENbFs4BslBdzhKtDDk",
+    "PVTI_lAHOAENbFs4BslBdzhKtIIk",
+    "PVTI_lAHOAENbFs4BslBdzhKtJik"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKr4oY"
+  },
+  {
+   "key": "784",
+   "runs": [
+    784,
+    785
+   ],
+   "card": "[первые 250, 5 уровней, слияние 0.9] → [случайные 250, 4 уровня, слияние 0.8] проверка на других картинках: опора до двух принятых правок",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKs_ME",
+   "parent": "778",
+   "status": "run",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKs_ME",
+    "PVTI_lAHOAENbFs4BslBdzhKtSyY"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKs_ME"
+  },
+  {
+   "key": "786",
+   "runs": [
+    786,
+    787
+   ],
+   "card": "опора на зёрнах 10/11",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKtP_E",
+   "parent": "778",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKtP_E",
+    "PVTI_lAHOAENbFs4BslBdzhKtXl4"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKtP_E"
+  }
+ ],
+ "tested": {
+  "ACTIVATION_DETECTOR_FILL_CELL": [
+   0,
+   1.0
+  ],
+  "LADDER_CLUSTER_LEVELS": [
+   4,
+   6
+  ],
+  "LADDER_MERGE_SIMILARITY": [
+   0.7,
+   0.8,
+   0.95,
+   1.0
+  ],
+  "LADDER_TARGET_DENSITY": [
+   0.085
+  ],
+  "ACTIVATION_SATURATION_LIMIT": [
+   8
+  ],
+  "LADDER_LAYOUT_LAMBDA_QUANTILE": [
+   0.74,
+   0.9
+  ],
+  "LADDER_CLUSTER_MIN_POINTS": [
+   [
+    10,
+    3,
+    10
+   ],
+   [
+    10,
+    3,
+    12
+   ],
+   [
+    10,
+    3,
+    18
+   ],
+   [
+    10,
+    5,
+    14
+   ]
+  ],
+  "LADDER_HIERARCHY_LAYERS": [
+   4
+  ]
+ }
+}

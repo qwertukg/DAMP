@@ -18,3 +18,6 @@ Thumbs.db
 
 # Сгенерированная справка API (python client/apidocs.py)
 docs/api/
+
+# Локальные настройки и секреты (GitLab и др.)
+.env

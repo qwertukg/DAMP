@@ -20,7 +20,7 @@ import sys
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = "c:/Users/danii/AppData/Local/Temp/claude/90c048c3c2430e10/50fe34b5-999a-4743-bfe4-e4327ebbf623/scratchpad/damp-second-level"
+REPO = os.path.dirname(os.path.dirname(HERE))  # корень репозитория (tools/tuning → ..)
 STORE = os.path.join(REPO, "docs", "runs.jsonl")
 TABLE = os.path.join(REPO, "docs", "RUNS.md")
 FIRST = int(sys.argv[sys.argv.index("--from") + 1]) if "--from" in sys.argv else 84
@@ -83,6 +83,11 @@ DEFAULTS = {"LADDER_CLUSTER_MIN_POINTS": 14, "LADDER_KEYHOLE_RADIUS_SHARE": 1.15
 CURRENT = {"LADDER_LEVEL0": True, "LADDER_LEVEL0_PLACE": "digit", "LADDER_KEYHOLE_WHOLE_PICTURE": False,
            "ACTIVATION_SATURATION_LIMIT": 50, "LADDER_TARGET_DENSITY": 0.217,
            "LADDER_BINDING_PLACE_CODE_LENGTH": [176, 1792, 1536, 1088]}
+# С прогона 574 (план подбора v2, 2026-11-20) в конфиге вариант 561: стенд меняет только подбираемую ось.
+CURRENT_V2 = {**CURRENT, "LADDER_KEYHOLE_WHOLE_PICTURE": True, "ACTIVATION_SATURATION_LIMIT": 10, "LADDER_TARGET_DENSITY": 0.1,
+              "LADDER_KEYHOLE_RADIUS_SHARE": [1.15, 0.5, 2.0], "LADDER_CLUSTER_MIN_POINTS": [10, 3, 14],
+              "LADDER_BINDING_PLACE_BITS": [39, 1], "ACTIVATION_DETECTOR_FILL_CELL": 0.5, "LAYOUT_LONG_WEIGHTED_FIRST": True}
+V2_FIRST = 574
 
 
 def shown(value) -> str:  # noqa: ANN001
@@ -107,7 +112,8 @@ def compact(entry: dict, date: str) -> dict:
         "label": entry.get("label", ""),
         "train": entry.get("count"),
         "tests": entry.get("test_count", 200),
-        "changes": ({**CURRENT, **entry.get("changes", {})} if entry["run"] >= 448 else entry.get("changes", {})),
+        "changes": ({**CURRENT_V2, **entry.get("changes", {})} if entry["run"] >= V2_FIRST
+                    else {**CURRENT, **entry.get("changes", {})} if entry["run"] >= 448 else entry.get("changes", {})),
         "levels": entry.get("levels"),
         "radius": [row.get("window_radius") for row in funnel],
         "sees": [row.get("window_sees") for row in funnel],
@@ -117,6 +123,7 @@ def compact(entry: dict, date: str) -> dict:
         "patches": entry.get("top_patches"),
         "in_main": entry.get("top_in_main"),
         "lonely": entry.get("top_lonely"),
+        "m1": entry.get("top_m1_main"), "m1_patches": entry.get("top_m1_patches"), "m2": entry.get("top_m2"),
         "reader": entry.get("accuracy200"),
         "memory": memory.get("right_share"),
         "x": {"memory": x.get("memory_digit"), "reader": x.get("reader_digit")} if x else None,
@@ -167,7 +174,7 @@ def table(rows: list) -> list:
 
     head = ["№", "Дата"] + [name for _, name in AXES] + [
         "Другие изменения", "Уровней", "Радиус окна, клеток", "Окно видит, %", "Деталей в окне", "Точек карты, тыс.",
-        "Сходимость по уровням", "Сходимость верха", "Пятен верха / в главном пятне", "Одиночек верха", "Читатель", "Память", "«X»: память / читатель", "Прогон, мин"]
+        "Сходимость по уровням", "Сходимость верха", "Пятен верха / в главном пятне", "М1 верха: в главном пятне / пятен", "М2 верха", "Одиночек верха", "Читатель", "Память", "«X»: память / читатель", "Прогон, мин"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for row in rows:
         changes = row.get("changes", {})
@@ -186,6 +193,8 @@ def table(rows: list) -> list:
             joined(row["honest"], lambda v: f"{v:.2f}"),
             bold(f"{top:.3f}", top == best_top),
             (f"{row['patches']} / {row['in_main']:.2f}" if row.get("patches") is not None else "—"),
+            (f"{row['m1']:.3f} / {row['m1_patches']}" if row.get("m1") is not None else "—"),
+            (f"{row['m2']:.3f}" if row.get("m2") is not None else "—"),
             (f"{100 * row['lonely']:.1f} %" if row.get("lonely") is not None else "—"),
             ("—" if not row.get("tests") else bold(f"{100 * (row['reader'] or 0):.1f} %", row["reader"] == best_reader)),
             ("—" if not row.get("tests") else bold(f"{100 * (row['memory'] or 0):.1f} %", row["memory"] == best_memory)),
@@ -202,7 +211,7 @@ def table(rows: list) -> list:
                f"лучший читатель — {name(max(rows, key=lambda r: r['reader'] or 0))}; "
                f"лучшая память — {name(max(rows, key=lambda r: r['memory'] or 0))}; "
                f"по обоим — {name(max(rows, key=lambda r: r['_both']))}")
-    lines.append("| **Итого** | | " + " | ".join("" for _ in AXES) + f" | | | | | | | | {leaders} | | | | | | | |")
+    lines.append("| **Итого** | | " + " | ".join("" for _ in AXES) + f" | | | | | | | | {leaders} | | | | | | | | | |")
     return lines
 
 
@@ -309,11 +318,18 @@ def analysis(runs: dict) -> None:
             "L0_smooth_deg": zero.get("smooth_deg", ""), "L0_inner_empty": zero.get("inner_empty", ""),
             "L0_longest_gap": zero.get("longest_gap", ""),
             "L0_retino_step": zero.get("retino_step", ""), "L0_retino_spearman": zero.get("retino_spearman", ""),
+            # План v2: М3 нити, М4 Ē, М5 свечение, М6 разрешение кода уровня 0.
+            **{f"L0_{key}": zero.get(key, "") for key in ("m3_threads", "m3_bridges", "m3_rubbish", "energy", "glow45", "glow60",
+                                                     "glow70", "glow80", "m6_codes", "m6_per_code", "m6_largest",
+                                                     "m6_angle_codes", "m6_angle_per_code", "m6_angle_largest")},
+            "top_m1_main": full.get("top_m1_main", ""), "top_m1_patches": full.get("top_m1_patches", ""),
+            "top_m2": full.get("top_m2", ""), "top_m2_chance": full.get("top_m2_chance", ""),
         })
         for i, shape in enumerate(full.get("detector_shapes") or []):
             record[f"detectors_by_layer_L{i + 1}"] = flat(shape.get("count", []))
             record[f"detector_radius_by_layer_L{i + 1}"] = flat(shape.get("radius", []))
-        for name in ("glow45", "glow60", "energy", "detectors"):
+        for name in ("glow45", "glow60", "glow70", "glow80", "energy", "detectors", "m1_main", "m1_patches", "m2",
+                     "m3_threads", "m3_bridges", "m3_rubbish", "m6_codes", "m6_per_code", "m6_largest"):
             values = full.get(name)
             if isinstance(values, list):
                 for i, v in enumerate(values):

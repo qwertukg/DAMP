@@ -338,19 +338,29 @@ class StepCache:
                 entry = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            size = path.stat().st_size + sum(
-                self._blob_path(item["blob"]).stat().st_size
-                for item in entry.get("outputs", {}).values()
-                if "blob" in item and self._blob_path(item["blob"]).exists()
-            )
-            found.append((path.parent.name, path, size, path.stat().st_mtime))
+            try:
+                size = path.stat().st_size + sum(
+                    self._blob_path(item["blob"]).stat().st_size
+                    for item in entry.get("outputs", {}).values()
+                    if "blob" in item and self._blob_path(item["blob"]).exists()
+                )
+                found.append((path.parent.name, path, size, path.stat().st_mtime))
+            except OSError:
+                continue  # запись удалил другой процесс (два прогона на одном кеше вытесняют одновременно)
         return found
 
     def size(self) -> int:
         """Байт на диске под кешем."""
         if not self.root.exists():
             return 0
-        return sum(path.stat().st_size for path in self.root.rglob("*") if path.is_file())
+        total = 0
+        for path in self.root.rglob("*"):
+            try:
+                if path.is_file():
+                    total += path.stat().st_size
+            except OSError:
+                continue  # файл удалил другой процесс
+        return total
 
     def _evict(self) -> None:
         """Сверх CACHE_MAX_BYTES — удалить давно не нужные записи до 90 % предела и массивы без ссылок."""
@@ -372,7 +382,12 @@ class StepCache:
                 break
             estimate = self._size
             for _, path, size, _ in rows:
-                path.unlink(missing_ok=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    # 2026-11-21 (прогон 641): два прогона пары вытесняли одновременно, и файл, занятый другим процессом,
+                    # не удалился — PermissionError ронял прогон. Такую запись пропускаем: её удалят в следующий раз.
+                    continue
                 removed += 1
                 estimate -= size
                 if estimate <= target:
@@ -387,6 +402,10 @@ class StepCache:
             data={"entries": removed, "blobs": freed, "bytes": self._size, "limit": limit},
         )
 
+    # Массив моложе стольких секунд не удаляется, даже если записи на него ещё нет: его мог только что записать другой
+    # процесс (два прогона на одном кеше), а его запись ляжет следом.
+    COLLECT_GRACE_SECONDS = 600
+
     def collect(self) -> int:
         """Удалить массивы, на которые не ссылается ни одна запись; вернуть, сколько удалено."""
         used: set[str] = set()
@@ -399,9 +418,16 @@ class StepCache:
         freed = 0
         blobs = self.root / "blobs"
         if blobs.exists():
+            now = time.time()
             for blob in blobs.glob("*/*.npy"):
                 if blob.stem not in used:
-                    blob.unlink(missing_ok=True)
+                    try:
+                        # Свежий массив мог только что записать другой процесс, а его запись ещё не легла: не трогать.
+                        if now - blob.stat().st_mtime < self.COLLECT_GRACE_SECONDS:
+                            continue
+                        blob.unlink(missing_ok=True)
+                    except OSError:
+                        continue
                     freed += 1
         return freed
 

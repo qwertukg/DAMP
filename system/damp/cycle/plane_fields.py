@@ -76,7 +76,13 @@ class PlaneFieldBuilder:
         concepts: int | None = None,
         radius_floor: float | None = None,
         whole_picture: bool = False,
+        one_window: bool = False,
     ) -> None:
+        # True — одно окно на картинку (стратегия v3, Б3, docs/CLUSTERS.md): центр — середина её деталей (как у окна уровня 0),
+        # радиус — до самой дальней детали. Окна на каждой детали записывают одну цифру разными кодами (маска содержания
+        # зависит от места относительно центра окна): на верхней карте картинка рвётся в среднем на 2.24 пятна. Вне статьи
+        # (П.2 ставит центр окна на элемент); П.4, П.6 — одно расположение частей у всех картинок записано одинаково.
+        self._one_window = bool(one_window)
         # True — окно на каждом элементе, без вытеснения перекрывающихся полей (продолжение статьи, П.2).
         self._dense = bool(dense)
         # True — картинка без окон не остаётся (верх цикла, §6.6; вне статьи): если на ней не нашлось ни одного
@@ -147,6 +153,8 @@ class PlaneFieldBuilder:
         positions = np.asarray(positions, dtype=np.float64)
         bits = np.asarray(bits, dtype=np.float32)
         ones = bits.sum(axis=1)
+        if self._one_window:
+            return self._one_field(positions, ones)
         if positions.shape[0] < self._min_points:
             return self._whole_fields(positions, ones) if self._whole_picture else []
         similarity = (bits @ bits.T) / np.sqrt(np.maximum(ones[:, None] * ones[None, :], 1.0))
@@ -172,6 +180,18 @@ class PlaneFieldBuilder:
                     seen.add(key)
                     chosen.append(field)
         return chosen
+
+    def _one_field(self, positions: "np.ndarray", ones: "np.ndarray") -> list[tuple[float, float, float, int]]:
+        """Одно окно картинки (Б3): центр — середина деталей с непустым кодом, радиус — до самой дальней из них, не меньше
+        нижнего предела; деталей без кода окно не видит центром, но включает, если они в круге."""
+        alive = np.flatnonzero(np.asarray(ones) > 0)
+        if alive.size == 0:
+            return []
+        y, x = (float(v) for v in positions[alive].mean(axis=0))
+        reach = np.hypot(positions[:, 0] - y, positions[:, 1] - x)
+        radius = max(self._radius_floor, float(reach[alive].max()))
+        self._whole_pictures += 1
+        return [(round(y, 6), round(x, 6), round(radius, 6), int((reach <= radius).sum()))]
 
     def _whole_fields(self, positions: "np.ndarray", ones: "np.ndarray") -> list[tuple[float, float, float, int]]:
         """Окна картинки, на которой кластер из min_points точек не нашёлся (верх цикла, §6.6; вне статьи).

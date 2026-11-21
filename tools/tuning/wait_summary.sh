@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Ждёт конца прогонов стенда (в tune_pair.done по строке на прогон; ждать столько, сколько номеров передано),
 # ловит застой (журнал прогона не растёт 15 минут — строка STALL и выход), печатает ошибки и сводку серии.
-d="C:/Users/danii/AppData/Local/Temp/claude/156391f67facb0d2/4902e47e-f207-47e9-8247-6a73f171df92/scratchpad"
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # папка стенда — там, где лежит скрипт
 want=$#
 sleep 60
 while true; do
@@ -21,4 +21,4 @@ cat "$d/tune_pair.done"
 for n in "$@"; do
   grep -a -A4 "^Traceback" "$d/tune2-$n.err" 2>/dev/null | grep -av "Logging\|rollover\|rename" | tail -4
 done
-PYTHONIOENCODING=utf-8 python "$d/summary.py" 250 496
+PYTHONIOENCODING=utf-8 python "$d/summary.py" 250 574

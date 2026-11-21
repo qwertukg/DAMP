@@ -87,6 +87,7 @@ class DetectorEmbeddings:
         seed: int,
         name: str = "sets",
         saturation_share: float = 0.0,
+        colour: "np.ndarray | None" = None,
     ) -> None:
         if detectors <= 0:
             raise ValueError("detectors must be positive")
@@ -108,6 +109,10 @@ class DetectorEmbeddings:
         self._max_steps = max(self._min_steps, int(max_length) // self.LENGTH_STEP)
         self._seed = int(seed)
         self._name = str(name)
+        # Цвет детектора (§6.5: λ_d — «цвет» кода детектора): номер слоя иерархии, 0 — самый низкий порог λ_d, самые
+        # широкие области («длинные волны», §3.3.1). Задан — σ в наборе отбираются сначала по цвету, внутри цвета по
+        # силе: colour merge, отбрасывающий коротковолновые биты (§3.3.2). None — только по силе.
+        self._colour = None if colour is None else np.asarray(colour, dtype=np.int64)
 
     def strongest(
         self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
@@ -115,6 +120,8 @@ class DetectorEmbeddings:
         """Пары (набор, детектор), оставшиеся после порога μ_c: σ самых сильных детекторов набора (§7.1.12)."""
         rows = np.asarray(rows, dtype=np.int64)
         columns = np.asarray(columns, dtype=np.int64)
+        if self._colour is not None and rows.size and (self._saturation > 0 or self._share > 0.0):
+            return self._strongest_colour(rows, columns, np.asarray(levels, dtype=np.float64))
         if self._share > 0.0 and rows.size:
             return self._strongest_share(rows, columns, np.asarray(levels, dtype=np.float64))
         if self._saturation == 0 or rows.size == 0:
@@ -131,6 +138,28 @@ class DetectorEmbeddings:
             if _strongest_compiled(starts, np.ascontiguousarray(columns), np.ascontiguousarray(levels), self._saturation, kept):
                 return rows[kept], columns[kept]
         return self._strongest_dense(rows, columns, levels)
+
+    def _strongest_colour(
+        self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Colour merge (§6.5, §3.3.2): в каждом наборе — σ детекторов, сначала самых широких слоёв (меньший цвет), внутри
+        слоя — сильнейшие; при равных — меньший номер детектора. σ — saturation_limit или доля share от сработавших."""
+        colour = self._colour[columns]
+        order = np.lexsort((columns, -levels, colour, rows))
+        sorted_rows = rows[order]
+        sets = int(sorted_rows[-1]) + 1
+        starts = np.searchsorted(sorted_rows, np.arange(sets + 1))
+        counts = np.diff(starts)
+        if self._share > 0.0:
+            take = np.maximum(1, np.rint(self._share * counts)).astype(np.int64)
+            if self._saturation > 0:
+                take = np.minimum(take, self._saturation)
+        else:
+            take = np.full(sets, self._saturation, dtype=np.int64)
+        rank = np.arange(sorted_rows.size, dtype=np.int64) - starts[sorted_rows]
+        kept = np.zeros(rows.size, dtype=bool)
+        kept[order[rank < take[sorted_rows]]] = True
+        return rows[kept], columns[kept]
 
     def _strongest_share(
         self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"

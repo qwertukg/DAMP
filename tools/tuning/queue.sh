@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Очередь прогонов стенда: строки файла «номер|подпись|правки JSON»; каждый ждёт конца предыдущего.
-d="C:/Users/danii/AppData/Local/Temp/claude/156391f67facb0d2/4902e47e-f207-47e9-8247-6a73f171df92/scratchpad"
+d="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"  # папка стенда — там, где лежит скрипт
 jobs="$1"
 while IFS='|' read -r number label changes; do
   [ -z "$number" ] && continue

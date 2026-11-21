@@ -1184,6 +1184,18 @@ class DetectorHierarchyBuilder:
     CLUSTER_CELLS = 40_000_000
     # Пакетный счёт кластеров (видеокарта); False — только поштучный счёт (эталон в тестах).
     BATCHED = True
+    # Пакетный счёт в окне вокруг диска центра (с таблицей общих бит): активируются только точки диска r_a (§6.4.1),
+    # поэтому сходство и сетка DBSCAN нужны лишь в квадрате со стороной 2·(r_a + 1) + 1, а не на всей карте (на 250
+    # цифрах в диске 11–177 точек из 13 тыс.). Результат тот же; False — прежний счёт по всей карте (эталон в тестах).
+    WINDOWED = True
+    # Центров за один проход счёта в окне — не больше CLUSTER_ROWS и не больше CLUSTER_CELLS пар «центр × клетка окна»:
+    # память блока не больше, чем у счёта по всей карте. 2026-11-21: блок 4096 центров при окне 83 × 83 (r_a = 40 на
+    # уровнях 1–3) переполнил видеопамять двух прогонов, и счёт встал.
+    WINDOW_ROWS = 1024
+    # Окно берётся, если в нём меньше этой доли клеток карты; иначе счёт по всей карте. 1.0 (анализ 2026-11-21): окно
+    # (2·r_a + 3)² — 0.49–0.52 карты на всех уровнях, при 0.5 оно включалось то на одном уровне, то ни на одном, а с ним
+    # детекторы быстрее и при такой доле (82 против 103 с, прогоны 596/597 против 588/589, числа те же).
+    WINDOW_MAX_SHARE = 1.0
     # Точек кодов за одно матричное произведение общих бит блока на видеокарте (без таблицы общих бит).
     COMMON_CHUNK = 16384
 
@@ -1238,16 +1250,25 @@ class DetectorHierarchyBuilder:
         candidates: list[list["DetectorCandidate | None"]] = [[None] * count for _ in layers]
         activated = [np.zeros(count, dtype=np.int64) for _ in layers]
         device = torch.device("cuda")
+        # Окно вокруг диска выгодно, только если оно меньше карты: при r_a ≈ 40 (уровни 1–3) окно 83 × 83 — почти вся карта.
+        side = 2 * (int(math.ceil(max(float(layer.activation_radius) for layer in layers))) + 1) + 1
+        windowed = table is not None and self.WINDOWED and side * side < cells * self.WINDOW_MAX_SHARE
+        if windowed:
+            block_rows = self._windowed_clusters(
+                table, ones, pos_y, pos_x, height, width, alive, layers, offsets, candidates, activated, torch, device
+            )
         # Без таблицы общие биты считаются по кодам на видеокарте: коды — байтами, в float32 — кусками по COMMON_CHUNK
         # точек (значения целые и меньше 2^24 — произведение точное).
         codes_gpu = None if table is not None else torch.as_tensor(np.asarray(code_matrix, dtype=np.uint8), device=device)
-        block_rows = max(1, min(self.CLUSTER_ROWS, int(self.CLUSTER_CELLS // max(1, count))))
+        if not windowed:
+            block_rows = max(1, min(self.CLUSTER_ROWS, int(self.CLUSTER_CELLS // max(1, count))))
         cell_t = torch.as_tensor(cell, device=device)
         kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
         steps = [dy * (width + 2) + dx for dy, dx in offsets if (dy, dx) != (0, 0)]
         pool = torch.nn.functional.max_pool2d
         with torch.no_grad():
-            for first in range(0, count, block_rows):
+            # Счёт в окне уже сделан (_windowed_clusters) — по всей карте не считается.
+            for first in range(0, 0 if windowed else count, block_rows):
                 rows = np.arange(first, min(count, first + block_rows))
                 block = rows.size
                 # Сходство центров блока со всеми точками — те же действия, что в _similarity_row.
@@ -1278,7 +1299,7 @@ class DetectorHierarchyBuilder:
                 lines = torch.arange(block, device=device)
                 centre = cell_t[torch.as_tensor(rows, device=device)]
                 for number, layer in enumerate(layers):
-                    lit = self._threshold_similarity_np(similarity, layer.lambda_threshold) > 0.0
+                    lit = self._lit(similarity, layer.lambda_threshold)
                     active = lit & within[number][gap_y, gap_x] & living
                     activated[number][rows] = active.sum(axis=1)
                     grid = torch.zeros((block, cells), dtype=torch.float32, device=device)
@@ -1320,12 +1341,94 @@ class DetectorHierarchyBuilder:
                 "centres": count,
                 "block_rows": int(block_rows),
                 "common_table": table is not None,
+                "windowed": bool(windowed),
                 "activated_mean": [float(item.mean()) for item in activated],
                 "note": "кластеры DBSCAN всех центров всех слоёв посчитаны разом (§6.4.1): ядра — свёрткой по сетке "
                 "карты, связная область — ростом от центра; по кластеру сразу строится кандидат в детекторы; "
                 "результат тот же, что при счёте по одному центру",
             },
         )
+
+    def _windowed_clusters(
+        self, table, ones, pos_y, pos_x, height, width, alive, layers, offsets, candidates, activated, torch, device
+    ) -> int:  # noqa: ANN001
+        """Кластеры §6.4.1 всех центров в окне вокруг диска центра — тот же счёт, что в _prepare_clusters по всей карте.
+
+        Активироваться могут только точки диска r_a (§6.4.1), поэтому сходство, ядра DBSCAN и рост связной области
+        считаются в квадрате со стороной 2·half + 1, half = ⌈наибольший r_a⌉ + 1: клетка поля за диском пуста на
+        любом слое, и свёртка 3×3 и рост у края окна дают то же, что на всей карте. Сходство — те же действия, что в
+        _similarity_row; принадлежность диску — та же таблица hypot(|dy|, |dx|); точки кластера — по возрастанию номера,
+        как flatnonzero по всей карте. Возвращает число центров в блоке."""
+        count = int(pos_y.shape[0])
+        half = int(math.ceil(max(float(layer.activation_radius) for layer in layers))) + 1
+        side = 2 * half + 1
+        # Номер точки в каждой клетке карты с полем half со всех сторон: −1 — пустая клетка.
+        index = np.full((height + 2 * half, width + 2 * half), -1, dtype=np.int64)
+        index[pos_y + half, pos_x + half] = np.arange(count)
+        shift_y, shift_x = (grid.reshape(-1) for grid in np.mgrid[-half : half + 1, -half : half + 1])
+        reach = np.hypot(np.abs(shift_y).astype(np.float64), np.abs(shift_x).astype(np.float64))
+        within = [reach <= float(layer.activation_radius) for layer in layers]
+        middle = half * side + half  # центр окна — сам центр детектора
+        steps = [dy * side + dx for dy, dx in offsets if (dy, dx) != (0, 0)]
+        kernel = torch.ones((1, 1, 3, 3), dtype=torch.float32, device=device)
+        pool = torch.nn.functional.max_pool2d
+        block_rows = max(1, min(int(self.WINDOW_ROWS), int(self.CLUSTER_CELLS // (side * side))))
+        with torch.no_grad():
+            for first in range(0, count, block_rows):
+                rows = np.arange(first, min(count, first + block_rows))
+                block = rows.size
+                window = index[(pos_y[rows] + half)[:, None] + shift_y[None, :], (pos_x[rows] + half)[:, None] + shift_x[None, :]]
+                present = window >= 0
+                safe = np.where(present, window, 0)
+                # Сходство центров блока с точками окна — те же действия, что в _similarity_row.
+                common = table[rows[:, None], safe]
+                ones_center = ones[rows][:, None]
+                ones_points = ones[safe]
+                if self._layout._similarity == "cosine":
+                    denominator = np.sqrt(ones_center * ones_points)
+                else:
+                    denominator = ones_center + ones_points - common
+                similarity = np.divide(
+                    common.astype(np.float64),
+                    denominator,
+                    out=np.zeros(common.shape, dtype=np.float64),
+                    where=(denominator > 0) & (ones_points > 0) & (ones_center > 0),
+                )
+                similarity[:, middle] = 1.0
+                living = present & alive[safe] & alive[rows][:, None]
+                lines = torch.arange(block, device=device)
+                for number, layer in enumerate(layers):
+                    lit = self._lit(similarity, layer.lambda_threshold)
+                    active = lit & within[number][None, :] & living
+                    activated[number][rows] = active.sum(axis=1)
+                    grid = torch.as_tensor(active, device=device).to(torch.float32).view(block, 1, side, side)
+                    # Ядро — активированная точка, у которой не меньше min_samples соседей (считая её саму).
+                    neighbours = torch.nn.functional.conv2d(grid, kernel, padding=1)
+                    core = grid * (neighbours >= float(self._clusterer.min_samples)).to(torch.float32)
+                    flat_core = core.view(block, side * side)
+                    centre = torch.full((block,), middle, dtype=torch.int64, device=device)
+                    start = torch.where(flat_core[:, middle] > 0, centre, torch.full_like(centre, -1))
+                    # Центр не ядро: кластер начинается с первого соседнего ядра (в порядке сдвигов), иначе шум.
+                    for step in steps:
+                        start = torch.where((start < 0) & (flat_core[:, middle + step] > 0), centre + step, start)
+                    valid = (start >= 0) & (grid.view(block, side * side)[:, middle] > 0)
+                    component = torch.zeros((block, side * side), dtype=torch.float32, device=device)
+                    component[lines[valid], start[valid]] = 1.0
+                    component = component.view(block, 1, side, side)
+                    while True:
+                        grown = pool(component, 3, stride=1, padding=1) * core
+                        if torch.equal(grown, component):
+                            break
+                        component = grown
+                    member = (pool(component, 3, stride=1, padding=1) * grid).view(block, side * side)
+                    member[lines[valid], middle] = 1.0
+                    inside = (member > 0).cpu().numpy()
+                    for line, centre_index in enumerate(rows.tolist()):
+                        found = np.sort(window[line][inside[line]])
+                        candidates[number][centre_index] = self._cluster_candidate(
+                            centre_index, layer, found, int(activated[number][centre_index])
+                        )
+        return block_rows
 
     # Карта не больше стольких точек получает таблицу общих бит всех пар кодов (int16: N² · 2 байта, 3.2 ГБ на
     # 40 000 точек); COMMON_TABLE_ROWS — строк таблицы за одно матричное произведение. Карта больше — общие биты блоками
@@ -1443,6 +1546,13 @@ class DetectorHierarchyBuilder:
         row = row.copy()
         row[indices == center_index] = 1.0
         return row
+
+    def _lit(self, similarity: "np.ndarray", lambda_value: float) -> "np.ndarray":
+        """Зажжена ли точка: _threshold_similarity_np(similarity, λ) > 0 — без η одним сравнением (тот же результат:
+        при пороге λ значение остаётся, только если сходство положительно и не ниже λ)."""
+        if self._eta is None:
+            return (similarity > 0.0) & (similarity >= lambda_value)
+        return self._threshold_similarity_np(similarity, lambda_value) > 0.0
 
     def _threshold_similarity_np(self, similarity: "np.ndarray", lambda_value: float) -> "np.ndarray":
         """Порог λ_d или сигмоида η для вектора сходств (§5.4), как _threshold_similarity поэлементно."""
