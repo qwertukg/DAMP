@@ -8,7 +8,8 @@
 2. Отметка присутствия — фоновой командой на всю сессию (роутер видит, что Claude на месте, и не отдаёт задачи GLM):
    `while true; do touch tools/tuning/stand/claude.heartbeat; sleep 60; done`
 3. Слежение (Monitor, перевзводить по истечении):
-   `tail -n 0 -F tools/tuning/stand/board_runner.log tools/tuning/stand/router.log | grep --line-buffered -E "комментарий автора|задача автора|ждёт Claude|ошибка шага|ошибка прогона|GLM берёт|GLM ответил|GLM не справился"`
+   `tail -n 0 -F tools/tuning/stand/board_runner.log tools/tuning/stand/router.log | grep --line-buffered -E "комментарий автора|задача автора|автор передвинул|ошибка шага|ошибка прогона|Traceback|ХОРОШО|плохо:"`
+   Токены — только на анализ и чтение задач и комментариев (автор 2026-11-21): без «ждёт Claude» (повтор раз в минуту) и строк о работе GLM.
 4. Открыть доску (`python tools/tuning/board.py read`): Очередь — разбирать сверху вниз по умолчанию; комментарии автора — отвечать в той же задаче (`🤖 Claude: …`).
 
 ## Коротко о главном
