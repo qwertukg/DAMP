@@ -54,7 +54,8 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 STAND = os.environ.get("DAMP_STAND") or B.CONF.get("DAMP_STAND") or os.path.join(HERE, "stand")
 LOG = os.path.join(STAND, "board_runner.log")
 TODO, QUEUE, RUN, ANALYSIS, GOOD, BAD = "Todo", "Очередь", "Прогон", "Анализ", "Хорошие", "Плохие"
-STAGES = [[1, 3], [0, 2], [4, 5]]
+STAGES = [[1, 3], [0, 2], [4, 5], [6, 7], [8, 9], [10, 11]]  # пары зёрен; решение — на 2, 6 и 12 зёрнах (CHECKPOINTS)
+CHECKPOINTS = {1: (-0.01, 0.04), 3: (0.015, 0.05), 6: (0.025, 0.045)}  # этап: (порог Δ М1u, порог Δ слабых) — правило v3.3
 SPEC = re.compile(r"```прогон\s*\n(.*?)\n```", re.S)
 STATE = re.compile(r"\n*```состояние\s*\n(.*?)\n```", re.S)
 RESULT = re.compile(r"\n*### Итоги прогонов.*", re.S)
@@ -170,9 +171,9 @@ def map_url(number: int) -> str | None:
     done = set(json.load(open(UPLOADED, encoding="utf-8"))) if os.path.exists(UPLOADED) else set()
     if number in done:
         return url
-    # Автор 2026-11-21: «у моего токена не должно быть доступа к коду. только в доске» — запись карт в ветку репозитория —
-    # это запись в код: новые карты не выкладываются, пока не будет отдельного места (репозиторий карт со своим токеном).
-    if not os.environ.get("DAMP_MAPS_UPLOAD"):
+    # Выкладывание карт в ветку board-maps — это запись в репозиторий; включено DAMP_MAPS_UPLOAD=1 в .env (автор 2026-11-21:
+    # «делай токен на запись обратно» — после того как карты пропали из комментариев).
+    if not (os.environ.get("DAMP_MAPS_UPLOAD") or B.CONF.get("DAMP_MAPS_UPLOAD")):
         return None
     path = os.path.join(ROOT, "data", "maps", f"tune2-{number}.png")
     if not os.path.exists(path):
@@ -278,7 +279,7 @@ def order_queue(project: dict) -> None:
     в Очередь, иначе это задача автора — 🔥 в заголовок (и у задач-Issue), Claude берёт её первой.
     Заголовок (задача автора #5): «приоритет итог было ---> стало, что проверяем»: приоритет — у Todo, Очереди, Прогона,
     Анализа; ✅ — Хорошие, ❌ — Плохие. Тело старых карточек — в новый вид (migrate_card).
-    Порядок Очереди и Прогона: запускаемые (начатые этапы первыми, потом 🔥 → ⬆️ → ➡️ → ⬇️), ниже идеи без блока «прогон»."""
+    Порядок колонок — порядок доски: пришедшая карточка встаёт первой, Очередь берётся сверху (автор 2026-11-22)."""
     status = B.status_field(project)["name"]
     rows = log_rows()
     for item in project["items"]["nodes"]:
@@ -301,6 +302,10 @@ def order_queue(project: dict) -> None:
         if content.get("__typename") not in CARD_TYPES:
             continue
         sync_issue_state(item, fields.get(status))
+        try:
+            sync_card_fields(project, item)  # «Версия» и «Прогоны» всегда актуальны (автор 2026-11-22)
+        except Exception as error:  # noqa: BLE001
+            say(f"поля карточки не обновлены: {error!r}")
         own = bool(CARD.search(content.get("body") or ""))  # карточка прогонщика; без блока «карточка» — задача автора
         if not own and content.get("__typename") == "Issue" and SPEC.search(content.get("body") or ""):
             migrate_card(item, rows)  # карточка прогонщика, созданная сразу задачей (add_card): в обычный вид
@@ -342,28 +347,18 @@ def order_queue(project: dict) -> None:
             save_card(content, title=title)
             if column == TODO and level == 3 and not held:
                 say(f"задача автора в Todo: {title}")
-    # Порядок во всех колонках (задача автора #60: «сначала по приоритету, потом — самые новые вверху»): 🔥 → ⬆️ → ➡️ → ⬇️,
-    # внутри приоритета — по времени создания карточки, новые выше. Порядок выбора прогонщиком — свой (seed_launch).
-    columns = [TODO, QUEUE, RUN, ANALYSIS, GOOD, BAD]
-    queue = list(project["items"]["nodes"])
-    # Задача автора #66: «сортировка в колонках сначала по времени, потом по приоритету» — новые вверху, при равном времени
-    # выше приоритет (было наоборот, #60).
-    # Автор, комментарий к #66: «из очереди бери всегда сверху, но по умолчанию сортировка — приоритетные вверху, потом по
-    # дате, в колонке Очередь; в других колонках — новые сверху».
-    def place(i: dict) -> tuple:
-        column = item_fields(i).get(status)
-        rank = columns.index(column) if column in columns else 99
-        newest = "".join(chr(0x10FFFF - ord(ch)) for ch in i.get("createdAt") or "")
-        return (rank, -item_priority(i), newest) if column == QUEUE else (rank, newest)
-
-    ordered = sorted(queue, key=place)
-    if [i["id"] for i in ordered] == [i["id"] for i in queue]:
-        return
-    after = None
-    for item in ordered:
-        B.graphql("""mutation($p: ID!, $i: ID!, $a: ID) { updateProjectV2ItemPosition(input: {projectId: $p, itemId: $i, afterId: $a}) {
-            items(first: 1) { nodes { id } } } }""", {"p": project["id"], "i": item["id"], "a": after})
-        after = item["id"]
+    # Порядок колонок (автор 2026-11-22: «задачи, когда в новую колонку переезжают, — всегда сверху» и «разбираться
+    # колонка тоже должна сверху»): порядок доски — главный. Пришедшая в колонку карточка встаёт первой (move() → to_top,
+    # перетащенные руками и созданные прямо в колонке — здесь); остальное прогонщик не пересортировывает, ручной порядок
+    # автора сохраняется. Очередь берётся строго сверху (seed_launch, step). Прежняя сортировка по приоритету (#60, #66)
+    # снята: эмодзи приоритета в заголовке — для глаз и для новых узлов дерева.
+    _, moved = arrival_times(project, status)
+    for item in moved:
+        try:
+            B.graphql("""mutation($p: ID!, $i: ID!) { updateProjectV2ItemPosition(input: {projectId: $p, itemId: $i}) {
+                items(first: 1) { nodes { id } } } }""", {"p": project["id"], "i": item["id"]})
+        except Exception as error:  # noqa: BLE001
+            say(f"карточка не поднята наверх: {error!r}")
 
 
 SEEN = os.path.join(STAND, "comments_seen.json")
@@ -404,6 +399,71 @@ def add_card(project: dict, title: str, body: str) -> None:
                         {"p": project["id"], "t": f"{PRIORITY_EMOJI[spec_priority(body)]} {title}", "b": body})
     item = to_issue(created["addProjectV2DraftIssue"]["projectItem"]["id"])
     move(project, item, QUEUE)
+
+
+PLAN_TABLE = os.path.join(HERE, "plan.md")
+PLAN_SEEN = os.path.join(STAND, "plan_seen.json")
+PLAN_ROW = re.compile(r"^\|\s*(v\d+\.\d+)\s*\|")
+PLAN_MARK = "<!-- план: {} -->"
+
+
+def plan_rows() -> list[dict]:
+    """Строки таблицы плана tools/tuning/plan.md (задача автора #88: «пусть листенер слушает таблицу с планом тоже, и если
+    появились новые задачи, берёт их в работу в канбан»). Колонки: № | Приоритет | Было | Стало | Что пробуем |
+    Настройки (JSON без «|», пусто или «код» — нужна правка кода) | Подробно."""
+    if not os.path.exists(PLAN_TABLE):
+        return []
+    rows = []
+    for line in open(PLAN_TABLE, encoding="utf-8"):
+        found = PLAN_ROW.match(line)
+        if not found:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 7:
+            continue
+        number, priority, was, became, short_text, settings, full = cells[:7]
+        settings = settings.strip("` ")
+        rows.append({"number": number, "priority": priority, "was": was.strip("[]"), "became": became.strip("[]"),
+                     "short": short_text, "settings": settings, "full": full})
+    return rows
+
+
+def plan_sync(project: dict) -> None:
+    """Новая строка таблицы плана — карточка в «Очередь» (один раз на номер; уже есть на доске — не повторять)."""
+    rows = plan_rows()
+    if not rows:
+        return
+    seen = json.load(open(PLAN_SEEN, encoding="utf-8")) if os.path.exists(PLAN_SEEN) else {}
+    on_board = {m for item in project["items"]["nodes"]
+                for m in re.findall(r"<!-- план: (v\d+\.\d+) -->", (item.get("content") or {}).get("body") or "")}
+    level = {emoji: lvl for lvl, emoji in PRIORITY_EMOJI.items()}
+    for row in rows:
+        if row["number"] in seen or row["number"] in on_board:
+            continue
+        priority = level.get(row["priority"], 1)
+        spec_text = None
+        if row["settings"] and row["settings"].lower() not in ("код", "—", "-"):
+            try:
+                changes = json.loads(row["settings"])
+            except ValueError as error:
+                say(f"план {row['number']}: настройки не JSON — {error}; строка пропущена")
+                seen[row["number"]] = "ошибка"
+                continue
+            spec_text = json.dumps({"changes": changes, "label": row["short"], "priority": priority, "plan": row["number"]},
+                                   ensure_ascii=False)
+        meta = {"short": row["short"], "full": row["full"] + ("" if spec_text else " Нужна правка кода — делает Claude (без Claude — GLM)."),
+                "was": row["was"] or "—", "became": row["became"] or "—", "manual": True}
+        body = compose(meta, spec_text, None, [], "", "") + "\n\n" + PLAN_MARK.format(row["number"])
+        title = f"{PRIORITY_EMOJI[priority]} {boxed(meta['was'])} → {boxed(meta['became'])} {row['short']}"
+        created = B.graphql("""mutation($p: ID!, $t: String!, $b: String) {
+            addProjectV2DraftIssue(input: {projectId: $p, title: $t, body: $b}) { projectItem { id } } }""",
+                            {"p": project["id"], "t": title, "b": body})
+        item = to_issue(created["addProjectV2DraftIssue"]["projectItem"]["id"])
+        move(project, item, QUEUE, f"новая строка {row['number']} таблицы плана (tools/tuning/plan.md)"
+             + ("" if spec_text else " — блока «прогон» нет, нужна правка кода"))
+        seen[row["number"]] = item["id"]
+        json.dump(seen, open(PLAN_SEEN, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        say(f"план: {row['number']} → карточка в Очереди — {row['short']}")
 
 
 def same_spec_waiting(project: dict, changes: dict) -> bool:
@@ -583,7 +643,7 @@ def item_fields(item: dict) -> dict:
     values = {}
     for value in item["fieldValues"]["nodes"]:
         if value and value.get("field"):
-            values[value["field"]["name"]] = value.get("name")
+            values[value["field"]["name"]] = value.get("name") if "name" in value else value.get("text")
     return values
 
 
@@ -591,17 +651,85 @@ MOVE_WHY = {"Todo": "нужно слово автора", "Очередь": "в 
             "Анализ": "прогон досчитан", "Хорошие": "правка принята", "Плохие": "правка закрыта"}
 
 
-def comment(item: dict, text: str) -> None:
-    """Комментарий прогонщика в задаче-карточке (автор 2026-11-21: «каждое движение по доске сопровождай комментом…
-    если ошибка — выводи в коммент»). Начинается с «🤖» — прогонщик и роутер считают его своим."""
+def stdout_block(lines) -> str:
+    """stdout под катом в конце комментария (задача автора #105: «перед любым действием подготавливай stdout и… добавляй
+    его в конец сообщения под кат»)."""
+    text = "\n".join(str(line) for line in lines).replace("```", "ʼʼʼ").strip()
+    if not text:
+        return ""
+    return "\n\n<details><summary>stdout</summary>\n\n```\n" + text[-3500:] + "\n```\n\n</details>"
+
+
+def log_tail(path: str, count: int = 8) -> list[str]:
+    try:
+        return open(path, encoding="utf-8", errors="replace").read().splitlines()[-count:]
+    except OSError:
+        return []
+
+
+def comment(item: dict, text: str, stdout=None) -> None:
+    """Комментарий в задаче-карточке (автор 2026-11-21: «каждое движение по доске сопровождай комментом… если ошибка —
+    выводи в коммент»; #105: «в начале строки всегда начинай с того, кто к нам обращается, как в пьесе» — «🤖 Прогонщик:»,
+    «🤖 Claude:», «🤖 GLM:», «🤖 Роутер:»; в конце — stdout под катом: по умолчанию хвост журнала прогонщика)."""
     content = item.get("content") or {}
     if content.get("__typename") != "Issue" or not content.get("id"):
         return
+    body = text if text.startswith("🤖") else f"🤖 Прогонщик: {text}"
+    body += stdout_block(log_tail(LOG) if stdout is None else stdout)
     try:
         B.graphql("""mutation($i: ID!, $b: String!) { addComment(input: {subjectId: $i, body: $b}) { clientMutationId } }""",
-                  {"i": content["id"], "b": text if text.startswith("🤖") else f"🤖 Прогонщик: {text}"})
+                  {"i": content["id"], "b": body})
     except Exception as error:  # noqa: BLE001  комментарий не должен ронять шаг
         say(f"комментарий не оставлен: {error!r}")
+
+
+ARRIVALS = os.path.join(STAND, "arrivals.json")  # карточка → (колонка, когда в неё пришла): порядок «пришедшие — сверху»
+
+
+def _arrivals() -> dict:
+    try:
+        return json.load(open(ARRIVALS, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def to_top(project: dict, item: dict, column: str) -> None:
+    """Автор 2026-11-22: «сделай, что задачи, когда в новую колонку переезжают, всегда сверху клались» — запомнить время
+    прихода и сразу поставить карточку первой (в виде доски по колонкам первая в списке — верхняя в своей колонке)."""
+    data = _arrivals()
+    data[item["id"]] = {"column": column, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    json.dump(data, open(ARRIVALS, "w", encoding="utf-8"), ensure_ascii=False)
+    try:
+        B.graphql("""mutation($p: ID!, $i: ID!) { updateProjectV2ItemPosition(input: {projectId: $p, itemId: $i}) {
+            items(first: 1) { nodes { id } } } }""", {"p": project["id"], "i": item["id"]})
+    except Exception as error:  # noqa: BLE001  порядок не должен ронять шаг
+        say(f"карточка не поднята наверх: {error!r}")
+
+
+def arrival_times(project: dict, status: str) -> tuple[dict, list[dict]]:
+    """Когда каждая карточка пришла в свою нынешнюю колонку. Новая в записи — время смены поля Status (updatedAt), без
+    него — создание карточки; колонка сменилась мимо move() (автор перетащил руками) — «сейчас»."""
+    data, changed = _arrivals(), False
+    seeded = bool(data)  # первый запуск — только запомнить, ничего не поднимать
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    moved = []
+    for item in project["items"]["nodes"]:
+        column = item_fields(item).get(status)
+        record = data.get(item["id"])
+        if record is None:
+            stamp = next((v.get("updatedAt") for v in (item.get("fieldValues") or {}).get("nodes", [])
+                          if v and v.get("field", {}).get("name") == status and v.get("updatedAt")), None)
+            data[item["id"]] = {"column": column, "at": now if seeded else (stamp or item.get("createdAt") or now)}
+            changed = True
+            if seeded:
+                moved.append(item)  # новая карточка (автор создал прямо в колонке) — тоже наверх
+        elif record.get("column") != column:
+            data[item["id"]] = {"column": column, "at": now}
+            changed = True
+            moved.append(item)
+    if changed:
+        json.dump(data, open(ARRIVALS, "w", encoding="utf-8"), ensure_ascii=False)
+    return {key: value["at"] for key, value in data.items()}, moved
 
 
 def move(project: dict, item: dict, column: str, why: str | None = None) -> None:
@@ -614,49 +742,82 @@ def move(project: dict, item: dict, column: str, why: str | None = None) -> None
         fieldId: $f, value: {singleSelectOptionId: $o}}) { projectV2Item { id } } }""",
               {"p": project["id"], "i": item["id"], "f": field["id"], "o": option})
     if current != column:
-        comment(item, f"🤖 Прогонщик: → «{column}». {why or MOVE_WHY.get(column, '')}".rstrip())
+        to_top(project, item, column)
+        why = why or MOVE_WHY.get(column, "")
+        comment(item, f"🤖 Прогонщик: → «{column}».{chr(10) * 2 if chr(10) in why else ' '}{why}".rstrip())
         nodes = item.setdefault("fieldValues", {"nodes": []})["nodes"]
         nodes[:] = [v for v in nodes if not (v and v.get("field", {}).get("name") == field["name"])]
         nodes.append({"name": column, "field": {"name": field["name"]}})
 
 
 def run_report(item: dict, state: dict, rows: dict, next_text: str) -> str:
-    """Ответ по прогону (автор 2026-11-21): как было — значение; как стало — значение; как стало — карта; что дальше."""
+    """Комментарий-итог прогона (автор 2026-11-21): как стало — значение; что дальше; карта «как стало». «Как было» — в теле."""
     meta = card_meta(item, state)
     base = json.load(open(os.path.join(HERE, "base_runs.json"), encoding="utf-8"))
     seed, run = str(state["seed"]), state.get("run")
     entry, ref_run = rows.get(int(run)) if run else None, base.get(seed)
     ref = rows.get(int(ref_run)) if ref_run else None
-    lines = [f"**Прогон:** {tag(PLAN, [run])}, зерно {seed}, этап {state['stage']}"]
-    if ref and m1u(ref) is not None:
-        lines.append(f"- **Как было:** {boxed(meta.get('was'))} — М1u опоры на зерне {seed}: {m1u(ref):.3f} ({tag(PLAN, [ref_run])}),"
-                     f" слабые 2, 4, 5 {weak(ref):.3f}")
-    else:
-        lines.append(f"- **Как было:** {boxed(meta.get('was'))} — опоры на зерне {seed} нет")
+    became = meta.get("became")
+    value = (f"{boxed(became)} — " if became and became != "—" else "опора — ") + f"{tag(PLAN, [run])}, зерно {seed}"
     if entry and m1u(entry) is not None:
-        delta = f" (Δ {m1u(entry) - m1u(ref):+.3f})" if ref and m1u(ref) is not None else ""
-        lines.append(f"- **Как стало:** {boxed(meta.get('became'))} — М1u {m1u(entry):.3f}{delta}, слабые 2, 4, 5 {weak(entry):.3f},"
-                     f" монопятен {entry.get('whole_mean')}, честная {entry.get('top_honest')}")
-    try:
-        url = map_url(int(run)) if run else None
-    except Exception:  # noqa: BLE001
-        url = None
-    lines.append(f"- **Как стало, карта:** ![карта {run}]({url})" if url else
-                 f"- **Как стало, карта:** `data/maps/tune2-{run}.png` — картинки в задачи пока не выкладываются"
-                 " (запись в репозиторий закрыта; нужен репозиторий карт со своим токеном)")
-    lines.append(f"- **Что дальше:** {next_text}")
+        delta = f" (Δ {m1u(entry) - m1u(ref):+.3f} к опоре)" if ref and m1u(ref) is not None else ""
+        value += (f": М1u {m1u(entry):.3f}{delta}, слабые 2, 4, 5 {weak(entry):.3f}, монопятен {entry.get('whole_mean')},"
+                  f" честная {entry.get('top_honest')}")
+    lines = [f"- **Как стало:** {value}", f"- **Что дальше:** {next_text}", map_line(item, run)]
     return "\n".join(lines)
 
 
-PLAN = "v3"  # версия плана подбора (docs/CLUSTERS.md); новая стратегия — новая версия
+MAPS_PENDING = os.path.join(STAND, "maps_pending.json")  # карточка → прогон, чья карта не выложилась: дослать комментарием
+
+
+def map_line(item: dict, run, title: str = "Карта, как стало") -> str:
+    """Строка с картой прогона для комментария (автор 2026-11-22: «после Анализа карта раскладки в комментарии должна быть
+    обязательно!»): три попытки выложить; не вышло — карточка в maps_pending, карта досылается отдельным комментарием."""
+    if not run:
+        return f"- **{title}:** прогона нет"
+    for attempt in range(3):
+        url = None
+        try:
+            url = map_url(int(run))
+        except Exception as error:  # noqa: BLE001
+            say(f"карта {run} не выложена (попытка {attempt + 1}): {error!r}")
+        if url:
+            return f"- **{title}:**\n\n![карта {run}]({url})"
+        time.sleep(5)
+    pending = json.load(open(MAPS_PENDING, encoding="utf-8")) if os.path.exists(MAPS_PENDING) else {}
+    pending[item["id"]] = int(run)
+    json.dump(pending, open(MAPS_PENDING, "w", encoding="utf-8"))
+    return f"- **{title}:** пока не выложена (`data/maps/tune2-{run}.png`) — пришлю отдельным комментарием"
+
+
+def maps_resend(project: dict) -> None:
+    """Дослать карты, которые не выложились при итоге (maps_pending)."""
+    if not os.path.exists(MAPS_PENDING):
+        return
+    pending = json.load(open(MAPS_PENDING, encoding="utf-8"))
+    by_id = {item["id"]: item for item in project["items"]["nodes"]}
+    for item_id, run in list(pending.items()):
+        try:
+            url = map_url(int(run))
+        except Exception as error:  # noqa: BLE001
+            say(f"карта {run} снова не выложена: {error!r}")
+            continue
+        if url and item_id in by_id:
+            comment(by_id[item_id], f"🤖 Прогонщик: карта прогона {tag(PLAN, [run])}, как стало:\n\n![карта {run}]({url})")
+        if url or item_id not in by_id:
+            pending.pop(item_id)
+    json.dump(pending, open(MAPS_PENDING, "w", encoding="utf-8"))
+
+
+PLAN = None  # версия плана — по номеру прогона (plan_versions.json) и заголовку plan.md, см. tag(), current_plan()
 PLAN_TITLE = re.compile(r"^(v\d+) · ")
 PREFIX = re.compile(r"^(\d+\.\d+\.\d+|v\d+)\+[\d–, ]+ · ")  # прежнее обозначение в заголовке — убрать
 
 
 def plan_version(title: str) -> str:
-    """Версия плана карточки: «v3 · …» в заголовке, иначе текущая PLAN."""
+    """Версия плана карточки: «v3 · …» в заголовке, иначе текущая (plan.md)."""
     found = PLAN_TITLE.match(PREFIX.sub("", title or ""))
-    return found.group(1) if found else PLAN
+    return found.group(1) if found else current_plan()
 
 
 def span(numbers) -> str:
@@ -671,10 +832,55 @@ def span(numbers) -> str:
     return ", ".join(parts)
 
 
-def tag(plan: str, numbers) -> str:
+PLAN_VERSIONS = os.path.join(HERE, "plan_versions.json")  # версия плана → номер первого её прогона
+
+
+def plan_starts() -> dict:
+    try:
+        return {k: int(v) for k, v in json.load(open(PLAN_VERSIONS, encoding="utf-8")).items()}
+    except (OSError, ValueError):
+        return {"v2": 574, "v3": 660}
+
+
+def current_plan() -> str:
+    """Версия плана сейчас — из заголовка tools/tuning/plan.md («# План подбора v4 …»); нет — последняя известная."""
+    try:
+        found = re.search(r"План подбора (v\d+)", open(PLAN_TABLE, encoding="utf-8").readline())
+        if found:
+            return found.group(1)
+    except OSError:
+        pass
+    return max(plan_starts().items(), key=lambda pair: pair[1])[0]
+
+
+def ensure_plan_start() -> None:
+    """Новая версия плана в plan.md — запомнить, с какого прогона она идёт (следующий номер стенда)."""
+    starts, plan = plan_starts(), current_plan()
+    if plan not in starts:
+        starts[plan] = next_number()
+        json.dump(starts, open(PLAN_VERSIONS, "w", encoding="utf-8"), ensure_ascii=False)
+        say(f"версия плана {plan} — с прогона {starts[plan]}")
+
+
+def version_of_run(number) -> str:
+    starts = sorted(plan_starts().items(), key=lambda pair: pair[1])
+    found = starts[0][0]
+    for name, first in starts:
+        if int(number) >= first:
+            found = name
+    return found
+
+
+def tag(plan: str | None, numbers) -> str:
     """Обозначение прогона «версия плана . номера» (автор 2026-11-21: «пиши версию и номер прогона… версия плана я имел
-    в виду… (<v3>.<660>)»): v3.720–723. В заголовок карточки не пишется — только поля, тексты и дерево."""
-    return f"{plan}.{span(numbers)}"
+    в виду… (<v3>.<660>)»): v3.720–723. Версия — по номеру прогона (plan_versions.json), а не по константе: автор
+    2026-11-22 «тег версии… должен быть актуальным». В заголовок карточки не пишется — только поля, тексты и дерево."""
+    groups: dict = {}
+    for number in numbers:
+        groups.setdefault(version_of_run(number), []).append(int(number))
+    if not groups:
+        return f"{plan or current_plan()}.—"
+    return ", ".join(f"{name}.{span(runs)}" for name, runs in sorted(groups.items(), key=lambda pair: min(pair[1])))
 
 
 TREE_PATH = os.path.join(HERE, "board_tree.json")
@@ -980,10 +1186,42 @@ def mark(project: dict, item: dict, state: dict) -> None:
     if title != content["title"]:
         save_card(content, title=title)
         content["title"] = title
-    set_text(project, item, "Версия", plan_version(title))
-    runs = list(state.get("runs", {}).values())
+    sync_card_fields(project, item, state)
+
+
+def card_runs(item: dict, state: dict | None = None) -> list[int]:
+    state = state if state is not None else (card_state(item) or {})
+    runs = [int(n) for n in (state.get("runs") or {}).values() if n]
+    if state.get("run"):
+        runs.append(int(state["run"]))
+    return sorted(set(runs))
+
+
+def card_fields_expected(item: dict, state: dict | None = None) -> dict:
+    """Поля «Версия» и «Прогоны» карточки (автор 2026-11-22: «тег версии / тег прогона должен быть актуальным и
+    указываться при создании и изменении карточки»): есть прогоны — версия по их номерам; нет — версия из плана карточки
+    («plan» блока «прогон», v4.6 → v4), иначе текущая; прогонов нет — «—»."""
+    runs = card_runs(item, state)
     if runs:
-        set_text(project, item, "Прогоны", span(runs))
+        versions = sorted({version_of_run(n) for n in runs}, key=lambda v: plan_starts().get(v, 0))
+        return {"Версия": ", ".join(versions), "Прогоны": span(runs)}
+    have = item_fields(item)
+    if have.get("Версия") and ({GOOD, BAD} & set(have.values())):
+        return {"Версия": have["Версия"], "Прогоны": have.get("Прогоны") or "—"}  # законченная без прогонов — как была
+    spec, _ = card_spec(item)
+    found = re.match(r"(v\d+)\.", str((spec or {}).get("plan") or ""))
+    return {"Версия": found.group(1) if found else plan_version((item.get("content") or {}).get("title") or ""), "Прогоны": "—"}
+
+
+def sync_card_fields(project: dict, item: dict, state: dict | None = None) -> None:
+    """Поставить «Версию» и «Прогоны», если на доске другие (только изменившиеся поля — по запросу на поле)."""
+    have = item_fields(item)
+    for name, value in card_fields_expected(item, state).items():
+        if have.get(name) != value:
+            set_text(project, item, name, value)
+            nodes = item.setdefault("fieldValues", {"nodes": []})["nodes"]
+            nodes[:] = [v for v in nodes if not (v and v.get("field", {}).get("name") == name)]
+            nodes.append({"text": value, "field": {"name": name}})
 
 
 def historical_base(state: dict, rows: dict) -> dict:
@@ -1052,9 +1290,41 @@ def patches_better(state: dict, rows: dict, base: dict, mean: float) -> tuple[bo
     return mean >= -0.01 and fewer == len(pairs) and same, text
 
 
-RULE = "v3.2"
+RULE = "v3.4"
 WEAK = (2, 4, 5)  # слабые цифры опоры (М1 0.38 / 0.47 / 0.43, docs/DIRECTION.md)
 BASE_SEEDS = [1, 3, 0, 2, 4, 5, 6, 7, 8, 9, 10, 11]  # опора — на 12 зёрнах (разбор методики 2026-11-21)
+FUTILITY_FROM = 4  # досрочное закрытие (v3.4, задача автора #119) — на этапах 4 и 5, перед решением по 12 зёрнам
+FUTILITY_SIGMAS = 2.0  # насколько среднее оставшихся зёрен должно превзойти наблюдаемое, чтобы ещё был шанс
+FUTILITY_SD_FLOOR = 0.05  # нижняя граница разброса Δ по зерну (опора: Δ М1u по зерну ±0.06)
+
+
+def futility(state: dict, rows: dict, base: dict) -> str | None:
+    """Правило v3.4 (разбор #119, 2026-11-22): на этапах 4–5 (8 и 10 зёрен) правка закрывается досрочно, если обоим путям
+    решения по 12 зёрнам (М1u +0.025, слабые +0.045) нужно, чтобы оставшиеся зёрна дали в среднем больше, чем наблюдаемая
+    Δ + FUTILITY_SIGMAS · sd / √остаток (Δ — к опоре на том же зерне: на 12 зёрнах это и есть сравнение со средним опоры).
+    Пример: плотность 0.07 на 8 зёрнах Δ +0.002 при sd 0.065 — нужно +0.072 на 4 зёрнах, шанс ≈ 2 %; экономит 1–2 пары."""
+    stage = state["stage"]
+    if stage < FUTILITY_FROM or stage >= len(STAGES):
+        return None
+    pairs = [(rows[int(n)], rows[int(base[str(s)])]) for s, n in state["runs"].items()
+             if str(s) in base and int(base[str(s)]) in rows and int(n) in rows]
+    total = sum(len(p) for p in STAGES)
+    left = total - len(pairs)
+    if left <= 0 or len(pairs) < 2:
+        return None
+    m1_gate, weak_gate = CHECKPOINTS[len(STAGES)]
+    parts = []
+    for name, measure, gate in (("М1u", m1u, m1_gate), ("слабые 2, 4, 5", weak, weak_gate)):
+        deltas = [measure(a) - measure(b) for a, b in pairs]
+        mean = sum(deltas) / len(deltas)
+        sd = max(FUTILITY_SD_FLOOR, (sum((d - mean) ** 2 for d in deltas) / (len(deltas) - 1)) ** 0.5)
+        need = (total * gate - sum(deltas)) / left
+        reach = FUTILITY_SIGMAS * sd / left ** 0.5
+        if need - mean <= reach:
+            return None
+        parts.append(f"{name}: Δ {mean:+.3f} по {len(deltas)} зёрнам, оставшимся {left} нужно {need:+.3f} в среднем "
+                     f"(на {need - mean:.3f} выше, допуск {FUTILITY_SIGMAS:g}·{sd:.3f}/√{left} = {reach:.3f})")
+    return f"этап {stage} ({len(pairs)} зёрен): досрочно закрыто — " + "; ".join(parts) + f" [правило {RULE}]"
 
 
 def weak(entry: dict) -> float:
@@ -1070,30 +1340,47 @@ def base_means(rows: dict, base: dict) -> tuple[float, float, int]:
 
 
 def decide(state: dict, rows: dict) -> tuple[str, str | None]:
-    """Правило v3.2 (2026-11-21, docs/DIRECTION.md): Δ — к среднему опоры по всем её зёрнам; этапы 1/3 → 0/2 → 4/5 с
-    порогами М1u 0 / +0.02 / +0.035, принять — только по 6 зёрнам. Пути: М1u; слабые цифры (2, 4, 5: среднее М1 выше на
-    +0.03 / +0.05 / +0.06 при М1u не хуже −0.01); пятна и монопятна на каждом зерне (как раньше)."""
+    """Правило v3.3 (план v4, задача автора #88; анализ шума опоры по 12 зёрнам, sd М1u 0.033): решение только на 2, 6 и 12
+    зёрнах (этапы 1, 3, 6 из пар STAGES; этапы между ними — дальше без решения, кроме досрочного закрытия v3.4 — futility). Этап 1 — Δ к опоре на ТЕХ ЖЕ зёрнах
+    (среднее 12 зёрен выше на 0.013 — сдвиг подмножества сидел у порога 0), этапы 3 и 6 — к среднему опоры по 12 зёрнам.
+    Пороги М1u −0.01 / +0.015 / +0.025; путь «слабые 2, 4, 5» +0.04 / +0.05 / +0.045 при М1u не хуже −0.01 и честной не ниже
+    опоры −0.05; пятна и монопятна на каждом зерне — как раньше. Принять — только по 12 зёрнам: прогоны правки сразу
+    становятся новой опорой. По модели: истинный +0.03 принимается в 67 % (v3.2 — 38 %), +0.02 — в 30 % (17 %), ложных 1 %."""
     base = json.load(open(os.path.join(HERE, "base_runs.json"), encoding="utf-8"))
-    mean_base, weak_base, seeds = base_means(rows, base)
+    stage = state["stage"]
+    if stage not in CHECKPOINTS:
+        hopeless = futility(state, rows, base)
+        return ("bad", hopeless) if hopeless else ("next", None)
     runs = [rows[int(n)] for n in state["runs"].values()]
+    if stage == 1:
+        same = [rows[int(base[str(s)])] for s in state["runs"] if str(s) in base and int(base[str(s)]) in rows]
+        mean_base = sum(m1u(e) for e in same) / len(same)
+        weak_base = sum(weak(e) for e in same) / len(same)
+        honest_base = sum(float(e.get("top_honest") or 0) for e in same) / len(same)
+        against = f"к опоре на тех же {len(same)} зёрнах"
+    else:
+        mean_base, weak_base, seeds = base_means(rows, base)
+        found = [rows[int(n)] for n in base.values() if int(n) in rows]
+        honest_base = sum(float(e.get("top_honest") or 0) for e in found) / len(found)
+        against = f"к среднему опоры по {seeds} зёрнам"
     mean = sum(m1u(e) for e in runs) / len(runs) - mean_base
     weak_mean = sum(weak(e) for e in runs) / len(runs) - weak_base
+    honest = sum(float(e.get("top_honest") or 0) for e in runs) / len(runs) - honest_base
     spots, spots_text = patches_better(state, rows, base, mean)
     pairs = [(rows[int(n)].get("whole_mean", 0), rows[int(base[str(s)])].get("whole_mean", 0)) for s, n in state["runs"].items()
              if str(s) in base]
     more = sum(a > b for a, b in pairs)
     spots = spots or (mean >= -0.01 and pairs and more == len(pairs))
-    stage = state["stage"]
-    m1_gate, weak_gate = {1: (0.0, 0.03), 2: (0.02, 0.05), 3: (0.035, 0.06)}[stage]
+    m1_gate, weak_gate = CHECKPOINTS[stage]
     by_m1 = mean >= m1_gate
-    by_weak = weak_mean >= weak_gate and mean >= -0.01
-    text = (f"Δ М1u {mean:+.3f} к среднему опоры по {seeds} зёрнам; слабые 2, 4, 5 {weak_mean:+.3f}; {spots_text}; "
+    by_weak = weak_mean >= weak_gate and mean >= -0.01 and honest >= -0.05
+    text = (f"Δ М1u {mean:+.3f} {against}; слабые 2, 4, 5 {weak_mean:+.3f}; честная {honest:+.3f}; {spots_text}; "
             f"монопятен больше на {more} из {len(pairs)} [правило {RULE}]")
     if by_m1 or by_weak or spots:
         why = "по М1u" if by_m1 else ("по слабым цифрам" if by_weak else "по пятнам")
-        if stage < 3:
+        if stage < len(STAGES):
             return "next", None
-        return "good", f"по 6 зёрнам {why}: {text} → принято, в опору; от узла — продолжение"
+        return "good", f"по {len(runs)} зёрнам {why}: {text} → принято, в опору; от узла — продолжение"
     return "bad", f"этап {stage} ({len(runs)} зёрен): {text} — ниже порога → закрыто"
 
 
@@ -1294,7 +1581,8 @@ def seed_finish(project: dict, items: list[dict], rows: dict) -> str | None:
         for item, state in everyone:
             state.update({"verdict": verdict, "variant_runs": vruns})
             write_seed_card(item, state, rows, project)
-            why = run_report(item, state, rows, after) if item["id"] in done_now else f"решение по правке целиком: {verdict}"
+            why = (run_report(item, state, rows, after) if item["id"] in done_now
+                   else f"решение по правке целиком: {verdict}\n\n" + map_line(item, state.get("run"), "Карта этого зерна, как стало"))
             move(project, item, GOOD if outcome == "good" else BAD, why)
         tuning_row(first_item["content"]["title"], agg, verdict)
         say(f"{'ХОРОШО' if outcome == 'good' else 'плохо'}: {verdict} — {first_item['content']['title']}")
@@ -1363,6 +1651,18 @@ def step() -> str:
         check_comments(project)
     except Exception as error:  # noqa: BLE001
         say(f"комментарии не проверены: {error!r}")
+    try:
+        plan_sync(project)  # новые строки таблицы плана — карточки в Очередь (задача автора #88)
+    except Exception as error:  # noqa: BLE001
+        say(f"план не прочитан: {error!r}")
+    try:
+        ensure_plan_start()  # новая версия плана в plan.md — с какого прогона
+    except Exception as error:  # noqa: BLE001
+        say(f"версия плана не записана: {error!r}")
+    try:
+        maps_resend(project)  # карты, не выложившиеся при итоге (автор 2026-11-22: карта в комментарии — обязательно)
+    except Exception as error:  # noqa: BLE001
+        say(f"карты не досланы: {error!r}")
     try:
         order_queue(project)  # автор мог переставить «Приоритет» на плитке — колонка снова по приоритету
     except Exception as error:  # noqa: BLE001
@@ -1448,8 +1748,9 @@ def step() -> str:
         legacy = state and "runs" in state and "seed" not in state  # старая схема: карточка = правка
         return state if legacy and state.get("await") and not state.get("verdict") else None
 
-    # начатые этапы → 🔥 → ⬆️ → ➡️ → ⬇️, внутри — по доске сверху вниз
-    for item in sorted(items, key=lambda i: (waiting_stage(i) is None, -item_priority(i))):
+    # строго по доске сверху вниз (автор 2026-11-22: «разбираться колонка тоже должна сверху»); следующий этап правки
+    # встаёт наверх Очереди сам (move → to_top), поэтому и берётся первым
+    for item in items:
         content = item.get("content") or {}
         fields = item_fields(item)
         if fields.get(status) not in (QUEUE, RUN) or fields.get("Метка") or content.get("__typename") not in CARD_TYPES:

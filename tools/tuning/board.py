@@ -12,6 +12,7 @@ MAP — JSON «статус плана → название колонки до�
 классический токен с областью project: токен с точными правами (github_pat_…) доску личного аккаунта не видит.
 Автор 2026-11-21: «я дал тебе канбан для прогонов, чтобы я в нём мог трекать прогресс… аккуратно загрузи туда v3 план».
 """
+import http.client
 import json
 import os
 import re
@@ -59,13 +60,13 @@ def graphql(query: str, variables: dict | None = None) -> dict:
         headers={"Authorization": f"bearer {token_for(query)}", "Content-Type": "application/json"},
     )
     # Тайм-аут и повторы: 2026-11-21 прогонщик повис навсегда на оборванном ответе GitHub (SSL read без тайм-аута).
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:  # ответ обычно 1–5 с; 30 — чтобы подвисший запрос не держал минуту
                 found = json.load(response)
             break
-        except (TimeoutError, OSError, ValueError):
-            if attempt == 2:
+        except (TimeoutError, OSError, ValueError, http.client.HTTPException):  # IncompleteRead — оборванный ответ
+            if attempt == 3:
                 raise
             time.sleep(5 * (attempt + 1))
     if found.get("errors"):
@@ -76,15 +77,16 @@ def graphql(query: str, variables: dict | None = None) -> dict:
 
 
 ITEM_FIELDS = """id createdAt content { __typename ... on DraftIssue { id title body } ... on Issue { id title body number state } }
-        fieldValues(first: 20) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } } }"""
+        fieldValues(first: 20) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt field { ... on ProjectV2SingleSelectField { name } } }
+                                          ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { name } } } } }"""
 
 
 def items(fragment: str) -> list[dict]:
-    """Все карточки доски постранично (по 100): fragment — поля карточки в запросе GraphQL."""
+    """Все карточки доски постранично (по 40: ответ по 100 карточек ~1 МБ, GitHub его обрывает — IncompleteRead): fragment — поля карточки в запросе GraphQL."""
     found, cursor = [], None
     while True:
         page = graphql("""query($owner: String!, $number: Int!, $after: String) { %s(login: $owner) { projectV2(number: $number) {
-          items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { %s } } } } }""" % (KIND, fragment),
+          items(first: 40, after: $after) { pageInfo { hasNextPage endCursor } nodes { %s } } } } }""" % (KIND, fragment),
                        {"owner": OWNER, "number": NUMBER, "after": cursor})[KIND]["projectV2"]["items"]
         found += page["nodes"]
         if not page["pageInfo"]["hasNextPage"]:

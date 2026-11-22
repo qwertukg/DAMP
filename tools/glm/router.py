@@ -29,8 +29,11 @@ import board_runner as R  # noqa: E402
 HEARTBEAT = os.path.join(R.STAND, "claude.heartbeat")
 LOG = os.path.join(R.STAND, "router.log")
 HANDLED = os.path.join(R.STAND, "router_handled.json")
-PRESENT_MINUTES, CLAIM_MINUTES = 5, 15
+PRESENT_MINUTES, CLAIM_MINUTES = 1, 15  # автор 2026-11-21: «пусть ждёт не 5 мин, а 1»; метка — каждые 20 с
 NOTIFIED: set = set()
+ACKED = os.path.join(R.STAND, "router_acked.json")
+ACK = "🤖 Роутер: принял"  # быстрое «принял» (задача автора #89; #105 — говорящий первым) — не ответ
+OLD_ACK = "🤖 Принял:"  # так «принял» писался до #105
 
 
 def say(text: str) -> None:
@@ -57,6 +60,33 @@ def ours(text: str) -> bool:
     return (text or "").lstrip().startswith("🤖")
 
 
+def is_ack(text: str) -> bool:
+    return (text or "").lstrip().startswith((ACK, OLD_ACK))
+
+
+def acknowledge(job: dict) -> None:
+    """Сразу, как роутер увидел действие автора (задача автора #89: «если смог отреагировать на действие пользователя —
+    сразу пиши стандартный коммент, типа „принял“, возможно более информативный»): кто ответит и когда. Один раз на ключ."""
+    acked = set(json.load(open(ACKED, encoding="utf-8"))) if os.path.exists(ACKED) else set()
+    if job["key"] in acked or job.get("queue"):
+        return
+    if claude_here() and not trial():
+        who = f"отвечает Claude (он на месте); если не ответит за {CLAIM_MINUTES} мин — GLM"
+    elif G.busy() >= G.SLOTS:
+        who = "Claude нет, оба потока GLM заняты — GLM ответит, как освободится"
+    else:
+        who = "Claude нет — отвечает GLM, обычно 1–5 мин"
+    what = "комментарий" if job["what"] == "комментарий автора" else "задачу"
+    try:
+        G.issue_comment(job["number"], f"{ACK}: {what} увидел — {who}." + R.stdout_block(
+            R.log_tail(LOG, 6) + [f"{time.strftime('%H:%M:%S')} принял: #{job['number']} {job['what']} → {who}"]), ack=True)
+    except Exception as error:  # noqa: BLE001
+        say(f"«принял» не оставлен в #{job['number']}: {error!r}")
+        return
+    acked.add(job["key"])
+    json.dump(sorted(acked), open(ACKED, "w", encoding="utf-8"))
+
+
 def age_minutes(stamp: str) -> float:
     when = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     return (dt.datetime.now(dt.timezone.utc) - when).total_seconds() / 60
@@ -74,7 +104,7 @@ def pending() -> list[dict]:
         if not issue.get("number"):
             continue
         column = next((v.get("name") for v in item["fieldValues"]["nodes"] if v and v.get("field", {}).get("name") == "Status"), "")
-        comments = issue["comments"]["nodes"]
+        comments = [c for c in issue["comments"]["nodes"] if not is_ack(c["body"])]  # «принял» — не ответ
         last = comments[-1] if comments else None
         label = next((v.get("name") for v in item["fieldValues"]["nodes"] if v and v.get("field", {}).get("name") == "Метка"), None)
         if column == R.TODO or label:
@@ -136,6 +166,7 @@ def step() -> str:
     here = claude_here() and not trial()
     handled = set(json.load(open(HANDLED, encoding="utf-8"))) if os.path.exists(HANDLED) else set()
     for job in jobs:
+        acknowledge(job)
         if here and (job.get("queue") or age_minutes(job["since"]) < CLAIM_MINUTES):
             if job["key"] not in NOTIFIED and not job.get("queue"):
                 NOTIFIED.add(job["key"])

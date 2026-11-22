@@ -6,7 +6,7 @@
 
 1. `pwsh tools/start.ps1 -Status` — прогонщик и роутер работают? Нет — `pwsh tools/start.ps1`.
 2. Отметка присутствия — фоновой командой на всю сессию (роутер видит, что Claude на месте, и не отдаёт задачи GLM):
-   `while true; do touch tools/tuning/stand/claude.heartbeat; sleep 60; done`
+   `while true; do touch tools/tuning/stand/claude.heartbeat; sleep 20; done`
 3. Слежение (Monitor, перевзводить по истечении):
    `tail -n 0 -F tools/tuning/stand/board_runner.log tools/tuning/stand/router.log | grep --line-buffered -E "комментарий автора|задача автора|автор передвинул|ошибка шага|ошибка прогона|Traceback|ХОРОШО|плохо:"`
    Токены — только на анализ и чтение задач и комментариев (автор 2026-11-21): без «ждёт Claude» (повтор раз в минуту) и строк о работе GLM.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import concurrent.futures
+import dataclasses
 from dataclasses import dataclass, field
 from collections import deque
 import json
@@ -95,8 +96,21 @@ class AdaptiveLayoutConfig:
     temperature: float = 0.0
     temperature_radius_max: int = 0
     temperature_radius_min: int = 0
+    # План v4.14 (рост λ, §7.1.7: «λ растёт при убывании радиуса»): > 0 — λ поднимается от начального до lambda_max
+    # вместе с убыванием радиуса пар, этим числом ступеней (ступени — чтобы не сбрасывать кеши порога каждый шаг);
+    # 0 — выкл. (в режиме сглаживания λ тогда постоянен).
+    lambda_ramp: int = 0
+
+    def lambda_for_radius(self, radius: int, start_lambda: float) -> float:
+        """λ на радиусе пар radius при росте вместе с радиусом (lambda_ramp ступеней от start_lambda до lambda_max)."""
+        span = max(1, int(self.start_radius) - int(self.end_radius))
+        progress = min(1.0, max(0.0, (int(self.start_radius) - int(radius)) / span))
+        stage = int(progress * int(self.lambda_ramp)) / int(self.lambda_ramp)
+        return float(start_lambda) + (float(self.lambda_max) - float(start_lambda)) * stage
 
     def __post_init__(self) -> None:
+        if self.lambda_ramp < 0:
+            raise ValueError("lambda_ramp must be >= 0")
         if not 0.0 < self.lambda_max <= 1.0:
             raise ValueError("lambda_max must be in (0, 1]")
         if self.temperature < 0.0:
@@ -2332,6 +2346,7 @@ class Layout:
                 },
             )
         adaptive_state: _AdaptiveLayoutState | None = None
+        ramp_start_lambda: float | None = None  # план v4.14: λ в начале фазы, от него растёт вместе с радиусом
         if adaptive_params is not None:
             adaptive_state = _AdaptiveLayoutState(adaptive_params, steps)
             LOGGER.event(
@@ -2582,6 +2597,12 @@ class Layout:
                         },
                     )
                 self._apply_adaptive_lambda(update, step=current_step)
+                if adaptive_params.lambda_ramp > 0:
+                    if ramp_start_lambda is None:
+                        ramp_start_lambda = float(self._lambda)
+                    ramped = adaptive_params.lambda_for_radius(int(update.radius), ramp_start_lambda)
+                    if abs(ramped - float(self._lambda)) > 1e-9:
+                        self._apply_adaptive_lambda(dataclasses.replace(update, new_lambda=ramped), step=current_step)
             if (
                 energy_target is not None
                 and energy_value is not None

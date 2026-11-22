@@ -77,7 +77,12 @@ class PlaneFieldBuilder:
         radius_floor: float | None = None,
         whole_picture: bool = False,
         one_window: bool = False,
+        shear: float = 0.0,
     ) -> None:
+        # Наклон почерка (план v4.13, вне статьи; классика MNIST): > 0 — место элемента в окне считается после сдвига
+        # dx′ = dx − s·dy, s = cov(y, x) / var(y) по элементам картинки, |s| ≤ shear. Наклонённая и прямая двойка
+        # получают одно и то же место частей. 0 — как было.
+        self._shear = float(shear)
         # True — одно окно на картинку (стратегия v3, Б3, docs/CLUSTERS.md): центр — середина её деталей (как у окна уровня 0),
         # радиус — до самой дальней детали. Окна на каждой детали записывают одну цифру разными кодами (маска содержания
         # зависит от места относительно центра окна): на верхней карте картинка рвётся в среднем на 2.24 пятна. Вне статьи
@@ -368,6 +373,12 @@ class PlaneFieldBuilder:
         self._whole_pictures = 0
         for number, first, last in zip(pictures, bounds[:-1], bounds[1:]):
             own = position[first:last]
+            slant = 0.0
+            if self._shear > 0.0 and own.shape[0] > 1:
+                spread = float(np.var(own[:, 0]))
+                if spread > 0.0:
+                    slant = float(np.clip(np.mean((own[:, 0] - own[:, 0].mean()) * (own[:, 1] - own[:, 1].mean())) / spread,
+                                          -self._shear, self._shear))
             for centre_y, centre_x, radius, inside in self.picture_fields(own, table[index[first:last]]):
                 reach = np.hypot(own[:, 0] - centre_y, own[:, 1] - centre_x)
                 rows = np.flatnonzero(reach <= radius + self.ROUNDING)
@@ -375,7 +386,10 @@ class PlaneFieldBuilder:
                 members.append(rows + first)
                 # Место элемента — смещение от центра поля в долях его радиуса: поле любого размера кодируется
                 # одними и теми же детекторами места.
-                shifts.append((own[rows] - (centre_y, centre_x)) / radius)
+                shift = (own[rows] - (centre_y, centre_x)) / radius
+                if slant:
+                    shift[:, 1] -= slant * shift[:, 0]
+                shifts.append(shift)
                 covered[rows + first] = True
                 field_picture.append(int(number))
                 centres.append((centre_y, centre_x))

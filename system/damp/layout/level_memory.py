@@ -48,7 +48,7 @@ class MemoryMap:
     порог λ берутся с диска, Layout восстанавливается по ячейкам точек.
     """
 
-    MODULES = ("damp.layout.level_memory", "damp.layout.far_force")  # far_force: α смешанного ядра (Р2) — в ключ кеша
+    MODULES = ("damp.layout.level_memory", "damp.layout.far_force", "damp.layout.rescue")  # far_force: α смешанного ядра (Р2), rescue: v4.15 — в ключ кеша
 
     def __init__(self) -> None:
         self._colorizer = None
@@ -122,7 +122,7 @@ class MemoryMap:
         level = int(name[5:]) if name.startswith("level") and name[5:].isdigit() else 0
         tries = int(settings.LADDER_LAYOUT_BEST_OF) if 0 < int(settings.LADDER_LAYOUT_BEST_OF_FROM) <= level else 1
         if tries <= 1:
-            return _layout_from_codes(table, params, self.colorizer, lambda_schedule=schedule)
+            return self._rescue(table, _layout_from_codes(table, params, self.colorizer, lambda_schedule=schedule), name, level)
         best, best_energy, energies = None, None, []
         for attempt in range(tries):
             with settings.overridden({"LAYOUT_RANDOM_SEED": int(settings.LAYOUT_RANDOM_SEED) + 1009 * attempt}):
@@ -138,7 +138,29 @@ class MemoryMap:
         LOGGER.event("layout.best_of", section=OUTSIDE_ARTICLE,
                      data={"name": name, "tries": tries, "energies": energies, "chosen": energies.index(round(best_energy, 4)),
                            "note": "лучшая из K раскладок по дальней энергии статьи φ = Σ s·d (§5.5.1), без меток"})
-        return best
+        return self._rescue(table, best, name, level)
+
+    @staticmethod
+    def _rescue(table: LayoutCodeTable, layout: Layout, name: str, level: int) -> Layout:
+        """План v4.15: с уровня LADDER_LAYOUT_RESCUE_FROM — LADDER_LAYOUT_RESCUE_PASSES проходов «лучший ответ»
+        (system/damp/layout/rescue.py): заблудшие точки (доля LADDER_LAYOUT_RESCUE_SHARE с наибольшим разрывом между
+        лучшей ячейкой и своей) меняются местами с жителем лучшей ячейки, если растёт энергия Σ (s − λ)·g(d), g — гаусс
+        с σ = LADDER_LAYOUT_RESCUE_SIGMA (масштаб кластера). 0 проходов — выкл., раскладка бит в бит прежняя."""
+        passes = int(settings.LADDER_LAYOUT_RESCUE_PASSES)
+        if passes <= 0 or level < int(settings.LADDER_LAYOUT_RESCUE_FROM):
+            return layout
+        from damp.layout.rescue import rescue_cells
+
+        cells, report = rescue_cells(table.bits(), layout.cells_array(), int(layout.height), int(layout.width),
+                                     float(layout.lambda_threshold), passes=passes,
+                                     share=float(settings.LADDER_LAYOUT_RESCUE_SHARE),
+                                     sigma=float(settings.LADDER_LAYOUT_RESCUE_SIGMA))
+        layout.place_cells(cells, log=False)
+        LOGGER.event("layout.rescue", section=OUTSIDE_ARTICLE,
+                     data={"name": name, "points": int(cells.shape[0]), "passes": report,
+                           "note": "проход «лучший ответ» (план v4.15): заблудшие точки — к месту с наибольшим полем "
+                                   "Σ (s − λ)·g(d), обмен при росте энергии; без меток"})
+        return layout
 
     @staticmethod
     def far_energy(bits: "np.ndarray", cells: "np.ndarray", threshold: float) -> float:

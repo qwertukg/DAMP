@@ -10,6 +10,21 @@ from damp.activation.set_embedding import DetectorEmbeddings
 from damp.encoding.elements import LadderElements, distinct_codes
 
 
+def _mix(number: int, layer: int, grid: int, ix: "np.ndarray", iy: "np.ndarray") -> "np.ndarray":
+    """Ключ ячейки (уровень, слой, сетка, x, y) — перемешанное 64-битное число (splitmix64): бит по модулю длины кода
+    ложится на код равномерно, как случайный бит статьи, но один на всю ячейку."""
+    with np.errstate(over="ignore"):
+        value = (np.asarray(ix, dtype=np.int64).astype(np.uint64) * np.uint64(0x9E3779B97F4A7C15)
+                 ^ np.asarray(iy, dtype=np.int64).astype(np.uint64) * np.uint64(0xC2B2AE3D27D4EB4F)
+                 ^ np.uint64((number * 1_000_003 + layer * 10_007 + grid * 101 + 17) & 0xFFFFFFFFFFFFFFFF))
+        value ^= value >> np.uint64(30)
+        value *= np.uint64(0xBF58476D1CE4E5B9)
+        value ^= value >> np.uint64(27)
+        value *= np.uint64(0x94D049BB133111EB)
+        value ^= value >> np.uint64(31)
+    return value
+
+
 class DetailCoder:
     """Код детали — эмбеддинг окна: не больше LADDER_SATURATION самых сильных детекторов, длина кода под плотность
     LADDER_TARGET_DENSITY (§6.6, §7.1.12). Деталь стоит в центре своего окна, её уровень активации — самый сильный
@@ -27,8 +42,32 @@ class DetailCoder:
         levels = list(levels) if isinstance(levels, (list, tuple)) else [levels]
         return float(levels[min(self.number, len(levels) - 1)])
 
+    def topography(self, centre: "np.ndarray", radius: "np.ndarray", layer_index: "np.ndarray") -> "np.ndarray | None":
+        """Ключи ячеек карты для топографических бит (план v4.11): ACTIVATION_DETECTOR_BIT_MODE "topographic" с уровня
+        ACTIVATION_DETECTOR_BIT_FROM. Ячейка слоя — ACTIVATION_DETECTOR_BIT_CELL медианных радиусов его детекторов;
+        ACTIVATION_DETECTOR_BIT_GRIDS сеток со сдвигом на долю ячейки: детекторы одного слоя в одной ячейке делят бит,
+        соседние ячейки разных сеток перекрываются. None — бит случайный, как в статье (§6.3)."""
+        start = int(settings.ACTIVATION_DETECTOR_BIT_FROM)
+        if settings.ACTIVATION_DETECTOR_BIT_MODE != "topographic" or not 0 < start <= self.number:
+            return None
+        centre = np.asarray(centre, dtype=np.float64)
+        radius = np.asarray(radius, dtype=np.float64)
+        layer_index = np.asarray(layer_index, dtype=np.int64)
+        grids = max(1, int(settings.ACTIVATION_DETECTOR_BIT_GRIDS))
+        keys = np.zeros((centre.shape[0], grids), dtype=np.uint64)
+        for layer in np.unique(layer_index):
+            inside = layer_index == layer
+            cell = max(1e-6, float(settings.ACTIVATION_DETECTOR_BIT_CELL) * float(np.median(radius[inside])))
+            for grid in range(grids):
+                shift = cell * grid / grids
+                ix = np.floor((centre[inside, 0] + shift) / cell).astype(np.int64)
+                iy = np.floor((centre[inside, 1] + shift) / cell).astype(np.int64)
+                keys[inside, grid] = _mix(self.number, int(layer), grid, ix, iy)
+        return keys
+
     def encode(
-        self, firing: Firing, layer_index: "np.ndarray", detectors: int, trained: "np.ndarray", *, length: int | None = None
+        self, firing: Firing, layer_index: "np.ndarray", detectors: int, trained: "np.ndarray", *, length: int | None = None,
+        geometry: "tuple[np.ndarray, np.ndarray] | None" = None,
     ) -> tuple["np.ndarray", int]:
         """Коды деталей, по строке на окно, и их длина (из кеша шагов, если такие срабатывания уже были).
 
@@ -44,6 +83,7 @@ class DetailCoder:
         # Отбор σ по цвету (§6.5, §3.3.2) с уровня LADDER_EMBEDDING_COLOUR_FROM: цвет детектора — его слой λ_d.
         colour_from = int(settings.LADDER_EMBEDDING_COLOUR_FROM)
         colour = layer_index if 0 < colour_from <= self.number else None
+        topography = None if geometry is None else self.topography(geometry[0], geometry[1], layer_index)
 
         def compute() -> dict[str, object]:
             coded = slice(None)
@@ -60,6 +100,7 @@ class DetailCoder:
                 seed=settings.LADDER_RANDOM_SEED + self.number,
                 name=f"details{self.number}",
                 colour=colour,
+                topography=topography,
             ).encode(rows[coded], columns[coded], levels[coded], firing.sets, calibration=trained, length=fixed)
             return {"details": details, "length": int(length)}
 
@@ -67,6 +108,7 @@ class DetailCoder:
             "rows": rows, "columns": columns, "levels": levels, "sets": int(firing.sets), "layer_index": layer_index,
             "detectors": int(detectors), "number": self.number, "trained": trained, "length": 0 if fixed is None else fixed,
             "colour": colour is not None,
+            **({} if topography is None else {"topography": topography}),
         }
         found = CACHE.run("embeddings.details", inputs, compute, modules=("damp.activation.details", "damp.activation.set_embedding"))
         return found["details"], int(found["length"])

@@ -804,6 +804,7 @@ def _run_long_phase(
         swap_ratio_trigger=settings.LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=settings.LAYOUT_ADAPTIVE_LAMBDA_STEP,
         lambda_max=settings.LAYOUT_ADAPTIVE_LAMBDA_MAX if lambda_max is None else float(lambda_max),
+        lambda_ramp=int(settings.LAYOUT_LAMBDA_RAMP),  # план v4.14: λ растёт вместе с убыванием радиуса (0 — выкл.)
         radius_schedule=settings.LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
         radius_factor=settings.LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
         swap_window=settings.LAYOUT_ADAPTIVE_SWAP_WINDOW,

@@ -313,6 +313,18 @@ LADDER_EMBEDDING_LAYERS = "none"  # [КАНОН]
 # the colour of the detector code», бит не больше σ; §3.3.2: «if the goal is to obtain a description that makes sense
 # as a whole, the short-wavelength bits can be discarded». Б7′ (docs/DIRECTION.md; задача #14, слово автора «делай»).
 LADDER_EMBEDDING_COLOUR_FROM = 0  # [КАНОН]
+# Топографические биты детекторов (план v4.11, задача #100): "random" — бит детектора случайный (§6.3); "topographic" —
+# с уровня ACTIVATION_DETECTOR_BIT_FROM бит от ячейки карты по центру детектора: ячейка — ACTIVATION_DETECTOR_BIT_CELL
+# медианных радиусов слоя, ACTIVATION_DETECTOR_BIT_GRIDS сеток со сдвигом (по биту на сетку). Соседние детекторы одного
+# слоя делят биты — окна одного класса с разными почерками, упавшие на соседние плитки, получают общие биты.
+ACTIVATION_DETECTOR_BIT_MODE = "random"  # [КАНОН]
+ACTIVATION_DETECTOR_BIT_FROM = 0  # [РАСШИРЕНИЕ]
+ACTIVATION_DETECTOR_BIT_CELL = 2.0  # [РАСШИРЕНИЕ]
+ACTIVATION_DETECTOR_BIT_GRIDS = 2  # [РАСШИРЕНИЕ]
+# Наклон почерка в коде места (план v4.13, задача #102): с уровня LADDER_PLACE_SHEAR_FROM (0 — нет) смещение элемента
+# от центра окна сдвигается на наклон картинки: dx′ = dx − s·dy, s = cov(y, x) / var(y) по её элементам, |s| ≤ LIMIT.
+LADDER_PLACE_SHEAR_FROM = 0  # [РАСШИРЕНИЕ]
+LADDER_PLACE_SHEAR_LIMIT = 0.5  # [РАСШИРЕНИЕ]
 # Границы длины кода детали, бит.
 LADDER_CODE_LENGTH_MIN = 64  # [РАСШИРЕНИЕ]
 LADDER_CODE_LENGTH_MAX = 8192  # [РАСШИРЕНИЕ]
@@ -602,6 +614,13 @@ LAYOUT_RANDOM_SEED = 0  # [РАСШИРЕНИЕ]
 # Раскладка верха даёт разброс М1u ±0.05 (docs/DIRECTION.md): выбор по φ может забрать его в плюс; время верха × K.
 LADDER_LAYOUT_BEST_OF = 1  # [РАСШИРЕНИЕ]
 LADDER_LAYOUT_BEST_OF_FROM = 0  # [РАСШИРЕНИЕ]
+# План v4.15 (system/damp/layout/rescue.py): после раскладки карты с уровня LADDER_LAYOUT_RESCUE_FROM — проходы «лучший
+# ответ»: доля SHARE точек с наибольшим разрывом между лучшей ячейкой и своей меняется местами с жителем лучшей ячейки, если
+# растёт энергия Σ (s − λ)·g(d), g — гаусс с σ = SIGMA клеток (масштаб кластера); без меток. 0 проходов — выкл.
+LADDER_LAYOUT_RESCUE_PASSES = 0  # [РАСШИРЕНИЕ]
+LADDER_LAYOUT_RESCUE_FROM = 3  # [РАСШИРЕНИЕ]
+LADDER_LAYOUT_RESCUE_SHARE = 0.2  # [РАСШИРЕНИЕ]
+LADDER_LAYOUT_RESCUE_SIGMA = 7.0  # [РАСШИРЕНИЕ]
 LAYOUT_LONG_PAIRS_PER_STEP = 24000  # [РАСШИРЕНИЕ]
 LAYOUT_LONG_STEPS = 14000  # [РАСШИРЕНИЕ]
 LAYOUT_SHORT_PAIRS_PER_STEP = 100  # [РАСШИРЕНИЕ]
@@ -646,6 +665,10 @@ LAYOUT_ADAPTIVE_SWAP_TRIGGER = { smooth = 0.0, article = 0.01 }  # [НЕ КАН�
 LAYOUT_ADAPTIVE_LAMBDA_STEP = { smooth = "none", article = 0.05 }  # [НЕ КАНОН]
 # λ поднимают с 0.65 до 0.8 (§7.1.7).
 LAYOUT_ADAPTIVE_LAMBDA_MAX = 0.8  # [КАНОН]
+# План v4.14 (§7.1.7: λ растёт при убывании радиуса; §7.1.8.3): > 0 — в дальней фазе λ поднимается от начального порога
+# до предела (у верхних карт — квантили LADDER_LAYOUT_LAMBDA_QUANTILE → …_MAX_QUANTILE) вместе с убыванием радиуса пар,
+# этим числом ступеней; 0 — выкл. (в режиме сглаживания λ постоянен). Для верхних карт — через LADDER_LAYOUT_UPPER_CHANGES.
+LAYOUT_LAMBDA_RAMP = 0  # [РАСШИРЕНИЕ]
 LAYOUT_SHORT_ADAPTIVE_RADIUS_FACTOR = 1.0  # [РАСШИРЕНИЕ]
 # Остановка (§5.6): число обменов за шаг ниже порога или качество Ē (§5.8) достигло заданного значения.
 # Ē считается каждые LAYOUT_ENERGY_EVAL_EVERY шагов дальней фазы по всем точкам V с нормировкой на E_max по V

@@ -12,3 +12,5 @@ glm_trial
 comments_seen.json
 router_handled.json
 maps_uploaded.json
+arrivals.json
+maps_pending.json

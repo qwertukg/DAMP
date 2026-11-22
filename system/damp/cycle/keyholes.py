@@ -169,6 +169,8 @@ class KeyholeBuilder:
             whole_picture=settings.LADDER_KEYHOLE_WHOLE_PICTURE,
             # Б3 стратегии v3: с уровня LADDER_KEYHOLE_ONE_FROM — одно окно на картинку в середине её деталей (0 — нет).
             one_window=0 < int(settings.LADDER_KEYHOLE_ONE_FROM) <= int(number),
+            # План v4.13: место в окне — с поправкой на наклон почерка картинки с уровня LADDER_PLACE_SHEAR_FROM (0 — нет).
+            shear=float(settings.LADDER_PLACE_SHEAR_LIMIT) if 0 < int(settings.LADDER_PLACE_SHEAR_FROM) <= int(number) else 0.0,
         )
 
     @staticmethod

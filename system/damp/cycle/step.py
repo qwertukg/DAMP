@@ -210,7 +210,11 @@ class CycleStep:
         """Детали окон (§6.5, П.1): коды, их длина, уровни активации и детали как элементы следующего уровня.
         Длина кода подбирается только по окнам обучающих картинок."""
         coder = DetailCoder(keyholes.number)
-        details, length = coder.encode(firing, detectors.layer_index, detectors.built, self.trained(keyholes))
+        geometry = None
+        if settings.ACTIVATION_DETECTOR_BIT_MODE == "topographic":  # план v4.11: топографические биты детекторов
+            found = detectors.detectors
+            geometry = (np.asarray([d.center for d in found], dtype=np.float64), np.asarray([d.radius for d in found], dtype=np.float64))
+        details, length = coder.encode(firing, detectors.layer_index, detectors.built, self.trained(keyholes), geometry=geometry)
         strength = firing.strength()
         pieces = keyholes.pieces
         elements = coder.elements(details, length, pieces.picture, pieces.centre, keyholes.extent, strength)

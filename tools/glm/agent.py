@@ -256,14 +256,19 @@ def issue_read(number: int) -> str:
     return f"#{found['number']} {found['title']} [{found['state']}]\n\n{body[:6000]}\n\nКомментарии:\n{comments[:6000]}"
 
 
-def issue_comment(number: int, text: str) -> str:
+def issue_comment(number: int, text: str, ack: bool = False) -> str:
     import board as B
     found = issue(number)
-    last = (found["comments"]["nodes"] or [{}])[-1].get("body") or ""
-    if last.lstrip().startswith("🤖"):  # пока GLM думал, ответил Claude (или прогонщик) — второй ответ не нужен
-        return "комментарий не оставлен: на последний комментарий автора уже ответили"
-    text = re.sub(r"^\s*(🤖\s*(Claude|GLM|Прогонщик)\s*:\s*)+", "", text)  # модель копирует чужую подпись
-    body = f"{MARK} {text}"
+    if ack:  # «🤖 Принял: …» роутера (задача автора #89) — как есть
+        body = text
+    else:
+        real = [c for c in found["comments"]["nodes"]
+                if not (c.get("body") or "").lstrip().startswith(("🤖 Принял:", "🤖 Роутер: принял"))]
+        last = (real or [{}])[-1].get("body") or ""
+        if real and last.lstrip().startswith("🤖"):  # пока GLM думал, ответил Claude (или прогонщик) — второй ответ не нужен
+            return "комментарий не оставлен: на последний комментарий автора уже ответили"
+        text = re.sub(r"^\s*(🤖\s*(Claude|GLM|Прогонщик|Принял|Роутер)\s*:\s*)+", "", text)  # модель копирует чужую подпись
+        body = f"{MARK} {text}" + R_stdout()
     B.graphql("""mutation($i: ID!, $b: String!) { addComment(input: {subjectId: $i, body: $b}) { clientMutationId } }""",
               {"i": found["id"], "b": body})
     return "комментарий оставлен"
@@ -299,6 +304,20 @@ def card_move(number: int, column: str) -> str:
 
 JOURNAL_DIR = os.path.join(tempfile.gettempdir(), "damp-glm-logs")
 JOURNAL = os.path.join(JOURNAL_DIR, time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}.jsonl")
+
+
+def R_stdout() -> str:
+    """stdout GLM под катом (задача автора #105): последние шаги агента — инструмент, аргументы, ответ (коротко)."""
+    import board_runner as R
+    lines = []
+    for raw in R.log_tail(JOURNAL, 14):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        parts = [entry.get("time", "")] + [f"{k}={str(v)[:160]}" for k, v in entry.items() if k != "time"]
+        lines.append(" ".join(parts)[:300])
+    return R.stdout_block(lines)
 
 
 def journal(entry: dict) -> None:

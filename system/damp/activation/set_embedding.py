@@ -88,6 +88,7 @@ class DetectorEmbeddings:
         name: str = "sets",
         saturation_share: float = 0.0,
         colour: "np.ndarray | None" = None,
+        topography: "np.ndarray | None" = None,
     ) -> None:
         if detectors <= 0:
             raise ValueError("detectors must be positive")
@@ -113,6 +114,11 @@ class DetectorEmbeddings:
         # широкие области («длинные волны», §3.3.1). Задан — σ в наборе отбираются сначала по цвету, внутри цвета по
         # силе: colour merge, отбрасывающий коротковолновые биты (§3.3.2). None — только по силе.
         self._colour = None if colour is None else np.asarray(colour, dtype=np.int64)
+        # Топографические биты (план v4.11, вне статьи по форме: §6.3 — бит детектора случайный): ключи ячеек карты
+        # (детекторы × сетки), бит = ключ по модулю длины кода — соседние детекторы одной ячейки делят бит. None — как было.
+        self._topography = None if topography is None else np.asarray(topography, dtype=np.uint64)
+        if self._topography is not None and self._topography.shape[0] != self._detectors:
+            raise ValueError("topography: по строке ключей на детектор")
 
     def strongest(
         self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
@@ -219,7 +225,10 @@ class DetectorEmbeddings:
         return np.concatenate(kept_rows), np.concatenate(kept_columns)
 
     def detector_bits(self, length: int) -> "np.ndarray":
-        """Бит каждого детектора в коде длины length: случайная перестановка, пока детекторов не больше длины."""
+        """Бит каждого детектора в коде длины length: случайная перестановка, пока детекторов не больше длины.
+        Топографические биты — по биту на сетку (детекторы × сетки): ключ ячейки по модулю длины."""
+        if self._topography is not None:
+            return (self._topography % np.uint64(int(length))).astype(np.int64)
         rng = np.random.default_rng(self._seed)
         parts = []
         left = self._detectors
@@ -236,8 +245,7 @@ class DetectorEmbeddings:
         без сортировки всех пар.
         """
         length = int(length)
-        place = self.detector_bits(length)[columns]
-        rows = np.asarray(rows, dtype=np.int64)
+        rows, place = self._pairs(np.asarray(rows, dtype=np.int64), self.detector_bits(length)[columns])
         if rows.size and np.any(np.diff(rows) < 0):
             order = np.argsort(rows, kind="stable")
             rows, place = rows[order], place[order]
@@ -256,9 +264,16 @@ class DetectorEmbeddings:
 
     def _density_sorted(self, rows: "np.ndarray", columns: "np.ndarray", count: int, length: int) -> float:
         """Прямой счёт плотности: различные пары (набор, бит) сортировкой. Мерка для быстрого счёта _density."""
-        bits = self.detector_bits(length)
-        keys = np.unique(rows * int(length) + bits[columns])
+        rows, place = self._pairs(np.asarray(rows, dtype=np.int64), self.detector_bits(length)[columns])
+        keys = np.unique(rows * int(length) + place)
         return float(keys.shape[0]) / (max(1, int(count)) * int(length))
+
+    @staticmethod
+    def _pairs(rows: "np.ndarray", place: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Пары (набор, бит): один бит на детектор — как есть; топографические — по паре на каждую сетку."""
+        if place.ndim == 1:
+            return rows, place
+        return np.repeat(rows, place.shape[1]), place.reshape(-1)
 
     def fit_length(self, rows: "np.ndarray", columns: "np.ndarray", count: int) -> int:
         """Наименьшая длина кода, при которой средняя плотность кодов наборов 0…count−1 не выше заданной."""
@@ -319,7 +334,8 @@ class DetectorEmbeddings:
             size = min(self.CHUNK_ROWS, int(count) - first)
             matrix = np.zeros((size, length), dtype=np.uint8)
             entries = slice(int(starts[chunk]), int(starts[chunk + 1]))
-            matrix[rows[entries] - first, bits[columns[entries]]] = 1
+            chunk_rows, chunk_bits = self._pairs(rows[entries] - first, bits[columns[entries]])
+            matrix[chunk_rows, chunk_bits] = 1
             ones += int(matrix.sum())
             packed[first : first + size] = np.packbits(matrix, axis=1)
         kept = np.bincount(rows, minlength=int(count))
