@@ -795,21 +795,45 @@
     830,
     831,
     832,
-    833
+    833,
+    834,
+    835
    ],
    "card": "[3] → [8] ядро раскладки верха не уже кластера",
    "item": "PVTI_lAHOAENbFs4BslBdzhKu99c",
    "parent": "784",
-   "status": "run",
+   "status": "bad",
    "items": [
     "PVTI_lAHOAENbFs4BslBdzhKu99c",
     "PVTI_lAHOAENbFs4BslBdzhK4hAE",
     "PVTI_lAHOAENbFs4BslBdzhK4nSE",
     "PVTI_lAHOAENbFs4BslBdzhK4nuA",
     "PVTI_lAHOAENbFs4BslBdzhK4rVI",
-    "PVTI_lAHOAENbFs4BslBdzhK4rso"
+    "PVTI_lAHOAENbFs4BslBdzhK4rso",
+    "PVTI_lAHOAENbFs4BslBdzhK4vNQ",
+    "PVTI_lAHOAENbFs4BslBdzhK4vlU"
    ],
    "variant": "PVTI_lAHOAENbFs4BslBdzhKu99c"
+  },
+  {
+   "key": "836",
+   "runs": [
+    836,
+    837,
+    838,
+    839
+   ],
+   "card": "[нет] → [проход «лучший ответ»] подтянуть заблудшие точки к своим",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-xY",
+   "parent": "784",
+   "status": "run",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-xY",
+    "PVTI_lAHOAENbFs4BslBdzhK42VU",
+    "PVTI_lAHOAENbFs4BslBdzhK46bg",
+    "PVTI_lAHOAENbFs4BslBdzhK46xo"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-xY"
   }
  ],
  "tested": {
