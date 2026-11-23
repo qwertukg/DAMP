@@ -1,6 +1,6 @@
 {
  "plan": "v3",
- "base": "784",
+ "base": "862",
  "nodes": [
   {
    "key": "664",
@@ -821,19 +821,595 @@
     836,
     837,
     838,
-    839
+    839,
+    840,
+    841
    ],
    "card": "[нет] → [проход «лучший ответ»] подтянуть заблудшие точки к своим",
    "item": "PVTI_lAHOAENbFs4BslBdzhKu-xY",
    "parent": "784",
-   "status": "run",
+   "status": "bad",
    "items": [
     "PVTI_lAHOAENbFs4BslBdzhKu-xY",
     "PVTI_lAHOAENbFs4BslBdzhK42VU",
     "PVTI_lAHOAENbFs4BslBdzhK46bg",
-    "PVTI_lAHOAENbFs4BslBdzhK46xo"
+    "PVTI_lAHOAENbFs4BslBdzhK46xo",
+    "PVTI_lAHOAENbFs4BslBdzhK4_fI",
+    "PVTI_lAHOAENbFs4BslBdzhK4_2k"
    ],
    "variant": "PVTI_lAHOAENbFs4BslBdzhKu-xY"
+  },
+  {
+   "key": "842",
+   "runs": [
+    842,
+    843,
+    844,
+    845
+   ],
+   "card": "[1.0] → [1.5] торможение шире — меньше мелких деталей в окне",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-X0",
+   "parent": "784",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-X0",
+    "PVTI_lAHOAENbFs4BslBdzhK7MJs",
+    "PVTI_lAHOAENbFs4BslBdzhK7PT8",
+    "PVTI_lAHOAENbFs4BslBdzhK7Pb8"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-X0"
+  },
+  {
+   "key": "848",
+   "runs": [
+    848,
+    849
+   ],
+   "card": "[0.2] → [0.15] код окна реже",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-T4",
+   "parent": "784",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-T4",
+    "PVTI_lAHOAENbFs4BslBdzhK7WS8"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-T4"
+  },
+  {
+   "key": "850",
+   "runs": [
+    850,
+    851,
+    852,
+    853,
+    854,
+    855,
+    856,
+    857,
+    858,
+    859,
+    860,
+    861
+   ],
+   "card": "[место без наклона] → [место с поправкой наклона] наклон почерка в коде места",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-p8",
+   "parent": "784",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-p8",
+    "PVTI_lAHOAENbFs4BslBdzhK7YOI",
+    "PVTI_lAHOAENbFs4BslBdzhK7ddc",
+    "PVTI_lAHOAENbFs4BslBdzhK7dl8",
+    "PVTI_lAHOAENbFs4BslBdzhK7fuM",
+    "PVTI_lAHOAENbFs4BslBdzhK7f24",
+    "PVTI_lAHOAENbFs4BslBdzhK7h_o",
+    "PVTI_lAHOAENbFs4BslBdzhK7iI4",
+    "PVTI_lAHOAENbFs4BslBdzhK7lko",
+    "PVTI_lAHOAENbFs4BslBdzhK7lss",
+    "PVTI_lAHOAENbFs4BslBdzhK7ozg",
+    "PVTI_lAHOAENbFs4BslBdzhK7o9w"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-p8"
+  },
+  {
+   "key": "862",
+   "runs": [
+    862,
+    863,
+    864,
+    865,
+    866,
+    867,
+    868,
+    869,
+    870,
+    871,
+    872,
+    873
+   ],
+   "card": "[10] → [13] σ больше — больше деталей в коде окна",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-PA",
+   "parent": "784",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-PA",
+    "PVTI_lAHOAENbFs4BslBdzhK7suc",
+    "PVTI_lAHOAENbFs4BslBdzhK7wpM",
+    "PVTI_lAHOAENbFs4BslBdzhK7w0k",
+    "PVTI_lAHOAENbFs4BslBdzhK70WU",
+    "PVTI_lAHOAENbFs4BslBdzhK70jA",
+    "PVTI_lAHOAENbFs4BslBdzhK7260",
+    "PVTI_lAHOAENbFs4BslBdzhK73EU",
+    "PVTI_lAHOAENbFs4BslBdzhK75yw",
+    "PVTI_lAHOAENbFs4BslBdzhK759E",
+    "PVTI_lAHOAENbFs4BslBdzhK78zE",
+    "PVTI_lAHOAENbFs4BslBdzhK788I"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-PA"
+  },
+  {
+   "key": "874",
+   "runs": [
+    874,
+    875
+   ],
+   "card": "[13] → [16] σ сильнейших детекторов",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8AfA",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8AfA",
+    "PVTI_lAHOAENbFs4BslBdzhK8Amg"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8AfA"
+  },
+  {
+   "key": "876",
+   "runs": [
+    876,
+    877
+   ],
+   "card": "[13] → [14] σ сильнейших детекторов",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8DcY",
+   "parent": "874",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8DcY",
+    "PVTI_lAHOAENbFs4BslBdzhK8Dm0"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8DcY"
+  },
+  {
+   "key": "878",
+   "runs": [
+    878,
+    879
+   ],
+   "card": "[10, 3, 14] → [10, 5, 14] окна уровня 2 крупнее",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-FU",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-FU",
+    "PVTI_lAHOAENbFs4BslBdzhK8GuQ"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-FU"
+  },
+  {
+   "key": "880",
+   "runs": [
+    880,
+    881
+   ],
+   "card": "[T 0.1, нагрев на r 5…0.4·W] → [T 0.4, нагрев на r 12…W] горячий отжиг только на больших радиусах верха",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-BI",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-BI",
+    "PVTI_lAHOAENbFs4BslBdzhK8IzY"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-BI"
+  },
+  {
+   "key": "882",
+   "runs": [
+    882,
+    883
+   ],
+   "card": "[λ константой] → [λ 0.60 → 0.85 вместе с радиусом] рост λ по ходу раскладки верха",
+   "item": "PVTI_lAHOAENbFs4BslBdzhKu-tY",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhKu-tY",
+    "PVTI_lAHOAENbFs4BslBdzhK8Kh4"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhKu-tY"
+  },
+  {
+   "key": "884",
+   "runs": [
+    884,
+    885,
+    886,
+    887,
+    888,
+    889
+   ],
+   "card": "[наклон с ур. 3] → [наклон с ур. 2] наклон почерка в коде места с уровня 2",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8MgA",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8MgA",
+    "PVTI_lAHOAENbFs4BslBdzhK8O4U",
+    "PVTI_lAHOAENbFs4BslBdzhK8RT0",
+    "PVTI_lAHOAENbFs4BslBdzhK8Rf4",
+    "PVTI_lAHOAENbFs4BslBdzhK8UAY",
+    "PVTI_lAHOAENbFs4BslBdzhK8UKw"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8MgA"
+  },
+  {
+   "key": "890",
+   "runs": [
+    890,
+    891
+   ],
+   "card": "[1 бит места на круг выше ур. 0] → [2 бита] место весомее на верхних уровнях",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8Mpg",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8Mpg",
+    "PVTI_lAHOAENbFs4BslBdzhK8W8U"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8Mpg"
+  },
+  {
+   "key": "892",
+   "runs": [
+    892,
+    893,
+    894,
+    895,
+    896,
+    897,
+    898,
+    899,
+    900,
+    901
+   ],
+   "card": "[предел наклона 0.5] → [предел 0.75] наклон сильнее",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8Mkc",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8Mkc",
+    "PVTI_lAHOAENbFs4BslBdzhK8aN4",
+    "PVTI_lAHOAENbFs4BslBdzhK8ceM",
+    "PVTI_lAHOAENbFs4BslBdzhK8cpE",
+    "PVTI_lAHOAENbFs4BslBdzhK8eqc",
+    "PVTI_lAHOAENbFs4BslBdzhK8e0U",
+    "PVTI_lAHOAENbFs4BslBdzhK8hAA",
+    "PVTI_lAHOAENbFs4BslBdzhK8hLk",
+    "PVTI_lAHOAENbFs4BslBdzhK8jY4",
+    "PVTI_lAHOAENbFs4BslBdzhK8jkA"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8Mkc"
+  },
+  {
+   "key": "902",
+   "runs": [
+    902,
+    903
+   ],
+   "card": "[10, 3, 14] → [10, 5, 14] окна уровня 2 крупнее — перепроверка на новой опоре",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8MuE",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8MuE",
+    "PVTI_lAHOAENbFs4BslBdzhK8mO4"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8MuE"
+  },
+  {
+   "key": "904",
+   "runs": [
+    904,
+    905
+   ],
+   "card": "[σ 13] → [σ 12] σ чуть меньше — проверить оптимум с другой стороны",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8MyM",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8MyM",
+    "PVTI_lAHOAENbFs4BslBdzhK8n_E"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8MyM"
+  },
+  {
+   "key": "906",
+   "runs": [
+    906,
+    907,
+    908,
+    909,
+    910,
+    911
+   ],
+   "card": "[предел наклона 0.5] → [0.4] наклон мягче — проверка оси с другой стороны",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8rpY",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8rpY",
+    "PVTI_lAHOAENbFs4BslBdzhK8r2w",
+    "PVTI_lAHOAENbFs4BslBdzhK8uPo",
+    "PVTI_lAHOAENbFs4BslBdzhK8ufo",
+    "PVTI_lAHOAENbFs4BslBdzhK8wp8",
+    "PVTI_lAHOAENbFs4BslBdzhK8w2M"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8rpY"
+  },
+  {
+   "key": "912",
+   "runs": [
+    912,
+    913
+   ],
+   "card": "[перекрытие кругов места 0.52] → [0.6] соседние круги места делят больше бит",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8rkM",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8rkM",
+    "PVTI_lAHOAENbFs4BslBdzhK8zZM"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8rkM"
+  },
+  {
+   "key": "914",
+   "runs": [
+    914,
+    915
+   ],
+   "card": "[плотность кода окна 0.2] → [0.25] код окна плотнее",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8rek",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8rek",
+    "PVTI_lAHOAENbFs4BslBdzhK838I"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8rek"
+  },
+  {
+   "key": "916",
+   "runs": [
+    916,
+    917,
+    918,
+    919,
+    920,
+    921
+   ],
+   "card": "[самые узкие круги места — 16 по стороне] → [12] место терпимее к сдвигу части",
+   "item": "PVTI_lAHOAENbFs4BslBdzhK8rZk",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhK8rZk",
+    "PVTI_lAHOAENbFs4BslBdzhK86lw",
+    "PVTI_lAHOAENbFs4BslBdzhK8-zA",
+    "PVTI_lAHOAENbFs4BslBdzhK8_BM",
+    "PVTI_lAHOAENbFs4BslBdzhK9Fw0",
+    "PVTI_lAHOAENbFs4BslBdzhK9F_0"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhK8rZk"
+  },
+  {
+   "key": "922",
+   "runs": [
+    922,
+    923
+   ],
+   "card": "[слияние окон 0.9] → [0.95] слияние строже — перепроверка на нынешней опоре",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAeR0",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAeR0",
+    "PVTI_lAHOAENbFs4BslBdzhLAfHY"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAeR0"
+  },
+  {
+   "key": "924",
+   "runs": [
+    924,
+    925
+   ],
+   "card": "[перечисление с ур. 4] → [с ур. 3] в код окна все детали с уровня 3 — перепроверка",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAeMQ",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAeMQ",
+    "PVTI_lAHOAENbFs4BslBdzhLAhiw"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAeMQ"
+  },
+  {
+   "key": "926",
+   "runs": [
+    926,
+    927
+   ],
+   "card": "[перекрытие кругов места 0.52] → [0.56] перекрытие чуть больше — полшага от v6.3",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAeHs",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAeHs",
+    "PVTI_lAHOAENbFs4BslBdzhLAjeg"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAeHs"
+  },
+  {
+   "key": "928",
+   "runs": [
+    928,
+    929
+   ],
+   "card": "[5 уровней] → [6] ещё уровень наверху — перепроверка",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAeCk",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAeCk",
+    "PVTI_lAHOAENbFs4BslBdzhLAnTM"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAeCk"
+  },
+  {
+   "key": "930",
+   "runs": [
+    930,
+    931
+   ],
+   "card": "[место — смещение / радиус окна] → [место — смещение / размах цифры] шкала места по самой цифре на верхних уровнях",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAtYI",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAtYI",
+    "PVTI_lAHOAENbFs4BslBdzhLAvCU"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAtYI"
+  },
+  {
+   "key": "932",
+   "runs": [
+    932,
+    933
+   ],
+   "card": "[код детали — 13 сильнейших детекторов] → [+ бит предка каждого] к узкому детектору — бит его широкого предка",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAtRQ",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAtRQ",
+    "PVTI_lAHOAENbFs4BslBdzhLAxEY"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAtRQ"
+  },
+  {
+   "key": "934",
+   "runs": [
+    934,
+    935,
+    936,
+    937,
+    938,
+    939
+   ],
+   "card": "[победитель круга места — один сильнейший] → [+ второй, если не слабее на 10 %] допуск при выборе победителя круга",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAtNM",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAtNM",
+    "PVTI_lAHOAENbFs4BslBdzhLA2jQ",
+    "PVTI_lAHOAENbFs4BslBdzhLA49Y",
+    "PVTI_lAHOAENbFs4BslBdzhLA5IM",
+    "PVTI_lAHOAENbFs4BslBdzhLA7Po",
+    "PVTI_lAHOAENbFs4BslBdzhLA7YU"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAtNM"
+  },
+  {
+   "key": "940",
+   "runs": [
+    940,
+    941
+   ],
+   "card": "[один наклон s] → [OR кодов места трёх кадров s−δ, s, s+δ] допуск места вдоль наклона",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAtHg",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAtHg",
+    "PVTI_lAHOAENbFs4BslBdzhLA9bg"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAtHg"
+  },
+  {
+   "key": "942",
+   "runs": [
+    942,
+    943,
+    944,
+    945,
+    946,
+    947,
+    948,
+    949,
+    950,
+    951
+   ],
+   "card": "[допуск при выборе элемента круга 0.1] → [0.2] допуск при выборе элемента круга сильнее",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLA9tw",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLA9tw",
+    "PVTI_lAHOAENbFs4BslBdzhLA_cA",
+    "PVTI_lAHOAENbFs4BslBdzhLBBe8",
+    "PVTI_lAHOAENbFs4BslBdzhLBBq8",
+    "PVTI_lAHOAENbFs4BslBdzhLBDR4",
+    "PVTI_lAHOAENbFs4BslBdzhLBDdc",
+    "PVTI_lAHOAENbFs4BslBdzhLBFGI",
+    "PVTI_lAHOAENbFs4BslBdzhLBFRY",
+    "PVTI_lAHOAENbFs4BslBdzhLBHdg",
+    "PVTI_lAHOAENbFs4BslBdzhLBHpE"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLA9tw"
+  },
+  {
+   "key": "952",
+   "runs": [
+    952,
+    953
+   ],
+   "card": "[σ сильнейших без учёта слоя] → [квота σ по слоям (широких ≤ трети)] в коде детали всегда есть широкие слои",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLAs70",
+   "parent": "862",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLAs70",
+    "PVTI_lAHOAENbFs4BslBdzhLBPaU"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLAs70"
+  },
+  {
+   "key": "954",
+   "runs": [
+    954,
+    955
+   ],
+   "card": "[порог раскладки верха сглажен (η 10)] → [жёсткий порог (η ∞) на ур. 4–5] жёсткий порог λ в раскладке верха",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLBbY0",
+   "parent": "862",
+   "status": "run",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLBbY0",
+    "PVTI_lAHOAENbFs4BslBdzhLBcRQ"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLBbY0"
   }
  ],
  "tested": {

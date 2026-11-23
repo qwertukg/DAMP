@@ -100,6 +100,7 @@ class PositionBindingEncoder:
         name: str = "keyholes",
         concepts: int | None = None,
         place_bits: int = 1,
+        pooling_tie: float = 0.0,
         content_layers: int | None = None,
     ) -> None:
         if concepts is not None and int(concepts) < 1:
@@ -120,6 +121,12 @@ class PositionBindingEncoder:
             raise ValueError("max_length must be a power of two")
         self._place = place
         self._pooling = str(pooling)
+        # Допуск при выборе элемента круга (план v8.3, П.5 — способ пулинга открыт): > 0 — к выбранному элементу круга
+        # («strongest», «enumerate») добавляется лучший из остальных кандидатов его области, если его сила не меньше
+        # (1 − pooling_tie) от сильнейшего; малая разница сил почерков не меняет код круга целиком. 0 — как было.
+        if not 0.0 <= float(pooling_tie) < 1.0:
+            raise ValueError("pooling_tie must be in [0, 1)")
+        self._tie = float(pooling_tie)
         self._mask = str(mask)
         self._mask_bits = int(mask_bits)
         self._target = float(target_density)
@@ -304,6 +311,7 @@ class PositionBindingEncoder:
             # остальных отбрасываются целиком («отбрасывать … целые коды»); их биты места уже выставлены выше.
             keep = np.isin(entry, self._strongest_entries(source, entry, first))
             entry, detector, keyhole, pair = entry[keep], detector[keep], keyhole[keep], pair[keep]
+        candidates = (entry, detector, keyhole, pair)
         if self._pooling == "strongest":
             # Перечисление выбранных: из области детектора берётся один, самый сильный признак.
             order = np.lexsort((entry, -source["strength"][entry], pair))
@@ -313,6 +321,8 @@ class PositionBindingEncoder:
         elif self._pooling == "enumerate":
             pick = self._enumerate(entry, detector, keyhole, pair, source["strength"])
             entry, detector, keyhole, pair = entry[pick], detector[pick], keyhole[pick], pair[pick]
+        if self._tie > 0.0 and self._pooling in ("strongest", "enumerate") and source["strength"] is not None:
+            entry, detector, keyhole, pair = self._with_ties(candidates, (entry, detector, keyhole, pair), source["strength"])
         # Единичные биты кодов признаков, попавших в область детектора.
         rows, spot = self._expand(source["what_index"][entry], source["bit_starts"])
         bit = source["bit_flat"][spot]
@@ -325,6 +335,37 @@ class PositionBindingEncoder:
         else:
             pair = pair[rows]
         return place, pair, bit, active, stats
+
+    def _with_ties(self, candidates: tuple, chosen: tuple, strength: "np.ndarray") -> tuple:
+        """План v8.3: к выбранному элементу каждого круга (пары окно–круг) — лучший из остальных кандидатов области, если
+        его сила не меньше (1 − tie) от сильнейшего кандидата. Возвращает выбранные и добавленные вхождения."""
+        entry, detector, keyhole, pair = candidates
+        if entry.size == 0 or chosen[0].size == 0:
+            return chosen
+        level = strength[entry]
+        order = np.lexsort((entry, -level, pair))
+        e, d, k, p, lv = entry[order], detector[order], keyhole[order], pair[order], level[order]
+        head = np.ones(p.shape[0], dtype=bool)
+        head[1:] = p[1:] != p[:-1]
+        starts = np.flatnonzero(head)
+        ends = np.append(starts[1:], p.shape[0])
+        best = lv[starts]
+        # Выбранный элемент каждого круга: пары выбранных отсортированы так же, как кандидаты (по номеру пары).
+        c_entry, c_pair = chosen[0], chosen[3]
+        c_order = np.argsort(c_pair, kind="stable")
+        c_pair, c_entry = c_pair[c_order], c_entry[c_order]
+        at = np.searchsorted(c_pair, p[starts])
+        picked = np.where((at < c_pair.shape[0]) & (c_pair[np.minimum(at, c_pair.shape[0] - 1)] == p[starts]),
+                          c_entry[np.minimum(at, c_pair.shape[0] - 1)], -1)
+        # Лучший из остальных: первый кандидат круга, если его не взяли, иначе второй.
+        first_taken = e[starts] == picked
+        second = np.where(first_taken, starts + 1, starts)
+        valid = second < ends
+        second = np.minimum(second, p.shape[0] - 1)
+        add = valid & (e[second] != picked) & (lv[second] >= (1.0 - self._tie) * best)
+        rows = second[add]
+        return (np.concatenate([chosen[0], e[rows]]), np.concatenate([chosen[1], d[rows]]),
+                np.concatenate([chosen[2], k[rows]]), np.concatenate([chosen[3], p[rows]]))
 
     def _enumerate(self, entry: "np.ndarray", detector: "np.ndarray", keyhole: "np.ndarray", pair: "np.ndarray",
                    strength: "np.ndarray") -> "np.ndarray":

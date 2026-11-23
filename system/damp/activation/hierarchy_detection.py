@@ -97,8 +97,8 @@ class HierarchyDetection:
         centre = np.asarray([detector.center for detector in self.detectors], dtype=np.float64)
         radius = np.asarray([detector.radius for detector in self.detectors], dtype=np.float64)
         # Поле детектора — точки не дальше r_d от его центра (§6.5), как в ActivationEngine.
-        inside = np.hypot(cells[:, None, 0] - centre[None, :, 0], cells[:, None, 1] - centre[None, :, 1]) <= radius[None, :]
-        self._coverage = torch.as_tensor(inside.astype(np.float32), device=self._device)
+        coverage, covered = self._coverage_matrix(cells, centre, radius)
+        self._coverage = torch.as_tensor(coverage, device=self._device)
         # Энергия активации точки (расширение статьи): формула энергии точки §5.7, где вместо сходства с соседями —
         # их активация a_v, с нормировкой на наибольшую по карте для того же стимула (Ê = E / E_max, §5.7). Точка с
         # Ê_a ниже μ_a гаснет: одиночная зажжённая точка, вокруг которой ничего не горит, в детекторы не идёт. В §6.5
@@ -131,7 +131,7 @@ class HierarchyDetection:
                 "layers": len(thresholds),
                 "layer_thresholds": list(thresholds),
                 "detectors_per_layer": np.bincount(self.layer_index, minlength=len(thresholds)).tolist(),
-                "covered_points_mean": float(inside.sum(axis=0).mean()),
+                "covered_points_mean": float(covered.mean()),
                 "lambda_threshold": self._lambda,
                 "eta": 0.0 if self._eta is None else self._eta,
                 "energy_threshold": float(energy_threshold),
@@ -144,6 +144,30 @@ class HierarchyDetection:
                 "точка с энергией активации Ê_a < μ_a гаснет (§5.7 на матрице активации, расширение статьи; 0 — выключено)",
             },
         )
+
+    @staticmethod
+    def _coverage_matrix(cells: "np.ndarray", centre: "np.ndarray", radius: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Поля детекторов: матрица «точки × детекторы» float32 из 0/1 и число точек в поле каждого детектора.
+
+        Тот же признак hypot(cell − centre) ≤ r (float64, те же биты на границе), но без матрицы N × D float64:
+        для каждого детектора hypot считается только по точкам прямоугольника радиуса (hypot ≥ |dx|, поэтому вне
+        прямоугольника признак ложен; прямоугольник взят с запасом, лишние кандидаты отсеивает сам hypot)."""
+        count, detectors = int(cells.shape[0]), int(centre.shape[0])
+        order = np.argsort(cells[:, 0], kind="stable")
+        xs, ys = cells[order, 0], cells[order, 1]
+        transposed = np.zeros((detectors, count), dtype=np.float32)
+        covered = np.zeros(detectors, dtype=np.int64)
+        for number in range(detectors):
+            cx, cy, r = float(centre[number, 0]), float(centre[number, 1]), float(radius[number])
+            margin = 1e-9 * (1.0 + abs(cx) + abs(r))
+            low = int(np.searchsorted(xs, cx - r - margin, side="left"))
+            high = int(np.searchsorted(xs, cx + r + margin, side="right"))
+            if high <= low:
+                continue
+            inside = np.hypot(xs[low:high] - cx, ys[low:high] - cy) <= r
+            transposed[number, order[low:high][inside]] = 1.0
+            covered[number] = int(inside.sum())
+        return np.ascontiguousarray(transposed.T), covered
 
     def _to_device(self, packed: "np.ndarray"):  # noqa: ANN202
         bits = np.unpackbits(packed, axis=1, count=self._length)

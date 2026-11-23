@@ -72,7 +72,9 @@ def graphql(query: str, variables: dict | None = None) -> dict:
     if found.get("errors"):
         messages = "; ".join(error.get("message", "") for error in found["errors"])
         hint = " — нужен классический токен с областью project" if "personal access token" in messages else ""
-        sys.exit(f"GitHub: {messages}{hint}")
+        # Исключение, а не выход: разовая ошибка GitHub («Something went wrong…», 2026-11-23) роняла весь прогонщик —
+        # SystemExit не ловится его `except Exception`; теперь шаг ловит и повторяет.
+        raise RuntimeError(f"GitHub: {messages}{hint}")
     return found["data"]
 
 

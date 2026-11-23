@@ -9,6 +9,7 @@ import numpy as np
 
 from damp import settings
 from damp.activation import DbscanClusterer, Detector, DetectorHierarchyBuilder, DetectorLayerConfig
+from damp.activation.activation import quiet_detector_init
 from damp.activation.hierarchy_detection import HierarchyDetection
 from damp.encoding.bitarray import BitArray
 from damp.layout.code_dictionary import PairwiseSimilarity
@@ -173,7 +174,8 @@ class LevelDetectors:
             "width": int(layout.width), "height": int(layout.height), "energies": np.asarray(memory.energies, dtype=np.float64),
             "codes": memory.dictionary.packed,
         }
-        found = CACHE.run("activation.detectors", inputs, compute, modules=cls.MODULES)
+        found = CACHE.run("activation.detectors", inputs, compute, modules=cls.MODULES,
+                          ignore=("damp.activation.hierarchy_detection",))  # С3: срабатывание (.detection) детекторы не строит
         detectors = cls._unpack(found)
         return cls(layout, detectors, found["thresholds"], memory.energies, float(found["activation_lambda"]), name)
 
@@ -197,6 +199,11 @@ class LevelDetectors:
     @staticmethod
     def _unpack(found: dict[str, object]) -> list[Detector]:
         center, starts, ones = found["center"].tolist(), found["output_starts"], found["output_ones"]
+        with quiet_detector_init():
+            return LevelDetectors._unpack_rows(found, center, starts, ones)
+
+    @staticmethod
+    def _unpack_rows(found: dict[str, object], center: list, starts: "np.ndarray", ones: "np.ndarray") -> list[Detector]:
         return [
             Detector(
                 center=(float(center[i][0]), float(center[i][1])),

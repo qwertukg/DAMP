@@ -96,8 +96,35 @@ class KeyholeBuilder:
             "number": int(number), "train_pictures": self._groups.train_pictures,
             "atom_picture": atoms.picture, "atom_y": atoms.y, "atom_x": atoms.x,
         }
-        found = CACHE.run("cycle.keyholes", inputs, lambda: self._pack(self._build(elements, number)), modules=("damp.cycle.keyholes",))
+        found = CACHE.run("cycle.keyholes", inputs, lambda: self._pack(self._build(elements, number)), modules=("damp.cycle.keyholes",),
+                          level_settings=self.level_settings(number))
         return self._unpack(found)
+
+    @classmethod
+    def level_settings(cls, number: int) -> dict[str, object]:
+        """Настройки окон, действующие с уровня или заданные по уровням, — их действующее значение на уровне number.
+
+        Одно окно на картинку (LADDER_KEYHOLE_ONE_FROM), поправка места на наклон почерка (LADDER_PLACE_SHEAR_FROM,
+        LADDER_PLACE_SHEAR_LIMIT; 0.0 — выключена), соседей окна и нижний предел радиуса (списки по уровням). Построитель
+        окон (fields) берёт значения отсюда, и ровно они идут в ключ кеша окон уровня (С3): правка «с уровня k» не
+        сбрасывает окна уровней ниже k."""
+        one = 0 < int(settings.LADDER_KEYHOLE_ONE_FROM) <= int(number)
+        shear = float(settings.LADDER_PLACE_SHEAR_LIMIT) if 0 < int(settings.LADDER_PLACE_SHEAR_FROM) <= int(number) else 0.0
+        # План v8.1: шкала места по размаху цифры с уровня LADDER_PLACE_SCALE_FROM (0 — нет), множитель LADDER_PLACE_SCALE_K.
+        scale = float(settings.LADDER_PLACE_SCALE_K) if 0 < int(settings.LADDER_PLACE_SCALE_FROM) <= int(number) else 0.0
+        # План v8.4: кадры наклона — там, где действует наклон; 1 — выкл.
+        frames = int(settings.LADDER_PLACE_SHEAR_FRAMES) if shear > 0.0 else 1
+        return {
+            "LADDER_PLACE_SHEAR_FRAMES": frames,
+            "LADDER_PLACE_SHEAR_DELTA": float(settings.LADDER_PLACE_SHEAR_DELTA) if frames > 1 else 0.0,
+            "LADDER_PLACE_SCALE_FROM": None,
+            "LADDER_PLACE_SCALE_K": scale,
+            "LADDER_KEYHOLE_ONE_FROM": one,
+            "LADDER_PLACE_SHEAR_FROM": None,
+            "LADDER_PLACE_SHEAR_LIMIT": shear,
+            "LADDER_CLUSTER_MIN_POINTS": cls.min_points(number),
+            "LADDER_KEYHOLE_RADIUS_SHARE": cls.radius_share(number),
+        }
 
     @staticmethod
     def _pack(keyholes: LevelKeyholes) -> dict[str, object]:
@@ -150,13 +177,15 @@ class KeyholeBuilder:
     @classmethod
     def fields(cls, step: float, thresholds: "tuple[float, ...] | list[float]", name: str, number: int = 1) -> PlaneFieldBuilder:
         """Построитель окон уровня number по его мере плоскости step и порогам слоёв (§6.4.1–§6.4.3): окрестность
-        кластера, радиус активации и наименьший радиус окна заданы в мере «что видит одна деталь уровня»."""
+        кластера, радиус активации и наименьший радиус окна заданы в мере «что видит одна деталь уровня».
+        Настройки «с уровня» — действующие на уровне number (level_settings, они же в ключе кеша окон)."""
+        plan = cls.level_settings(number)
         return PlaneFieldBuilder(
             lambda_thresholds=thresholds,
             activation_radius=settings.LADDER_CLUSTER_ACTIVATION_RADIUS * step,
             eps=settings.LADDER_CLUSTER_EPS * step,
             min_samples=settings.LADDER_CLUSTER_MIN_SAMPLES,
-            min_points=cls.min_points(number),
+            min_points=int(plan["LADDER_CLUSTER_MIN_POINTS"]),
             radius_min=settings.LADDER_CLUSTER_RADIUS_MIN * step,
             energy_radius=settings.LADDER_CLUSTER_ENERGY_RADIUS * step,
             energy_threshold=settings.ACTIVATION_ENERGY_THRESHOLD,
@@ -164,13 +193,18 @@ class KeyholeBuilder:
             name=name,
             concepts=settings.LADDER_KEYHOLE_CONCEPTS,  # П.7: окно объединяет около 5–7 понятий
             # Нижний предел радиуса окна — доля того, что видит одна деталь уровня: от неё зависит рост поля за уровень.
-            radius_floor=cls.radius_share(number) * step,
+            radius_floor=float(plan["LADDER_KEYHOLE_RADIUS_SHARE"]) * step,
             # Картинка без окон не остаётся: деталей меньше, чем нужно кластеру, — окно видит её целиком (§6.6).
             whole_picture=settings.LADDER_KEYHOLE_WHOLE_PICTURE,
             # Б3 стратегии v3: с уровня LADDER_KEYHOLE_ONE_FROM — одно окно на картинку в середине её деталей (0 — нет).
-            one_window=0 < int(settings.LADDER_KEYHOLE_ONE_FROM) <= int(number),
+            one_window=bool(plan["LADDER_KEYHOLE_ONE_FROM"]),
             # План v4.13: место в окне — с поправкой на наклон почерка картинки с уровня LADDER_PLACE_SHEAR_FROM (0 — нет).
-            shear=float(settings.LADDER_PLACE_SHEAR_LIMIT) if 0 < int(settings.LADDER_PLACE_SHEAR_FROM) <= int(number) else 0.0,
+            shear=float(plan["LADDER_PLACE_SHEAR_LIMIT"]),
+            # План v8.1: место — в долях размаха цифры, а не радиуса окна (0 — как было).
+            place_scale=float(plan["LADDER_PLACE_SCALE_K"]),
+            # План v8.4: место ещё в кадрах наклона s ± δ (OR); 1 — как было.
+            shear_frames=int(plan["LADDER_PLACE_SHEAR_FRAMES"]),
+            shear_delta=float(plan["LADDER_PLACE_SHEAR_DELTA"]),
         )
 
     @staticmethod

@@ -15,6 +15,9 @@ import sys
 import time
 
 sys.path[:0] = [os.path.join(os.getcwd(), "client"), os.path.join(os.getcwd(), "system")]
+# Вывод стенда: события системы — не каждое в консоль (их тысячи, полный журнал — logs/damp.jsonl), а предупреждения и
+# раз в 30 с строка «жив» (по свежести .out прогонщик видит, что пара идёт). DAMP_LOG_CONSOLE=all — как раньше.
+os.environ.setdefault("DAMP_LOG_CONSOLE", "heartbeat")
 
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
@@ -497,13 +500,22 @@ def main() -> None:
     right = 0
     memory = {"agree": 0, "agree_right": 0, "mostly": 0, "mostly_right": 0, "split": 0, "split_right": 0, "unknown": 0}
     started = time.perf_counter()
-    for i in range(first, last):
-        picture = digits.picture(i)
-        sight = ladder.see(np.asarray(picture.image, dtype=np.uint8), log=False)
-        right += int(sight.digit == int(picture.digit))
-        memory[sight.verdict] += 1
-        if sight.verdict != "unknown":
-            memory[sight.verdict + "_right"] += int(sight.memory_digit == int(picture.digit))
+    # Штрихи проверочных — из набора картинок (digits), а не заново из пикселов: те же строки до бита (atom_sticks).
+    # Ответ — тот же, что у ladder.see: digit = answer, verdict = verdict.kind, memory_digit = verdict.digit.
+    from damp.cycle.trained import TrainedLadder as SystemLadder
+
+    atoms = digits._groups.atoms if digits is not None else None
+    pictures = [digits.picture(i) for i in range(first, last)]
+    # Пачкой по уровням (see_many, ускорение С2): ответ каждой картинки тот же до бита, что у see по одной.
+    with ladder._session.active():
+        sights = ladder._ladder.see_many([np.asarray(picture.image, dtype=np.uint8) for picture in pictures],
+                                         sticks=[SystemLadder.atom_sticks(atoms, i) for i in range(first, last)])
+    for picture, sight in zip(pictures, sights):
+        right += int(sight.answer == int(picture.digit))
+        kind = str(sight.verdict.kind)
+        memory[kind] += 1
+        if kind != "unknown":
+            memory[kind + "_right"] += int(sight.verdict.digit == int(picture.digit))
     accuracy = right / max(1, last - first)
     memory["right_share"] = round((memory["agree_right"] + memory["mostly_right"] + memory["split_right"]) / max(1, last - first), 3)
     memory["thresholds"] = [round(value, 3) for value in ladder.knowledge_thresholds]

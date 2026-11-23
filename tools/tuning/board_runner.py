@@ -353,7 +353,7 @@ def order_queue(project: dict) -> None:
     # автора сохраняется. Очередь берётся строго сверху (seed_launch, step). Прежняя сортировка по приоритету (#60, #66)
     # снята: эмодзи приоритета в заголовке — для глаз и для новых узлов дерева.
     _, moved = arrival_times(project, status)
-    for item in moved:
+    for item in reversed(moved):  # каждый подъём ставит карточку первой: снизу вверх — верхний из пришедших остаётся верхним
         try:
             B.graphql("""mutation($p: ID!, $i: ID!) { updateProjectV2ItemPosition(input: {projectId: $p, itemId: $i}) {
                 items(first: 1) { nodes { id } } } }""", {"p": project["id"], "i": item["id"]})
@@ -437,7 +437,9 @@ def plan_sync(project: dict) -> None:
     on_board = {m for item in project["items"]["nodes"]
                 for m in re.findall(r"<!-- план: (v\d+\.\d+) -->", (item.get("content") or {}).get("body") or "")}
     level = {emoji: lvl for lvl, emoji in PRIORITY_EMOJI.items()}
-    for row in rows:
+    # Каждая новая карточка встаёт наверх Очереди (move → to_top), а Очередь берётся сверху: новые строки — с конца
+    # таблицы, чтобы первая строка плана оказалась верхней и пошла первой (2026-11-23: v5.5 ⬇️ встала первой).
+    for row in reversed(rows):
         if row["number"] in seen or row["number"] in on_board:
             continue
         priority = level.get(row["priority"], 1)
@@ -684,21 +686,31 @@ def comment(item: dict, text: str, stdout=None) -> None:
 
 
 ARRIVALS = os.path.join(STAND, "arrivals.json")  # карточка → (колонка, когда в неё пришла): порядок «пришедшие — сверху»
+ARRIVALS_BURST = 5  # больше «пришедших» за шаг мимо move() — считать потерей записей, а не приходом
 
 
-def _arrivals() -> dict:
+def _arrivals() -> dict | None:
+    """Записи прихода; None — файла нет или он испорчен (тогда запомнить заново, ничего не поднимая)."""
     try:
         return json.load(open(ARRIVALS, encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return None
+
+
+def _save_arrivals(data: dict) -> None:
+    """Атомарно: прогонщик гасят принудительно, обрезанный файл давал «все карточки пришли» (2026-11-22)."""
+    temporary = f"{ARRIVALS}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as out:
+        json.dump(data, out, ensure_ascii=False)
+    os.replace(temporary, ARRIVALS)
 
 
 def to_top(project: dict, item: dict, column: str) -> None:
     """Автор 2026-11-22: «сделай, что задачи, когда в новую колонку переезжают, всегда сверху клались» — запомнить время
     прихода и сразу поставить карточку первой (в виде доски по колонкам первая в списке — верхняя в своей колонке)."""
-    data = _arrivals()
+    data = _arrivals() or {}
     data[item["id"]] = {"column": column, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    json.dump(data, open(ARRIVALS, "w", encoding="utf-8"), ensure_ascii=False)
+    _save_arrivals(data)
     try:
         B.graphql("""mutation($p: ID!, $i: ID!) { updateProjectV2ItemPosition(input: {projectId: $p, itemId: $i}) {
             items(first: 1) { nodes { id } } } }""", {"p": project["id"], "i": item["id"]})
@@ -710,7 +722,8 @@ def arrival_times(project: dict, status: str) -> tuple[dict, list[dict]]:
     """Когда каждая карточка пришла в свою нынешнюю колонку. Новая в записи — время смены поля Status (updatedAt), без
     него — создание карточки; колонка сменилась мимо move() (автор перетащил руками) — «сейчас»."""
     data, changed = _arrivals(), False
-    seeded = bool(data)  # первый запуск — только запомнить, ничего не поднимать
+    seeded = bool(data)  # первый запуск или испорченный файл — только запомнить, ничего не поднимать
+    data = data or {}
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     moved = []
     for item in project["items"]["nodes"]:
@@ -728,7 +741,11 @@ def arrival_times(project: dict, status: str) -> tuple[dict, list[dict]]:
             changed = True
             moved.append(item)
     if changed:
-        json.dump(data, open(ARRIVALS, "w", encoding="utf-8"), ensure_ascii=False)
+        _save_arrivals(data)
+    if len(moved) > ARRIVALS_BURST:
+        # Столько карточек сразу мимо move() автор не двигает: это потеря записей, а не приход — порядок доски не трогать.
+        say(f"порядок: {len(moved)} карточек «пришли» разом мимо move() — похоже на потерю записей, наверх не поднимаю")
+        moved = []
     return {key: value["at"] for key, value in data.items()}, moved
 
 
@@ -1156,6 +1173,7 @@ def tree_sync() -> None:
     site = re.sub(r"^https://github\.com", "", found["url"])
     links = {i["id"]: f"{site}/views/1?pane=issue&itemId={i['databaseId']}" for i in found["items"]["nodes"]}
     names = {i["id"]: re.sub(r" · зерно \d+$", "", TITLE_MARKS.sub("", (i.get("content") or {}).get("title") or "")) for i in project["items"]["nodes"]}
+    busy, written = pair_busy(), 0
     for item in project["items"]["nodes"]:
         content = item.get("content") or {}
         if content.get("__typename") not in CARD_TYPES:
@@ -1169,6 +1187,13 @@ def tree_sync() -> None:
         text = body + "\n\n### Дерево прогонов\n<pre>\n" + tree_text(tree, item["id"], rows, links, names) + "\n</pre>"
         if text != content.get("body"):
             save_card(content, body=text)
+            written += 1
+            # Дерево — во всех карточках, после решения переписывается десяток минут запросов к GitHub; пара за это время
+            # может кончиться (2026-11-22: 846/847 упали через 30 с, а заметили через 4 мин). Пара кончилась — остаток
+            # карточек в следующий раз (их текст всё равно будет отличаться), сначала решение и запуск.
+            if busy and written % 5 == 0 and not pair_busy():
+                say(f"дерево: пара кончилась — переписано {written} карточек, остальные — в следующий раз")
+                return
 
 
 def set_text(project: dict, item: dict, name: str, value: str) -> None:
@@ -1348,6 +1373,18 @@ def decide(state: dict, rows: dict) -> tuple[str, str | None]:
     становятся новой опорой. По модели: истинный +0.03 принимается в 67 % (v3.2 — 38 %), +0.02 — в 30 % (17 %), ложных 1 %."""
     base = json.load(open(os.path.join(HERE, "base_runs.json"), encoding="utf-8"))
     stage = state["stage"]
+    missing = [n for n in state["runs"].values() if int(n) not in rows]
+    if missing:
+        # Прогон без итога в журнале стенда (упавший, дубль карточки) — не основание ронять шаг (2026-11-22: KeyError(847)).
+        say(f"решение без прогонов {sorted(int(n) for n in missing)}: их итога нет в журнале стенда")
+        state["runs"] = {s: n for s, n in state["runs"].items() if int(n) in rows}
+    # Настройка не действует (2026-11-22: v4.9 торможение 1.0 → 1.5 дало на зёрнах 1/3 тот же результат до бита, что
+    # опора): все прогоны правки совпали с опорой на тех же зёрнах по М1u цифр, точкам и сходимости — закрыть сразу.
+    paired = [(rows[int(n)], rows[int(base[str(s)])]) for s, n in state["runs"].items()
+              if str(s) in base and int(base[str(s)]) in rows and int(n) in rows]
+    if paired and all(a.get(key) == b.get(key) for a, b in paired for key in ("m1_digits_mean", "points", "honest")):
+        return "bad", (f"этап {stage} ({len(paired)} зёрен): настройка не действует — все прогоны совпали с опорой на тех же "
+                       f"зёрнах до бита (М1u по цифрам, точки карт, сходимость) [правило {RULE}]")
     if stage not in CHECKPOINTS:
         hopeless = futility(state, rows, base)
         return ("bad", hopeless) if hopeless else ("next", None)
@@ -1481,7 +1518,9 @@ def new_card(project: dict, item: dict, spec: dict, spec_text: str, state: dict,
     body = compose(meta, json.dumps(spec, ensure_ascii=False), state, [], "", "")
     created = B.graphql("""mutation($p: ID!, $t: String!, $b: String) {
         addProjectV2DraftIssue(input: {projectId: $p, title: $t, body: $b}) { projectItem { id } } }""",
-                        {"p": project["id"], "t": f"{title_core(meta)} · зерно {state['seed']}", "b": body})
+                        # Приоритет — с создания, первым (автор 2026-11-23: «в карточке ВСЕГДА должен быть приоритет!!!»).
+                        {"p": project["id"], "t": f"{PRIORITY_EMOJI[item_priority(item)]} {title_core(meta)} · зерно {state['seed']}",
+                         "b": body})
     found = to_issue(created["addProjectV2DraftIssue"]["projectItem"]["id"])
     move(project, found, column, f"карточка зерна {state['seed']}, этап {state['stage']} правки «{card_name(item['content']['title'])}»")
     return found
@@ -1636,17 +1675,17 @@ def seed_launch(project: dict, items: list[dict], rows: dict) -> str | None:
     numbers.append(numbers[0] + 1)
     for (card, card_st), number in zip(cards, numbers):
         card_st.update({"run": number, "status": "running", "await": False})
+    # План ускорения П1 (docs/SPEEDUP.md): пара стартует сразу, карточки пишутся уже во время её счёта.
+    launch(numbers, [int(s["seed"]) for _, s in cards], spec.get("changes", {}), spec.get("label", item["content"]["title"]))
+    for (card, card_st), number in zip(cards, numbers):
         write_seed_card(card, card_st, rows, project)
         move(project, card, RUN, f"запущен прогон {tag(PLAN, [number])}: зерно {card_st['seed']}, этап {card_st['stage']} — "
                                  f"{spec.get('label', '')}; ~8 мин")
-    launch(numbers, [int(s["seed"]) for _, s in cards], spec.get("changes", {}), spec.get("label", item["content"]["title"]))
     return f"взята — {card_name(item['content']['title'])} (зёрна {[int(s['seed']) for _, s in cards]}, прогоны {numbers})"
 
 
-def step() -> str:
-    project = B.board()
-    rows = log_rows()
-    items = project["items"]["nodes"]
+def housekeeping(project: dict) -> None:
+    """Учёт доски, не нужный для решения и запуска пары: комментарии, план, версия плана, карты, порядок и поля."""
     try:
         check_comments(project)
     except Exception as error:  # noqa: BLE001
@@ -1664,9 +1703,30 @@ def step() -> str:
     except Exception as error:  # noqa: BLE001
         say(f"карты не досланы: {error!r}")
     try:
-        order_queue(project)  # автор мог переставить «Приоритет» на плитке — колонка снова по приоритету
+        order_queue(project)  # пришедшие карточки — наверх, поля «Версия» и «Прогоны»
     except Exception as error:  # noqa: BLE001
         say(f"порядок очереди не обновлён: {error!r}")
+
+
+def step() -> str:
+    """Шаг прогонщика. План ускорения П1 (docs/SPEEDUP.md, 2026-11-22): сначала решение по законченной паре и сразу запуск
+    следующей (доска перечитывается один раз — чтобы увидеть карточку следующего этапа), учёт доски — после запуска."""
+    project = B.board()
+    rows = log_rows()
+    items = project["items"]["nodes"]
+    try:
+        status = pair_step(project, items, rows)
+        if status == "итог" and not pair_busy():
+            project = B.board()
+            relaunched = launch_step(project, project["items"]["nodes"], log_rows())
+            status = f"итог; {relaunched}" if relaunched else status
+    finally:
+        housekeeping(project)
+    return status
+
+
+def pair_step(project: dict, items: list[dict], rows: dict) -> str:
+    """Законченная пара — решение; иначе — запуск следующей карточки, если стенд свободен."""
     # 1. Карточка в работе (есть «состояние» с незаконченной парой) — дождаться пары и решить.
     waiting = ""
     for item in items:
@@ -1738,7 +1798,11 @@ def step() -> str:
     waiting = waiting or found
     if waiting:
         return waiting
-    # 2. Новая карточка: первая сверху в очереди, без метки, с блоком «прогон».
+    return launch_step(project, items, rows) or "очередь пуста"
+
+
+def launch_step(project: dict, items: list[dict], rows: dict) -> str | None:
+    """2. Новая карточка: первая сверху в очереди, без метки, с блоком «прогон»; None — запускать нечего."""
     if pair_busy():
         return "стенд занят чужой парой"
     status = B.status_field(project)["name"]
@@ -1764,41 +1828,58 @@ def step() -> str:
             spec = json.loads(spec_found.group(1))
             state["runs"].update({str(s): n for s, n in zip(seeds, numbers)})
             state["pending"], state["await"] = numbers, False
+            launch(numbers, seeds, spec.get("changes", {}), spec.get("label", content["title"]))  # П1: сначала запуск
             write_body(item, state, rows, project)
             move(project, item, RUN)
-            launch(numbers, seeds, spec.get("changes", {}), spec.get("label", content["title"]))
             return f"этап {state['stage']} — {content['title']}"
         continue  # свежие правки — по новой схеме «зерно = карточка» (seed_launch)
-    launched = seed_launch(project, items, rows)
-    if launched:
-        return launched
-    return "очередь пуста"
+    return seed_launch(project, items, rows)
 
 
 def main() -> None:
     once = "--once" in sys.argv
     say("прогонщик запущен")
     last = None
-    try:
-        tree_sync()
-    except Exception as error:  # noqa: BLE001
-        say(f"дерево не обновлено: {error!r}")
+    first = True  # дерево — после первого шага, не до него: сначала решение по законченной паре и запуск (2026-11-22)
     while True:
+        started = time.time()
         try:
             status = step()
         except Exception as error:  # noqa: BLE001  сеть / GitHub — повторить позже
             status = f"ошибка шага: {error!r}"
-        if status != last:
+        changed = status != last
+        if changed:
             say(status)
             last = status
-        if status.startswith(("взята", "этап", "итог", "пауза", "ошибка", "прогонщик")) or status == "итог":
+        if status == "итог":
+            # Решение без запуска (Очередь была пуста, а учёт доски мог завести карточки) — сразу шаг запуска; дерево —
+            # после запуска или при пустой Очереди (2026-11-22: стенд стоял 5 мин, пока переписывалось дерево).
+            time.sleep(3)
+            continue
+        if first or status.startswith(("взята", "этап", "итог", "пауза", "ошибка", "прогонщик")) or (status == "очередь пуста" and changed):
+            first = False
             try:
                 tree_sync()
             except Exception as error:  # noqa: BLE001
                 say(f"дерево не обновлено: {error!r}")
         if once:
             return
-        time.sleep(3 if status in ("итог", "ошибка") else 60)  # раз в минуту: и пары, и комментарии автора
+        if status in ("итог", "ошибка"):
+            time.sleep(3)
+            continue
+        # Пара кончилась, пока шёл шаг или дерево (2026-11-22: 854/855 ждали решения полторы минуты) — сразу новый шаг.
+        done = os.path.join(STAND, "tune_pair.done")
+        if os.path.exists(done) and os.path.getmtime(done) > started:
+            time.sleep(3)
+            continue
+        # П1: пока идёт пара — локальная проверка её конца раз в 5 с; полный шаг (доска, комментарии) — раз в минуту.
+        waited = 0
+        busy = pair_busy()
+        while waited < 60:
+            time.sleep(5)
+            waited += 5
+            if busy and not pair_busy():
+                break
 
 
 if __name__ == "__main__":

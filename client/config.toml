@@ -325,6 +325,27 @@ ACTIVATION_DETECTOR_BIT_GRIDS = 2  # [РАСШИРЕНИЕ]
 # от центра окна сдвигается на наклон картинки: dx′ = dx − s·dy, s = cov(y, x) / var(y) по её элементам, |s| ≤ LIMIT.
 LADDER_PLACE_SHEAR_FROM = 0  # [РАСШИРЕНИЕ]
 LADDER_PLACE_SHEAR_LIMIT = 0.5  # [РАСШИРЕНИЕ]
+# Шкала места по самой цифре (план v8.1): с уровня LADDER_PLACE_SCALE_FROM (0 — нет) смещение элемента в окне делится не на
+# радиус окна, а на LADDER_PLACE_SCALE_K · √(var y + var x) по элементам картинки (меньшее из двух), с прижатием к плоскости
+# мест. Окна верха в 3–6 раз шире цифры: без этого все части цифры попадают в 1–2 шага сетки места (замер 2026-11-23).
+# Допуск места вдоль наклона (план v8.4): LADDER_PLACE_SHEAR_FRAMES кадров наклона s, s ± δ, … (1 — нет) там, где действует
+# наклон; элемент окна вносит место и содержание во все круги своих мест (OR). δ — LADDER_PLACE_SHEAR_DELTA.
+LADDER_PLACE_SHEAR_FRAMES = 1  # [РАСШИРЕНИЕ]
+LADDER_PLACE_SHEAR_DELTA = 0.15  # [РАСШИРЕНИЕ]
+LADDER_PLACE_SCALE_FROM = 0  # [РАСШИРЕНИЕ]
+LADDER_PLACE_SCALE_K = 2.0  # [РАСШИРЕНИЕ]
+# Предки детекторов в коде детали (план v8.2): с уровня LADDER_EMBEDDING_ANCESTORS_FROM (0 — нет) к каждому из σ сильнейших
+# детекторов добавляется его предок — детектор на слой шире, в круг которого попадает его центр (LADDER_EMBEDDING_ANCESTORS
+# слоёв вверх), со своим случайным битом. Разные почерки зажигают соседние узкие детекторы — общий бит предка.
+LADDER_EMBEDDING_ANCESTORS_FROM = 0  # [РАСШИРЕНИЕ]
+LADDER_EMBEDDING_ANCESTORS = 1  # [РАСШИРЕНИЕ]
+# Квота σ по слоям (план v8.6): с уровня LADDER_EMBEDDING_LAYER_QUOTA_FROM (0 — нет) в коде детали сначала не больше ⌈σ / слоёв⌉
+# сильнейших детекторов каждого слоя, остаток σ — по силе. Широкие слои всегда представлены, узкие не вытесняются.
+LADDER_EMBEDDING_LAYER_QUOTA_FROM = 0  # [РАСШИРЕНИЕ]
+# Допуск при выборе элемента круга места (план v8.3, П.5): с уровня LADDER_BINDING_POOLING_TIE_FROM (0 — нет) в круг идёт и
+# лучший из остальных элементов его области, если его сила не меньше (1 − LADDER_BINDING_POOLING_TIE) от сильнейшего.
+LADDER_BINDING_POOLING_TIE_FROM = 0  # [РАСШИРЕНИЕ]
+LADDER_BINDING_POOLING_TIE = 0.1  # [РАСШИРЕНИЕ]
 # Границы длины кода детали, бит.
 LADDER_CODE_LENGTH_MIN = 64  # [РАСШИРЕНИЕ]
 LADDER_CODE_LENGTH_MAX = 8192  # [РАСШИРЕНИЕ]
@@ -993,7 +1014,7 @@ LOG_INTERVAL_LAYOUT_SHORT_SAMPLING = 500  # [РАСШИРЕНИЕ]
 LOG_INTERVAL_LAYOUT_SHORT_TILES = 50  # [РАСШИРЕНИЕ]
 LOG_INTERVAL_LAYOUT_EXPORT = 1  # [РАСШИРЕНИЕ]
 LOG_INTERVAL_LAYOUT_ENERGY_PROGRESS = 1  # [РАСШИРЕНИЕ]
-LOG_INTERVAL_ACTIVATION_INIT = 1  # [РАСШИРЕНИЕ]
+LOG_INTERVAL_ACTIVATION_INIT = 100  # [РАСШИРЕНИЕ]
 LOG_INTERVAL_ACTIVATION_MAP = 100  # [РАСШИРЕНИЕ]
 LOG_INTERVAL_ACTIVATION_DETECTOR_LEVEL = 10000  # [РАСШИРЕНИЕ]
 LOG_INTERVAL_ACTIVATION_DETECTOR_ACTIVE = 10000  # [РАСШИРЕНИЕ]

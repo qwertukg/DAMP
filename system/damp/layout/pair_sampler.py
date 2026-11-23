@@ -124,6 +124,30 @@ def _long_pairs_py(rng, pos, count, radius, height, width):
     return pairs
 
 
+def _long_pairs_weighted_py(rng, pos, cdf, count, radius, height, width):
+    """Пары дальней фазы с весами −ln Ê (§5.9.3): первая точка — по накопленной сумме весов cdf, вторая — рядом.
+
+    Те же запросы к генератору, что у выборки numpy: random(count), затем попытки второй ячейки.
+    """
+    draws = rng.random(count) * cdf[cdf.size - 1]
+    first = np.searchsorted(cdf, draws, side="right")
+    y1 = np.empty(count, dtype=np.int64)
+    x1 = np.empty(count, dtype=np.int64)
+    last = pos.shape[0] - 1
+    for index in range(count):
+        point = min(first[index], last)
+        y1[index] = pos[point, 0]
+        x1[index] = pos[point, 1]
+    y2, x2 = _nearby(rng, y1, x1, radius, 0, height - 1, 0, width - 1, height, width)
+    pairs = np.empty((count, 4), dtype=np.int64)
+    for index in range(count):
+        pairs[index, 0] = y1[index]
+        pairs[index, 1] = x1[index]
+        pairs[index, 2] = y2[index]
+        pairs[index, 3] = x2[index]
+    return pairs
+
+
 def _pair_similarity_py(packed, ones, cosine, point, second):
     """sim(a, b) пары точек без порога (§2.2.4) — те же операции float64, что у выборки numpy."""
     if point == second:
@@ -343,6 +367,7 @@ if numba is not None:
     _pair_similarity = numba.njit(cache=True, inline="always")(_pair_similarity_py)
     _nearby = numba.njit(cache=True)(_nearby_py)
     _long_pairs = numba.njit(cache=True)(_long_pairs_py)
+    _long_pairs_weighted = numba.njit(cache=True)(_long_pairs_weighted_py)
     _weighted_pick = numba.njit(cache=True, inline="always")(_weighted_pick_py)
     _tile_groups = numba.njit(cache=True)(_tile_groups_py)
     _short_tile_pairs = numba.njit(cache=True)(_short_tile_pairs_py)
@@ -353,6 +378,7 @@ else:  # pragma: no cover - без numba класс CompiledPairSampler не с�
     _pair_similarity = _pair_similarity_py
     _nearby = _nearby_py
     _long_pairs = _long_pairs_py
+    _long_pairs_weighted = _long_pairs_weighted_py
     _weighted_pick = _weighted_pick_py
     _tile_groups = _tile_groups_py
     _short_tile_pairs = _short_tile_pairs_py
@@ -422,6 +448,15 @@ class CompiledPairSampler:
     ) -> "np.ndarray":
         """Пары дальней фазы (§5.3): массив count × 4 (y1, x1, y2, x2)."""
         return _long_pairs(rng, pos, int(count), -1 if radius is None else int(radius), self._height, self._width)
+
+    def long_pairs_weighted(
+        self, rng: "np.random.Generator", pos: "np.ndarray", cdf: "np.ndarray", count: int, radius: int | None
+    ) -> "np.ndarray":
+        """Пары дальней фазы, первая точка по весам −ln Ê (§5.9.3; cdf — их накопленная сумма): count × 4."""
+        return _long_pairs_weighted(
+            rng, pos, np.ascontiguousarray(cdf, dtype=np.float64), int(count),
+            -1 if radius is None else int(radius), self._height, self._width,
+        )
 
     @staticmethod
     def tile_groups(

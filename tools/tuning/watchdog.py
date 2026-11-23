@@ -60,8 +60,14 @@ def main() -> None:
             if missing >= 2:
                 missing = 0
                 say("ПРОГОНЩИК УПАЛ — поднимаю tools/start.ps1")
-                subprocess.run(["pwsh", "-NoProfile", "-File", os.path.join(ROOT, "tools", "start.ps1")], cwd=ROOT,
-                               capture_output=True, timeout=300)
+                # Напрямую, не start.ps1: тот минуты две проверяет туннель GLM (2026-11-23).
+                python = sys.executable.replace("pythonw", "python")
+                proc = subprocess.Popen([python, "-X", "utf8", os.path.join("tools", "tuning", "board_runner.py")], cwd=ROOT,
+                                        stdout=open(os.path.join(STAND, "board_runner.out"), "w"),
+                                        stderr=open(os.path.join(STAND, "board_runner.err"), "w"),
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                open(PID, "w", encoding="ascii").write(str(proc.pid))
+                time.sleep(10)
                 say("ПРОГОНЩИК ПОДНЯТ" if any("board_runner.py" in c for _, c in processes()) else "ПРОГОНЩИК НЕ ПОДНЯЛСЯ")
             tail = last_line()
             if "очередь пуста" in tail and not empty_said:

@@ -49,6 +49,11 @@ class MemoryMap:
     """
 
     MODULES = ("damp.layout.level_memory", "damp.layout.far_force", "damp.layout.rescue")  # far_force: α смешанного ядра (Р2), rescue: v4.15 — в ключ кеша
+    # Модули из импортов шага, которые на карту не влияют, — в ключ кеша не входят (С3, docs/SPEEDUP.md): раскраска точек
+    # в псевдоцвета (§5.14, encoding.mnist_codes — она тянет кодер угла и разбор картинок) идёт только в рисунки карты
+    # (Layout._colors_array: журнал, render_*), мерка качества карты (decode.map_quality) считается после шага и в его
+    # выход не входит. Сверка: CACHE_VERIFY_SHARE пересчитывает долю попаданий и сравнивает бит в бит.
+    IGNORED_MODULES = ("damp.encoding.mnist_codes", "damp.decode.map_quality")
 
     def __init__(self) -> None:
         self._colorizer = None
@@ -111,6 +116,31 @@ class MemoryMap:
             start_radius_factor=settings.LAYOUT_ADAPTIVE_RADIUS_START_FACTOR,
         )
 
+    @staticmethod
+    def level(name: str) -> int:
+        """Номер уровня по имени карты («level3» → 3); у других карт (первичная, перекладки стенда) — 0."""
+        return int(name[5:]) if name.startswith("level") and name[5:].isdigit() else 0
+
+    @staticmethod
+    def level_settings(level: int) -> dict[str, object]:
+        """Настройки раскладки, действующие с уровня, — их действующее значение на уровне level (вне статьи).
+
+        Р5 «лучшая из K»: LADDER_LAYOUT_BEST_OF раскладок с уровня LADDER_LAYOUT_BEST_OF_FROM (1 — одна раскладка);
+        v4.15 «лучший ответ»: LADDER_LAYOUT_RESCUE_PASSES проходов с уровня LADDER_LAYOUT_RESCUE_FROM (0 — выключен; доля
+        и σ — только при включённом). Счёт (lay_out, _rescue) берёт значения отсюда, и ровно они идут в ключ кеша карты
+        уровня (С3): правка «с уровня 3» не сбрасывает карты уровней 1–2, у которых действующее значение то же."""
+        tries = int(settings.LADDER_LAYOUT_BEST_OF) if 0 < int(settings.LADDER_LAYOUT_BEST_OF_FROM) <= int(level) else 1
+        passes = int(settings.LADDER_LAYOUT_RESCUE_PASSES)
+        rescue = passes > 0 and int(level) >= int(settings.LADDER_LAYOUT_RESCUE_FROM)
+        return {
+            "LADDER_LAYOUT_BEST_OF": tries if tries > 1 else 1,
+            "LADDER_LAYOUT_BEST_OF_FROM": None,
+            "LADDER_LAYOUT_RESCUE_PASSES": passes if rescue else 0,
+            "LADDER_LAYOUT_RESCUE_FROM": None,
+            "LADDER_LAYOUT_RESCUE_SHARE": float(settings.LADDER_LAYOUT_RESCUE_SHARE) if rescue else None,
+            "LADDER_LAYOUT_RESCUE_SIGMA": float(settings.LADDER_LAYOUT_RESCUE_SIGMA) if rescue else None,
+        }
+
     def lay_out(self, bits: "np.ndarray", labels: "np.ndarray", name: str) -> Layout:
         """Раскладка кодов тем же Layout и с той же настройкой, что первая; цвет точки — класс цифры.
 
@@ -119,8 +149,8 @@ class MemoryMap:
         φ = Σ s·d по парам с s ≥ λ (§5.5.1: «penalises strongly correlated points that are distant») — без меток цифр."""
         table = self._table(bits, labels)
         params, schedule = self._tuner().tune(table.count), self.lambda_schedule(bits, name)
-        level = int(name[5:]) if name.startswith("level") and name[5:].isdigit() else 0
-        tries = int(settings.LADDER_LAYOUT_BEST_OF) if 0 < int(settings.LADDER_LAYOUT_BEST_OF_FROM) <= level else 1
+        level = self.level(name)
+        tries = int(self.level_settings(level)["LADDER_LAYOUT_BEST_OF"])
         if tries <= 1:
             return self._rescue(table, _layout_from_codes(table, params, self.colorizer, lambda_schedule=schedule), name, level)
         best, best_energy, energies = None, None, []
@@ -145,16 +175,18 @@ class MemoryMap:
         """План v4.15: с уровня LADDER_LAYOUT_RESCUE_FROM — LADDER_LAYOUT_RESCUE_PASSES проходов «лучший ответ»
         (system/damp/layout/rescue.py): заблудшие точки (доля LADDER_LAYOUT_RESCUE_SHARE с наибольшим разрывом между
         лучшей ячейкой и своей) меняются местами с жителем лучшей ячейки, если растёт энергия Σ (s − λ)·g(d), g — гаусс
-        с σ = LADDER_LAYOUT_RESCUE_SIGMA (масштаб кластера). 0 проходов — выкл., раскладка бит в бит прежняя."""
-        passes = int(settings.LADDER_LAYOUT_RESCUE_PASSES)
-        if passes <= 0 or level < int(settings.LADDER_LAYOUT_RESCUE_FROM):
+        с σ = LADDER_LAYOUT_RESCUE_SIGMA (масштаб кластера). 0 проходов — выкл., раскладка бит в бит прежняя.
+        Действующие на уровне значения — level_settings (они же в ключе кеша карты)."""
+        plan = MemoryMap.level_settings(level)
+        passes = int(plan["LADDER_LAYOUT_RESCUE_PASSES"])
+        if passes <= 0:
             return layout
         from damp.layout.rescue import rescue_cells
 
         cells, report = rescue_cells(table.bits(), layout.cells_array(), int(layout.height), int(layout.width),
                                      float(layout.lambda_threshold), passes=passes,
-                                     share=float(settings.LADDER_LAYOUT_RESCUE_SHARE),
-                                     sigma=float(settings.LADDER_LAYOUT_RESCUE_SIGMA))
+                                     share=float(plan["LADDER_LAYOUT_RESCUE_SHARE"]),
+                                     sigma=float(plan["LADDER_LAYOUT_RESCUE_SIGMA"]))
         layout.place_cells(cells, log=False)
         LOGGER.event("layout.rescue", section=OUTSIDE_ARTICLE,
                      data={"name": name, "points": int(cells.shape[0]), "passes": report,
@@ -227,7 +259,8 @@ class MemoryMap:
             }
 
         found = CACHE.run("layout.memory", {"codes": dictionary.packed, "code_length": dictionary.code_length, "labels": labels},
-                          compute, modules=self.MODULES)
+                          compute, modules=self.MODULES, ignore=self.IGNORED_MODULES,
+                          level_settings=self.level_settings(self.level(name)))
         layout = computed.get("layout")
         if layout is None:
             layout = self.restore(bits, labels, found["cells"], int(found["width"]), float(found["lambda"]), found["pair_radius"])

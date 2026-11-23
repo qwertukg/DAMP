@@ -78,7 +78,21 @@ class PlaneFieldBuilder:
         whole_picture: bool = False,
         one_window: bool = False,
         shear: float = 0.0,
+        place_scale: float = 0.0,
+        shear_frames: int = 1,
+        shear_delta: float = 0.0,
     ) -> None:
+        # Допуск места вдоль наклона (план v8.4, §7.1.4 — несколько разбиений сразу, П.5): > 1 — место элемента ещё в
+        # кадрах наклона s ± k·shear_delta (k = 1…(frames−1)/2); элемент окна вносит место и содержание во все круги своих
+        # мест (OR). Допуск только по помеховой оси наклона, x и y остаются точными. 1 — как было.
+        self._frames = max(1, int(shear_frames))
+        self._delta = float(shear_delta)
+        # Шкала места по самой цифре (план v8.1, вне статьи; замер 2026-11-23 по кешу: на ур. 4 / 5 / 6 смещения частей —
+        # медиана 0.25 / 0.125 / 0.125 радиуса окна, всего 80 / 22 / 9 мест на уровень против ~270 на ур. 1–3 — окно в 3–6
+        # раз шире цифры, место схлопывается в 1–2 шага сетки, код окна верха — «мешок частей»). > 0 — смещение делится
+        # не на радиус окна, а на place_scale·√(var y + var x) по элементам картинки (меньшее из двух), обе координаты
+        # прижимаются к плоскости мест; 0 — как было. П.3–П.6: расположение частей цифры.
+        self._place_scale = float(place_scale)
         # Наклон почерка (план v4.13, вне статьи; классика MNIST): > 0 — место элемента в окне считается после сдвига
         # dx′ = dx − s·dy, s = cov(y, x) / var(y) по элементам картинки, |s| ≤ shear. Наклонённая и прямая двойка
         # получают одно и то же место частей. 0 — как было.
@@ -379,6 +393,11 @@ class PlaneFieldBuilder:
                 if spread > 0.0:
                     slant = float(np.clip(np.mean((own[:, 0] - own[:, 0].mean()) * (own[:, 1] - own[:, 1].mean())) / spread,
                                           -self._shear, self._shear))
+            digit_scale = None
+            if self._place_scale > 0.0 and own.shape[0] > 1:
+                spread = float(np.sqrt(np.var(own[:, 0]) + np.var(own[:, 1])))
+                if spread > 0.0:
+                    digit_scale = self._place_scale * spread
             for centre_y, centre_x, radius, inside in self.picture_fields(own, table[index[first:last]]):
                 reach = np.hypot(own[:, 0] - centre_y, own[:, 1] - centre_x)
                 rows = np.flatnonzero(reach <= radius + self.ROUNDING)
@@ -386,10 +405,24 @@ class PlaneFieldBuilder:
                 members.append(rows + first)
                 # Место элемента — смещение от центра поля в долях его радиуса: поле любого размера кодируется
                 # одними и теми же детекторами места.
-                shift = (own[rows] - (centre_y, centre_x)) / radius
-                if slant:
-                    shift[:, 1] -= slant * shift[:, 0]
-                shifts.append(shift)
+                scale = radius if digit_scale is None else min(radius, digit_scale)
+                base = (own[rows] - (centre_y, centre_x)) / scale
+                if digit_scale is not None:
+                    base = np.clip(base, -1.0, 1.0)
+                slants = [slant]
+                if self._frames > 1 and self._shear > 0.0 and self._delta > 0.0:
+                    for k in range(1, (self._frames - 1) // 2 + 1):
+                        slants += [slant - k * self._delta, slant + k * self._delta]
+                for number_frame, frame in enumerate(slants):
+                    shift = base.copy()
+                    if frame:
+                        # Сдвиг на s·dy выводит место за плоскость мест (|dx′| до 1.5 радиуса при |s| ≤ 0.5): прижать к
+                        # краю плоскости, как и любое место элемента в поле (|смещение| ≤ 1 радиуса). 846/847 падали здесь.
+                        shift[:, 1] = np.clip(shift[:, 1] - frame * shift[:, 0], -1.0, 1.0)
+                    if number_frame:  # лишние кадры (v8.4): те же элементы окна ещё раз, со своим местом
+                        owner.append(np.full(rows.size, len(radii), dtype=np.int64))
+                        members.append(rows + first)
+                    shifts.append(shift)
                 covered[rows + first] = True
                 field_picture.append(int(number))
                 centres.append((centre_y, centre_x))

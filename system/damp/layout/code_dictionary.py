@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -133,6 +134,8 @@ class LeaderDictionary:
 class PairwiseSimilarity:
     """Квантили попарных сходств кодов (§2.2.4): по ним задаётся порог λ раскладки этих кодов (§7.1.7)."""
 
+    _MEMO: dict[tuple, tuple[list[float], int, float]] = {}  # на процесс: (значения, строк выборки, среднее)
+
     def __init__(self, *, sample: int = 2000, seed: int = 0) -> None:
         self._sample = int(sample)
         self._seed = int(seed)
@@ -142,21 +145,41 @@ class PairwiseSimilarity:
         bits = np.asarray(bits)
         if bits.shape[0] < 2:
             raise ValueError("at least two codes are required")
-        rng = np.random.default_rng(self._seed)
-        rows = rng.choice(bits.shape[0], size=min(self._sample, bits.shape[0]), replace=False)
-        sample = bits[np.sort(rows)].astype(np.float32)
-        ones = sample.sum(axis=1)
-        cosine = (sample @ sample.T) / np.sqrt(np.maximum(ones[:, None] * ones[None, :], 1.0))
-        pairs = cosine[np.triu_indices(sample.shape[0], k=1)]
-        values = [float(np.quantile(pairs, q)) for q in quantiles]
+        quantiles = tuple(quantiles)
+        # Раскладка и детекторы уровня (и повторные раскладки верха) спрашивают одно и то же — по тем же битам, зерну,
+        # выборке и квантилям: `sample @ sample.T` считается один раз на процесс, ответ тот же до бита.
+        content = np.ascontiguousarray(bits)
+        memo_key = (
+            hashlib.blake2b(content.tobytes(), digest_size=20).digest(),
+            str(content.dtype),
+            content.shape,
+            self._seed,
+            self._sample,
+            tuple(float(q) for q in quantiles),
+        )
+        known = self._MEMO.get(memo_key)
+        if known is None:
+            rng = np.random.default_rng(self._seed)
+            rows = rng.choice(bits.shape[0], size=min(self._sample, bits.shape[0]), replace=False)
+            sample = bits[np.sort(rows)].astype(np.float32)
+            ones = sample.sum(axis=1)
+            cosine = (sample @ sample.T) / np.sqrt(np.maximum(ones[:, None] * ones[None, :], 1.0))
+            pairs = cosine[np.triu_indices(sample.shape[0], k=1)]
+            values = [float(np.quantile(pairs, q)) for q in quantiles]
+            known = (values, int(sample.shape[0]), float(pairs.mean()))
+            if len(self._MEMO) >= 64:
+                self._MEMO.pop(next(iter(self._MEMO)))
+            self._MEMO[memo_key] = known
+        values, sampled, mean = known
+        values = list(values)
         LOGGER.event(
             "codes.pairwise_similarity",
             section=SIMILARITY_MEASURES,
             data={
                 "name": name,
                 "codes": int(bits.shape[0]),
-                "sampled": int(sample.shape[0]),
-                "mean": float(pairs.mean()),
+                "sampled": sampled,
+                "mean": mean,
                 "quantiles": {f"{q:g}": value for q, value in zip(quantiles, values)},
             },
         )

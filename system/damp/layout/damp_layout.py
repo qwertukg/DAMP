@@ -1792,7 +1792,7 @@ class Layout:
         self._compiled_sampler_enabled = bool(compiled_sampler)
         self._compiled_sampler: CompiledPairSampler | None = None
         self._sampler_verify_every = int(sampler_verify_every)
-        self._sampler_calls = {"long": 0, "short": 0}
+        self._sampler_calls = {"long": 0, "short": 0, "long_weighted": 0}
         self._ones_float64 = None if self._ones_array is None else self._ones_array.astype(np.float64)
         # Класс одинаковых кодов каждой точки: у пары точек одного класса φ_c = φ_s точно (PairSignKernel).
         # Считается при первом расчёте по строкам сходства: большим раскладкам (без строк) он не нужен.
@@ -3387,12 +3387,20 @@ class Layout:
         """
         cdf = self._long_weights_cdf
         if cdf is not None:
-            draws = self._np_rng.random(count) * cdf[-1]
-            idx_a = np.minimum(np.searchsorted(cdf, draws, side="right"), self._point_count - 1)
-            y1 = self._pos_np[idx_a, 0]
-            x1 = self._pos_np[idx_a, 1]
-            y2, x2 = self._sample_nearby_np(y1, x1, radius, None)
-            return np.stack([y1, x1, y2, x2], axis=1)
+            sampler = self._compiled_sampler
+            if sampler is None:
+                return self._sample_pairs_long_weighted_numpy(count, radius, cdf)
+            if not self._sampler_check_due("long_weighted"):
+                return sampler.long_pairs_weighted(self._np_rng, self._pos_np, cdf, count, radius)
+            clone = sampler.clone_generator(self._np_rng)
+            reference = self._sample_pairs_long_weighted_numpy(count, radius, cdf)
+            compiled = sampler.long_pairs_weighted(clone, self._pos_np, cdf, count, radius)
+            self._sampler_checked(
+                "long_weighted",
+                bool(np.array_equal(reference, compiled))
+                and clone.bit_generator.state == self._np_rng.bit_generator.state,
+            )
+            return reference
         sampler = self._compiled_sampler
         if sampler is None:
             return self._sample_pairs_long_numpy(count, radius)
@@ -3408,6 +3416,15 @@ class Layout:
             and clone.bit_generator.state == self._np_rng.bit_generator.state,
         )
         return reference
+
+    def _sample_pairs_long_weighted_numpy(self, count: int, radius: int | None, cdf: "np.ndarray") -> "np.ndarray":
+        """Пары дальней фазы с весами −ln Ê (§5.9.3) выборкой numpy: эталон для скомпилированной выборки."""
+        draws = self._np_rng.random(count) * cdf[-1]
+        idx_a = np.minimum(np.searchsorted(cdf, draws, side="right"), self._point_count - 1)
+        y1 = self._pos_np[idx_a, 0]
+        x1 = self._pos_np[idx_a, 1]
+        y2, x2 = self._sample_nearby_np(y1, x1, radius, None)
+        return np.stack([y1, x1, y2, x2], axis=1)
 
     def _sample_pairs_long_numpy(self, count: int, radius: int | None) -> "np.ndarray":
         """Пары дальней фазы (§5.3) выборкой numpy: эталон для скомпилированной выборки."""
@@ -6390,31 +6407,10 @@ class Layout:
                 )
                 return
 
-        sim_base: list[list[float]] = [
-            [0.0] * point_count for _ in range(point_count)
-        ]
-        for i in range(point_count):
-            sim_base[i][i] = 1.0
-
-        if workers < 2:
-            for i in range(point_count):
-                for j in range(i + 1, point_count):
-                    sim = self._similarity_base(self._points[i], self._points[j])
-                    sim_base[i][j] = sim
-                    sim_base[j][i] = sim
-        else:
-            tasks = [(offset, workers, point_count) for offset in range(workers)]
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_similarity_worker,
-                initargs=(self._points, self._similarity),
-            ) as executor:
-                for chunk in executor.map(_compute_similarity_stride, tasks):
-                    for i, sims in chunk:
-                        row = sim_base[i]
-                        for j, sim in enumerate(sims, start=i + 1):
-                            row[j] = sim
-                            sim_base[j][i] = sim
+        # Одним умножением матриц 0/1: целые числа общих бит точны во float32 (L < 2^24), затем те же
+        # float64-sqrt и деление, что в _similarity_base_points; значения совпадают с прежним путём до бита.
+        # Пул процессов на BitArray.common и объекты LayoutPoint (_points) больше не нужны.
+        sim_base = self._similarity_matrix_from_bits().tolist()
         self._sim_base = sim_base
         if self._gpu_engine is not None:
             try:
@@ -6428,6 +6424,34 @@ class Layout:
                 section=OPTIM_SIM_MATRIX,
                 data={"mode": "cpu"},
             )
+
+    def _similarity_matrix_from_bits(self) -> "np.ndarray":
+        """Таблица сходства N × N (float64) по матрице бит: общие биты — целые, как BitArray.common."""
+        bits = self._code_matrix
+        point_count = self._point_count
+        ones = np.asarray(self._table.ones, dtype=np.int64)
+        matrix = np.zeros((point_count, point_count), dtype=np.float64)
+        if point_count == 0:
+            return matrix
+        columns = np.ascontiguousarray(bits.astype(np.float32).T)
+        chunk = 512
+        cosine = self._similarity == "cosine"
+        for start in range(0, point_count, chunk):
+            stop = min(start + chunk, point_count)
+            common = (bits[start:stop].astype(np.float32) @ columns).astype(np.float64)
+            if cosine:
+                denom = np.sqrt((ones[start:stop, None] * ones[None, :]).astype(np.float64))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    block = common / denom
+            else:
+                union = (ones[start:stop, None] + ones[None, :]).astype(np.float64) - common
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    block = common / union
+            block[(ones[start:stop, None] == 0) | (ones[None, :] == 0)] = 0.0
+            block[~np.isfinite(block)] = 0.0
+            matrix[start:stop] = block
+        matrix[np.arange(point_count), np.arange(point_count)] = 1.0
+        return matrix
 
     def _build_similarity_cache_gpu(self) -> list[list[float]] | None:
         if self._gpu_engine is not None:

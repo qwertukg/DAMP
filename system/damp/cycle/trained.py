@@ -174,59 +174,147 @@ class TrainedLadder:
         first, last = self.groups.ranges["train"]
         chosen = np.unique(np.linspace(first, last - 1, min(int(settings.RECOGNITION_KNOWLEDGE_PICTURES), last - first)).astype(np.int64))
         found = np.zeros((chosen.shape[0], len(self.levels)), dtype=np.float64)
-        for row, picture in enumerate(chosen.tolist()):
-            sight = self._see(self.groups.atoms.images[picture], own=int(self.groups.atoms.index[picture]))
+        atoms = self.groups.atoms
+        pictures = chosen.tolist()
+        # Картинки идут пачкой по уровням (see_many), штрихи — из набора картинок прогона (atom_sticks), а не заново из
+        # пикселов: знание каждой картинки то же до бита, что у прохода по одной.
+        sights = self.see_many(
+            [atoms.images[picture] for picture in pictures],
+            owns=[int(atoms.index[picture]) for picture in pictures],
+            sticks=[self.atom_sticks(atoms, picture) for picture in pictures],
+        )
+        for row, sight in enumerate(sights):
             for votes in sight.votes:
                 found[row, votes.number - 1] = votes.knowledge
         return found
 
     # ------------------------------------------------------------------ новая картинка
-    def see(self, image: "np.ndarray", *, log: bool = False) -> Sight:
+    def see(self, image: "np.ndarray", *, log: bool = False, sticks: "np.ndarray | None" = None) -> Sight:
         """Картинка 28×28 (uint8 0…255 либо float в [0, 1], белая цифра на чёрном) через все обученные уровни.
 
         Каждый уровень: окна на элементах (П.2) → коды окон (П.4–П.7) → срабатывания детекторов карты (§6.5) →
         детали — элементы следующего уровня (П.1). Затем класс: голоса памяти по уровням, их среднее и согласие
         уровней (§2.2.5, §7.1.13.3) — и ответ линейного читателя по пикам уровней (§9.3). Шаги
         считаются заново и в кеш не пишутся; журнал шагов молчит. log — записать итог событием dashboard.see.
+        sticks — уже разобранные штрихи этой картинки (atom_sticks картинки набора); None — разбор пикселов.
         """
-        return self._see(image, log=log)
+        return self._see(image, log=log, sticks=sticks)
 
-    def _see(self, image: "np.ndarray", *, own: int = -1, log: bool = False) -> Sight:
-        """Путь картинки; own — номер MNIST обучающей картинки, чьи точки памяти не голосуют (мерка порога знания)."""
+    def _see(self, image: "np.ndarray", *, own: int = -1, log: bool = False, sticks: "np.ndarray | None" = None) -> Sight:
+        """Путь картинки; own — номер MNIST обучающей картинки, чьи точки памяти не голосуют (мерка порога знания);
+        sticks — её штрихи из набора картинок (atom_sticks), None — разбор пикселов (MnistDigits.sticks_of).
+        Тот же путь, что у пачки (see_many): пачка из одной картинки."""
+        return self._see_batch([image], [int(own)], [sticks], log=log)[0]
+
+    def see_many(self, images, *, owns=None, sticks=None, chunk: int = 64) -> "list[Sight]":  # noqa: ANN001
+        """Картинки 28×28 пачкой (вне статьи, техника счёта): тот же путь, что у see, но уровень за уровнем —
+        срабатывания и зажжённые точки окон всех картинок пачки одним вызовом активации (fire_and_light), а не вызовом
+        на картинку.
+
+        Ответ каждой картинки тот же до бита, что у see: окна, коды, детали и голоса считаются по картинке, а строка
+        срабатываний зависит только от своего кода (активация — целые общие биты; уровни и энергия активации — частями
+        ровно по HierarchyDetection.ROWS строк). owns — номера MNIST обучающих картинок, чьи точки памяти не голосуют
+        (−1 — проверочная); sticks — готовые штрихи (atom_sticks), None — разбор пикселов; chunk — картинок в пачке
+        (память видеокарты под активацию растёт с числом окон)."""
+        images = list(images)
+        owns = [-1] * len(images) if owns is None else [int(value) for value in owns]
+        sticks = [None] * len(images) if sticks is None else list(sticks)
+        if not len(owns) == len(sticks) == len(images):
+            raise ValueError("owns и sticks нужны по каждой картинке")
+        step = max(1, int(chunk))
+        found: list[Sight] = []
+        for start in range(0, len(images), step):
+            found.extend(self._see_batch(images[start : start + step], owns[start : start + step], sticks[start : start + step]))
+        return found
+
+    @staticmethod
+    def _fire_batch(detectors, codes: "list[np.ndarray]") -> list:  # noqa: ANN001
+        """Срабатывания и зажжённые точки кодов окон нескольких картинок одним вызовом; результат — по картинке, как
+        у fire_and_light на её кодах: (Firing, (окно, точка, активация)), номера окон — внутри картинки."""
+        from damp.activation.level_detectors import Firing
+
+        counts = [int(part.shape[0]) for part in codes]
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+        firing, (lit_rows, lit_points, lit_values) = detectors.fire_and_light(np.concatenate(codes))
+        # Строки ответа активации идут по возрастанию номера кода: кусок картинки — от её первого окна до следующей.
+        fired_at, lit_at = np.searchsorted(firing.rows, offsets), np.searchsorted(lit_rows, offsets)
+        parts = []
+        for number, count in enumerate(counts):
+            a, b, c, d = int(fired_at[number]), int(fired_at[number + 1]), int(lit_at[number]), int(lit_at[number + 1])
+            own = Firing(sets=count, rows=firing.rows[a:b] - offsets[number], columns=firing.columns[a:b].copy(),
+                         levels=firing.levels[a:b].copy())
+            parts.append((own, (lit_rows[c:d] - offsets[number], lit_points[c:d].copy(), lit_values[c:d].copy())))
+        return parts
+
+    def _see_batch(self, images: list, owns: list, sticks: list, *, log: bool = False) -> "list[Sight]":
+        """Путь пачки картинок по уровням (see, see_many): у каждой картинки — свои окна, коды, детали и голоса."""
         started = time.perf_counter()
-        pixels = self._pixels(image)
-        levels: list[SightLevel] = []
-        peaks: list["np.ndarray"] = []
-        primary = None
+        size = len(images)
+        pixels = [self._pixels(image) for image in images]
+        atoms: list = [None] * size
+        elements: list = [None] * size
+        levels: list[list[SightLevel]] = [[] for _ in range(size)]
+        peaks: list[list["np.ndarray"]] = [[] for _ in range(size)]
+        primary: list = [None] * size
         from damp.cache import CACHE
 
         with CACHE.bypassed(), LOGGER.quiet():
-            values = self._digits.sticks_of(pixels)
-            atoms = DigitAtoms.from_rows(
-                [np.column_stack([np.zeros(values.shape[0], dtype=np.float64), values])],
-                [-1], [np.clip(np.rint(pixels * 255.0), 0, 255).astype(np.uint8)], [-1],
-            )
-            elements = self._sticks.encode(atoms) if values.shape[0] else None
+            for k in range(size):
+                values = (self._digits.sticks_of(pixels[k]) if sticks[k] is None
+                          else np.asarray(sticks[k], dtype=np.float64).reshape(-1, 5))
+                atoms[k] = DigitAtoms.from_rows(
+                    [np.column_stack([np.zeros(values.shape[0], dtype=np.float64), values])],
+                    [-1], [np.clip(np.rint(pixels[k] * 255.0), 0, 255).astype(np.uint8)], [-1],
+                )
+                elements[k] = self._sticks.encode(atoms[k]) if values.shape[0] else None
             if isinstance(self.primary, StrokeLevel):
                 # Уровень 0 цикла (LADDER_LEVEL0): штрихи получают выученные коды — как в прогоне (MnistLadderRunner._run).
-                if elements is not None:
-                    seen, elements = self.primary.embed(elements, pixels=pixels)
-                    primary = seen if own < 0 else None
-            elif self.primary is not None and own < 0:
-                # Уровень 0 только для показа: штрихи рисунка на первичной карте (мерке порогов знания он не нужен).
-                primary = self.primary.see(atoms.angle, atoms.y, atoms.x)
+                ready = {}
+                for k in range(size):
+                    if elements[k] is None:
+                        continue
+                    codes = self.primary.embed_prepare(elements[k], pixels=pixels[k])
+                    if codes is None:
+                        primary[k] = self.primary.empty_sight() if owns[k] < 0 else None
+                    else:
+                        ready[k] = codes
+                if ready:
+                    fired = self._fire_batch(self.primary.detectors, [codes.packed for codes in ready.values()])
+                    for k, (firing, lit) in zip(list(ready), fired):
+                        seen, elements[k] = self.primary.embed_finish(elements[k], ready[k], firing, lit)
+                        primary[k] = seen if owns[k] < 0 else None
+            elif self.primary is not None:
+                for k in range(size):
+                    if owns[k] < 0:
+                        # Уровень 0 только для показа: штрихи рисунка на первичной карте (мерке порогов знания он не нужен).
+                        primary[k] = self.primary.see(atoms[k].angle, atoms[k].y, atoms[k].x)
+            alive = [k for k in range(size) if elements[k] is not None]
             for trained in self.levels:
-                if elements is None or elements.count == 0:
+                prepared = {}
+                for k in alive:
+                    if elements[k].count == 0:
+                        continue  # картинка дальше не идёт: элементов нет
+                    # Пятна — как в прогоне (MnistLadderRunner._ladder): они внутри своей картинки.
+                    elements[k] = CycleStep.thin(elements[k], trained.number)
+                    if elements[k].count == 0:
+                        continue
+                    found = self._level_prepare(trained, elements[k])
+                    if found is not None:
+                        prepared[k] = found  # нет окон — картинка дальше не идёт
+                alive = list(prepared)
+                if not alive:
                     break
-                # Пятна — как в прогоне (MnistLadderRunner._ladder): они внутри своей картинки.
-                elements = CycleStep.thin(elements, trained.number)
-                if elements.count == 0:
-                    break
-                level, elements = self._level(trained, elements)
-                if level is None:
-                    break
-                levels.append(level)
-                peaks.append(level.peak)
+                fired = self._fire_batch(trained.detectors, [prepared[k][2].packed for k in alive])
+                for k, (firing, lit) in zip(alive, fired):
+                    level, elements[k] = self._level_finish(trained, elements[k], *prepared[k], firing, lit)
+                    levels[k].append(level)
+                    peaks[k].append(level.peak)
+        seconds = (time.perf_counter() - started) / max(1, size)
+        return [self._sight(atoms[k], levels[k], peaks[k], primary[k], owns[k], seconds, log=log) for k in range(size)]
+
+    def _sight(self, atoms: DigitAtoms, levels: list, peaks: list, primary, own: int, seconds: float, *,  # noqa: ANN001
+               log: bool) -> Sight:
+        """Ответ по пройденным уровням картинки: пики, читатель (§9.3), голоса памяти и вердикт (§2.2.5, §7.1.13.3)."""
         # Уровни, до которых картинка не дошла, молчат: их пики нулевые, как у такой картинки в прогоне.
         for trained in self.levels[len(peaks):]:
             peaks.append(np.zeros(int(trained.detectors.built), dtype=np.float32))
@@ -253,7 +341,7 @@ class TrainedLadder:
             answer=answer,
             votes=votes,
             verdict=verdict,
-            seconds=time.perf_counter() - started,
+            seconds=seconds,
         )
         if log:
             LOGGER.event(
@@ -281,22 +369,55 @@ class TrainedLadder:
             )
         return sight
 
+    @staticmethod
+    def atom_sticks(atoms: DigitAtoms, picture: int) -> "np.ndarray | None":
+        """Штрихи картинки набора в виде MnistDigits.sticks_of: строки (угол, x, y, сила, полудлина поля); None —
+        полудлин поля в наборе нет (тогда штрихи разбираются из пикселов).
+
+        Набор хранит те же строки, что дал разбор её пикселов (вне статьи, техника счёта): пикселы картинки набора —
+        uint8, и uint8 → float32 / 255 → uint8 идёт без потерь, поэтому разбор картинки заново дал бы те же строки;
+        сила в наборе уже нормирована внутри картинки (сильнейший штрих — ровно 1.0), и DigitAtoms.from_rows делит её
+        ещё раз на 1.0 — те же биты. Сверено до бита на 400 обучающих с видами и 200 проверочных."""
+        if atoms.span is None:
+            return None
+        rows = np.flatnonzero(np.asarray(atoms.picture) == int(picture))
+        return np.column_stack([
+            np.asarray(atoms.angle, dtype=np.float64)[rows], np.asarray(atoms.x, dtype=np.float64)[rows],
+            np.asarray(atoms.y, dtype=np.float64)[rows], np.asarray(atoms.strength, dtype=np.float64)[rows],
+            np.asarray(atoms.span, dtype=np.float64)[rows],
+        ]).reshape(-1, 5)
+
     def _level(self, trained: TrainedLevel, elements: LadderElements) -> tuple[SightLevel | None, LadderElements | None]:
         """Проход обученного уровня над элементами одной картинки — те же шаги, что CycleStep.run, без подбора."""
+        prepared = self._level_prepare(trained, elements)
+        if prepared is None:
+            return None, None
+        firing, lit = trained.detectors.fire_and_light(prepared[2].packed)
+        return self._level_finish(trained, elements, *prepared, firing, lit)
+
+    def _level_prepare(self, trained: TrainedLevel, elements: LadderElements):  # noqa: ANN202
+        """Окна уровня на элементах картинки (П.2) и их коды (П.4–П.7): (окна, размеры окон, коды); None — окон нет."""
         pieces, extent = KeyholeBuilder.place(elements, number=trained.number, step=trained.step, thresholds=trained.thresholds)
         if pieces.count == 0:
-            return None, None
+            return None
         codes = self._coder.encode(
             elements, pieces, number=trained.number, unit=trained.field.unit, taught=pieces.count,
             content_length=trained.content_length,
         )
+        return pieces, extent, codes
+
+    def _level_finish(self, trained: TrainedLevel, elements: LadderElements, pieces, extent, codes,  # noqa: ANN001
+                      firing, lit) -> tuple[SightLevel, LadderElements]:
+        """Уровень картинки по срабатываниям её окон (каждое окно — набор из одного кода; срабатывания и зажжённые
+        точки карты — за один проход активации, своей или пачки): детали (П.1), пик уровня и элементы следующего."""
+        lit_keyhole, lit_point, lit_value = lit
         detectors = trained.detectors
-        # Каждое окно — набор из одного кода; срабатывания и зажжённые точки карты — за один проход активации.
-        firing, (lit_keyhole, lit_point, lit_value) = detectors.fire_and_light(codes.packed)
         if trained.scale is not None:
             firing = firing.scaled(trained.scale)  # нормировка — делителями обучающих окон (вне статьи)
-        details, length = DetailCoder(trained.number).encode(
-            firing, detectors.layer_index, detectors.built, np.ones(codes.count, dtype=bool), length=trained.detail_length
+        coder = DetailCoder(trained.number)
+        details, length = coder.encode(
+            firing, detectors.layer_index, detectors.built, np.ones(codes.count, dtype=bool), length=trained.detail_length,
+            geometry=DetailCoder.geometry(detectors) if coder.needs_geometry() else None,  # предки (v8.2) — как при обучении
         )
         strength = firing.strength()
         _, peak = LevelRecognition.responses(pieces.picture, firing.rows, firing.columns, firing.levels, 1, detectors.built)

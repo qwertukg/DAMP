@@ -14,3 +14,4 @@ router_handled.json
 maps_uploaded.json
 arrivals.json
 maps_pending.json
+watchdog.log
