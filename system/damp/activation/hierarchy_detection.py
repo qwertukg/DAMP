@@ -98,7 +98,9 @@ class HierarchyDetection:
         radius = np.asarray([detector.radius for detector in self.detectors], dtype=np.float64)
         # Поле детектора — точки не дальше r_d от его центра (§6.5), как в ActivationEngine.
         coverage, covered = self._coverage_matrix(cells, centre, radius)
-        self._coverage = torch.as_tensor(coverage, device=self._device)
+        # Поля — нули и единицы: на хосте они uint8 (у карты в 29 тыс. точек с 12 тыс. детекторов — 0.35 ГБ, а float32 вместе с
+        # транспонированием держал 2.8 ГБ ОЗУ — пик прогона, 2026-11-24), во float32 — уже на устройстве; значения те же.
+        self._coverage = torch.as_tensor(coverage, device=self._device).to(torch.float32)
         # Энергия активации точки (расширение статьи): формула энергии точки §5.7, где вместо сходства с соседями —
         # их активация a_v, с нормировкой на наибольшую по карте для того же стимула (Ê = E / E_max, §5.7). Точка с
         # Ê_a ниже μ_a гаснет: одиночная зажжённая точка, вокруг которой ничего не горит, в детекторы не идёт. В §6.5
@@ -147,7 +149,7 @@ class HierarchyDetection:
 
     @staticmethod
     def _coverage_matrix(cells: "np.ndarray", centre: "np.ndarray", radius: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
-        """Поля детекторов: матрица «точки × детекторы» float32 из 0/1 и число точек в поле каждого детектора.
+        """Поля детекторов: матрица «точки × детекторы» uint8 из 0/1 и число точек в поле каждого детектора.
 
         Тот же признак hypot(cell − centre) ≤ r (float64, те же биты на границе), но без матрицы N × D float64:
         для каждого детектора hypot считается только по точкам прямоугольника радиуса (hypot ≥ |dx|, поэтому вне
@@ -155,7 +157,7 @@ class HierarchyDetection:
         count, detectors = int(cells.shape[0]), int(centre.shape[0])
         order = np.argsort(cells[:, 0], kind="stable")
         xs, ys = cells[order, 0], cells[order, 1]
-        transposed = np.zeros((detectors, count), dtype=np.float32)
+        transposed = np.zeros((detectors, count), dtype=np.uint8)
         covered = np.zeros(detectors, dtype=np.int64)
         for number in range(detectors):
             cx, cy, r = float(centre[number, 0]), float(centre[number, 1]), float(radius[number])
@@ -165,7 +167,7 @@ class HierarchyDetection:
             if high <= low:
                 continue
             inside = np.hypot(xs[low:high] - cx, ys[low:high] - cy) <= r
-            transposed[number, order[low:high][inside]] = 1.0
+            transposed[number, order[low:high][inside]] = 1
             covered[number] = int(inside.sum())
         return np.ascontiguousarray(transposed.T), covered
 

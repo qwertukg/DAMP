@@ -93,7 +93,7 @@ class KeyholeBuilder:
         inputs = {
             "picture": elements.picture, "y": elements.y, "x": elements.x, "what": elements.what_packed,
             "what_index": elements.what_index, "what_length": elements.what_length, "extent": elements.extent,
-            "number": int(number), "train_pictures": self._groups.train_pictures,
+            "number": int(number), "train_pictures": self._groups.taught_pictures(number),
             "atom_picture": atoms.picture, "atom_y": atoms.y, "atom_x": atoms.x,
         }
         found = CACHE.run("cycle.keyholes", inputs, lambda: self._pack(self._build(elements, number)), modules=("damp.cycle.keyholes",),
@@ -232,7 +232,8 @@ class KeyholeBuilder:
 
     def _build(self, elements: LadderElements, number: int) -> LevelKeyholes:
         name = f"level{number}"
-        train_pictures = self._groups.train_pictures
+        # Обучающие картинки уровня: с уровня LADDER_EXTRA_FROM — вместе с добавочными (DigitGroups.taught_pictures).
+        train_pictures = self._groups.taught_pictures(number)
         taught = elements.picture < train_pictures
         previous = 0.5 if elements.extent is None else float(elements.reach()[taught].mean())
         # Шаг между соседями и пары соседей меряются по сетке окон Собеля: углопозиции стоят по одной на окно, а

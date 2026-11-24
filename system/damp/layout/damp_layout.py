@@ -1579,6 +1579,7 @@ class Layout:
         fused_block_elements: int = 40_000_000,
         fused_verify_every: int = 2000,
         fused_similarity_table: bool = True,
+        int8_codes: bool = False,
         neighbourhood_sample_side: int | None = None,
         enforce_pair_radius: bool = False,
         neighbourhood_radius_min: int | None = None,
@@ -1975,6 +1976,8 @@ class Layout:
                 ones=self._ones_array,
                 similarity=self._similarity,
                 grid_shape=(self.height, self.width),
+                # Коды точек на устройстве int8 вместо float32 (LAYOUT_INT8_CODES): общие биты — то же целое число.
+                int8_codes=bool(int8_codes),
             )
             if self._torch_engine is not None:
                 # Слитый расчёт энергий: те же φ_c, φ_s одним ядром на слагаемое (§5.5, §5.9.5, §5.12).

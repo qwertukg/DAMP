@@ -111,7 +111,7 @@ class Digits(_Part):
     def groups(self) -> dict[str, tuple[int, int]]:
         """Группа → (первая картинка, после последней).
 
-        Имена: `"train"`, `"validation"`, `"test"`; сдвиг на клетки сетки — `"dy,dx"`; сдвиг на пиксели —
+        Имена: `"train"`, `"extra"` (добавочные картинки верхних уровней, LADDER_EXTRA_PICTURES), `"validation"`, `"test"`; сдвиг на клетки сетки — `"dy,dx"`; сдвиг на пиксели —
         `"pixel:dy,dx"` (у разных сдвигов разные имена).
         """
         return {self._group_name(key): value for key, value in self._groups.ranges.items()}

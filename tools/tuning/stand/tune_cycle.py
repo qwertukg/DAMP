@@ -138,6 +138,24 @@ def skip_primary_map() -> None:
 skip_primary_map()
 
 
+def limit_detector_table() -> None:
+    """Предел таблицы общих бит при построении детекторов — только по явной просьбе: TUNE_DETECTOR_TABLE_POINTS=<точек>.
+
+    Таблица (DetectorHierarchyBuilder.COMMON_TABLE_POINTS = 40 000) держит на хосте N² · 2 байта: 1.6 ГБ у карты в 28 тыс. точек;
+    с ней холодное построение детекторов такой карты занимает 5.3–5.7 ГБ ОЗУ процесса около минуты. Проба 2026-11-24 (прогон
+    1478, предел 24 000, карта ур. 0 — 24 458 точек): путь без таблицы строил детекторы 583 с вместо ~40 с и всё это время
+    держал 4.5 ГБ — хуже и по времени, и по запасу памяти. Поэтому по умолчанию предел не трогается."""
+    value = os.environ.get("TUNE_DETECTOR_TABLE_POINTS")
+    if not value:
+        return
+    from damp.activation.activation import DetectorHierarchyBuilder
+
+    DetectorHierarchyBuilder.COMMON_TABLE_POINTS = int(value)
+
+
+limit_detector_table()
+
+
 def level0_shape(cells, angle, period: float, height: int, width: int) -> dict:  # noqa: ANN001
     """Цельность и гладкость карты уровня 0 (автор 2026-11-20: «гладкость первичной карты очень важна!»).
 
@@ -451,9 +469,11 @@ def main() -> None:
 
         place_length = first("LADDER_BINDING_PLACE_CODE_LENGTH") * first("LADDER_BINDING_PLACE_BITS")
         table = ladder._ladder.primary.memory.layout.code_table
-        bits = np.unpackbits(np.asarray(table.packed), axis=1, count=int(table.code_length)).astype(np.int64)
-        place_ones = bits[:, :place_length].sum(axis=1)
-        content_ones = bits[:, place_length:].sum(axis=1)
+        # Биты — uint8, суммы — в int64 (2026-11-24): прежний .astype(np.int64) всей таблицы на 500 картинках занимал 2.9 ГБ
+        # (23 807 точек × 15 056 бит × 8 байт) и давал пик ОЗУ прогона 5.6 ГБ при 2.3 ГБ у самого обучения. Числа те же.
+        bits = np.unpackbits(np.asarray(table.packed), axis=1, count=int(table.code_length))
+        place_ones = bits[:, :place_length].sum(axis=1, dtype=np.int64)
+        content_ones = bits[:, place_length:].sum(axis=1, dtype=np.int64)
         share = place_ones / np.maximum(1, place_ones + content_ones)
         # М6 по коду угла (§5.13.2.3 мерит разрешение кода самого признака): весь код уровня 0 уникален из-за места,
         # поэтому разрешение считается по части содержания — сколько разных кодов угла у штрихов и самая большая группа.
@@ -577,6 +597,9 @@ def main() -> None:
     sheet.save(image_path)
     groups = ladder._ladder.groups
     first, last = groups.ranges["train"]
+    if "extra" in groups.ranges:
+        # Добавочные картинки верхних уровней (LADDER_EXTRA_PICTURES): на верхней карте они обучающие, покрытие цифры — по ним тоже.
+        last = int(groups.ranges["extra"][1])
     digits = class_by_digit(top.cells, top.labels, top.point_picture, int(top.height), int(top.width), np.asarray(groups.labels)[first:last])
     # Стратегия v3 (2026-11-21, docs/CLUSTERS.md): М1ц без удачи раскладки. Верх раскладывается ещё TUNE_RELAYOUTS раз на ТЕХ ЖЕ
     # кодах с другими зёрнами раскладки (тем же режимом, что в прогоне); М1ц — среднее по всем раскладкам. Разброс одной
@@ -600,7 +623,10 @@ def main() -> None:
             base_seed = int(live.LAYOUT_RANDOM_SEED)
         for k in range(relayouts):
             with live.overridden({**run_settings, **mode, "LAYOUT_RANDOM_SEED": base_seed + 101 + k}):
-                fresh = MemoryMap().lay_out(top_bits, top_labels, f"tune-relayout-{k}")
+                # Имя — уровень верха: настройки «с уровня» (проход «лучший ответ», повторная раскладка, две фазы со сменой кода)
+                # действуют и на повторных раскладках. До 2026-11-23 имя было «tune-relayout-k» (уровень 0): две раскладки из трёх шли
+                # без них, и их эффект в М1u занижался втрое (v9.6, v17.1–v17.5, v18.3, v18.4).
+                fresh = MemoryMap().lay_out(top_bits, top_labels, f"level{top_number}")
             got = np.asarray([int(v) for v in fresh.code_table.labels()], dtype=np.int64)
             again = class_by_digit(fresh.cells_array(), got, np.full(got.size, -1), int(fresh.height), int(fresh.width), np.asarray(groups.labels)[first:last])
             m1_runs.append(again["m1_digits"])

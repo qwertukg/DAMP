@@ -172,7 +172,7 @@ class CommonBitsTable:
         torch = engine.torch_mod
         device = engine.torch_device
         count = engine.point_count
-        if not engine.has_float_codes:
+        if not engine.has_dense_codes:
             LOGGER.event(
                 "layout.fused.table.skipped",
                 section=OPTIM_SIM_MATRIX,
@@ -214,11 +214,11 @@ class CommonBitsTable:
         with torch.no_grad():
             table = torch.zeros((classes + 1, classes + 1), dtype=dtype, device=device)
             block = max(1, cls.BLOCK_ELEMENTS // max(1, classes))
-            transposed = class_codes.T
             for start in range(0, classes, block):
                 stop = min(classes, start + block)
-                # Сумма произведений бит — целое не больше длины кода: в float32 точна при любом порядке.
-                table[start:stop, :classes] = (class_codes[start:stop] @ transposed).to(dtype)
+                # Сумма произведений бит — целое не больше длины кода: в float32 точна при любом порядке
+                # (коды int8 — целочисленное произведение, то же число: TorchPairEnergyEngine.common_bits).
+                table[start:stop, :classes] = engine.common_bits(class_codes[start:stop], class_codes).to(dtype)
         LOGGER.event(
             "layout.fused.table.build",
             section=OPTIM_SIM_MATRIX,
@@ -856,8 +856,8 @@ template <typename T> T damp_popcount(T a0, T a1, T a2, T a3, T v0, T v1, T v2, 
                 dense = subset is not None or (2 * reach + 1) ** 2 >= count
                 if not dense and reach >= self.OFFSET_BIAS:
                     return None
-        if dense and subset is None and not self._sim_enabled and self._table is None and not engine.has_float_codes:
-            # По всем точкам V общие биты дают произведения кодов float32 — их на устройстве нет.
+        if dense and subset is None and not self._sim_enabled and self._table is None and not engine.has_dense_codes:
+            # По всем точкам V общие биты дают произведения плотных кодов — их на устройстве нет.
             return None
         if dense:
             width = count if subset is None else int(subset.size)
@@ -1182,7 +1182,7 @@ template <typename T> T damp_popcount(T a0, T a1, T a2, T a3, T v0, T v1, T v2, 
         else:
             codes = self._engine.codes
             # «Точки нет» (номер N) берёт код точки N − 1: её нормировка 0, сходство обнуляется в ядре.
-            common = codes[torch.clamp(points, max=self._count - 1)] @ codes.T
+            common = self._engine.common_bits(codes[torch.clamp(points, max=self._count - 1)], codes)
         return common[:rows], common[rows:]
 
     def _common_window(

@@ -327,6 +327,7 @@ class DigitGroups:
         validation_numbers: Sequence[int] | None = None,
         test_numbers: Sequence[int] | None = None,
         train_views: Sequence[tuple[int, int]] = (),
+        extra: int = 0,
     ) -> "DigitGroups":
         """Обучающие, отложенные, проверочные цифры и их сдвиги (на клетки и на пиксели) одним набором.
 
@@ -338,6 +339,9 @@ class DigitGroups:
         train_views — ещё виды каждой обучающей цифры, сдвинутые на (dy, dx) пикселей (§7.1.4: слово берётся в
         нескольких разбиениях сразу, чтобы сходство не зависело от разбиения; у картинки «разбиение» — то, в какие
         клетки сетки попали штрихи). Виды идут следом за обучающими и сами обучающие: память строится и по ним.
+        extra — добавочные картинки (LADDER_EXTRA_PICTURES, вне статьи): столько следующих по порядку картинок MNIST
+        train после обучающих; идут сразу за обучающими (и их видами), группа "extra". Обучающими они становятся
+        только с уровня LADDER_EXTRA_FROM (taught_pictures), ниже — только предъявляются.
         """
         if train_numbers is not None:
             taught = digits.load(train=True, count=len(train_numbers), numbers=train_numbers)
@@ -356,6 +360,20 @@ class DigitGroups:
                       "note": "каждая обучающая цифра ещё и в сдвинутых видах — несколько разбиений одной картинки на клетки "
                               "сетки (как несколько разбиений слова на токены, §7.1.4); виды — тоже обучающие"},
             )
+        more = None
+        if int(extra) > 0:
+            # Добавочные — следующие по порядку MNIST train после последней обучающей цифры (без видов).
+            more = digits.load(train=True, count=int(extra), start=int(np.max(taught.index)) + 1)
+            assert not set(more.index.tolist()) & set(taught.index.tolist()), "добавочные картинки пересекаются с обучающими"
+            LOGGER.event(
+                "stimuli.extra",
+                section=TOKEN_ENCODING,
+                data={"pictures": more.pictures, "first_number": int(more.index[0]) if more.pictures else -1,
+                      "train_pictures": taught.pictures,
+                      "taught_by_level": [cls.extra_count(number) for number in range(1, 7)],
+                      "note": "добавочные картинки верхних уровней (вне статьи): на уровне обучающие — первые taught_by_level "
+                              "из них (уровни 1…6), остальные только предъявляются; идут в наборе сразу за обучающими"},
+            )
         held = None
         if validation_numbers is not None and len(validation_numbers):
             held = digits.load(train=True, count=len(validation_numbers), numbers=validation_numbers)
@@ -364,17 +382,21 @@ class DigitGroups:
             held = digits.load(train=True, count=int(validation), start=first)
         if held is not None:
             assert not set(held.index.tolist()) & set(taught.index.tolist()), "отложенная выборка пересекается с обучающей"
+            assert more is None or not set(held.index.tolist()) & set(more.index.tolist()), "отложенная выборка пересекается с добавочными"
         checked = None
         if test_numbers is not None and len(test_numbers):
             checked = digits.load(train=split == "train", count=len(test_numbers), numbers=test_numbers)
         elif test:
             checked = digits.load(train=split == "train", count=int(test))
-        atoms = taught.joined(held).joined(checked) if held is not None else taught.joined(checked)
+        first = taught.joined(more)  # обучающие (с видами) и сразу за ними добавочные
+        atoms = first.joined(held).joined(checked) if held is not None else first.joined(checked)
         ranges: dict[object, tuple[int, int]] = {"train": (0, taught.pictures)}
         if views:
             ranges["views"] = (originals_count, taught.pictures)  # виды — часть обучающих, следом за исходными цифрами
+        if more is not None:
+            ranges["extra"] = (taught.pictures, first.pictures)
         if held is not None:
-            ranges["validation"] = (taught.pictures, taught.pictures + held.pictures)
+            ranges["validation"] = (first.pictures, first.pictures + held.pictures)
         if checked is not None:
             ranges["test"] = (atoms.pictures - checked.pictures, atoms.pictures)
             for dy, dx in shifts:
@@ -401,6 +423,32 @@ class DigitGroups:
     def train_pictures(self) -> int:
         """Обучающих картинок вместе с видами (§7.1.4): по ним всем строится память."""
         return int(self.ranges["train"][1])
+
+    @staticmethod
+    def extra_count(number: int) -> int:
+        """Сколько добавочных картинок — обучающие для уровня number (LADDER_EXTRA_PICTURES): число — все они с уровня
+        LADDER_EXTRA_FROM (0 — ни на каком); список по уровням 1, 2, … (последнее значение — на всех уровнях выше) —
+        столько первых добавочных на уровне (уровень 0 учится только на обучающих)."""
+        value = settings.LADDER_EXTRA_PICTURES
+        if isinstance(value, (list, tuple)):
+            return int(value[min(int(number), len(value)) - 1]) if int(number) >= 1 and len(value) else 0
+        return int(value) if 0 < int(settings.LADDER_EXTRA_FROM) <= int(number) else 0
+
+    @staticmethod
+    def extra_wanted() -> int:
+        """Сколько добавочных картинок нужно в наборе: наибольшее число по уровням (0 — добавочных нет)."""
+        value = settings.LADDER_EXTRA_PICTURES
+        if isinstance(value, (list, tuple)):
+            return max((int(count) for count in value), default=0)
+        return int(value) if int(settings.LADDER_EXTRA_FROM) > 0 else 0
+
+    def taught_pictures(self, number: int) -> int:
+        """Сколько первых картинок набора — обучающие для уровня number: обучающие (с видами) и первые extra_count(number)
+        добавочных (группа "extra" идёт следом). Без добавочных — train_pictures."""
+        if "extra" not in self.ranges:
+            return self.train_pictures
+        first, last = self.ranges["extra"]
+        return int(min(last, first + max(0, self.extra_count(number))))
 
     @property
     def original_pictures(self) -> int:

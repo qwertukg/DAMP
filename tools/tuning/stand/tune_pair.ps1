@@ -1,10 +1,13 @@
-# Стенд подбора: прогоны одновременно (пара от прогонщика доски), на Count обучающих и Tests проверочных цифрах.
+# Стенд подбора: прогоны пары от прогонщика доски, на Count обучающих и Tests проверочных цифрах.
 # Каждый номер — файл tune2-<номер>.json (label, changes) рядом. Вывод — tune2-<номер>.out; итог — строка «ИТОГ».
 # Если «ИТОГ» уже есть, а процесс висит на выходе, через минуту он останавливается. Готовые номера — в tune_pair.done.
+# Одновременно — не больше Parallel прогонов (0 — сам: 2 при Count ≤ 250, иначе 1). 2026-11-24: на 500 картинках две
+# копии разом заняли 10.7 ГБ ОЗУ (свободно 0.9 ГБ при запасе 6) и 7.6 ГБ видеопамяти из 8 — прогоны идут по одному.
 # Пути не зашиты: репозиторий — три уровня выше этой папки (tools/tuning/stand); Python — DAMP_PYTHON из окружения
 # или .env, иначе python из PATH (docs/HARNESS.md).
-param([string]$List, [int]$Count = 100, [int]$Tests = 100)
+param([string]$List, [int]$Count = 100, [int]$Tests = 100, [int]$Parallel = 0)
 $Numbers = @($List -split '[ ,;]+' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+if ($Parallel -le 0) { $Parallel = if ($Count -gt 250) { 1 } else { 2 } }
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repo = (Resolve-Path (Join-Path $here '..\..\..')).Path
 $python = $env:DAMP_PYTHON
@@ -21,15 +24,20 @@ $env:PYTHONUNBUFFERED = '1'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $start = Get-Date
 $running = @{}
+$pending = [System.Collections.Queue]::new()
 foreach ($number in $Numbers) {
-    $out = "$here\tune2-$number.out"; $err = "$here\tune2-$number.err"
-    Remove-Item $out, $err -ErrorAction SilentlyContinue
-    $spec = Get-Content "$here\tune2-$number.json" -Raw -Encoding utf8 | ConvertFrom-Json
-    Write-Host "== прогон ${number}: $($spec.label)" -ForegroundColor Cyan
-    $running[$number] = Start-Process -FilePath $python -ArgumentList @('-X', 'utf8', "`"$here\tune_cycle.py`"", $number, "`"$here\tune2-$number.json`"", $Count, $Tests) -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    Remove-Item "$here\tune2-$number.out", "$here\tune2-$number.err" -ErrorAction SilentlyContinue
+    $pending.Enqueue($number)
 }
 $seen = @{}
-while ($running.Count -gt 0) {
+while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+    while ($running.Count -lt $Parallel -and $pending.Count -gt 0) {
+        $number = $pending.Dequeue()
+        $out = "$here\tune2-$number.out"; $err = "$here\tune2-$number.err"
+        $spec = Get-Content "$here\tune2-$number.json" -Raw -Encoding utf8 | ConvertFrom-Json
+        Write-Host "== прогон ${number}: $($spec.label)" -ForegroundColor Cyan
+        $running[$number] = Start-Process -FilePath $python -ArgumentList @('-X', 'utf8', "`"$here\tune_cycle.py`"", $number, "`"$here\tune2-$number.json`"", $Count, $Tests) -NoNewWindow -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+    }
     Start-Sleep -Seconds 5
     foreach ($number in @($running.Keys)) {
         $process = $running[$number]

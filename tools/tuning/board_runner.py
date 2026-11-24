@@ -54,8 +54,24 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 STAND = os.environ.get("DAMP_STAND") or B.CONF.get("DAMP_STAND") or os.path.join(HERE, "stand")
 LOG = os.path.join(STAND, "board_runner.log")
 TODO, QUEUE, RUN, ANALYSIS, GOOD, BAD = "Todo", "Очередь", "Прогон", "Анализ", "Хорошие", "Плохие"
-STAGES = [[1, 3], [0, 2], [4, 5], [6, 7], [8, 9], [10, 11]]  # пары зёрен; решение — на 2, 6 и 12 зёрнах (CHECKPOINTS)
-CHECKPOINTS = {1: (-0.01, 0.04), 3: (0.015, 0.05), 6: (0.025, 0.045)}  # этап: (порог Δ М1u, порог Δ слабых) — правило v3.3
+# Пары зёрен; решение — на 2, 6 и 12 зёрнах (CHECKPOINTS). Правило v3.6 (2026-11-23, docs/CONVERGENCE.md §2.13): порядок
+# пар — по опоре v19.15, чтобы среднее опоры на первых 2, 4 и 6 зёрнах совпадало со средним по 12 (0.840 / 0.844 / 0.844 при
+# 0.844). Прежний порядок [1, 3], [0, 2], [4, 5], … ставил первым этапом зёрна 1 и 3, а они в опоре выше среднего на 0.018:
+# правка, меняющая коды, получала на первом этапе ≈ −0.010 от возврата к среднему — ровно порог этапа. При новой опоре порядок
+# пересчитать (зёрна, ближайшие к среднему, — вперёд; первую пару менять, только когда ни одна карточка не ушла дальше этапа 1).
+# Опора v21.8 (2026-11-24, прогоны 1298–1309, М1u 0.912; первая пара оставлена — на ней уже шла карточка): среднее опоры на
+# первых 2 / 4 / 6 / 8 зёрнах — 0.913 / 0.912 / 0.913 / 0.912 при 0.912 по 12. Было (опора v20.7): [0, 7], [4, 11], [5, 8], …
+# Опора на 500 картинках (2026-11-24, прогоны 1432–1443, М1u 0.916, на верху 494–500 точек): среднее опоры на первых
+# 2 / 4 / 6 / 8 зёрнах — 0.916 / 0.918 / 0.916 / 0.915 при 0.916 по 12. Было (опора v21.8 на 250): [0, 7], [1, 2], [3, 6],
+# [4, 10], [5, 8], [9, 11] — на новой опоре давало 0.917 / 0.915 / 0.919 / 0.921.
+# Опора v27.2 (2026-11-24, прогоны 1450–1461, М1u 0.917, на верху 1489–1499 точек — 500 обучающих и 1000 добавочных
+# картинок): среднее опоры на первых 2 / 4 / 6 / 8 зёрнах — 0.917 / 0.917 / 0.917 / 0.917 при 0.917 по 12. Было (опора на
+# 500 точках): [1, 3], [2, 8], [0, 11], [5, 7], [4, 6], [9, 10] — на новой опоре давало 0.920 / 0.914 / 0.912 / 0.914.
+# Опора v27.3 (2026-11-24, прогоны 1464–1475, М1u 0.936, на верху 3958–3992 точки — 500 обучающих и 3500 добавочных картинок,
+# доводка гладкого старта с радиуса 0.05): среднее опоры на первых 2 / 4 / 6 / 8 зёрнах — 0.936 / 0.935 / 0.936 / 0.936 при
+# 0.936 по 12. Было (опора v27.2): [4, 10], [0, 6], [5, 9], [3, 11], [1, 2], [7, 8] — на новой опоре 0.943 / 0.935 / 0.936 / 0.934.
+STAGES = [[1, 7], [6, 11], [2, 10], [4, 5], [0, 3], [8, 9]]
+CHECKPOINTS = {1: (-0.01, 0.04), 3: (0.015, 0.05), 6: (0.025, 0.045)}  # этап: (порог Δ М1u, порог Δ слабых) — правило v3.3; v3.5 добавило T_GATES
 SPEC = re.compile(r"```прогон\s*\n(.*?)\n```", re.S)
 STATE = re.compile(r"\n*```состояние\s*\n(.*?)\n```", re.S)
 RESULT = re.compile(r"\n*### Итоги прогонов.*", re.S)
@@ -503,6 +519,11 @@ def grow(project: dict, item: dict, state: dict, outcome: str, mean: float) -> N
     spec = json.loads(SPEC.search(content["body"]).group(1))
     if spec.get("base") or (outcome == "bad" and spec.get("gen") in ("half", "back")):
         return
+    # Настройки «с уровня» (…_FROM) — номера уровней, а не величины: шаг по ним меняет устройство прогона. 2026-11-24: после
+    # принятия v27.2 авто-узел «добавочные 1000 → 2000, с ур. 4 → 3» раздул бы карту ур. 3 с 14 до ~70 тыс. точек (снят вручную,
+    # пара остановлена). Продолжение таких правок пишется строкой плана.
+    if any(str(key).endswith("_FROM") for key in spec.get("changes", {})):
+        return
     # Плато (разбор методики 2026-11-21): «полшага» / «обратно» — только при заметном эффекте, |Δ| ≥ 0.03 по 4+ зёрнам;
     # иначе ветка — плато, узлов не порождать (5 авто-узлов при |Δ| ≤ 0.035 не дали ни одного принятия).
     if outcome == "bad" and spec.get("gen") != "continue" and (len(state.get("runs", {})) < 4 or abs(mean) < 0.03):
@@ -586,20 +607,26 @@ def next_number() -> int:
     return number + (number % 2)
 
 
+# Обучающих картинок на стенде (проверочных — STAND_TESTS). Автор 2026-11-24: «увеличь число картинок на стенде» — 250 → 500;
+# опора на 250 (прогоны 1298–1309) — в base_runs.250.json, с прогонами на 500 она несравнима.
+STAND_COUNT = 500
+STAND_TESTS = 100
+
+
 def launch(numbers: list[int], seeds: list[int], changes: dict, label: str) -> None:
     base = json.load(open(os.path.join(STAND, "base.json"), encoding="utf-8-sig"))
     for number, seed in zip(numbers, seeds):
         over = {**base, **changes}
         if seed:
             over["ENCODER_RANDOM_SEED"] = seed
-        spec = {"label": f"250 цифр: {label}, зерно {seed}", "changes": over}
+        spec = {"label": f"{STAND_COUNT} цифр: {label}, зерно {seed}", "changes": over}
         json.dump(spec, open(os.path.join(STAND, f"tune2-{number}.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     done = os.path.join(STAND, "tune_pair.done")
     if os.path.exists(done):
         os.remove(done)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
     subprocess.Popen(["pwsh", "-NoProfile", "-File", os.path.join(STAND, "tune_pair.ps1"), "-List", ",".join(map(str, numbers)),
-                      "-Count", "250", "-Tests", "100"], creationflags=flags, cwd=ROOT)
+                      "-Count", str(STAND_COUNT), "-Tests", str(STAND_TESTS)], creationflags=flags, cwd=ROOT)
     say(f"запущено {numbers} (зёрна {seeds}) — {label}")
 
 
@@ -1173,11 +1200,21 @@ def tree_sync() -> None:
     site = re.sub(r"^https://github\.com", "", found["url"])
     links = {i["id"]: f"{site}/views/1?pane=issue&itemId={i['databaseId']}" for i in found["items"]["nodes"]}
     names = {i["id"]: re.sub(r" · зерно \d+$", "", TITLE_MARKS.sub("", (i.get("content") or {}).get("title") or "")) for i in project["items"]["nodes"]}
-    busy, written = pair_busy(), 0
+    busy, written, started = pair_busy(), 0, time.time()
     for item in project["items"]["nodes"]:
         content = item.get("content") or {}
         if content.get("__typename") not in CARD_TYPES:
             continue
+        # Стенд стоит, а в plan.md появились новые строки (2026-11-23: v17 ждала 6 мин, пока переписывалось дерево) —
+        # остаток дерева в следующий раз, сначала карточки плана и запуск.
+        if not busy and written and written % 5 == 0 and os.path.getmtime(PLAN_TABLE) > started:
+            say(f"дерево: новый план — переписано {written} карточек, остальные — в следующий раз")
+            return
+        # Решение и запуск важнее дерева (2026-11-23: пара из кеша считается 2–3 мин, а запись дерева в 430 карточек — 10+ мин,
+        # GitHub отвечал по минуте на карточку): пара досчиталась либо вышло время — остаток в следующий раз.
+        if pair_waits_decision(started) or (busy and not pair_busy()) or time.time() - started > TREE_BUDGET:
+            say(f"дерево: отложено — переписано {written} карточек, остальные — в следующий раз")
+            return
         if not CARD.search(content.get("body") or ""):
             # Задача автора — не карточка прогона: дерево в её текст не писать, попавшее раньше — убрать.
             if TREE_BLOCK.search(content.get("body") or ""):
@@ -1315,12 +1352,34 @@ def patches_better(state: dict, rows: dict, base: dict, mean: float) -> tuple[bo
     return mean >= -0.01 and fewer == len(pairs) and same, text
 
 
-RULE = "v3.4"
+RULE = "v3.7"  # v3.6 (порядок пар зёрен без перекоса первого этапа, STAGES) + точки верхней карты (TOP_GROWTH)
+# Правило v3.7 (цель автора 2026-11-24: «сходимость на верхнем уровне важнее, если в ней больше точек»; толкование — моё,
+# память top-convergence-more-points). Точки верха правки — к точкам верха опоры на тех же зёрнах (среднее отношение):
+# не меньше TOP_GROWTH — правка проходит этап при сходимости не хуже опоры (Δ М1u ≥ TOP_M1_GATE, честная не ниже −0.05) и
+# досрочно не закрывается; не больше TOP_SHRINK — правка не принимается, даже если М1u выше (маленький верх собрать легче:
+# одно окно на картинку дало +0.016 при верхе в 6 раз меньше).
+TOP_GROWTH, TOP_SHRINK, TOP_M1_GATE = 1.5, 0.67, -0.010
 WEAK = (2, 4, 5)  # слабые цифры опоры (М1 0.38 / 0.47 / 0.43, docs/DIRECTION.md)
 BASE_SEEDS = [1, 3, 0, 2, 4, 5, 6, 7, 8, 9, 10, 11]  # опора — на 12 зёрнах (разбор методики 2026-11-21)
 FUTILITY_FROM = 4  # досрочное закрытие (v3.4, задача автора #119) — на этапах 4 и 5, перед решением по 12 зёрнам
 FUTILITY_SIGMAS = 2.0  # насколько среднее оставшихся зёрен должно превзойти наблюдаемое, чтобы ещё был шанс
 FUTILITY_SD_FLOOR = 0.05  # нижняя граница разброса Δ по зерну (опора: Δ М1u по зерну ±0.06)
+# Правило v3.5 (план v19.7, docs/CONVERGENCE.md §2.7; слово автора 2026-11-23): шум парной разности «правка − опора на том же
+# зерне» — 0.036 на зерно, истинный +0.015 проходил порог +0.025 в 17 % случаев (v18.1: слабые +0.040 при t 3.0 — закрыта).
+# К порогам Δ добавлены пути по t-критерию парных разностей: этап: (t М1u, наименьшая Δ М1u, t слабых, наименьшая Δ слабых).
+T_GATES = {3: (1.3, 0.005, 1.8, 0.02), 6: (2.0, 0.015, 2.5, 0.03)}
+FUTILITY_GATES = (0.015, 0.03)  # досрочное закрытие меряет шанс самого мягкого пути по 12 зёрнам (Δ М1u, Δ слабых)
+
+
+def paired_t(state: dict, rows: dict, base: dict, measure) -> tuple[float, float, int]:  # noqa: ANN001
+    """Парные разности мерки «правка − опора на том же зерне»: среднее, t = среднее / (sd / √n), число зёрен."""
+    deltas = [measure(rows[int(n)]) - measure(rows[int(base[str(s)])]) for s, n in state["runs"].items()
+              if str(s) in base and int(base[str(s)]) in rows and int(n) in rows]
+    if len(deltas) < 3:
+        return (sum(deltas) / len(deltas) if deltas else 0.0), 0.0, len(deltas)
+    mean = sum(deltas) / len(deltas)
+    sd = (sum((d - mean) ** 2 for d in deltas) / (len(deltas) - 1)) ** 0.5
+    return mean, mean / (sd / len(deltas) ** 0.5 + 1e-9), len(deltas)
 
 
 def futility(state: dict, rows: dict, base: dict) -> str | None:
@@ -1337,7 +1396,7 @@ def futility(state: dict, rows: dict, base: dict) -> str | None:
     left = total - len(pairs)
     if left <= 0 or len(pairs) < 2:
         return None
-    m1_gate, weak_gate = CHECKPOINTS[len(STAGES)]
+    m1_gate, weak_gate = FUTILITY_GATES  # v3.5: самый мягкий путь решения по 12 зёрнам
     parts = []
     for name, measure, gate in (("М1u", m1u, m1_gate), ("слабые 2, 4, 5", weak, weak_gate)):
         deltas = [measure(a) - measure(b) for a, b in pairs]
@@ -1355,6 +1414,18 @@ def futility(state: dict, rows: dict, base: dict) -> str | None:
 def weak(entry: dict) -> float:
     values = entry.get("m1_digits_mean") or [0.0] * 10
     return sum(values[d] for d in WEAK) / len(WEAK)
+
+
+def top_ratio(state: dict, rows: dict, base: dict) -> float:
+    """Во сколько раз точек на верхней карте у правки больше, чем у опоры на тех же зёрнах (среднее по зёрнам; 1.0 — нет пар)."""
+    found = []
+    for seed, number in state["runs"].items():
+        if str(seed) not in base or int(base[str(seed)]) not in rows or int(number) not in rows:
+            continue
+        mine, theirs = rows[int(number)].get("points") or [], rows[int(base[str(seed)])].get("points") or []
+        if mine and theirs and theirs[-1]:
+            found.append(float(mine[-1]) / float(theirs[-1]))
+    return sum(found) / len(found) if found else 1.0
 
 
 def base_means(rows: dict, base: dict) -> tuple[float, float, int]:
@@ -1385,8 +1456,10 @@ def decide(state: dict, rows: dict) -> tuple[str, str | None]:
     if paired and all(a.get(key) == b.get(key) for a, b in paired for key in ("m1_digits_mean", "points", "honest")):
         return "bad", (f"этап {stage} ({len(paired)} зёрен): настройка не действует — все прогоны совпали с опорой на тех же "
                        f"зёрнах до бита (М1u по цифрам, точки карт, сходимость) [правило {RULE}]")
+    grown = top_ratio(state, rows, base)
     if stage not in CHECKPOINTS:
-        hopeless = futility(state, rows, base)
+        # v3.7: правку, растящую верх, досрочно не закрываем — ей не нужен прирост М1u.
+        hopeless = None if grown >= TOP_GROWTH else futility(state, rows, base)
         return ("bad", hopeless) if hopeless else ("next", None)
     runs = [rows[int(n)] for n in state["runs"].values()]
     if stage == 1:
@@ -1411,10 +1484,25 @@ def decide(state: dict, rows: dict) -> tuple[str, str | None]:
     m1_gate, weak_gate = CHECKPOINTS[stage]
     by_m1 = mean >= m1_gate
     by_weak = weak_mean >= weak_gate and mean >= -0.01 and honest >= -0.05
-    text = (f"Δ М1u {mean:+.3f} {against}; слабые 2, 4, 5 {weak_mean:+.3f}; честная {honest:+.3f}; {spots_text}; "
-            f"монопятен больше на {more} из {len(pairs)} [правило {RULE}]")
-    if by_m1 or by_weak or spots:
-        why = "по М1u" if by_m1 else ("по слабым цифрам" if by_weak else "по пятнам")
+    # v3.5: пути по t-критерию парных разностей к опоре на тех же зёрнах (этапы 3 и 6)
+    pair_m1, t_m1, _ = paired_t(state, rows, base, m1u)
+    pair_weak, t_weak, _ = paired_t(state, rows, base, weak)
+    by_t_m1 = by_t_weak = False
+    if stage in T_GATES:
+        gate_t_m1, least_m1, gate_t_weak, least_weak = T_GATES[stage]
+        by_t_m1 = t_m1 >= gate_t_m1 and pair_m1 >= least_m1
+        by_t_weak = t_weak >= gate_t_weak and pair_weak >= least_weak and pair_m1 >= 0.0 and honest >= -0.05
+    # v3.7: точек на верхней карте заметно больше, а сходимость не хуже опоры.
+    by_top = grown >= TOP_GROWTH and mean >= TOP_M1_GATE and honest >= -0.05
+    text = (f"Δ М1u {mean:+.3f} {against}; слабые 2, 4, 5 {weak_mean:+.3f}; честная {honest:+.3f}; точек верха ×{grown:.2f}; {spots_text}; "
+            f"монопятен больше на {more} из {len(pairs)}; t парных разностей: М1u {t_m1:+.1f}, слабые {t_weak:+.1f} [правило {RULE}]")
+    if grown <= TOP_SHRINK:
+        return "bad", (f"этап {stage} ({len(runs)} зёрен): {text} — верхняя карта меньше, чем у опоры: рост М1u на маленькой карте "
+                       "не считается (цель автора 2026-11-24) → закрыто")
+    if by_m1 or by_weak or spots or by_t_m1 or by_t_weak or by_top:
+        why = ("по числу точек верха при той же сходимости" if by_top and not (by_m1 or by_weak or by_t_m1 or by_t_weak)
+               else "по М1u" if by_m1 else "по слабым цифрам" if by_weak else "по пятнам" if spots
+               else "по t-критерию М1u" if by_t_m1 else "по t-критерию слабых цифр")
         if stage < len(STAGES):
             return "next", None
         return "good", f"по {len(runs)} зёрнам {why}: {text} → принято, в опору; от узла — продолжение"
@@ -1648,6 +1736,10 @@ def seed_launch(project: dict, items: list[dict], rows: dict) -> str | None:
     # потом приоритет, внутри — раньше созданные (показ в колонках — по времени, новые вверху).
     # Брать из Очереди всегда сверху (автор, комментарий к #66): порядок доски — приоритет, потом новые выше.
     candidates = [i for i in items if queued(i)]
+    # Начатые этапы — раньше свежих правок (тот же порядок доски внутри): список items прочитан в начале шага, а
+    # решение по паре в этом же шаге уже переставило карточку следующего этапа наверх (2026-11-23: этап 3 v17.5
+    # пропустил вперёд свежую v17.2).
+    candidates.sort(key=lambda item: (0 if card_state(item) else 1, -item_priority(item)))  # #66: этапы, потом приоритет
     if not candidates:
         return None
     item = candidates[0]
@@ -1684,12 +1776,28 @@ def seed_launch(project: dict, items: list[dict], rows: dict) -> str | None:
     return f"взята — {card_name(item['content']['title'])} (зёрна {[int(s['seed']) for _, s in cards]}, прогоны {numbers})"
 
 
-def housekeeping(project: dict) -> None:
-    """Учёт доски, не нужный для решения и запуска пары: комментарии, план, версия плана, карты, порядок и поля."""
-    try:
-        check_comments(project)
-    except Exception as error:  # noqa: BLE001
-        say(f"комментарии не проверены: {error!r}")
+TREE_BUDGET = 90  # с: не больше на одну запись дерева в карточки
+COMMENTS_EVERY = 300  # с: комментарии всех карточек читаются не чаще (2026-11-23: на 430 карточках чтение шло 7 мин —
+COMMENTS_CHECKED = [0.0]  # дольше самой пары из кеша (2.3 мин), и готовая пара всё это время ждала решения)
+
+
+def pair_waits_decision(since: float) -> bool:
+    """Пара досчиталась после момента since (tune_pair.done свежее) — сначала решение и запуск, учёт доски потом."""
+    done = os.path.join(STAND, "tune_pair.done")
+    return os.path.exists(done) and os.path.getmtime(done) > since
+
+
+def housekeeping(project: dict, started: float = 0.0) -> None:
+    """Учёт доски, не нужный для решения и запуска пары: комментарии, план, версия плана, карты, порядок и поля.
+    Пара досчиталась, пока шёл учёт (pair_waits_decision), — остаток учёта откладывается до следующего шага."""
+    if time.time() - COMMENTS_CHECKED[0] >= COMMENTS_EVERY:
+        COMMENTS_CHECKED[0] = time.time()
+        try:
+            check_comments(project)
+        except Exception as error:  # noqa: BLE001
+            say(f"комментарии не проверены: {error!r}")
+    if started and pair_waits_decision(started):
+        return
     try:
         plan_sync(project)  # новые строки таблицы плана — карточки в Очередь (задача автора #88)
     except Exception as error:  # noqa: BLE001
@@ -1698,6 +1806,8 @@ def housekeeping(project: dict) -> None:
         ensure_plan_start()  # новая версия плана в plan.md — с какого прогона
     except Exception as error:  # noqa: BLE001
         say(f"версия плана не записана: {error!r}")
+    if started and pair_waits_decision(started):
+        return
     try:
         maps_resend(project)  # карты, не выложившиеся при итоге (автор 2026-11-22: карта в комментарии — обязательно)
     except Exception as error:  # noqa: BLE001
@@ -1711,6 +1821,7 @@ def housekeeping(project: dict) -> None:
 def step() -> str:
     """Шаг прогонщика. План ускорения П1 (docs/SPEEDUP.md, 2026-11-22): сначала решение по законченной паре и сразу запуск
     следующей (доска перечитывается один раз — чтобы увидеть карточку следующего этапа), учёт доски — после запуска."""
+    started = time.time()
     project = B.board()
     rows = log_rows()
     items = project["items"]["nodes"]
@@ -1721,7 +1832,7 @@ def step() -> str:
             relaunched = launch_step(project, project["items"]["nodes"], log_rows())
             status = f"итог; {relaunched}" if relaunched else status
     finally:
-        housekeeping(project)
+        housekeeping(project, started)
     return status
 
 
@@ -1856,6 +1967,8 @@ def main() -> None:
             # после запуска или при пустой Очереди (2026-11-22: стенд стоял 5 мин, пока переписывалось дерево).
             time.sleep(3)
             continue
+        if pair_waits_decision(started):
+            continue  # пара досчиталась за время шага — сначала решение и запуск, дерево потом (2026-11-23)
         if first or status.startswith(("взята", "этап", "итог", "пауза", "ошибка", "прогонщик")) or (status == "очередь пуста" and changed):
             first = False
             try:

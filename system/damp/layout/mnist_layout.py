@@ -311,6 +311,7 @@ def _sparse_layout_options() -> dict[str, object]:
         "fused_block_elements": settings.LAYOUT_FUSED_BLOCK_ELEMENTS,
         "fused_verify_every": settings.LAYOUT_FUSED_VERIFY_EVERY,
         "fused_similarity_table": settings.LAYOUT_FUSED_SIMILARITY_TABLE,
+        "int8_codes": settings.LAYOUT_INT8_CODES,
     }
 
 

@@ -83,17 +83,36 @@ ITEM_FIELDS = """id createdAt content { __typename ... on DraftIssue { id title 
                                           ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { name } } } } }"""
 
 
-def items(fragment: str) -> list[dict]:
-    """Все карточки доски постранично (по 40: ответ по 100 карточек ~1 МБ, GitHub его обрывает — IncompleteRead): fragment — поля карточки в запросе GraphQL."""
+def items(fragment: str, page_size: int = 40) -> list[dict]:
+    """Все карточки доски постранично (по 40: ответ по 100 карточек с текстами ~1 МБ, GitHub его обрывает — IncompleteRead;
+    без текстов можно по 100): fragment — поля карточки в запросе GraphQL."""
     found, cursor = [], None
     while True:
         page = graphql("""query($owner: String!, $number: Int!, $after: String) { %s(login: $owner) { projectV2(number: $number) {
-          items(first: 40, after: $after) { pageInfo { hasNextPage endCursor } nodes { %s } } } } }""" % (KIND, fragment),
+          items(first: %d, after: $after) { pageInfo { hasNextPage endCursor } nodes { %s } } } } }""" % (KIND, int(page_size), fragment),
                        {"owner": OWNER, "number": NUMBER, "after": cursor})[KIND]["projectV2"]["items"]
         found += page["nodes"]
         if not page["pageInfo"]["hasNextPage"]:
             return found
         cursor = page["pageInfo"]["endCursor"]
+
+
+# Тексты карточек-задач читаются только у изменившихся (2026-11-23): на 430 карточках с деревом прогонов в каждом тексте полное
+# чтение доски шло 2.5 мин — дольше пары стенда из кеша (2.3 мин). Список карточек берётся без текстов (по 100 на запрос),
+# тексты — по id задачи, если её updatedAt не тот, что в памяти процесса.
+LIGHT_FIELDS = """id createdAt content { __typename ... on DraftIssue { id title body } ... on Issue { id title number state updatedAt } }
+        fieldValues(first: 20) { nodes { ... on ProjectV2ItemFieldSingleSelectValue { name updatedAt field { ... on ProjectV2SingleSelectField { name } } }
+                                          ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2Field { name } } } } }"""
+BODIES: dict[str, tuple[str, str]] = {}  # id задачи → (updatedAt, текст)
+
+
+def bodies(ids: list[str]) -> None:
+    """Дочитать в BODIES тексты задач по id (по 25 на запрос)."""
+    for start in range(0, len(ids), 25):
+        found = graphql("query($ids: [ID!]!) { nodes(ids: $ids) { ... on Issue { id body updatedAt } } }", {"ids": ids[start:start + 25]})
+        for node in found["nodes"]:
+            if node and node.get("id"):
+                BODIES[node["id"]] = (node.get("updatedAt") or "", node.get("body") or "")
 
 
 def board() -> dict:
@@ -103,7 +122,14 @@ def board() -> dict:
                                   ... on ProjectV2Field { id name dataType } } }
     } } }""" % KIND
     project = graphql(query, {"owner": OWNER, "number": NUMBER})[KIND]["projectV2"]
-    project["items"] = {"nodes": items(ITEM_FIELDS)}
+    nodes = items(LIGHT_FIELDS, page_size=100)
+    issues = [node["content"] for node in nodes if (node.get("content") or {}).get("__typename") == "Issue"]
+    stale = [content["id"] for content in issues if BODIES.get(content["id"], ("", ""))[0] != (content.get("updatedAt") or "?")]
+    if stale:
+        bodies(stale)
+    for content in issues:
+        content["body"] = BODIES.get(content["id"], ("", ""))[1]
+    project["items"] = {"nodes": nodes}
     return project
 
 

@@ -217,6 +217,8 @@ class MnistLadderRunner:
             validation_numbers=self._numbers["validation"],
             test_numbers=self._numbers["test"],
             train_views=settings.LADDER_TRAIN_VIEWS,
+            # Добавочные картинки верхних уровней (вне статьи): в наборе они есть, только когда задан уровень, с которого учат.
+            extra=DigitGroups.extra_wanted(),
         )
         self._groups = groups
         self.groups = groups

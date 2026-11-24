@@ -29,7 +29,7 @@ class KeyholeCoder:
             repr(settings.ENCODER_LAYER_PHASE), repr(settings.LADDER_RANDOM_SEED), repr(settings.LADDER_BINDING_ENUMERATE_FROM),
             repr(settings.LADDER_BINDING_POOLING), repr(settings.LADDER_BINDING_MASK), repr(settings.LADDER_BINDING_MASK_BITS),
             repr(settings.LADDER_BINDING_TARGET_DENSITY), repr(settings.LADDER_BINDING_SATURATION),
-            repr(settings.LADDER_BINDING_LENGTH_MAX), repr(settings.ACTIVATION_USE_GPU), repr(settings.LADDER_BINDING_CONCEPTS),
+            repr(self.length_max(number)), repr(settings.ACTIVATION_USE_GPU), repr(settings.LADDER_BINDING_CONCEPTS),
             repr(self.place_bits(number)), repr(self.content_layers(number)),
         )
 
@@ -61,19 +61,20 @@ class KeyholeCoder:
         LADDER_BINDING_PLACE_NARROWEST, у каждого слоя своя цветовая полоса бит (§3.2, §4.2.1). Слои и перекрытие
         подобраны под плотность кода угла (автор 2026-11-19), длина — под плотность кода окна уровня (§2)."""
         length = self.place_length(number)
-        if length not in self._places:
+        narrowest, layers = self.place_narrowest(number), self.place_layers(number)
+        if (length, narrowest, layers) not in self._places:
             extent = float(settings.LADDER_PLACE_EXTENT)
             overlap = float(settings.LADDER_BINDING_PLACE_OVERLAP)
             # Радиус круга слоя из n кругов по стороне — 1 / (2 · n · (1 − перекрытие)) стороны (plane_detector_layers).
             radius = lambda count: 1.0 / (2.0 * float(count) * (1.0 - overlap))  # noqa: E731
-            self._places[length] = Encoder(
+            self._places[(length, narrowest, layers)] = Encoder(
                 PlaneDimension(
                     "Place",
                     ((-extent, extent), (-extent, extent)),
                     plane_detector_layers(
-                        layers_count=settings.LADDER_BINDING_PLACE_LAYERS,
+                        layers_count=layers,
                         widest_radius=radius(settings.LADDER_BINDING_PLACE_WIDEST),
-                        narrowest_radius=radius(settings.LADDER_BINDING_PLACE_NARROWEST),
+                        narrowest_radius=radius(narrowest),
                         overlap=overlap,
                     ),
                     code_length=length,
@@ -82,7 +83,27 @@ class KeyholeCoder:
                 random_seed=settings.LADDER_RANDOM_SEED,
                 layer_phase=settings.ENCODER_LAYER_PHASE,
             )
-        return self._places[length]
+        return self._places[(length, narrowest, layers)]
+
+    @staticmethod
+    def place_layers(number: int) -> int:
+        """Слоёв кругов места на уровне number: LADDER_BINDING_PLACE_LAYERS — число на все уровни либо список по уровням
+        0, 1, 2, … (последнее — на всех выше). Число кругов по стороне у слоёв не повторяется, поэтому при 10 слоях от 2
+        самый узкий — не меньше 11 по стороне; грубее — только меньше слоёв (план v18)."""
+        value = settings.LADDER_BINDING_PLACE_LAYERS
+        if isinstance(value, (list, tuple)):
+            return int(value[min(max(int(number), 0), len(value) - 1)])
+        return int(value)
+
+    @staticmethod
+    def place_narrowest(number: int) -> int:
+        """Кругов по стороне у самого узкого слоя места на уровне number: LADDER_BINDING_PLACE_NARROWEST — число на все
+        уровни либо список по уровням 0, 1, 2, … (последнее — на всех выше). Меньше — место грубее: на окнах во всю цифру
+        узкие круги различают почерк, а не цифру (план v18, вслед за v8.1 и v6.1)."""
+        value = settings.LADDER_BINDING_PLACE_NARROWEST
+        if isinstance(value, (list, tuple)):
+            return int(value[min(max(int(number), 0), len(value) - 1)])
+        return int(value)
 
     @staticmethod
     def pooling(number: int) -> str:
@@ -109,7 +130,25 @@ class KeyholeCoder:
             "LADDER_BINDING_POOLING": cls.pooling(number),
             "LADDER_BINDING_POOLING_TIE_FROM": None,
             "LADDER_BINDING_POOLING_TIE": cls.pooling_tie(number),
+            # Список по уровням — в ключ идёт значение уровня; число — как раньше (ключи кеша прежние).
+            **({"LADDER_BINDING_PLACE_NARROWEST": cls.place_narrowest(number)}
+               if isinstance(settings.LADDER_BINDING_PLACE_NARROWEST, (list, tuple)) else {}),
+            **({"LADDER_BINDING_PLACE_LAYERS": cls.place_layers(number)}
+               if isinstance(settings.LADDER_BINDING_PLACE_LAYERS, (list, tuple)) else {}),
+            **({"LADDER_BINDING_LENGTH_MAX": cls.length_max(number)}
+               if isinstance(settings.LADDER_BINDING_LENGTH_MAX, (list, tuple)) else {}),
         }
+
+    @staticmethod
+    def length_max(number: int) -> int:
+        """Наибольшая длина сегмента содержания окон уровня number: LADDER_BINDING_LENGTH_MAX — число на все уровни либо
+        список по уровням 0, 1, 2, … (последнее — на всех выше). План v23 (2026-11-24): на ур. 3–4 длина упирается в
+        8192 (плотность 0.23 / 0.21 при цели 0.2 — окна у порога слияния цветов), а уровень 0 тем же кодером стоит
+        на 0.203: предел одним числом удлинил бы и коды штрихов — вся иерархия с раскладкой ур. 0 заново."""
+        value = settings.LADDER_BINDING_LENGTH_MAX
+        if isinstance(value, (list, tuple)):
+            return int(value[min(max(int(number), 0), len(value) - 1)])
+        return int(value)
 
     def encoder(self, number: int) -> PositionBindingEncoder:
         """Кодер окон уровня number (П.5)."""
@@ -121,7 +160,7 @@ class KeyholeCoder:
             mask_bits=settings.LADDER_BINDING_MASK_BITS,
             target_density=settings.LADDER_BINDING_TARGET_DENSITY,
             saturation=settings.LADDER_BINDING_SATURATION,
-            max_length=settings.LADDER_BINDING_LENGTH_MAX,
+            max_length=self.length_max(number),
             seed=settings.LADDER_RANDOM_SEED + number,
             use_gpu=settings.ACTIVATION_USE_GPU,
             name=f"level{number}",

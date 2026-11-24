@@ -545,8 +545,12 @@ class StepCache:
         self._counter_set(total)
         return total
 
+    # До какой доли предела вытеснять. Было 0.9: у предела 20 ГиБ вытеснение (обход кеша, 150–230 с) шло раз в 2 ГиБ записей —
+    # на стенде с добавочными картинками каждые 2–3 прогона, 8–10 % времени стенда (2026-11-24). 0.75 — в 2.5 раза реже.
+    EVICT_TO = 0.75
+
     def _evict(self) -> None:
-        """Сверх CACHE_MAX_BYTES — удалить давно не нужные записи до 90 % предела и массивы без ссылок."""
+        """Сверх CACHE_MAX_BYTES — удалить давно не нужные записи до доли EVICT_TO предела и массивы без ссылок."""
         limit = int(settings.CACHE_MAX_BYTES)
         self._size, self._size_root = self._counter_size(), self.root
         if self._size <= limit:
@@ -561,7 +565,7 @@ class StepCache:
         # записи одну за другой по секунде на каждую (2026-11-20: подбор стоял часами в _evict). Массивы, общие с
         # оставшимися записями, не освобождаются, поэтому проход повторяется, пока размер не опустится до 90 % предела.
         removed = freed = 0
-        target = int(limit * 0.9)
+        target = int(limit * self.EVICT_TO)
         for _ in range(8):
             rows = sorted(self.entries(), key=lambda row: row[3])
             if not rows:
