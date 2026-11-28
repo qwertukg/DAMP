@@ -32,7 +32,10 @@ class TrainedLadderTest(unittest.TestCase):
                 self.levels = []
 
             def level(self, trace) -> None:  # noqa: ANN001
-                self.levels.append(trace)
+                # Уровень 0 цикла (LADDER_LEVEL0) тоже отдаёт след, но среди обученных уровней (runner.levels) его нет:
+                # он хранится отдельно (runner.primary). Сверяются уровни цикла 1, 2, …
+                if int(trace.number) >= 1:
+                    self.levels.append(trace)
 
         cls.traces = Traces()
         changes = {"LADDER_SAVE_MAPS": False, "LADDER_TRAIN_VIEWS": ()}

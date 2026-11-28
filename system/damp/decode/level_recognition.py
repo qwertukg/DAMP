@@ -18,6 +18,11 @@ from damp.decode.nearest_codes import NearestCodeClassifier, NearestVectorClassi
 class LevelRecognition:
     """Узнавание по уровню цикла: отклик картинки и голосование её деталей по самым похожим обучающим (§2.2.5)."""
 
+    # Срабатываний за кусок при подсчёте откликов: временные массивы (картинка срабатывания, уровни float32) — по куску,
+    # а не по всем срабатываниям уровня (на 40 000 картинках у уровня 3 их 110 млн — 1.3 ГБ копий). Числа те же:
+    # счётчик срабатываний — целые числа в float32, сумма не зависит от порядка; максимум — тоже.
+    RESPONSE_CHUNK = 1 << 24
+
     def __init__(self, labels: "np.ndarray", train: tuple[int, int], neighbours: Sequence[int] | None = None) -> None:
         self.labels = np.asarray(labels)
         self.train = (int(train[0]), int(train[1]))
@@ -37,10 +42,14 @@ class LevelRecognition:
 
         def compute() -> dict[str, object]:
             response = np.zeros((int(pictures), int(detectors)), dtype=np.float32)
-            np.add.at(response, (picture[rows], columns), 1.0)
-            response /= np.maximum(np.sqrt((response * response).sum(axis=1, keepdims=True)), 1e-12)
             peak = np.zeros((int(pictures), int(detectors)), dtype=np.float32)
-            np.maximum.at(peak, (picture[rows], columns), levels.astype(np.float32))
+            chunk = int(LevelRecognition.RESPONSE_CHUNK)
+            for start in range(0, int(np.shape(rows)[0]), chunk):
+                owner, column = picture[rows[start : start + chunk]], columns[start : start + chunk]
+                np.add.at(response, (owner, column), 1.0)
+                np.maximum.at(peak, (owner, column), levels[start : start + chunk].astype(np.float32))
+                del owner, column
+            response /= np.maximum(np.sqrt((response * response).sum(axis=1, keepdims=True)), 1e-12)
             peak /= np.maximum(np.sqrt((peak * peak).sum(axis=1, keepdims=True)), 1e-12)
             return {"response": response, "peak": peak}
 

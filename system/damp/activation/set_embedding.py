@@ -63,6 +63,21 @@ def _strongest_py(starts, columns, levels, saturation, kept):  # noqa: ANN001, A
 
 _strongest_compiled = None if numba is None else numba.njit(cache=True, nogil=True)(_strongest_py)
 
+# Пар за один шаг проверки порядка (_descends).
+ORDER_CHUNK = 1 << 22
+
+
+def _descends(values: "np.ndarray") -> bool:
+    """Есть ли спад: values[i + 1] < values[i] хоть где-то — то же, что np.any(np.diff(values) < 0), но кусками, без
+    массива разностей во все пары (на уровне 3 при 40 000 картинках — 111 млн пар: 0.9 ГБ int64 и 0.1 ГБ флагов разом;
+    разбор 2026-11-26)."""
+    count = int(values.shape[0])
+    for start in range(1, count, ORDER_CHUNK):
+        stop = min(count, start + ORDER_CHUNK)
+        if np.any(values[start:stop] < values[start - 1 : stop - 1]):
+            return True
+    return False
+
 
 class DetectorEmbeddings:
     """Коды наборов по сработавшим детекторам: выбор σ сильнейших, длина под плотность, один бит на детектор."""
@@ -86,9 +101,16 @@ class DetectorEmbeddings:
         max_length: int,
         seed: int,
         name: str = "sets",
+        saturation_share: float = 0.0,
+        colour: "np.ndarray | None" = None,
+        topography: "np.ndarray | None" = None,
+        ancestors: "np.ndarray | None" = None,
+        layers: "np.ndarray | None" = None,
     ) -> None:
         if detectors <= 0:
             raise ValueError("detectors must be positive")
+        if not 0.0 <= saturation_share <= 1.0:
+            raise ValueError("saturation_share must be in [0, 1] (0 — σ задан числом)")
         if saturation_limit < 0:
             raise ValueError("saturation_limit must be non-negative (0 — без ограничения)")
         if not 0.0 < target_density < 1.0:
@@ -97,11 +119,40 @@ class DetectorEmbeddings:
             raise ValueError("code length bounds must satisfy 0 < min_length <= max_length")
         self._detectors = int(detectors)
         self._saturation = int(saturation_limit)
+        # σ долей от сработавших в наборе (вне статьи; разметка автора 2026-11-20 «середина плато»): берётся
+        # round(share · сработавших), не меньше 1 и не больше saturation_limit (если он задан); 0 — σ числом.
+        self._share = float(saturation_share)
         self._target = float(target_density)
         self._min_steps = -(-int(min_length) // self.LENGTH_STEP)
         self._max_steps = max(self._min_steps, int(max_length) // self.LENGTH_STEP)
         self._seed = int(seed)
         self._name = str(name)
+        # Цвет детектора (§6.5: λ_d — «цвет» кода детектора): номер слоя иерархии, 0 — самый низкий порог λ_d, самые
+        # широкие области («длинные волны», §3.3.1). Задан — σ в наборе отбираются сначала по цвету, внутри цвета по
+        # силе: colour merge, отбрасывающий коротковолновые биты (§3.3.2). None — только по силе.
+        self._colour = None if colour is None else np.asarray(colour, dtype=np.int64)
+        # Топографические биты (план v4.11, вне статьи по форме: §6.3 — бит детектора случайный): ключи ячеек карты
+        # (детекторы × сетки), бит = ключ по модулю длины кода — соседние детекторы одной ячейки делят бит. None — как было.
+        self._topography = None if topography is None else np.asarray(topography, dtype=np.uint64)
+        if self._topography is not None and self._topography.shape[0] != self._detectors:
+            raise ValueError("topography: по строке ключей на детектор")
+        # Предки детекторов (план v8.2): к каждому из σ выбранных добавляется его широкий предок (детекторы × слоёв вверх,
+        # −1 — нет) со своим случайным битом. None — как было.
+        self._ancestors = None if ancestors is None else np.asarray(ancestors, dtype=np.int64).reshape(self._detectors, -1)
+        # Квота σ по слоям (план v8.6): слой каждого детектора; задан — в наборе сначала не больше ⌈σ / слоёв⌉ сильнейших
+        # от каждого слоя, остаток σ — по силе из остальных. Широкие слои всегда в коде, узкие не вытесняются. None — выкл.
+        self._layers = None if layers is None else np.asarray(layers, dtype=np.int64)
+
+    def with_ancestors(self, rows: "np.ndarray", columns: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Пары (набор, детектор) выбранных σ и их предков без повторов; без предков — как есть."""
+        if self._ancestors is None or rows.size == 0:
+            return rows, columns
+        extra = self._ancestors[columns]
+        rows_all = np.concatenate([rows, np.repeat(rows, extra.shape[1])])
+        columns_all = np.concatenate([columns, extra.reshape(-1)])
+        keep = columns_all >= 0
+        keys = np.unique(rows_all[keep] * np.int64(self._detectors) + columns_all[keep])
+        return keys // self._detectors, keys % self._detectors
 
     def strongest(
         self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
@@ -109,10 +160,16 @@ class DetectorEmbeddings:
         """Пары (набор, детектор), оставшиеся после порога μ_c: σ самых сильных детекторов набора (§7.1.12)."""
         rows = np.asarray(rows, dtype=np.int64)
         columns = np.asarray(columns, dtype=np.int64)
+        if self._layers is not None and rows.size and self._saturation > 0:
+            return self._strongest_quota(rows, columns, np.asarray(levels, dtype=np.float64))
+        if self._colour is not None and rows.size and (self._saturation > 0 or self._share > 0.0):
+            return self._strongest_colour(rows, columns, np.asarray(levels, dtype=np.float64))
+        if self._share > 0.0 and rows.size:
+            return self._strongest_share(rows, columns, np.asarray(levels, dtype=np.float64))
         if self._saturation == 0 or rows.size == 0:
             return rows, columns
         levels = np.asarray(levels)
-        if np.any(np.diff(rows) < 0):
+        if _descends(rows):
             order = np.argsort(rows, kind="stable")
             rows, columns, levels = rows[order], columns[order], levels[order]
         if _strongest_compiled is not None:
@@ -123,6 +180,70 @@ class DetectorEmbeddings:
             if _strongest_compiled(starts, np.ascontiguousarray(columns), np.ascontiguousarray(levels), self._saturation, kept):
                 return rows[kept], columns[kept]
         return self._strongest_dense(rows, columns, levels)
+
+    def _strongest_quota(
+        self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """План v8.6: σ сильнейших с квотой по слоям — в каждом наборе сначала не больше ⌈σ / слоёв⌉ сильнейших каждого
+        слоя (по силе), затем остаток σ — по силе из остальных; при равных — меньший номер детектора."""
+        layer = self._layers[columns]
+        count = int(self._layers.max()) + 1 if self._layers.size else 1
+        cap = -(-self._saturation // max(1, count))
+        order = np.lexsort((columns, -levels, layer, rows))
+        group = rows[order] * np.int64(count) + layer[order]
+        starts = np.flatnonzero(np.r_[True, group[1:] != group[:-1]])
+        rank = np.arange(order.size, dtype=np.int64) - np.repeat(starts, np.diff(np.r_[starts, order.size]))
+        first = np.zeros(rows.size, dtype=bool)
+        first[order] = rank < cap
+        order2 = np.lexsort((columns, -levels, ~first, rows))
+        sorted_rows = rows[order2]
+        sets = int(sorted_rows[-1]) + 1
+        bounds = np.searchsorted(sorted_rows, np.arange(sets + 1))
+        within = np.arange(sorted_rows.size, dtype=np.int64) - bounds[sorted_rows]
+        kept = np.zeros(rows.size, dtype=bool)
+        kept[order2[within < self._saturation]] = True
+        return rows[kept], columns[kept]
+
+    def _strongest_colour(
+        self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """Colour merge (§6.5, §3.3.2): в каждом наборе — σ детекторов, сначала самых широких слоёв (меньший цвет), внутри
+        слоя — сильнейшие; при равных — меньший номер детектора. σ — saturation_limit или доля share от сработавших."""
+        colour = self._colour[columns]
+        order = np.lexsort((columns, -levels, colour, rows))
+        sorted_rows = rows[order]
+        sets = int(sorted_rows[-1]) + 1
+        starts = np.searchsorted(sorted_rows, np.arange(sets + 1))
+        counts = np.diff(starts)
+        if self._share > 0.0:
+            take = np.maximum(1, np.rint(self._share * counts)).astype(np.int64)
+            if self._saturation > 0:
+                take = np.minimum(take, self._saturation)
+        else:
+            take = np.full(sets, self._saturation, dtype=np.int64)
+        rank = np.arange(sorted_rows.size, dtype=np.int64) - starts[sorted_rows]
+        kept = np.zeros(rows.size, dtype=bool)
+        kept[order[rank < take[sorted_rows]]] = True
+        return rows[kept], columns[kept]
+
+    def _strongest_share(
+        self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
+    ) -> tuple["np.ndarray", "np.ndarray"]:
+        """σ долей: в каждом наборе — round(share · сработавших) сильнейших (не меньше 1; не больше saturation_limit,
+        если он задан). Разметка автора 2026-11-20: σ — середина «плато» уровней; по всем окнам она около половины
+        сработавших (§7.1.12, пример статьи — 30 из 80). При равных уровнях раньше идёт меньший номер детектора."""
+        order = np.lexsort((columns, -levels, rows))
+        sorted_rows = rows[order]
+        sets = int(sorted_rows[-1]) + 1
+        starts = np.searchsorted(sorted_rows, np.arange(sets + 1))
+        counts = np.diff(starts)
+        take = np.maximum(1, np.rint(self._share * counts)).astype(np.int64)
+        if self._saturation > 0:
+            take = np.minimum(take, self._saturation)
+        rank = np.arange(sorted_rows.size, dtype=np.int64) - starts[sorted_rows]
+        kept = np.zeros(rows.size, dtype=bool)
+        kept[order[rank < take[sorted_rows]]] = True
+        return rows[kept], columns[kept]
 
     def _strongest_dense(
         self, rows: "np.ndarray", columns: "np.ndarray", levels: "np.ndarray"
@@ -163,7 +284,10 @@ class DetectorEmbeddings:
         return np.concatenate(kept_rows), np.concatenate(kept_columns)
 
     def detector_bits(self, length: int) -> "np.ndarray":
-        """Бит каждого детектора в коде длины length: случайная перестановка, пока детекторов не больше длины."""
+        """Бит каждого детектора в коде длины length: случайная перестановка, пока детекторов не больше длины.
+        Топографические биты — по биту на сетку (детекторы × сетки): ключ ячейки по модулю длины."""
+        if self._topography is not None:
+            return (self._topography % np.uint64(int(length))).astype(np.int64)
         rng = np.random.default_rng(self._seed)
         parts = []
         left = self._detectors
@@ -180,9 +304,8 @@ class DetectorEmbeddings:
         без сортировки всех пар.
         """
         length = int(length)
-        place = self.detector_bits(length)[columns]
-        rows = np.asarray(rows, dtype=np.int64)
-        if rows.size and np.any(np.diff(rows) < 0):
+        rows, place = self._pairs(np.asarray(rows, dtype=np.int64), self.detector_bits(length)[columns])
+        if rows.size and _descends(rows):
             order = np.argsort(rows, kind="stable")
             rows, place = rows[order], place[order]
         sets = int(rows[-1]) + 1 if rows.size else 0
@@ -200,9 +323,16 @@ class DetectorEmbeddings:
 
     def _density_sorted(self, rows: "np.ndarray", columns: "np.ndarray", count: int, length: int) -> float:
         """Прямой счёт плотности: различные пары (набор, бит) сортировкой. Мерка для быстрого счёта _density."""
-        bits = self.detector_bits(length)
-        keys = np.unique(rows * int(length) + bits[columns])
+        rows, place = self._pairs(np.asarray(rows, dtype=np.int64), self.detector_bits(length)[columns])
+        keys = np.unique(rows * int(length) + place)
         return float(keys.shape[0]) / (max(1, int(count)) * int(length))
+
+    @staticmethod
+    def _pairs(rows: "np.ndarray", place: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Пары (набор, бит): один бит на детектор — как есть; топографические — по паре на каждую сетку."""
+        if place.ndim == 1:
+            return rows, place
+        return np.repeat(rows, place.shape[1]), place.reshape(-1)
 
     def fit_length(self, rows: "np.ndarray", columns: "np.ndarray", count: int) -> int:
         """Наименьшая длина кода, при которой средняя плотность кодов наборов 0…count−1 не выше заданной."""
@@ -239,7 +369,7 @@ class DetectorEmbeddings:
         подбирается.
         """
         fired = np.bincount(np.asarray(rows, dtype=np.int64), minlength=int(count))
-        rows, columns = self.strongest(rows, columns, levels)
+        rows, columns = self.with_ancestors(*self.strongest(rows, columns, levels))
         if length is not None:
             sample = int(count)
             length = int(length)
@@ -263,7 +393,8 @@ class DetectorEmbeddings:
             size = min(self.CHUNK_ROWS, int(count) - first)
             matrix = np.zeros((size, length), dtype=np.uint8)
             entries = slice(int(starts[chunk]), int(starts[chunk + 1]))
-            matrix[rows[entries] - first, bits[columns[entries]]] = 1
+            chunk_rows, chunk_bits = self._pairs(rows[entries] - first, bits[columns[entries]])
+            matrix[chunk_rows, chunk_bits] = 1
             ones += int(matrix.sum())
             packed[first : first + size] = np.packbits(matrix, axis=1)
         kept = np.bincount(rows, minlength=int(count))

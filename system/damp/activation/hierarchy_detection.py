@@ -58,6 +58,7 @@ class HierarchyDetection:
         local_energy_threshold: float = 0.0,
         local_energy_radius: float = 0.0,
         use_gpu: bool = True,
+        int8_codes: bool = False,
         name: str = "layout",
     ) -> None:
         import torch
@@ -87,8 +88,21 @@ class HierarchyDetection:
         # не оставил бы следа на карте (расширение статьи).
         self._activate_best = bool(activate_best)
         self._name = str(name)
-        self._points = self._to_device(np.ascontiguousarray(table.packed))
-        self._ones = self._points.sum(dim=1)
+        # Коды на устройстве (вне статьи, техника счёта): int8 и целочисленное произведение int8 × int8 → int32
+        # (torch._int_mm) дают то же число общих бит (§2.2.4), что произведение float32, — срабатывания те же до бита;
+        # памяти под коды точек вчетверо меньше (карта в 28 тыс. точек: 0.29 ГБ вместо 1.14 ГБ), произведение быстрее.
+        # Первые точки сверяются с подсчётом бит по упакованным кодам; не сошлось или не CUDA — float32, как раньше.
+        packed_points = np.ascontiguousarray(table.packed)
+        self._point_count = int(packed_points.shape[0])
+        self._int8 = bool(int8_codes) and self._device.type == "cuda" and hasattr(torch, "_int_mm")
+        self._points = self._to_device(packed_points, points=True)
+        if self._int8 and not self._int8_matches(packed_points):
+            self._int8 = False
+            self._points = self._to_device(packed_points, points=True)
+        if self._int8:
+            self._ones = self._points[: self._point_count].sum(dim=1, dtype=torch.int32).to(torch.float32)
+        else:
+            self._ones = self._points.sum(dim=1)
         energy = np.asarray(energies, dtype=np.float32)
         # Точки с энергией ниже μ_e в уровень активации детектора не входят (§6.5).
         weights = np.where(energy >= float(energy_threshold), energy, 0.0).astype(np.float32)
@@ -97,8 +111,10 @@ class HierarchyDetection:
         centre = np.asarray([detector.center for detector in self.detectors], dtype=np.float64)
         radius = np.asarray([detector.radius for detector in self.detectors], dtype=np.float64)
         # Поле детектора — точки не дальше r_d от его центра (§6.5), как в ActivationEngine.
-        inside = np.hypot(cells[:, None, 0] - centre[None, :, 0], cells[:, None, 1] - centre[None, :, 1]) <= radius[None, :]
-        self._coverage = torch.as_tensor(inside.astype(np.float32), device=self._device)
+        coverage, covered = self._coverage_matrix(cells, centre, radius)
+        # Поля — нули и единицы: на хосте они uint8 (у карты в 29 тыс. точек с 12 тыс. детекторов — 0.35 ГБ, а float32 вместе с
+        # транспонированием держал 2.8 ГБ ОЗУ — пик прогона, 2026-11-24), во float32 — уже на устройстве; значения те же.
+        self._coverage = torch.as_tensor(coverage, device=self._device).to(torch.float32)
         # Энергия активации точки (расширение статьи): формула энергии точки §5.7, где вместо сходства с соседями —
         # их активация a_v, с нормировкой на наибольшую по карте для того же стимула (Ê = E / E_max, §5.7). Точка с
         # Ê_a ниже μ_a гаснет: одиночная зажжённая точка, вокруг которой ничего не горит, в детекторы не идёт. В §6.5
@@ -131,7 +147,7 @@ class HierarchyDetection:
                 "layers": len(thresholds),
                 "layer_thresholds": list(thresholds),
                 "detectors_per_layer": np.bincount(self.layer_index, minlength=len(thresholds)).tolist(),
-                "covered_points_mean": float(inside.sum(axis=0).mean()),
+                "covered_points_mean": float(covered.mean()),
                 "lambda_threshold": self._lambda,
                 "eta": 0.0 if self._eta is None else self._eta,
                 "energy_threshold": float(energy_threshold),
@@ -140,14 +156,83 @@ class HierarchyDetection:
                 "local_energy_threshold": self._local_threshold,
                 "local_energy_radius": self._local_radius,
                 "local_energy_pairs": 0 if self._neighbours is None else int(self._neighbours.values().shape[0]),
+                "codes": "int8" if self._int8 else "float32",
                 "note": "детекторы упорядочены по слоям: слой 0 — самый низкий порог λ_d (самые широкие области); "
                 "точка с энергией активации Ê_a < μ_a гаснет (§5.7 на матрице активации, расширение статьи; 0 — выключено)",
             },
         )
 
-    def _to_device(self, packed: "np.ndarray"):  # noqa: ANN202
+    @staticmethod
+    def _coverage_matrix(cells: "np.ndarray", centre: "np.ndarray", radius: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
+        """Поля детекторов: матрица «точки × детекторы» uint8 из 0/1 и число точек в поле каждого детектора.
+
+        Тот же признак hypot(cell − centre) ≤ r (float64, те же биты на границе), но без матрицы N × D float64:
+        для каждого детектора hypot считается только по точкам прямоугольника радиуса (hypot ≥ |dx|, поэтому вне
+        прямоугольника признак ложен; прямоугольник взят с запасом, лишние кандидаты отсеивает сам hypot)."""
+        count, detectors = int(cells.shape[0]), int(centre.shape[0])
+        order = np.argsort(cells[:, 0], kind="stable")
+        xs, ys = cells[order, 0], cells[order, 1]
+        transposed = np.zeros((detectors, count), dtype=np.uint8)
+        covered = np.zeros(detectors, dtype=np.int64)
+        for number in range(detectors):
+            cx, cy, r = float(centre[number, 0]), float(centre[number, 1]), float(radius[number])
+            margin = 1e-9 * (1.0 + abs(cx) + abs(r))
+            low = int(np.searchsorted(xs, cx - r - margin, side="left"))
+            high = int(np.searchsorted(xs, cx + r + margin, side="right"))
+            if high <= low:
+                continue
+            inside = np.hypot(xs[low:high] - cx, ys[low:high] - cy) <= r
+            transposed[number, order[low:high][inside]] = 1
+            covered[number] = int(inside.sum())
+        return np.ascontiguousarray(transposed.T), covered
+
+    # torch._int_mm: левая матрица — больше 16 строк, длина кода и число точек — кратны 8 (дополняются нулями: нулевой
+    # бит и нулевая точка общих бит не добавляют).
+    INT_MM_ROWS_MIN = 17
+    INT_MM_MULTIPLE = 8
+    INT8_CHECK_ROWS = 8
+
+    def _to_device(self, packed: "np.ndarray", points: bool = False):  # noqa: ANN202
+        """Коды на устройстве: float32 (строки × длина) либо, при int8, int8 с длиной, дополненной до кратной 8;
+        points — это коды точек карты: у них и число строк дополняется до кратного 8."""
+        torch = self._torch
         bits = np.unpackbits(packed, axis=1, count=self._length)
-        return self._torch.as_tensor(bits, device=self._device).to(self._torch.float32)
+        if not self._int8:
+            return torch.as_tensor(bits, device=self._device).to(torch.float32)
+        rows, length = int(bits.shape[0]), int(bits.shape[1])
+        multiple = self.INT_MM_MULTIPLE
+        codes = torch.zeros(((-(-rows // multiple) * multiple) if points else rows, -(-length // multiple) * multiple),
+                            dtype=torch.int8, device=self._device)
+        codes[:rows, :length] = torch.as_tensor(bits, device=self._device).to(torch.int8)
+        return codes
+
+    def _common(self, block):  # noqa: ANN001, ANN202
+        """Число общих бит (§2.2.4) кодов блока с кодами точек карты, float32 (строки × точки): целые числа, одни и те
+        же у произведения float32 и у целочисленного int8 × int8 → int32."""
+        torch = self._torch
+        if block.dtype != torch.int8:
+            return block @ self._points.T
+        taken = int(block.shape[0])
+        if taken == 0:
+            return torch.zeros((0, self._point_count), dtype=torch.float32, device=self._device)
+        if taken < self.INT_MM_ROWS_MIN:
+            block = torch.cat((block, block.new_zeros((self.INT_MM_ROWS_MIN - taken, block.shape[1]))))
+        return torch._int_mm(block, self._points.T)[:taken, : self._point_count].to(torch.float32)
+
+    def _int8_matches(self, packed_points: "np.ndarray") -> bool:
+        """Сверка int8-произведения с подсчётом бит по упакованным кодам: несколько точек карты со всеми точками."""
+        torch = self._torch
+        count = self._point_count
+        if count == 0 or not hasattr(np, "bitwise_count"):
+            return count == 0
+        probe = np.unique(np.linspace(0, count - 1, min(count, self.INT8_CHECK_ROWS)).astype(np.int64))
+        try:
+            with torch.no_grad():
+                found = self._common(self._points[torch.as_tensor(probe, device=self._device)]).cpu().numpy()
+        except Exception:  # noqa: BLE001 — нет целочисленного произведения на этом устройстве
+            return False
+        expected = np.stack([np.bitwise_count(packed_points & packed_points[row]).sum(axis=1) for row in probe])
+        return bool(np.array_equal(found.astype(np.int64), expected.astype(np.int64)))
 
     def active(self, packed: "np.ndarray") -> tuple["np.ndarray", "np.ndarray"]:
         """Пары (номер кода, номер детектора) для всех сработавших детекторов; коды — строки × ⌈L/8⌉ байт."""
@@ -178,10 +263,7 @@ class HierarchyDetection:
                 "points_lit_per_code": lit / max(1, packed.shape[0]),
                 "points_dropped_by_local_energy_per_code": dropped / max(1, packed.shape[0]),
                 "detectors_per_code": float(per_code.mean()) if per_code.size else 0.0,
-                "detectors_per_code_by_layer": [
-                    float(np.count_nonzero(self.layer_index[columns] == number)) / max(1, packed.shape[0])
-                    for number in range(len(self.layer_thresholds))
-                ],
+                "detectors_per_code_by_layer": [float(count) / max(1, packed.shape[0]) for count in self._per_layer(columns)],
                 "codes_without_detectors": float(np.mean(per_code == 0)) if per_code.size else 0.0,
                 "note": "код зажигает все точки со сходством не ниже λ_a (§6.1); детектор активен, если энергия "
                 "зажжённых точек его поля не меньше доли μ_d его собственной энергии (§6.5)",
@@ -243,6 +325,40 @@ class HierarchyDetection:
         return (joined(rows, np.int64), joined(columns, np.int64), joined(levels, np.float32),
                 joined(lit_rows, np.int64), joined(lit_points, np.int64), joined(lit_values, np.float32))
 
+    def _host(self, tensor) -> "np.ndarray":  # noqa: ANN001
+        """Тензор устройства — в новый массив, чью память держит numpy, а не распределитель torch; числа те же, что у
+        .cpu().numpy(). Мелкие куски из .cpu() распределитель torch на Windows после освобождения системе не отдаёт: на
+        146 млн троек уровня 3 (50 000 картинок, ~1330 проходов по наборам) процесс держал лишние ~1.7 ГБ до конца уровня
+        (замер 2026-11-26 на тех же кусках: после склейки .cpu() — 4.91 ГиБ, копия в numpy — 3.26 ГиБ)."""
+        torch = self._torch
+        kind = {torch.int32: np.int32, torch.int64: np.int64, torch.float32: np.float32}[tensor.dtype]
+        found = np.empty(tuple(tensor.shape), dtype=kind)
+        if found.size:
+            torch.from_numpy(found).copy_(tensor)
+        return found
+
+    LAYER_CHUNK = 1 << 24
+
+    def _per_layer(self, columns: "np.ndarray") -> "np.ndarray":
+        """Сработавших детекторов каждого слоя (для журнала) — кусками столбца троек: без массива слоёв на все тройки
+        разом (на 146 млн троек он брал +1.2 ГБ ОЗУ на пике, замер 2026-11-26). Те же числа, что у count_nonzero."""
+        layers = len(self.layer_thresholds)
+        found = np.zeros(layers, dtype=np.int64)
+        for start in range(0, int(np.shape(columns)[0]), self.LAYER_CHUNK):
+            found += np.bincount(self.layer_index[columns[start : start + self.LAYER_CHUNK]], minlength=layers)[:layers]
+        return found
+
+    @staticmethod
+    def _joined(parts: list, dtype) -> "np.ndarray":  # noqa: ANN001
+        """Куски одного столбца троек — сразу в один массив dtype (без промежуточной склейки и копии astype), куски
+        отдаются тут же. На 2.5 млн окон уровня 0 (40 000 картинок) прежняя склейка держала разом куски, их склейку и
+        копию — +3.2 ГБ ОЗУ к проходу (замер 2026-11-26)."""
+        if not parts:
+            return np.zeros(0, dtype=dtype)
+        found = np.concatenate(parts, dtype=dtype)
+        parts.clear()
+        return found
+
     def _by_rows(self, activation, compute):  # noqa: ANN001, ANN202
         """compute над строками activation частями ровно по ROWS строк (последняя часть дополняется нулевыми
         строками): ядро умножения одно и то же, результат строки зависит только от неё самой (вне статьи — техника
@@ -282,8 +398,8 @@ class HierarchyDetection:
     def _activation(self, block):  # noqa: ANN001, ANN202
         """Пороговая активация точек карты кодами блока (§6.1): строки — коды, столбцы — точки."""
         torch = self._torch
-        ones = block.sum(dim=1)
-        common = block @ self._points.T
+        ones = block.sum(dim=1, dtype=torch.int32).to(torch.float32) if block.dtype == torch.int8 else block.sum(dim=1)
+        common = self._common(block)
         if self._similarity == "cosine":
             denominator = torch.sqrt(ones[:, None] * self._ones[None, :])
         else:
@@ -311,9 +427,15 @@ class HierarchyDetection:
         номер набора у каждого вхождения, по возрастанию. Реакции карты на стимулы набора объединяются:
         a_j = max по s ∈ S от sim_λa(s, v_j); дальше, как для одного стимула, E(d) = Σ a_j · e_j / e_d и
         детектор активен при E(d) ≥ μ_d. Набор из одного стимула даёт то же, что active.
+
+        packed может лежать на диске (damp.rows_on_disk.RowsOnDisk — коды окон уровня после отбора образцов карты):
+        тогда коды читаются только кусками прохода, packed[номера] — те же байты, что у массива в ОЗУ.
         """
         torch = self._torch
-        packed = np.ascontiguousarray(packed, dtype=np.uint8)
+        if not getattr(packed, "on_disk", False):
+            packed = np.ascontiguousarray(packed, dtype=np.uint8)
+        elif packed.dtype != np.uint8:
+            raise ValueError("codes must be rows × ceil(code_length / 8) packed bytes")
         index = np.asarray(index, dtype=np.int64)
         groups = np.asarray(groups, dtype=np.int64)
         if packed.ndim != 2 or packed.shape[1] != self._row_bytes:
@@ -324,7 +446,9 @@ class HierarchyDetection:
             raise ValueError("groups must be ascending set numbers below group_count")
         starts = np.searchsorted(groups, np.arange(int(group_count) + 1))
         # Вхождений в одном проходе — столько, чтобы матрица «вхождения × точки» помещалась в память устройства.
-        limit = max(64, self.SET_CELLS // max(1, int(self._points.shape[0])))
+        limit = max(64, self.SET_CELLS // max(1, self._point_count))
+        # Куски номеров — int32 (пока номера наборов и детекторов меньше 2³¹), итог — int64, те же числа (_joined).
+        narrow = torch.int32 if max(int(group_count), int(self._coverage.shape[1])) < 2**31 else torch.int64
         rows, columns, levels, lit, dropped = [], [], [], 0, 0
         first = 0
         with torch.no_grad():
@@ -354,13 +478,13 @@ class HierarchyDetection:
                     dropped += before - int((combined > 0).sum().item())
                     level = self._level(combined)
                     found = torch.nonzero(level >= self._detector_threshold)
-                    rows.append(found[:, 0].cpu().numpy() + first)
-                    columns.append(found[:, 1].cpu().numpy())
-                    levels.append(level[found[:, 0], found[:, 1]].cpu().numpy())
+                    rows.append(self._host((found[:, 0] + first).to(narrow)))
+                    columns.append(self._host(found[:, 1].to(narrow)))
+                    levels.append(self._host(level[found[:, 0], found[:, 1]]))
                 first = last
-        rows = np.concatenate(rows).astype(np.int64) if rows else np.zeros(0, dtype=np.int64)
-        columns = np.concatenate(columns).astype(np.int64) if columns else np.zeros(0, dtype=np.int64)
-        levels = np.concatenate(levels).astype(np.float32) if levels else np.zeros(0, dtype=np.float32)
+        rows = self._joined(rows, np.int64)
+        columns = self._joined(columns, np.int64)
+        levels = self._joined(levels, np.float32)
         per_set = np.bincount(rows, minlength=int(group_count))
         LOGGER.event(
             "activation.hierarchy.detect_sets",
@@ -374,10 +498,7 @@ class HierarchyDetection:
                 "points_lit_per_set": lit / max(1, int(group_count)),
                 "points_dropped_by_local_energy_per_set": dropped / max(1, int(group_count)),
                 "detectors_per_set": float(per_set.mean()) if per_set.size else 0.0,
-                "detectors_per_set_by_layer": [
-                    float(np.count_nonzero(self.layer_index[columns] == number)) / max(1, int(group_count))
-                    for number in range(len(self.layer_thresholds))
-                ],
+                "detectors_per_set_by_layer": [float(count) / max(1, int(group_count)) for count in self._per_layer(columns)],
                 "sets_without_detectors": float(np.mean(per_set == 0)) if per_set.size else 0.0,
                 "note": "реакции карты на стимулы набора объединяются максимумом по точкам; детектор активен, "
                 "если энергия зажжённых точек его поля не меньше доли μ_d его собственной энергии (§6.5)",

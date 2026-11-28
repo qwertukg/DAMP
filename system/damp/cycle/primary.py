@@ -26,7 +26,7 @@ import numpy as np
 
 from damp import settings
 from damp.activation.details import DetailCoder
-from damp.activation.level_detectors import LevelDetectors
+from damp.activation.level_detectors import Firing, LevelDetectors
 from damp.article_refs import LAID_OUT_STRUCTURE, MORPHOLOGICAL_EMBEDDINGS
 from damp.cycle.keyholes import LadderField, LevelKeyholes
 from damp.cycle.plane_fields import PlaneFieldBuilder
@@ -35,6 +35,7 @@ from damp.encoding.damp_encoder import Encoder
 from damp.encoding.elements import LadderElements, StickCoder, distinct_codes
 from damp.encoding.keyhole import KeyholePieces
 from damp.encoding.keyhole_code import KeyholeCoder
+from damp.encoding.position_binding import KeyholeCodes
 from damp.encoding.mnist_codes import _build_encoder
 from damp.layout.code_table import LayoutCodeTable
 from damp.layout.level_memory import LevelMemory, MemoryMap
@@ -487,6 +488,9 @@ class StrokeLevel:
         lap("codes", lambda: codes)
         # Первичные коды соседних штрихов похожи сильнее кодов окон: порог слияния — свой, как у первичной карты.
         memory = step.remember(codes, keyholes, merge_similarity=float(settings.LADDER_PRIMARY_MERGE_SIMILARITY))
+        # Коды штрихов дальше читают только срабатывания: большие — во временный файл (CycleStep.on_disk; на 40 000
+        # картинках — 4.4 ГБ ОЗУ).
+        codes = step.on_disk(codes, watch)
         lap("memory", lambda: memory)
         detectors = step.detect(memory)
         lap("detectors", lambda: detectors)
@@ -541,13 +545,32 @@ class StrokeLevel:
         """Штрихи новой картинки через обученный уровень 0 — те же шаги, что в train, без подбора: зажжённые точки и
         сработавшие детекторы (для показа) и штрихи с выученными кодами — вход уровня 1. pixels — сама картинка
         (float32 в [0, 1], по ней найдены sticks): уровню 0 по точкам (place "stroke") нужны точки её штрихов."""
+        prepared = self.embed_prepare(sticks, pixels=pixels)
+        if prepared is None:
+            return self.empty_sight(), sticks
+        firing, lit = self.detectors.fire_and_light(prepared.packed)
+        return self.embed_finish(sticks, prepared, firing, lit)
+
+    def embed_prepare(self, sticks: LadderElements, *, pixels: "np.ndarray | None" = None) -> "KeyholeCodes | None":
+        """Первая половина embed: коды окон штрихов новой картинки; None — окон нет. Срабатывания делает вызывающий:
+        на одну картинку (embed) либо одним вызовом на пачку картинок (TrainedLadder.see_many) — строка срабатываний
+        зависит только от своего кода (HierarchyDetection.ROWS), поэтому результат тот же."""
         elements, pieces, _ = self.inputs(sticks, self.place, pixels=pixels)
         if pieces.count == 0:
-            empty, nothing = np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
-            return PrimarySight(empty, empty, nothing, empty, empty, nothing), sticks
-        codes = self._coder.encode(elements, pieces, number=self.NUMBER, unit=self.unit, taught=pieces.count,
-                                   content_length=self.content_length)
-        firing, (lit_stick, lit_point, lit_value) = self.detectors.fire_and_light(codes.packed)
+            return None
+        return self._coder.encode(elements, pieces, number=self.NUMBER, unit=self.unit, taught=pieces.count,
+                                  content_length=self.content_length)
+
+    @staticmethod
+    def empty_sight() -> "PrimarySight":
+        """Уровень 0 картинки без окон: ничего не зажглось и не сработало."""
+        empty, nothing = np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float32)
+        return PrimarySight(empty, empty, nothing, empty, empty, nothing)
+
+    def embed_finish(self, sticks: LadderElements, codes: "KeyholeCodes", firing: Firing,
+                     lit: "tuple[np.ndarray, np.ndarray, np.ndarray]") -> "tuple[PrimarySight, LadderElements]":
+        """Вторая половина embed: по срабатываниям окон и зажжённым точкам — показ и штрихи с выученными кодами."""
+        lit_stick, lit_point, lit_value = lit
         if self.scale is not None:
             firing = firing.scaled(self.scale)  # нормировка — делителями обучающих штрихов (вне статьи)
         details, length = DetailCoder(self.NUMBER).encode(

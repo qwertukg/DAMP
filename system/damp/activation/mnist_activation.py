@@ -297,6 +297,8 @@ def _build_detectors_from_layout(
             eps=settings.ACTIVATION_DBSCAN_EPS,
             min_samples=settings.ACTIVATION_DBSCAN_MIN_SAMPLES,
         ),
+        fill_cell=float(settings.ACTIVATION_DETECTOR_FILL_CELL),
+        radius_mode=str(settings.ACTIVATION_DETECTOR_RADIUS_MODE),
     ).build()
 
 

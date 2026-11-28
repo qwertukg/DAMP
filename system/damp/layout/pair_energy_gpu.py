@@ -51,16 +51,27 @@ class TorchPairEnergyEngine:
     # побитового подсчёта по окну (измерено: N = 8 693, окно 441 ячейка — 1.9 мс против 2.5 мс;
     # N = 88 317 — 139 мс против 25 мс). Оба способа дают одно и то же целое число общих бит.
     WINDOW_FULL_PRODUCT_RATIO = 32
-    # Коды float32 N × L держатся на устройстве, пока занимают не больше стольких байт: они нужны только
-    # произведениям «код × коды всех точек» (проход по всему V, таблицы сходства). При большем числе точек
-    # на устройстве остаются коды 64-битными словами (N × ⌈L/64⌉), общие биты считаются по ним (§2.2.4).
-    FLOAT_CODES_MAX_BYTES = 1 << 30
+    # Коды N × L держатся на устройстве плотной матрицей (float32 — 4 байта на бит, int8 — 1 байт), пока занимают не
+    # больше стольких байт: они нужны только произведениям «код × коды всех точек» (проход по всему V, таблицы
+    # сходства). При большем числе точек на устройстве остаются коды 64-битными словами (N × ⌈L/64⌉), общие биты
+    # считаются по ним (§2.2.4).
+    # 2026-11-24: 1 ГиБ → 2 ГиБ. Стенд на 500 картинках: коды ур. 0 (23 807 × 15 056) — 1.43 ГБ, ур. 1 — ~1.1 ГБ; без
+    # них слитое ядро выключалось (нужен проход по всему V), и раскладка ур. 0 шла исходным проходом — 3.3 с на шаг
+    # против 0.02 с на 250 картинках (2 500 шагов — 2.3 ч). Слитое ядро сверяется с исходным проходом побитово.
+    DENSE_CODES_MAX_BYTES = 2 << 30
+    # Коды int8 (LAYOUT_INT8_CODES): torch._int_mm (cuBLAS, int8 × int8 → int32) требует больше 16 строк у левой
+    # матрицы и кратных 8 длины кода и числа столбцов — коды хранятся с дополнением нулями (нулевой бит и нулевая
+    # точка общих бит не добавляют), короткая порция строк дополняется нулевыми строками.
+    INT_MM_ROWS_MIN = 17
+    INT_MM_MULTIPLE = 8
+    # Сверка int8-произведения с подсчётом бит по 64-битным словам при создании движка: столько точек со всеми точками V.
+    INT8_CHECK_ROWS = 8
     # Наименьшая порция редукции пути по окну ячеек: при N > LOCAL_CHUNK_ELEMENTS / 64 порция из
     # LOCAL_CHUNK_ELEMENTS // N пар вырождается (единицы строк), и редукции нельзя объединять.
     LOCAL_CHUNK_ROWS_MIN = 64
-    # Сверка слитого ядра с исходным проходом — не больше чем на стольких первых парах шага (целое число
-    # порций редукции): исходный проход на сотнях тысяч пар занял бы минуты.
-    VERIFY_MAX_PAIRS = 32768
+    # Сверка слитого ядра с исходным проходом — на первых парах шага (целое число порций редукции, но не меньше
+    # одной): суммы пар друг от друга не зависят, а проход по 32768 парам на каждой сверке стоил секунды.
+    VERIFY_MAX_PAIRS = 1024
 
     def __init__(
         self,
@@ -72,29 +83,39 @@ class TorchPairEnergyEngine:
         similarity: str,
         grid_shape: tuple[int, int],
         code_table: Any = None,
+        int8_codes: bool = False,
     ) -> None:
         self._torch = torch_mod
         self._device = device
         self._similarity = similarity
         # Коды точек: таблица массивов (LayoutCodeTable) или матрица бит N × L.
         self._code_table = code_table
-        self._codes_float: Any = None
         if code_table is not None:
             self._point_count = int(code_table.count)
             self._code_length = int(code_table.code_length)
-            if self._point_count * self._code_length * 4 <= self.FLOAT_CODES_MAX_BYTES:
-                codes = torch_mod.empty((self._point_count, self._code_length), dtype=torch_mod.float32, device=device)
-                for start, bits in code_table.bit_chunks():
-                    codes[start : start + bits.shape[0]] = torch_mod.as_tensor(bits, device=device)
-                self._codes_float = codes
         else:
-            self._codes_float = torch_mod.as_tensor(code_matrix, dtype=torch_mod.float32, device=device)
             self._point_count = int(code_matrix.shape[0])
             self._code_length = int(code_matrix.shape[1])
-        self._ones = torch_mod.as_tensor(ones, dtype=torch_mod.float32, device=device)
         self._codes_packed: Any = None
         # Место бита кода в 64-битных словах (номер слова и сдвиг) — для распаковки строк кодов из слов.
         self._bit_places: tuple[Any, Any] | None = None
+        # Плотные коды на устройстве: float32 N × L либо int8 с дополнением нулями до кратных 8 (INT_MM_MULTIPLE);
+        # _codes_view — строки точек (первые N), их отдаёт codes. None — только 64-битные слова.
+        self._codes_dense: Any = None
+        self._codes_view: Any = None
+        self._int8 = False
+        if int8_codes:
+            self._load_int8_codes(code_matrix)
+        if self._codes_dense is None:
+            if code_table is None:
+                self._codes_dense = torch_mod.as_tensor(code_matrix, dtype=torch_mod.float32, device=device)
+            elif self._point_count * self._code_length * 4 <= self.DENSE_CODES_MAX_BYTES:
+                codes = torch_mod.empty((self._point_count, self._code_length), dtype=torch_mod.float32, device=device)
+                for start, bits in code_table.bit_chunks():
+                    codes[start : start + bits.shape[0]] = torch_mod.as_tensor(bits, device=device)
+                self._codes_dense = codes
+            self._codes_view = self._codes_dense
+        self._ones = torch_mod.as_tensor(ones, dtype=torch_mod.float32, device=device)
         self._height, self._width = int(grid_shape[0]), int(grid_shape[1])
         self._pos = torch_mod.zeros((self._point_count, 2), dtype=torch_mod.float32, device=device)
         self._grid = torch_mod.full((self._height, self._width), -1, dtype=torch_mod.long, device=device)
@@ -115,10 +136,111 @@ class TorchPairEnergyEngine:
                 "code_length": self._code_length,
                 "similarity": similarity,
                 "chunk_elements": self.CHUNK_ELEMENTS,
-                "float_codes": self._codes_float is not None,
+                "float_codes": self._codes_dense is not None and not self._int8,
+                "int8_codes": self._int8,
                 "note": "сходство из кодов на лету, матрица N×N не строится (§5.9.5, §5.12)",
             },
         )
+
+    def _load_int8_codes(self, code_matrix: Any) -> None:
+        """Коды int8 на устройство (LAYOUT_INT8_CODES); не подходит устройство, не помещаются или int8-произведение
+        не сошлось с подсчётом бит по словам — плотных кодов нет (вызывающий кладёт float32, как раньше)."""
+        torch = self._torch
+        reason = None
+        rows = -(-self._point_count // self.INT_MM_MULTIPLE) * self.INT_MM_MULTIPLE
+        cols = -(-self._code_length // self.INT_MM_MULTIPLE) * self.INT_MM_MULTIPLE
+        if self._device.type != "cuda" or not hasattr(torch, "_int_mm"):
+            reason = "torch._int_mm is available on CUDA only"
+        elif rows * cols > self.DENSE_CODES_MAX_BYTES or rows == 0 or cols == 0:
+            reason = "int8 codes do not fit the dense codes limit"
+        else:
+            try:
+                codes = torch.zeros((rows, cols), dtype=torch.int8, device=self._device)
+                if self._code_table is not None:
+                    for start, bits in self._code_table.bit_chunks():
+                        codes[start : start + bits.shape[0], : self._code_length] = torch.as_tensor(bits, device=self._device)
+                else:
+                    codes[: self._point_count, : self._code_length] = torch.as_tensor(code_matrix, device=self._device) != 0
+                self._codes_dense, self._codes_view, self._int8 = codes, codes[: self._point_count], True
+                if not self._int8_matches_words():
+                    reason = "int8 product differs from the popcount of the packed words"
+            except Exception as exc:  # noqa: BLE001  нет памяти, сбой cuBLAS — коды float32
+                reason = repr(exc)
+        if reason is not None:
+            self._codes_dense, self._codes_view, self._int8 = None, None, False
+            if self._device.type == "cuda":
+                torch.cuda.empty_cache()
+        LOGGER.event(
+            "layout.gpu.int8_codes",
+            section=GPU_IMPLEMENTATION,
+            data={
+                "enabled": reason is None,
+                "points": self._point_count,
+                "code_length": self._code_length,
+                "codes_mb": rows * cols / 1e6,
+                "float32_mb": self._point_count * self._code_length * 4 / 1e6,
+                "error": reason or "",
+                "note": "коды точек int8: общие биты (§2.2.4) — целочисленное произведение int8 × int8 → int32 "
+                "(torch._int_mm), то же целое, что у произведения float32; сверено с подсчётом бит по 64-битным словам",
+            },
+            force=reason is not None,
+        )
+
+    def _int8_matches_words(self) -> bool:
+        """Сверка: общие биты INT8_CHECK_ROWS точек со всеми точками V по int8-произведению и по 64-битным словам."""
+        torch = self._torch
+        count = self._point_count
+        sample = torch.unique(
+            torch.linspace(0, count - 1, steps=min(count, self.INT8_CHECK_ROWS), device=self._device).round().long()
+        )
+        fast = self._common(self._codes_view[sample], self._codes_view)
+        kept = self._codes_packed is not None
+        packed = self._packed_codes()
+        matched = True
+        for row, point in enumerate(sample.tolist()):
+            exact = self._popcount(packed & packed[point]).sum(dim=1)
+            if not bool(torch.equal(fast[row].to(torch.int64), exact)):
+                matched = False
+                break
+        if not kept:
+            self._codes_packed = None  # слова нужны только пути по окну при большом N — как и раньше, по требованию
+        return matched
+
+    @staticmethod
+    def _popcount(bits: Any) -> Any:
+        """Число единиц в каждом 64-битном слове (int64): параллельный подсчёт бит (SWAR) целочисленными операциями."""
+        bits = bits - ((bits >> 1) & 0x5555555555555555)
+        bits = (bits & 0x3333333333333333) + ((bits >> 2) & 0x3333333333333333)
+        bits = (bits + (bits >> 4)) & 0x0F0F0F0F0F0F0F0F
+        return ((bits * 0x0101010101010101) >> 56) & 0xFF
+
+    def _common(self, rows: Any, cols: Any) -> Any:
+        """Число общих бит кодов rows [k, L] и cols [m, L] (§2.2.4): float32 [k, m].
+
+        float32 — произведение матриц, как раньше. int8 — torch._int_mm (int8 × int8 → int32, целые точны), затем
+        float32: то же число. Его ограничения (INT_MM_ROWS_MIN, INT_MM_MULTIPLE) закрывает дополнение нулями: коды
+        всех точек V хранятся уже дополненными, прочим столбцам и короткой порции строк дописываются нулевые строки.
+        """
+        torch = self._torch
+        if rows.dtype != torch.int8:
+            return rows @ cols.T
+        k = int(rows.shape[0])
+        if cols is self._codes_view:
+            mat2, m = self._codes_dense.T, self._point_count
+        else:
+            m = int(cols.shape[0])
+            if m % self.INT_MM_MULTIPLE:
+                cols = torch.cat((cols, cols.new_zeros((-m % self.INT_MM_MULTIPLE, cols.shape[1]))))
+            mat2 = cols.T
+        if k == 0 or m == 0:
+            return torch.zeros((k, m), dtype=torch.float32, device=rows.device)
+        if k < self.INT_MM_ROWS_MIN:
+            rows = torch.cat((rows, rows.new_zeros((self.INT_MM_ROWS_MIN - k, rows.shape[1]))))
+        return torch._int_mm(rows, mat2)[:k, :m].to(torch.float32)
+
+    def common_bits(self, rows: Any, cols: Any) -> Any:
+        """Число общих бит кодов rows [k, L] и cols [m, L] в виде, в каком их отдаёт codes: float32 [k, m]."""
+        return self._common(rows, cols)
 
     @classmethod
     def create(
@@ -129,6 +251,7 @@ class TorchPairEnergyEngine:
         similarity: str,
         grid_shape: tuple[int, int],
         code_table: Any = None,
+        int8_codes: bool = False,
     ) -> "TorchPairEnergyEngine | None":
         try:
             import torch
@@ -167,6 +290,7 @@ class TorchPairEnergyEngine:
                 similarity=similarity,
                 grid_shape=grid_shape,
                 code_table=code_table,
+                int8_codes=int8_codes,
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.event(
@@ -209,27 +333,39 @@ class TorchPairEnergyEngine:
 
     @property
     def codes(self) -> Any:
-        """Коды точек на устройстве (N × L float32, биты 0/1)."""
+        """Коды точек на устройстве строками (биты 0/1): N × L float32 либо N × (L, дополненное нулями до кратного 8)
+        int8 (LAYOUT_INT8_CODES). Число общих бит строк — common_bits."""
         return self._codes
 
     @property
     def _codes(self) -> Any:
-        if self._codes_float is None:
+        if self._codes_view is None:
             raise RuntimeError(
                 "codes N × L float32 are not kept on the device for this many points: "
                 "a pass over all points of V is unavailable (use the subset B or the cell window)"
             )
-        return self._codes_float
+        return self._codes_view
+
+    @property
+    def has_dense_codes(self) -> bool:
+        """Коды N × L есть на устройстве плотной матрицей — float32 или int8 (иначе — только 64-битными словами)."""
+        return self._codes_view is not None
 
     @property
     def has_float_codes(self) -> bool:
-        """Коды float32 N × L есть на устройстве (иначе — только 64-битными словами)."""
-        return self._codes_float is not None
+        """Прежнее имя has_dense_codes."""
+        return self._codes_view is not None
+
+    @property
+    def int8_codes(self) -> bool:
+        """Плотные коды на устройстве — int8 (LAYOUT_INT8_CODES), а не float32."""
+        return self._int8
 
     def _code_rows(self, indices: Any) -> Any:
-        """Коды точек indices строками float32 (k × L): из матрицы кодов или распаковкой 64-битных слов."""
-        if self._codes_float is not None:
-            return self._codes_float[indices]
+        """Коды точек indices строками (k × L): из плотной матрицы кодов (float32 или int8) или распаковкой 64-битных
+        слов (float32)."""
+        if self._codes_view is not None:
+            return self._codes_view[indices]
         torch = self._torch
         if self._bit_places is None:
             import numpy as np
@@ -334,7 +470,8 @@ class TorchPairEnergyEngine:
         """Отдать память устройства: таблицы слитого расчёта, коды, расстановку. Движок после этого не годен."""
         self._fused = None
         self._fused_options = None
-        self._codes_float = None
+        self._codes_dense = None
+        self._codes_view = None
         self._codes_packed = None
         self._pos = None
         self._grid = None
@@ -420,13 +557,13 @@ class TorchPairEnergyEngine:
         torch = self._torch
         pair_count, cells = int(window.shape[0]), int(window.shape[1])
         common = torch.empty((pair_count, cells), dtype=torch.float32, device=self._device)
-        if self._codes_float is not None and self._point_count <= self.WINDOW_FULL_PRODUCT_RATIO * cells:
+        if self._codes_view is not None and self._point_count <= self.WINDOW_FULL_PRODUCT_RATIO * cells:
             # Точек мало: строка произведения на коды всех точек дешевле побитового счёта по окну.
             step = max(1, self.LOCAL_CHUNK_ELEMENTS // max(1, self._point_count))
             for start in range(0, pair_count, step):
                 stop = min(pair_count, start + step)
                 common[start:stop] = torch.gather(
-                    self._codes[points[start:stop]] @ self._codes.T, 1, window[start:stop]
+                    self._common(self._codes[points[start:stop]], self._codes), 1, window[start:stop]
                 )
             return common
         packed = self._packed_codes()
@@ -435,11 +572,7 @@ class TorchPairEnergyEngine:
         for start in range(0, pair_count, step):
             stop = min(pair_count, start + step)
             # popcount(a & v) по 64-битным словам: параллельный подсчёт бит (SWAR) целочисленными операциями.
-            bits = packed[window[start:stop]] & packed[points[start:stop]].unsqueeze(1)  # p × K × слова
-            bits = bits - ((bits >> 1) & 0x5555555555555555)
-            bits = (bits & 0x3333333333333333) + ((bits >> 2) & 0x3333333333333333)
-            bits = (bits + (bits >> 4)) & 0x0F0F0F0F0F0F0F0F
-            bits = ((bits * 0x0101010101010101) >> 56) & 0xFF
+            bits = self._popcount(packed[window[start:stop]] & packed[points[start:stop]].unsqueeze(1))  # p × K × слова
             common[start:stop] = bits.sum(dim=2)
         return common
 
@@ -453,7 +586,7 @@ class TorchPairEnergyEngine:
         if self._codes_packed is None:
             import numpy as np
 
-            codes = (self._codes != 0).to(self._torch.uint8).cpu().numpy()
+            codes = (self._codes[:, : self._code_length] != 0).to(self._torch.uint8).cpu().numpy()
             words = -(-self._code_length // 64)
             padded = np.zeros((self._point_count, words * 64), dtype=np.uint8)
             padded[:, : self._code_length] = codes
@@ -516,7 +649,7 @@ class TorchPairEnergyEngine:
         eta: float | None,
     ) -> Any:
         """sim_λ(a, v) для кодов a (по индексам) и столбцов v: общие биты через матричное произведение (§2.2.4, §5.4)."""
-        common = self._code_rows(row_indices) @ col_codes.T
+        common = self._common(self._code_rows(row_indices), col_codes)
         return self._sim_lambda_from_common(
             common, self._ones[row_indices][:, None], col_ones[None, :], lambda_threshold=lambda_threshold, eta=eta
         )
@@ -875,6 +1008,11 @@ class TorchPairEnergyEngine:
                         sig2 = 2.0 * kernel_width * kernel_width * radius_sq[start:stop, None]
                         w1 = torch.exp(-d1_sq / sig2)
                         w2 = torch.exp(-d2_sq / sig2)
+                        from damp.layout.far_force import far_alpha
+                        if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                            rr = torch.sqrt(radius_sq[start:stop, None])
+                            w1 = w1 - far_alpha() * torch.sqrt(d1_sq) / rr
+                            w2 = w2 - far_alpha() * torch.sqrt(d2_sq) / rr
                     else:
                         d1 = torch.sqrt(d1_sq) if euclidean else d1_sq
                         d2 = torch.sqrt(d2_sq) if euclidean else d2_sq
@@ -984,6 +1122,11 @@ class TorchPairEnergyEngine:
                 sig2 = 2.0 * kernel_width * kernel_width * radius_sq[start:stop, None]
                 w1 = torch.exp(-d1_sq / sig2)
                 w2 = torch.exp(-d2_sq / sig2)
+                from damp.layout.far_force import far_alpha
+                if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                    rr = torch.sqrt(radius_sq[start:stop, None])
+                    w1 = w1 - far_alpha() * torch.sqrt(d1_sq) / rr
+                    w2 = w2 - far_alpha() * torch.sqrt(d2_sq) / rr
             else:
                 d1 = torch.sqrt(d1_sq) if euclidean else d1_sq
                 d2 = torch.sqrt(d2_sq) if euclidean else d2_sq

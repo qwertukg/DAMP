@@ -237,7 +237,8 @@ class CycleFigures:
         ]
         angle_code, angle_stats = angle_view.code((angle,))
         bits = self.unpack(level.keyhole_codes[keyhole], level.code_length)
-        place_bits = np.flatnonzero(bits[: level.place_length])
+        # Сегмент места — копии кода кругов (LADDER_BINDING_PLACE_BITS): рисуется и сверяется первая копия.
+        place_bits = np.flatnonzero(bits[: int(level.place_encoder.code_length)])
         place_code, place_stats = place_view.code(None, bits=place_bits)
         # Сверка: биты места окна — OR битов кругов, в которые попали его элементы (§2.2.1, П.5).
         expected: set[int] = set()
@@ -498,7 +499,10 @@ class CycleFigures:
         # Код окна.
         bits = self.unpack(level.keyhole_codes[keyhole], level.code_length)
         place, content = bits[: level.place_length], bits[level.place_length :]
-        cell = 6
+        # Клетка — самая крупная (до 6 px), при которой весь код окна (место и содержание) входит в панель: длина места
+        # своя у уровня (LADDER_BINDING_PLACE_CODE_LENGTH), на уровнях 1–3 код окна — 5–6 тыс. бит.
+        code_rows = -(-place.shape[0] // 64) + -(-content.shape[0] // 64)
+        cell = next((side for side in (6, 5, 4, 3) if code_rows * side + 10 <= size), 3)
         code = Image.new("RGB", (size, size), style.background)
         place_picture = bits_raster(place, 64, cell, style.orange, style.off)
         content_picture = bits_raster(content, 64, cell, style.blue, style.off)

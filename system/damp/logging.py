@@ -485,6 +485,27 @@ class DampLogger:
         except Exception as exc:  # окно всё равно получает данные, просто с панелями по умолчанию
             self._console_log(f"rerun.blueprint.error error={exc!r}")
 
+    @staticmethod
+    def _rerun_off() -> bool:
+        """True — Rerun выключен переменной окружения RERUN (0 / false / off / no — как читает её сам Rerun)."""
+        return os.environ.get("RERUN", "").strip().lower() in ("0", "false", "off", "no")
+
+    HEARTBEAT_SECONDS = 30.0  # DAMP_LOG_CONSOLE=heartbeat: не чаще одной строки событий в столько секунд
+
+    def _console_wanted(self, event: str) -> bool:
+        """Печатать ли событие в консоль. По умолчанию — каждое. DAMP_LOG_CONSOLE=heartbeat (стенд подбора): сотни тысяч
+        строк события только раздувают вывод — печатаются предупреждения, ошибки, расхождения кеша и раз в
+        HEARTBEAT_SECONDS любая строка (по ней видно, что прогон жив). Файл журнала logs/damp.jsonl пишется целиком."""
+        if os.environ.get("DAMP_LOG_CONSOLE", "all").strip().lower() != "heartbeat":
+            return True
+        if ".warning" in event or ".error" in event or "mismatch" in event:
+            return True
+        now = time.monotonic()
+        if now - getattr(self, "_console_last", float("-inf")) >= self.HEARTBEAT_SECONDS:
+            self._console_last = now
+            return True
+        return False
+
     def _console_log(self, message: str) -> None:
         stream = sys.stdout
         try:
@@ -623,9 +644,12 @@ class DampLogger:
         else:
             message = event
         message = f"{message} [{section}]"
-        self._console_log(message)
+        if self._console_wanted(event):
+            self._console_log(message)
         if self._file is not None:
             self._file.write(event, section, data, message, cycle=self._cycle)
+        if self._rerun_off():
+            return  # RERUN=off: в Rerun писать нечего — ни init, ни отметки времени, ни rr.log (файл журнала записан выше)
         self._ensure_rerun()
         self._stamp()
         base_path = path or self._base_path

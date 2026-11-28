@@ -123,9 +123,9 @@ class CycleStep:
         """Элементы уровня number после пятен (П.3): из соседних деталей с похожим кодом остаётся сильнейшая
         (LADDER_INHIBITION_RADIUS, LADDER_INHIBITION_SIMILARITY). Штрихи (уровень 1) и выключенные пятна — те же
         элементы. Один вход для прогона цикла, кубиков фреймворка и пути одной картинки."""
-        if int(number) <= 1 or settings.LADDER_INHIBITION_RADIUS is None:
+        if int(number) <= 1 or LateralInhibition.radius_share(int(number)) is None:
             return elements
-        return LateralInhibition.thin(elements, f"details{int(number) - 1}")
+        return LateralInhibition.thin(elements, f"details{int(number) - 1}", number=int(number))
 
     def keyholes(self, elements: LadderElements, number: int) -> LevelKeyholes:
         """Окна внимания уровня number (П.2, П.3)."""
@@ -136,7 +136,7 @@ class CycleStep:
         pieces = keyholes.pieces
         if pieces.count == 0:
             raise LadderLevelDegenerate(f"уровень {keyholes.number}: ни одного окна внимания")
-        taught = int(np.count_nonzero(pieces.picture < self.groups.train_pictures))
+        taught = int(np.count_nonzero(pieces.picture < self.groups.taught_pictures(keyholes.number)))
         return self.coder.encode(elements, pieces, number=keyholes.number, unit=keyholes.field.unit, taught=taught)
 
     def remember(self, codes: KeyholeCodes, keyholes: LevelKeyholes, *, merge_similarity: float | None = None) -> LevelMemory:
@@ -144,13 +144,14 @@ class CycleStep:
         merge_similarity — порог слияния кодов к образцу; None — LADDER_MERGE_SIMILARITY (уровень 0 берёт свой)."""
         number = keyholes.number
         picture = keyholes.pieces.picture
+        self._clear_device_cache()  # раскладке — чистая видеопамять (см. _clear_device_cache)
         # Коды окон почти все различны, и с пределом карты образцами стали бы окна первых картинок: окна
         # обходятся в случайном порядке, чтобы на карту попали окна всех обучающих картинок.
         dictionary, train_rows = self.memory.samples(
             codes.packed,
             codes.code_length,
             picture,
-            self.groups.train_pictures,
+            self.groups.taught_pictures(number),  # с уровня LADDER_EXTRA_FROM — вместе с добавочными
             merge_similarity=float(settings.LADDER_MERGE_SIMILARITY if merge_similarity is None else merge_similarity),
             max_points=self.map_limit(),
             shuffle_seed=None if self.map_max_points is None else settings.LADDER_RANDOM_SEED + number,
@@ -161,19 +162,92 @@ class CycleStep:
                 "коды слились"
             )
         rows = train_rows[dictionary.rows]
-        memory = self.memory.remember(dictionary, rows, self.groups.labels[picture[rows]], f"level{number}")
+        # Карты уровней с номера LADDER_LAYOUT_ARTICLE_FROM — в режиме статьи (§5.5.1: φ = Σ s·d по всей карте, η = ∞, без
+        # отжига), даже если нижние раскладываются сглаживанием: ограниченное гауссово ядро сглаживания не тянет друг к
+        # другу далёкие куски одного класса, и верх рвётся на пятна (разбор 2026-11-21, docs/CLUSTERS.md). Ключ кеша
+        # раскладки видит режим: настройки раскладки входят в него значениями.
+        article = 0 < int(settings.LADDER_LAYOUT_ARTICLE_FROM) <= int(number) and bool(settings.LAYOUT_SMOOTH_PINWHEELS)
+        # Свои настройки раскладки верхних карт (LADDER_LAYOUT_UPPER_CHANGES с уровня LADDER_LAYOUT_UPPER_FROM): рычаги раскладки
+        # верха пробуются, не трогая пинвилы нижних уровней (стратегия v3, docs/CLUSTERS.md).
+        upper = dict(settings.LADDER_LAYOUT_UPPER_CHANGES) if 0 < int(settings.LADDER_LAYOUT_UPPER_FROM) <= int(number) else {}
+        # Отбор образцов (CodeDictionary.select) считает сходства на видеокарте одним куском в 3.7 ГБ и отдаёт его в запас
+        # torch; коды точек раскладки (сотни мегабайт, живут до конца уровня) ложились внутрь этого куска и не давали
+        # вернуть его видеокарте — запас в 3.7 ГБ висел весь проход уровня, а таблица раскладки вставала рядом. Запас
+        # возвращается до раскладки.
+        self._clear_device_cache()
+        with settings.overridden({**({"LAYOUT_SMOOTH_PINWHEELS": False} if article else {}), **upper}):
+            memory = self.memory.remember(dictionary, rows, self.groups.labels[picture[rows]], f"level{number}")
+        self._drop_layout_tables(memory.layout)
         # Мерка (вне статьи): одной ли цифры картинки, чьи окна слились в одну точку карты.
         merge = MergePurity(seed=settings.LADDER_RANDOM_SEED + number).measure(
-            codes.packed[train_rows], codes.code_length, picture[train_rows], self.groups.labels[picture[train_rows]],
-            dictionary, name=f"level{number}",
+            codes.packed, codes.code_length, picture[train_rows], self.groups.labels[picture[train_rows]],
+            dictionary, name=f"level{number}", rows=train_rows,  # коды — по номерам, без копии всех обучающих окон
         )
         return replace(memory, quality={**memory.quality, **merge})
 
     @staticmethod
-    def detect(memory: LevelMemory) -> LevelDetectors:
+    def on_disk(codes: KeyholeCodes, watch: "Callable[[str, object], None] | None" = None) -> KeyholeCodes:
+        """Коды окон после отбора образцов карты — во временный файл, если они большие (вне статьи, техника счёта;
+        damp.rows_on_disk). Дальше их читают только срабатывания, кусками по порядку; остальным нужны число и длины.
+        На 40 000 картинках так уходит из ОЗУ 4.4 ГБ кодов уровня 0 и 1.3–2.5 ГБ кодов уровней 1–3. watch получает
+        «codes_on_disk» с новыми кодами — смотритель отпускает ссылку на массив в ОЗУ. Числа те же."""
+        from damp.rows_on_disk import RowsOnDisk
+
+        packed = RowsOnDisk.maybe(codes.packed)
+        if packed is codes.packed:
+            return codes
+        moved = replace(codes, packed=packed)
+        if watch is not None:
+            watch("codes_on_disk", moved)
+        return moved
+
+    @staticmethod
+    def _drop_layout_tables(layout) -> None:  # noqa: ANN001
+        """Отдать таблицы сходств только что посчитанной раскладки (вне статьи, техника счёта): 4·N² байт на устройстве —
+        3.4 ГБ у карты в 29 тыс. точек. Детекторам и срабатываниям они не нужны, а держались до конца прохода уровня
+        (2026-11-24: 7.3 из 8 ГБ видеопамяти при срабатываниях на удвоенной карте ур. 3). Таблица строится заново, если
+        энергии раскладки понадобятся ещё раз (TorchPairEnergyEngine._fused_engine). Сделано здесь, а не в модулях
+        раскладки: их текст входит в ключ кеша карт, и правка там сбросила бы все посчитанные карты."""
+        engine = getattr(layout, "_torch_engine", None)
+        if engine is None or getattr(engine, "_fused", None) is None:
+            return
+        engine._fused = None
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 — освобождение памяти не должно ронять проход
+            pass
+
+    @staticmethod
+    def _clear_device_cache() -> None:
+        """Вернуть видеокарте память, которую torch держит про запас после освобождённых тензоров (вне статьи, техника
+        счёта). Замер 2026-11-24 на 750 картинках: после построения детекторов ур. 0 у torch оставалось 3.8 ГБ кусками по
+        сотне мегабайт (сетки счёта в окне); таблица общих бит раскладки ур. 1 (3.7 ГБ одним куском) в них не помещалась
+        и ложилась сверху — 7.9 из 8 ГБ, раскладка шла 307 с вместо ~150 с. Раньше память возвращалась попутно — при
+        освобождении срабатываний, — но не тогда, когда отклики уровня взяты из кеша шагов. На результат не влияет."""
+        try:
+            import gc
+
+            import torch
+
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 — освобождение памяти не должно ронять проход
+            pass
+
+    @classmethod
+    def detect(cls, memory: LevelMemory) -> LevelDetectors:
         """Детекторы над картой уровня (§6.4); нет ни одного — уровень не сложился."""
         try:
-            return LevelDetectors.build(memory)
+            found = LevelDetectors.build(memory)
+            cls._clear_device_cache()  # срабатываниям — чистая видеопамять
+            return found
         except RuntimeError as error:
             memory.release()
             raise LadderLevelDegenerate(f"{memory.name}: над картой из {memory.points} точек {error}") from error
@@ -181,7 +255,7 @@ class CycleStep:
     def trained(self, keyholes: LevelKeyholes) -> "np.ndarray":
         """Маска окон обучающих картинок (по маске, а не по порядку строк): по ним подбирается длина кода детали и
         нормировка уровней активации — проверочные окна на обучение не влияют."""
-        return np.asarray(keyholes.pieces.picture) < int(self.groups.train_pictures)
+        return np.asarray(keyholes.pieces.picture) < int(self.groups.taught_pictures(keyholes.number))
 
     @staticmethod
     def fire(detectors: LevelDetectors, codes: KeyholeCodes, trained: "np.ndarray") -> Firing:
@@ -201,7 +275,9 @@ class CycleStep:
         """Детали окон (§6.5, П.1): коды, их длина, уровни активации и детали как элементы следующего уровня.
         Длина кода подбирается только по окнам обучающих картинок."""
         coder = DetailCoder(keyholes.number)
-        details, length = coder.encode(firing, detectors.layer_index, detectors.built, self.trained(keyholes))
+        # Геометрия детекторов — для топографических бит (v4.11) и предков (v8.2).
+        geometry = DetailCoder.geometry(detectors) if coder.needs_geometry() else None
+        details, length = coder.encode(firing, detectors.layer_index, detectors.built, self.trained(keyholes), geometry=geometry)
         strength = firing.strength()
         pieces = keyholes.pieces
         elements = coder.elements(details, length, pieces.picture, pieces.centre, keyholes.extent, strength)
@@ -229,6 +305,7 @@ class CycleStep:
         codes = self.encode(elements, keyholes)
         lap("codes", codes)
         memory = self.remember(codes, keyholes)
+        codes = self.on_disk(codes, watch)
         lap("memory", memory)
         detectors = self.detect(memory)
         lap("detectors", detectors)

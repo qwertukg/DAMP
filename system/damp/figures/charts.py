@@ -64,7 +64,8 @@ class AccuracyChart:
         axis.tick_params(colors=muted, length=0)
         figure.subplots_adjust(left=0.07, right=0.89, top=0.80, bottom=0.14)
         axis.set_xlim(-0.5, len(levels) - 0.5)
-        axis.set_ylim(0, 80)
+        # Ось до 100 %: на 100 проверочных цифрах уровни доходят до 85–90 %, при прежней оси до 80 % столбцы обрезались.
+        axis.set_ylim(0, 100)
         width, gap = 0.22, 0.03
         for number, (name, colour, values) in enumerate(series):
             for index, value in enumerate(values):
@@ -78,8 +79,8 @@ class AccuracyChart:
         axis.text(len(levels) - 0.47, 10, "наугад\n10 %", color=muted, fontsize=10, va="center", clip_on=False)
         axis.set_xticks(range(len(levels)))
         axis.set_xticklabels([f"уровень {level['number']}\nокно видит {100 * level['seen']:.0f} % цифры" for level in levels], color=second)
-        axis.set_yticks([0, 20, 40, 60, 80])
-        axis.set_yticklabels(["0", "20", "40", "60", "80 %"])
+        axis.set_yticks([0, 20, 40, 60, 80, 100])
+        axis.set_yticklabels(["0", "20", "40", "60", "80", "100 %"])
         axis.grid(axis="y", color=grid, linewidth=1)
         axis.set_axisbelow(True)
         axis.legend(loc="lower left", frameon=False, ncols=3, labelcolor=second, handlelength=1.0, handleheight=1.0, bbox_to_anchor=(-0.01, 1.0))

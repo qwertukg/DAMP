@@ -11,6 +11,7 @@ import unittest
 os.environ.setdefault("RERUN", "off")
 os.environ.setdefault("DAMP_LOG_FILE", "off")
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "system"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "client"))
 
 import numpy as np  # noqa: E402
 
@@ -78,6 +79,60 @@ class MergePurityTest(unittest.TestCase):
         self.assertEqual((found["merge_shared_points"], found["merge_purity"], found["merge_pure_points"]), (1.0, 1.0, 1.0))
         self.assertAlmostEqual(found["merge_pictures_per_point"], 6.0)
         self.assertLess(found["merge_purity_random"], 0.6)
+
+
+    def test_int8_codes_find_the_same_nearest_points_as_float32(self) -> None:
+        """Мерка на видеокарте с кодами int8 (ACTIVATION_INT8_CODES) даёт те же ближайшие точки, что float32: число общих
+        бит — то же целое, косинус — та же формула. Код в 299 бит и карта в 501 точку — ни то, ни другое не кратно 8;
+        частей кодов — короче и длиннее 17 строк."""
+        import torch
+
+        from damp import settings
+
+        if not torch.cuda.is_available() or not hasattr(torch, "_int_mm"):
+            self.skipTest("нужны CUDA и torch._int_mm")
+        rng = np.random.default_rng(3)
+        length, points = 299, 501
+        prototypes = rng.random((20, length)) < 0.2
+        bank = prototypes[np.arange(points) % 20] ^ (rng.random((points, length)) < 0.03)
+        dictionary = CodeDictionary(packed=np.packbits(bank, axis=1), rows=np.arange(points), code_length=length, distinct=points)
+        for count in (5, 2048 + 40):
+            codes = prototypes[rng.integers(0, 20, size=count)] ^ (rng.random((count, length)) < 0.05)
+            packed = np.packbits(codes, axis=1)
+            measure = MergePurity(use_gpu=True)
+            with settings.overridden({"ACTIVATION_INT8_CODES": False}):
+                plain = measure.nearest(packed, length, dictionary)
+            with settings.overridden({"ACTIVATION_INT8_CODES": True}):
+                fast = measure._nearest_int8(torch, torch.device("cuda"), packed, length, dictionary)
+                used = measure.nearest(packed, length, dictionary)
+            self.assertIsNotNone(fast, f"кодов {count}: сверка с float32 не прошла")
+            self.assertTrue(np.array_equal(plain, fast), f"кодов {count}")
+            self.assertTrue(np.array_equal(plain, used), f"кодов {count}")
+
+
+    def test_rows_without_copy_give_the_same_measure(self) -> None:
+        """Коды по номерам (rows) — то же, что копия этих кодов: на процессоре, на видеокарте float32 и int8."""
+        import torch
+
+        from damp import settings
+
+        rng = np.random.default_rng(11)
+        length, points = 301, 300
+        prototypes = rng.random((10, length)) < 0.2
+        bank = prototypes[np.arange(points) % 10] ^ (rng.random((points, length)) < 0.03)
+        dictionary = CodeDictionary(packed=np.packbits(bank, axis=1), rows=np.arange(points), code_length=length, distinct=points)
+        codes = np.packbits(prototypes[rng.integers(0, 10, size=5000)] ^ (rng.random((5000, length)) < 0.05), axis=1)
+        rows = rng.permutation(5000)[:3100]
+        picture = rng.integers(0, 400, size=rows.shape[0])
+        labels = rng.integers(0, 10, size=rows.shape[0])
+        devices = [False] + ([True] if torch.cuda.is_available() else [])
+        for use_gpu in devices:
+            for int8 in (False, True):
+                with settings.overridden({"ACTIVATION_INT8_CODES": int8}):
+                    measure = MergePurity(seed=3, use_gpu=use_gpu)
+                    copied = measure.measure(codes[rows], length, picture, labels, dictionary, name="test")
+                    indexed = measure.measure(codes, length, picture, labels, dictionary, name="test", rows=rows)
+                    self.assertEqual(copied, indexed, f"видеокарта {use_gpu}, int8 {int8}")
 
 
 if __name__ == "__main__":

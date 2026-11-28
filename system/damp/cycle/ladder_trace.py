@@ -83,6 +83,8 @@ class LadderLevelTrace:
     response: np.ndarray
     # Секунды шагов прохода: окна, коды окон, память, детекторы, срабатывания, детали (из кеша — почти ноль).
     seconds: dict = field(default_factory=dict)
+    # Угол штриха каждой точки карты — только у уровня 0 (карта штрихов, показ пинвилом); у уровней цикла None.
+    map_angle: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

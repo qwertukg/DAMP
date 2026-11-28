@@ -29,10 +29,16 @@ class LinearReader:
     def __init__(self, features: "np.ndarray", labels: "np.ndarray", decay: float) -> None:
         from scipy.optimize import minimize
 
-        features = np.asarray(features, dtype=np.float64)
+        features = np.asarray(features)
         labels = np.asarray(labels, dtype=np.int64)
         loud = features.any(axis=1)
-        x, y = features[loud], labels[loud]
+        # Одна копия float64 (2026-11-27): прежде в float64 переводились все картинки, и уже из этой копии брались строки
+        # с откликом — на 60 000 обе копии жили разом (пик процесса 10.2 ГиБ при обучении читателя). Перевод в float64
+        # точен, строки и их порядок те же, x — C-порядка, как прежде, поэтому и читатель тот же, цифра в цифру.
+        every = bool(loud.all())
+        x = np.ascontiguousarray(features if every else features[loud], dtype=np.float64)
+        y = labels if every else labels[loud]
+        del features
         self.classes = int(labels.max()) + 1 if labels.size else 0
         self.decay = float(decay)
         count, width = x.shape

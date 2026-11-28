@@ -77,7 +77,7 @@ class PositionBindingEncoder:
     один кодер места служит всем уровням.
     """
 
-    POOLINGS = ("max", "min", "strongest")
+    POOLINGS = ("max", "min", "strongest", "enumerate")
     MASKS = ("address", "bits")
     # Ячеек плотной матрицы «окна × биты» за один проход.
     CHUNK_CELLS = 8_000_000
@@ -99,6 +99,9 @@ class PositionBindingEncoder:
         use_gpu: bool = True,
         name: str = "keyholes",
         concepts: int | None = None,
+        place_bits: int = 1,
+        pooling_tie: float = 0.0,
+        content_layers: int | None = None,
     ) -> None:
         if concepts is not None and int(concepts) < 1:
             raise ValueError("concepts must be positive or None")
@@ -118,6 +121,12 @@ class PositionBindingEncoder:
             raise ValueError("max_length must be a power of two")
         self._place = place
         self._pooling = str(pooling)
+        # Допуск при выборе элемента круга (план v8.3, П.5 — способ пулинга открыт): > 0 — к выбранному элементу круга
+        # («strongest», «enumerate») добавляется лучший из остальных кандидатов его области, если его сила не меньше
+        # (1 − pooling_tie) от сильнейшего; малая разница сил почерков не меняет код круга целиком. 0 — как было.
+        if not 0.0 <= float(pooling_tie) < 1.0:
+            raise ValueError("pooling_tie must be in [0, 1)")
+        self._tie = float(pooling_tie)
         self._mask = str(mask)
         self._mask_bits = int(mask_bits)
         self._target = float(target_density)
@@ -140,7 +149,33 @@ class PositionBindingEncoder:
             except ImportError:  # pragma: no cover - без torch всё считается на numpy
                 pass
         self._layers = np.asarray(place.detector_layer_indices(), dtype=np.int64)
-        self._place_bits = np.asarray(place.detector_bits(), dtype=np.int64)
+        # Бит места на круг (автор 2026-11-20: «биты позиции должны перевешивать биты угла»): сегмент места — place_bits
+        # копий кода кругов подряд; в копии j у круга свой случайный бит той же цветовой полосы (перестановка полосы,
+        # своя у копии). Плотность каждой копии та же, что у одного кода места (§2), а вес места в сходстве кодов окон
+        # растёт в place_bits раз. Копия 0 — сам код кругов (place.detector_bits()).
+        if int(place_bits) < 1:
+            raise ValueError("place_bits must be positive")
+        # Грубое связывание (стратегия v3, 2026-11-21, docs/CLUSTERS.md, Б4): содержание кладут только круги места слоёв
+        # 0…content_layers−1 (широкие); биты места — от всех слоёв. На окнах во всю цифру узкие круги различают почерк, а не
+        # цифру: §3.3.2 «if the goal is… a description that makes sense as a whole, the short-wavelength bits can be
+        # discarded»; П.7 — мелкие детали уступают место. None — все слои.
+        if content_layers is not None and int(content_layers) < 1:
+            raise ValueError("content_layers must be positive or None")
+        self._content_layers = None if content_layers is None else int(content_layers)
+        self._place_copies = int(place_bits)
+        base = np.asarray(place.detector_bits(), dtype=np.int64)
+        copies = [base]
+        dimension = place.dimensions[0]
+        for copy in range(1, self._place_copies):
+            rng = np.random.default_rng([self._seed, 3, copy])
+            moved = base.copy()
+            for layer in range(len(dimension.detector_layers)):
+                start, length = dimension.layer_band(layer)
+                permutation = rng.permutation(int(length))
+                inside = (base >= start) & (base < start + length)
+                moved[inside] = start + permutation[base[inside] - start]
+            copies.append(moved + copy * int(place.code_length))
+        self._place_bits = np.stack(copies, axis=1)  # (круги, копии)
         if int(self._layers.max()) >= self._UNSET:
             raise ValueError("too many detector layers")
         # Маска адреса у детектора одна на все длины кода: от неё берутся младшие биты.
@@ -156,6 +191,8 @@ class PositionBindingEncoder:
                 "detectors": int(self._layers.shape[0]),
                 "detectors_per_layer": np.bincount(self._layers).tolist(),
                 "place_length": self.place_length,
+                "place_bits": self._place_copies,
+                "content_layers": self._content_layers,
                 "pooling": self._pooling,
                 "mask": self._mask,
                 "mask_bits": self._mask_bits,
@@ -171,7 +208,8 @@ class PositionBindingEncoder:
 
     @property
     def place_length(self) -> int:
-        return int(self._place.code_length)
+        """Длина сегмента места: код кругов места × бит места на круг (копий)."""
+        return int(self._place.code_length) * self._place_copies
 
     @property
     def content_length(self) -> int:
@@ -261,21 +299,30 @@ class PositionBindingEncoder:
         keyhole = source["groups"][entry] - first
         stats["members"] = int(entry.shape[0])
         # Позиция: бит сработавшего детектора входит в код окна операцией OR (§2.2.1).
-        place[keyhole, self._place_bits[detector]] = 1
+        place[keyhole[:, None], self._place_bits[detector]] = 1
         pair = keyhole * detectors + detector
         active = np.unique(pair)
         stats["pairs"] = int(active.shape[0])
+        if self._content_layers is not None:
+            coarse = self._layers[detector] < self._content_layers
+            entry, detector, keyhole, pair = entry[coarse], detector[coarse], keyhole[coarse], pair[coarse]
         if self._concepts is not None:
             # П.7: окно объединяет около 5–7 понятий. В содержание идут только самые сильные элементы окна, коды
             # остальных отбрасываются целиком («отбрасывать … целые коды»); их биты места уже выставлены выше.
             keep = np.isin(entry, self._strongest_entries(source, entry, first))
             entry, detector, keyhole, pair = entry[keep], detector[keep], keyhole[keep], pair[keep]
+        candidates = (entry, detector, keyhole, pair)
         if self._pooling == "strongest":
             # Перечисление выбранных: из области детектора берётся один, самый сильный признак.
             order = np.lexsort((entry, -source["strength"][entry], pair))
             head = np.ones(order.shape[0], dtype=bool)
             head[1:] = pair[order][1:] != pair[order][:-1]
             entry, detector, keyhole, pair = entry[order][head], detector[order][head], keyhole[order][head], pair[order][head]
+        elif self._pooling == "enumerate":
+            pick = self._enumerate(entry, detector, keyhole, pair, source["strength"])
+            entry, detector, keyhole, pair = entry[pick], detector[pick], keyhole[pick], pair[pick]
+        if self._tie > 0.0 and self._pooling in ("strongest", "enumerate") and source["strength"] is not None:
+            entry, detector, keyhole, pair = self._with_ties(candidates, (entry, detector, keyhole, pair), source["strength"])
         # Единичные биты кодов признаков, попавших в область детектора.
         rows, spot = self._expand(source["what_index"][entry], source["bit_starts"])
         bit = source["bit_flat"][spot]
@@ -288,6 +335,68 @@ class PositionBindingEncoder:
         else:
             pair = pair[rows]
         return place, pair, bit, active, stats
+
+    def _with_ties(self, candidates: tuple, chosen: tuple, strength: "np.ndarray") -> tuple:
+        """План v8.3: к выбранному элементу каждого круга (пары окно–круг) — лучший из остальных кандидатов области, если
+        его сила не меньше (1 − tie) от сильнейшего кандидата. Возвращает выбранные и добавленные вхождения."""
+        entry, detector, keyhole, pair = candidates
+        if entry.size == 0 or chosen[0].size == 0:
+            return chosen
+        level = strength[entry]
+        order = np.lexsort((entry, -level, pair))
+        e, d, k, p, lv = entry[order], detector[order], keyhole[order], pair[order], level[order]
+        head = np.ones(p.shape[0], dtype=bool)
+        head[1:] = p[1:] != p[:-1]
+        starts = np.flatnonzero(head)
+        ends = np.append(starts[1:], p.shape[0])
+        best = lv[starts]
+        # Выбранный элемент каждого круга: пары выбранных отсортированы так же, как кандидаты (по номеру пары).
+        c_entry, c_pair = chosen[0], chosen[3]
+        c_order = np.argsort(c_pair, kind="stable")
+        c_pair, c_entry = c_pair[c_order], c_entry[c_order]
+        at = np.searchsorted(c_pair, p[starts])
+        picked = np.where((at < c_pair.shape[0]) & (c_pair[np.minimum(at, c_pair.shape[0] - 1)] == p[starts]),
+                          c_entry[np.minimum(at, c_pair.shape[0] - 1)], -1)
+        # Лучший из остальных: первый кандидат круга, если его не взяли, иначе второй.
+        first_taken = e[starts] == picked
+        second = np.where(first_taken, starts + 1, starts)
+        valid = second < ends
+        second = np.minimum(second, p.shape[0] - 1)
+        add = valid & (e[second] != picked) & (lv[second] >= (1.0 - self._tie) * best)
+        rows = second[add]
+        return (np.concatenate([chosen[0], e[rows]]), np.concatenate([chosen[1], d[rows]]),
+                np.concatenate([chosen[2], k[rows]]), np.concatenate([chosen[3], p[rows]]))
+
+    def _enumerate(self, entry: "np.ndarray", detector: "np.ndarray", keyhole: "np.ndarray", pair: "np.ndarray",
+                   strength: "np.ndarray") -> "np.ndarray":
+        """Перечисление выбранных (П.5; задача #17): в каждом окне и слое круги места по очереди — от круга с самым
+        сильным элементом области к слабым — берут сильнейший элемент своей области, ещё не взятый другим кругом этого
+        слоя; если все взяты — свой сильнейший (как «strongest»). Возвращает номера выбранных вхождений (по одному на
+        круг). Ничьи — по номеру вхождения, порядок полностью определён."""
+        if entry.size == 0:
+            return np.zeros(0, dtype=np.int64)
+        level = strength[entry]
+        layer = self._layers[detector]
+        # Кандидаты каждого круга — по убыванию силы; круги группы (окно, слой) — по силе своего лучшего кандидата.
+        order = np.lexsort((entry, -level, pair))
+        head = np.ones(order.shape[0], dtype=bool)
+        head[1:] = pair[order][1:] != pair[order][:-1]
+        starts = np.flatnonzero(head)
+        ends = np.append(starts[1:], order.shape[0])
+        best = level[order][starts]
+        groups = keyhole[order][starts].astype(np.int64) * (int(layer.max()) + 1) + layer[order][starts]
+        circles = np.lexsort((pair[order][starts], -best, groups))
+        picks = np.empty(starts.shape[0], dtype=np.int64)
+        taken: set = set()
+        group = None
+        for index in circles:
+            if groups[index] != group:
+                group, taken = groups[index], set()
+            span = order[starts[index]:ends[index]]
+            choice = next((row for row in span if int(entry[row]) not in taken), span[0])
+            taken.add(int(entry[choice]))
+            picks[index] = choice
+        return np.sort(picks)
 
     def _strongest_entries(self, source: dict, entry: "np.ndarray", first: int) -> "np.ndarray":
         """Вхождения-понятия окна (П.7): в каждом окне — self._concepts самых сильных элементов (ничья — по номеру
@@ -326,22 +435,37 @@ class PositionBindingEncoder:
             colour[keyhole[mine], address[mine]] = number
         return colour
 
-    def _paint_device(self, source: dict, pair: "np.ndarray", bit: "np.ndarray", keyholes: int, length: int):  # noqa: ANN202
-        """То же, что _paint для маски адреса, на видеокарте: тензор цветов «окна × биты содержания»."""
+    def _on_device(self, values):  # noqa: ANN001, ANN202
+        """Массив numpy — на видеокарту (тензор — как есть)."""
+        torch = self._torch
+        return values if torch.is_tensor(values) else torch.as_tensor(np.ascontiguousarray(values), device=self._device)
+
+    def _paint_device(self, source: dict, pair, bit, keyholes: int, length: int):  # noqa: ANN001, ANN202
+        """То же, что _paint для маски адреса, на видеокарте: тензор цветов «окна × биты содержания». pair и bit —
+        массивы numpy или уже тензоры на видеокарте (подбор длины кода раскрашивает один кусок окон восемью длинами —
+        данные куска передаются один раз). Адреса, слои и номера клеток считаются на видеокарте теми же целочисленными
+        действиями, что прежде на процессоре (2026-11-25: numpy здесь занимал половину времени кодов окон)."""
         torch = self._torch
         detectors = int(self._layers.shape[0])
         colour = torch.full((keyholes, int(length)), self._UNSET, dtype=torch.uint8, device=self._device)
-        if pair.size == 0:
+        if int(pair.shape[0]) == 0:
             return colour
+        pair, bit = self._on_device(pair), self._on_device(bit)
+        detector = pair % detectors
         # XOR маски с адресом бита: перестановка битов кода признака, своя у каждого детектора.
-        address = bit ^ source["address_masks"][pair % detectors]
-        layer = self._layers[pair % detectors]
-        cell = torch.as_tensor((pair // detectors) * int(length) + address, device=self._device)
-        layer_device = torch.as_tensor(layer, device=self._device)
+        cell = (pair // detectors) * int(length) + (bit ^ self._on_device(source["address_masks"])[detector])
+        layers = self.__dict__.get("_layers_device")
+        if layers is None:
+            layers = self._layers_device = torch.as_tensor(self._layers, device=self._device)
+        layer_device = layers[detector]
+        del detector
         flat = colour.view(-1)
-        # Цвет бита — слой детектора (§3.2): от узких слоёв к широким, чтобы у общего бита остался цвет широкого.
-        for number in np.unique(layer)[::-1]:
-            flat[cell[layer_device == int(number)]] = int(number)
+        # Цвет бита — слой детектора (§3.2): от узких слоёв к широким, чтобы у общего бита остался цвет широкого. Слои
+        # без бит пропускаются — тот же порядок записей, что по встретившимся слоям.
+        for number in range(int(self._layers.max()), -1, -1):
+            mine = cell[layer_device == number]
+            if int(mine.shape[0]):
+                flat[mine] = number
         return colour
 
     def _merge_device(self, colour, budget: int, priority) -> int:  # noqa: ANN001
@@ -395,6 +519,8 @@ class PositionBindingEncoder:
         for first in range(0, keyholes, step):
             last = min(keyholes, first + step)
             _, pair, bit, active, _ = self._passes(source, first, last)
+            if self._device is not None:
+                pair, bit = self._on_device(pair), self._on_device(bit)  # кусок — на видеокарту один раз на все длины
             for size in lengths:
                 source["address_masks"] = self.address_masks(size)
                 if self._device is not None:
@@ -458,8 +584,8 @@ class PositionBindingEncoder:
             raise ValueError("no elements")
         if np.any(np.diff(groups) < 0) or groups[0] < 0 or groups[-1] >= group_count:
             raise ValueError("groups must be ascending keyhole numbers below group_count")
-        if self._pooling == "strongest" and strength is None:
-            raise ValueError("pooling 'strongest' needs the activation level of every element")
+        if self._pooling in ("strongest", "enumerate") and strength is None:
+            raise ValueError(f"pooling '{self._pooling}' needs the activation level of every element")
         offsets = np.asarray(offsets, dtype=np.float64).reshape(-1, 2)
         bit_starts, bit_flat = self._code_bits(what_packed, int(what_length))
         place_starts, place_flat = self._place_detectors(offsets, offset_index, float(unit))

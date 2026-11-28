@@ -38,17 +38,34 @@ class LateralInhibition:
         self._similarity = None if similarity is None else float(similarity)
         self._name = str(name)
 
-    @classmethod
-    def thin(cls, elements, name: str):  # noqa: ANN001, ANN206
-        """Элементы уровня после торможения по настройкам (LADDER_INHIBITION_RADIUS, LADDER_INHIBITION_SIMILARITY);
-        без торможения — те же элементы. Один вход для прогона цикла и для пути одной картинки."""
+    @staticmethod
+    def radius_share(number: int | None) -> float | None:
+        """Радиус торможения на входе окон уровня number (доля того, что видит деталь): LADDER_INHIBITION_RADIUS — число
+        на все уровни либо список по уровням 0, 1, 2, … (последнее — на всех выше); None или 0 — без торможения.
+        Список — план v21 (2026-11-24): с одним окном на картинку (LADDER_KEYHOLE_ONE_FROM) деталь ур. 4 видит ~29
+        клеток при цифре ±7, круг торможения покрывает всю картинку, и из похожих частей в разных местах цифры
+        остаётся одна — место, которое окно кодирует в масштабе цифры, теряется."""
         from damp import settings
 
-        if settings.LADDER_INHIBITION_RADIUS is None:
+        value = settings.LADDER_INHIBITION_RADIUS
+        if isinstance(value, (list, tuple)):
+            value = value[min(max(int(number if number is not None else len(value) - 1), 0), len(value) - 1)]
+        if value is None or float(value) <= 0.0:
+            return None
+        return float(value)
+
+    @classmethod
+    def thin(cls, elements, name: str, number: int | None = None):  # noqa: ANN001, ANN206
+        """Элементы уровня после торможения по настройкам (LADDER_INHIBITION_RADIUS, LADDER_INHIBITION_SIMILARITY);
+        без торможения — те же элементы. Один вход для прогона цикла и для пути одной картинки. number — уровень,
+        чьи окна возьмут эти элементы (для радиуса списком по уровням)."""
+        from damp import settings
+
+        share = cls.radius_share(number)
+        if share is None:
             return elements
         similarity = settings.LADDER_INHIBITION_SIMILARITY
-        chooser = cls(radius_share=float(settings.LADDER_INHIBITION_RADIUS),
-                      similarity=None if similarity is None else float(similarity), name=name)
+        chooser = cls(radius_share=share, similarity=None if similarity is None else float(similarity), name=name)
         codes = None if similarity is None else (elements.codes(), int(elements.what_length))
         return elements.only(chooser.survivors(elements.picture, elements.y, elements.x, elements.power(), elements.reach(), codes=codes))
 

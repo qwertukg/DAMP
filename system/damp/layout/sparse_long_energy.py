@@ -531,6 +531,9 @@ class SparseLongEnergy:
         if kernel == "gauss":
             sig2 = 2.0 * kernel_width * kernel_width * radius_sq[pair].view(-1, 1, 1)
             weight = torch.exp(-d_sq / sig2)
+            from damp.layout.far_force import far_alpha
+            if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                weight = weight - far_alpha() * torch.sqrt(d_sq) / torch.sqrt(radius_sq[pair].view(-1, 1, 1))
         else:
             distance = torch.sqrt(d_sq) if euclidean else d_sq
             weight = 1.0 / (distance + distance_eps)

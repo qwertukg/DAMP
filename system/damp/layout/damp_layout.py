@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import concurrent.futures
+import dataclasses
 from dataclasses import dataclass, field
 from collections import deque
 import json
@@ -95,8 +96,21 @@ class AdaptiveLayoutConfig:
     temperature: float = 0.0
     temperature_radius_max: int = 0
     temperature_radius_min: int = 0
+    # План v4.14 (рост λ, §7.1.7: «λ растёт при убывании радиуса»): > 0 — λ поднимается от начального до lambda_max
+    # вместе с убыванием радиуса пар, этим числом ступеней (ступени — чтобы не сбрасывать кеши порога каждый шаг);
+    # 0 — выкл. (в режиме сглаживания λ тогда постоянен).
+    lambda_ramp: int = 0
+
+    def lambda_for_radius(self, radius: int, start_lambda: float) -> float:
+        """λ на радиусе пар radius при росте вместе с радиусом (lambda_ramp ступеней от start_lambda до lambda_max)."""
+        span = max(1, int(self.start_radius) - int(self.end_radius))
+        progress = min(1.0, max(0.0, (int(self.start_radius) - int(radius)) / span))
+        stage = int(progress * int(self.lambda_ramp)) / int(self.lambda_ramp)
+        return float(start_lambda) + (float(self.lambda_max) - float(start_lambda)) * stage
 
     def __post_init__(self) -> None:
+        if self.lambda_ramp < 0:
+            raise ValueError("lambda_ramp must be >= 0")
         if not 0.0 < self.lambda_max <= 1.0:
             raise ValueError("lambda_max must be in (0, 1]")
         if self.temperature < 0.0:
@@ -263,6 +277,7 @@ class _GpuLayoutEngine:
         uniform int euclidean_distance;
         uniform int kernel_mode;
         uniform float kernel_width;
+        uniform float far_alpha;
         out vec4 frag;
 
         float apply_lambda(float sim) {
@@ -354,6 +369,12 @@ class _GpuLayoutEngine:
                         float sig2 = 2.0 * kernel_width * kernel_width * radius_sq;
                         w1 = exp(-d1sq / sig2);
                         w2 = exp(-d2sq / sig2);
+                        if (far_alpha > 0.0) {
+                            // Смешанное ядро (Р2, far_force.py): − α·d / r, сила не убывает с расстоянием.
+                            float rr = sqrt(radius_sq);
+                            w1 -= far_alpha * sqrt(d1sq) / rr;
+                            w2 -= far_alpha * sqrt(d2sq) / rr;
+                        }
                     } else {
                         w1 = 1.0 / (d1 + distance_eps);
                         w2 = 1.0 / (d2 + distance_eps);
@@ -675,6 +696,11 @@ class _GpuLayoutEngine:
         self._pair_prog["euclidean_distance"].value = 1 if euclidean else 0
         self._pair_prog["kernel_mode"].value = {"inverse": 0, "gauss": 1}[kernel]
         self._pair_prog["kernel_width"].value = float(kernel_width)
+        try:  # смешанное ядро (Р2): uniform есть в шейдере пар; 0 — чистое гауссово
+            from damp.layout.far_force import far_alpha
+            self._pair_prog["far_alpha"].value = far_alpha() if kernel == "gauss" else 0.0
+        except KeyError:
+            pass
 
         self._pair_fbo.use()
         self._ctx.viewport = (0, 0, pair_count, 1)
@@ -1225,6 +1251,11 @@ class _TensorLayoutEngine:
                 sig2 = 2.0 * kernel_width * kernel_width * radius_sq
                 w1 = torch.exp(-dist1 / sig2)
                 w2 = torch.exp(-dist2 / sig2)
+                from damp.layout.far_force import far_alpha
+                if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                    rr = torch.sqrt(radius_sq)
+                    w1 = w1 - far_alpha() * torch.sqrt(dist1) / rr
+                    w2 = w2 - far_alpha() * torch.sqrt(dist2) / rr
             else:
                 if euclidean:
                     # §5.5.2: φ = Σ(s1/d1 + s2/d2) с евклидовыми d; иначе d² (§5.9.2).
@@ -1548,6 +1579,7 @@ class Layout:
         fused_block_elements: int = 40_000_000,
         fused_verify_every: int = 2000,
         fused_similarity_table: bool = True,
+        int8_codes: bool = False,
         neighbourhood_sample_side: int | None = None,
         enforce_pair_radius: bool = False,
         neighbourhood_radius_min: int | None = None,
@@ -1761,7 +1793,7 @@ class Layout:
         self._compiled_sampler_enabled = bool(compiled_sampler)
         self._compiled_sampler: CompiledPairSampler | None = None
         self._sampler_verify_every = int(sampler_verify_every)
-        self._sampler_calls = {"long": 0, "short": 0}
+        self._sampler_calls = {"long": 0, "short": 0, "long_weighted": 0}
         self._ones_float64 = None if self._ones_array is None else self._ones_array.astype(np.float64)
         # Класс одинаковых кодов каждой точки: у пары точек одного класса φ_c = φ_s точно (PairSignKernel).
         # Считается при первом расчёте по строкам сходства: большим раскладкам (без строк) он не нужен.
@@ -1884,6 +1916,9 @@ class Layout:
         self._row_occupied_sets: list[set[int]] = [set() for _ in range(self.height)]
         self._radius_offsets_cache: dict[int, list[tuple[int, int]]] = {}
         self._short_energy_weights: list[float] | None = None
+        # Накопленные веса первой точки пары дальней фазы P(p) ∝ −ln Ê (§5.9.3); None — первая точка равновероятна.
+        self._long_weights_cdf: "np.ndarray | None" = None
+        self._long_weighted_first = False
         self._short_energy_last_step: int = -1
         self._short_energy_radius: int | None = None
         self._short_energy_eps: float = 1e-6
@@ -1941,6 +1976,8 @@ class Layout:
                 ones=self._ones_array,
                 similarity=self._similarity,
                 grid_shape=(self.height, self.width),
+                # Коды точек на устройстве int8 вместо float32 (LAYOUT_INT8_CODES): общие биты — то же целое число.
+                int8_codes=bool(int8_codes),
             )
             if self._torch_engine is not None:
                 # Слитый расчёт энергий: те же φ_c, φ_s одним ядром на слагаемое (§5.5, §5.9.5, §5.12).
@@ -2181,9 +2218,15 @@ class Layout:
         adaptive_params: AdaptiveLayoutConfig | None = None,
         short_optim: ShortLayoutOptimConfig | None = None,
         save_on_stop_path: str | None = None,
+        long_weighted_first: bool = False,
     ) -> int:
         if steps <= 0:
             raise ValueError("steps must be positive")
+        if long_weighted_first and (mode != "long" or energy_every is None):
+            raise ValueError("long_weighted_first needs mode 'long' and energy_every: weights come from Ê of all points (§5.9.3)")
+        # §5.9.3 в дальней фазе: веса первой точки берутся из энергий, которые считаются для Ē раз в energy_every шагов.
+        self._long_weighted_first = bool(long_weighted_first)
+        self._long_weights_cdf = None
         if pairs_per_step <= 0:
             raise ValueError("pairs_per_step must be positive")
         if pair_radius is not None and pair_radius <= 0:
@@ -2306,6 +2349,7 @@ class Layout:
                 },
             )
         adaptive_state: _AdaptiveLayoutState | None = None
+        ramp_start_lambda: float | None = None  # план v4.14: λ в начале фазы, от него растёт вместе с радиусом
         if adaptive_params is not None:
             adaptive_state = _AdaptiveLayoutState(adaptive_params, steps)
             LOGGER.event(
@@ -2487,6 +2531,8 @@ class Layout:
                 self._last_energy_value = energy_value
                 self._last_energy_step = step + step_offset
                 self._last_energy_progress = energy_value
+                if mode == "long" and self._long_weighted_first:
+                    self._refresh_long_weights(effective_energy_radius, step + step_offset)
             if mode == "long" and energy_value is not None:
                 # §5.8: Ē — качество раскладки, при упорядочивании растёт; прирост за период оценки.
                 energy_gain = (
@@ -2554,6 +2600,12 @@ class Layout:
                         },
                     )
                 self._apply_adaptive_lambda(update, step=current_step)
+                if adaptive_params.lambda_ramp > 0:
+                    if ramp_start_lambda is None:
+                        ramp_start_lambda = float(self._lambda)
+                    ramped = adaptive_params.lambda_for_radius(int(update.radius), ramp_start_lambda)
+                    if abs(ramped - float(self._lambda)) > 1e-9:
+                        self._apply_adaptive_lambda(dataclasses.replace(update, new_lambda=ramped), step=current_step)
             if (
                 energy_target is not None
                 and energy_value is not None
@@ -3332,7 +3384,26 @@ class Layout:
             self._compiled_sampler = None
 
     def _sample_pairs_long_np(self, count: int, radius: int | None) -> "np.ndarray":
-        """Пары дальней фазы (§5.3): первая точка — любая, вторая — ячейка в радиусе r; массив count × 4."""
+        """Пары дальней фазы (§5.3): первая точка — любая, вторая — ячейка в радиусе r; массив count × 4.
+
+        С весами −ln Ê (§5.9.3, LAYOUT_LONG_WEIGHTED_FIRST) первая точка выбирается по ним, вторая — как обычно.
+        """
+        cdf = self._long_weights_cdf
+        if cdf is not None:
+            sampler = self._compiled_sampler
+            if sampler is None:
+                return self._sample_pairs_long_weighted_numpy(count, radius, cdf)
+            if not self._sampler_check_due("long_weighted"):
+                return sampler.long_pairs_weighted(self._np_rng, self._pos_np, cdf, count, radius)
+            clone = sampler.clone_generator(self._np_rng)
+            reference = self._sample_pairs_long_weighted_numpy(count, radius, cdf)
+            compiled = sampler.long_pairs_weighted(clone, self._pos_np, cdf, count, radius)
+            self._sampler_checked(
+                "long_weighted",
+                bool(np.array_equal(reference, compiled))
+                and clone.bit_generator.state == self._np_rng.bit_generator.state,
+            )
+            return reference
         sampler = self._compiled_sampler
         if sampler is None:
             return self._sample_pairs_long_numpy(count, radius)
@@ -3348,6 +3419,15 @@ class Layout:
             and clone.bit_generator.state == self._np_rng.bit_generator.state,
         )
         return reference
+
+    def _sample_pairs_long_weighted_numpy(self, count: int, radius: int | None, cdf: "np.ndarray") -> "np.ndarray":
+        """Пары дальней фазы с весами −ln Ê (§5.9.3) выборкой numpy: эталон для скомпилированной выборки."""
+        draws = self._np_rng.random(count) * cdf[-1]
+        idx_a = np.minimum(np.searchsorted(cdf, draws, side="right"), self._point_count - 1)
+        y1 = self._pos_np[idx_a, 0]
+        x1 = self._pos_np[idx_a, 1]
+        y2, x2 = self._sample_nearby_np(y1, x1, radius, None)
+        return np.stack([y1, x1, y2, x2], axis=1)
 
     def _sample_pairs_long_numpy(self, count: int, radius: int | None) -> "np.ndarray":
         """Пары дальней фазы (§5.3) выборкой numpy: эталон для скомпилированной выборки."""
@@ -5038,6 +5118,35 @@ class Layout:
         )
         return normalized
 
+    def _refresh_long_weights(self, radius: int, step: int) -> None:
+        """Веса первой точки дальней фазы P(p) ∝ −ln Ê(p, r) по энергиям всех точек (§5.9.3).
+
+        «As the code space is laid out, we can periodically calculate the energies of all points and use this
+        information to select points» — пока карта не упорядочена, Ê ≈ 0 и выбор почти равновероятен; по мере
+        раскладки вероятность смещается к плохо уложенным точкам (одиночкам вдали от своих).
+        """
+        energies = np.asarray(self._compute_point_energies(int(radius)), dtype=np.float64)
+        emax = float(energies.max()) if energies.size else 0.0
+        if emax > 0.0:
+            weights = np.maximum(0.0, -np.log(np.maximum(energies / emax, 1e-6)))
+        else:
+            weights = np.zeros_like(energies)
+        total = float(weights.sum())
+        self._long_weights_cdf = np.cumsum(weights) if total > 0.0 else None
+        LOGGER.event(
+            "layout.long.energy_weights",
+            section=OPTIM_FIRST_POINT,
+            data={
+                "energy_radius": int(radius),
+                "points": self._point_count,
+                "step": int(step),
+                "weighted": self._long_weights_cdf is not None,
+                "weight_mean": float(weights.mean()) if weights.size else 0.0,
+                "weight_max": float(weights.max()) if weights.size else 0.0,
+                "note": "дальняя фаза: первая точка пары с вероятностью P(p) ∝ −ln Ê по энергиям для Ē (§5.9.3)",
+            },
+        )
+
     def _ensure_short_energy_weights(
         self, *, step_index: int | None, config: ShortLayoutOptimConfig
     ) -> None:
@@ -6076,6 +6185,11 @@ class Layout:
                     sig2 = 2.0 * self._long_kernel_width ** 2 * radius_sq
                     w1 = math.exp(-d1 / sig2)
                     w2 = math.exp(-d2 / sig2)
+                    from damp.layout.far_force import far_alpha
+                    if far_alpha() > 0.0:  # смешанное ядро (Р2): − α·d / r
+                        rr = math.sqrt(radius_sq)
+                        w1 -= far_alpha() * math.sqrt(d1) / rr
+                        w2 -= far_alpha() * math.sqrt(d2) / rr
                 else:
                     if self._short_distance == "euclidean":
                         # §5.5.2: φ = Σ(s1/d1 + s2/d2) с евклидовыми d; иначе d² (§5.9.2).
@@ -6296,31 +6410,10 @@ class Layout:
                 )
                 return
 
-        sim_base: list[list[float]] = [
-            [0.0] * point_count for _ in range(point_count)
-        ]
-        for i in range(point_count):
-            sim_base[i][i] = 1.0
-
-        if workers < 2:
-            for i in range(point_count):
-                for j in range(i + 1, point_count):
-                    sim = self._similarity_base(self._points[i], self._points[j])
-                    sim_base[i][j] = sim
-                    sim_base[j][i] = sim
-        else:
-            tasks = [(offset, workers, point_count) for offset in range(workers)]
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=workers,
-                initializer=_init_similarity_worker,
-                initargs=(self._points, self._similarity),
-            ) as executor:
-                for chunk in executor.map(_compute_similarity_stride, tasks):
-                    for i, sims in chunk:
-                        row = sim_base[i]
-                        for j, sim in enumerate(sims, start=i + 1):
-                            row[j] = sim
-                            sim_base[j][i] = sim
+        # Одним умножением матриц 0/1: целые числа общих бит точны во float32 (L < 2^24), затем те же
+        # float64-sqrt и деление, что в _similarity_base_points; значения совпадают с прежним путём до бита.
+        # Пул процессов на BitArray.common и объекты LayoutPoint (_points) больше не нужны.
+        sim_base = self._similarity_matrix_from_bits().tolist()
         self._sim_base = sim_base
         if self._gpu_engine is not None:
             try:
@@ -6334,6 +6427,34 @@ class Layout:
                 section=OPTIM_SIM_MATRIX,
                 data={"mode": "cpu"},
             )
+
+    def _similarity_matrix_from_bits(self) -> "np.ndarray":
+        """Таблица сходства N × N (float64) по матрице бит: общие биты — целые, как BitArray.common."""
+        bits = self._code_matrix
+        point_count = self._point_count
+        ones = np.asarray(self._table.ones, dtype=np.int64)
+        matrix = np.zeros((point_count, point_count), dtype=np.float64)
+        if point_count == 0:
+            return matrix
+        columns = np.ascontiguousarray(bits.astype(np.float32).T)
+        chunk = 512
+        cosine = self._similarity == "cosine"
+        for start in range(0, point_count, chunk):
+            stop = min(start + chunk, point_count)
+            common = (bits[start:stop].astype(np.float32) @ columns).astype(np.float64)
+            if cosine:
+                denom = np.sqrt((ones[start:stop, None] * ones[None, :]).astype(np.float64))
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    block = common / denom
+            else:
+                union = (ones[start:stop, None] + ones[None, :]).astype(np.float64) - common
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    block = common / union
+            block[(ones[start:stop, None] == 0) | (ones[None, :] == 0)] = 0.0
+            block[~np.isfinite(block)] = 0.0
+            matrix[start:stop] = block
+        matrix[np.arange(point_count), np.arange(point_count)] = 1.0
+        return matrix
 
     def _build_similarity_cache_gpu(self) -> list[list[float]] | None:
         if self._gpu_engine is not None:

@@ -311,6 +311,7 @@ def _sparse_layout_options() -> dict[str, object]:
         "fused_block_elements": settings.LAYOUT_FUSED_BLOCK_ELEMENTS,
         "fused_verify_every": settings.LAYOUT_FUSED_VERIFY_EVERY,
         "fused_similarity_table": settings.LAYOUT_FUSED_SIMILARITY_TABLE,
+        "int8_codes": settings.LAYOUT_INT8_CODES,
     }
 
 
@@ -804,6 +805,7 @@ def _run_long_phase(
         swap_ratio_trigger=settings.LAYOUT_ADAPTIVE_SWAP_TRIGGER,
         lambda_step=settings.LAYOUT_ADAPTIVE_LAMBDA_STEP,
         lambda_max=settings.LAYOUT_ADAPTIVE_LAMBDA_MAX if lambda_max is None else float(lambda_max),
+        lambda_ramp=int(settings.LAYOUT_LAMBDA_RAMP),  # план v4.14: λ растёт вместе с убыванием радиуса (0 — выкл.)
         radius_schedule=settings.LAYOUT_ADAPTIVE_RADIUS_SCHEDULE,
         radius_factor=settings.LAYOUT_ADAPTIVE_RADIUS_TRIGGER_FACTOR,
         swap_window=settings.LAYOUT_ADAPTIVE_SWAP_WINDOW,
@@ -826,6 +828,7 @@ def _run_long_phase(
         log_visuals=settings.LAYOUT_LOG_VISUALS,
         adaptive_params=adaptive_long,
         save_on_stop_path=layout_path,
+        long_weighted_first=bool(settings.LAYOUT_LONG_WEIGHTED_FIRST),
     )
 
 
@@ -884,4 +887,6 @@ def _run_short_phase(
         step_offset=step_offset,
         adaptive_params=adaptive_short,
         short_optim=short_optim,
+        # Картинки и цвета карты — только для журнала и Rerun (анализ 2026-11-21: ближняя фаза рисовала их и без Rerun).
+        log_visuals=settings.LAYOUT_LOG_VISUALS,
     )

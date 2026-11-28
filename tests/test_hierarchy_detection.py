@@ -109,6 +109,69 @@ class HierarchyDetectionTest(unittest.TestCase):
         sets_rows, sets_found, _ = detection.active_sets(packed, np.arange(3), np.arange(3), 3)
         self.assertEqual(sorted(zip(sets_rows.tolist(), sets_found.tolist())), sorted(zip(rows.tolist(), found.tolist())))
 
+    def test_int8_codes_give_the_same_firing(self) -> None:
+        """Коды int8 на видеокарте (ACTIVATION_INT8_CODES) дают те же срабатывания и зажжённые точки до бита, что float32:
+        число общих бит — целое у обоих произведений. Карта — 501 точка с кодом в 99 бит (ни то, ни другое не кратно 8),
+        пачки кодов короче и длиннее 17 строк."""
+        import torch
+
+        if not torch.cuda.is_available() or not hasattr(torch, "_int_mm"):
+            self.skipTest("нужны CUDA и torch._int_mm")
+        from damp.layout.damp_layout import Layout
+        from tests.test_layout_int8_codes import _LAYOUT_PARAMS, _table
+
+        layout = Layout(_table(), **_LAYOUT_PARAMS)
+        points, side = 501, int(layout.width)
+        rng = np.random.default_rng(7)
+        bit = BitArray.from_indices(16, [0])
+        detectors = [
+            Detector(center=(float(rng.uniform(2, side - 2)), float(rng.uniform(2, side - 2))), radius=float(rng.uniform(2.0, 5.0)),
+                     lambda_threshold=(0.3, 0.5)[number % 2], energy=float(rng.uniform(1.0, 4.0)), points_count=8, output_code=bit)
+            for number in range(24)
+        ]
+        energies = [1.0 if point % 7 else 0.05 for point in range(points)]
+        common = dict(similarity="cosine", lambda_threshold=0.3, eta=None, energy_threshold=0.12, detector_threshold=0.2,
+                      activate_best=True, local_energy_threshold=0.2, local_energy_radius=3.0)
+        plain = HierarchyDetection(layout, detectors, energies, **common)
+        fast = HierarchyDetection(layout, detectors, energies, int8_codes=True, **common)
+        self.assertFalse(plain._int8)
+        self.assertTrue(fast._int8)
+        self.assertTrue(bool(torch.equal(plain._ones, fast._ones)))
+        bits = np.asarray(layout.code_table.bits(), dtype=np.uint8)
+        fired = 0
+        for count in (1, 5, 16, 17, 40, 300):
+            codes = bits[rng.integers(0, points, size=count)].copy()
+            flips = rng.integers(0, codes.shape[1], size=(count, 3))
+            codes[np.arange(count)[:, None], flips] ^= 1  # коды окон — похожие на точки карты, но не равные им
+            packed = np.packbits(codes, axis=1)
+            for method in ("active", "lit", "active_with_lit"):
+                for expected, found in zip(getattr(plain, method)(packed), getattr(fast, method)(packed)):
+                    self.assertTrue(np.array_equal(expected, found), f"{method}, кодов {count}")
+            groups = np.sort(rng.integers(0, max(1, count // 3), size=count))
+            index = rng.permutation(count)
+            expected = plain.active_sets(packed, index, groups, max(1, count // 3))
+            found = fast.active_sets(packed, index, groups, max(1, count // 3))
+            for left, right in zip(expected, found):
+                self.assertTrue(np.array_equal(left, right), f"active_sets, кодов {count}")
+            fired += int(expected[0].size)
+        self.assertGreater(fired, 0)  # сверка не пустая: детекторы срабатывали
+
+    def test_int8_codes_fall_back_to_float32_when_the_check_fails(self) -> None:
+        import torch
+
+        if not torch.cuda.is_available() or not hasattr(torch, "_int_mm"):
+            self.skipTest("нужны CUDA и torch._int_mm")
+        layout = _clustered_layout()
+        settings = {"similarity": "cosine", "lambda_threshold": 0.5, "eta": None, "energy_threshold": 0.12, "detector_threshold": 0.5}
+        check = HierarchyDetection._int8_matches
+        HierarchyDetection._int8_matches = lambda self, packed: False
+        try:
+            detection = HierarchyDetection(layout, self._detectors(), [1.0] * 32, int8_codes=True, **settings)
+        finally:
+            HierarchyDetection._int8_matches = check
+        self.assertFalse(detection._int8)
+        self.assertEqual(detection._points.dtype, torch.float32)
+
 
 if __name__ == "__main__":
     unittest.main()

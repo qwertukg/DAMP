@@ -110,6 +110,7 @@ class MnistLadderRunner:
         validation_numbers: Sequence[int] | None = None,
         test_numbers: Sequence[int] | None = None,
         keep_levels: bool = False,
+        keep_top_firing: bool = True,
     ) -> None:
         evaluate_limit = settings.LADDER_EVALUATE_LIMIT if evaluate_limit is None else evaluate_limit
         if count <= 0:
@@ -169,6 +170,10 @@ class MnistLadderRunner:
         # keep_levels — сохранить уровни после обучения (TrainedLevel): по ним идёт новая картинка (дашборд). На счёт
         # прогона не влияет; карта и детекторы уровня остаются в памяти, видеокарта под ними освобождается как обычно.
         self._keep_levels = bool(keep_levels)
+        # keep_top_firing — держать срабатывания верхнего уровня по окнам (top_firing; читает только стенд сравнения
+        # моделей, decode/bench.py). Обученному циклу они не нужны, а держались весь следующий уровень: на 40 000
+        # картинках — около гигабайта ОЗУ на стыке уровней 3 и 4 (2026-11-26).
+        self._keep_top_firing = bool(keep_top_firing)
         self.levels: list = []  # TrainedLevel по уровням (при keep_levels)
         # Уровень 0 — первичная раскладка штрихов (LADDER_LEVEL0): штрихи идут в уровень 1 с выученными кодами.
         self.primary = None
@@ -194,6 +199,14 @@ class MnistLadderRunner:
     def _run(self) -> dict[int, float] | None:
         # Группы картинок: обучающие, проверочные и проверочные со сдвигом (первая картинка, после последней).
         self._observer.stage(0, 1)
+        chosen = settings.LADDER_TRAIN_DIGITS if hasattr(settings, "LADDER_TRAIN_DIGITS") else "all"
+        if self._numbers["train"] is None and chosen != "all":
+            # Обучение только на заданных цифрах (вне статьи; автор 2026-11-20: «просто возьми из мниста первые 100
+            # двоек»): первые count картинок MNIST train с этими метками, начиная с train_start.
+            self._numbers["train"] = self._first_train_numbers(self.count, settings.LADDER_TRAIN_DIGITS, self._train_start)
+        if self._numbers["train"] is None and settings.LADDER_TRAIN_SAMPLE_SEED is not None:
+            # Проверка опоры на других картинках (задача #15): случайные count картинок пула BENCH_TRAIN_POOL с этим зерном.
+            self._numbers["train"] = self._sample_train_numbers(self.count, int(settings.LADDER_TRAIN_SAMPLE_SEED))
         groups = DigitGroups.load(
             self._digits,
             train=self.count,
@@ -209,6 +222,8 @@ class MnistLadderRunner:
             validation_numbers=self._numbers["validation"],
             test_numbers=self._numbers["test"],
             train_views=settings.LADDER_TRAIN_VIEWS,
+            # Добавочные картинки верхних уровней (вне статьи): в наборе они есть, только когда задан уровень, с которого учат.
+            extra=DigitGroups.extra_wanted(),
         )
         self._groups = groups
         self.groups = groups
@@ -259,15 +274,44 @@ class MnistLadderRunner:
             # карта уровня 0 (30 тыс. точек на 500 цифрах) держит видеокарту всё обучение уровней 1–3, и раскладка
             # следующей карты упирается в память (прогон 446, 2026-11-19).
             self.primary.release()
+            self._drop_dense_codes(self.primary.memory.layout)
         elements, reached = self._ladder(elements, responses)
         if reached is None:
             raise RuntimeError("лестница не построила ни одного уровня")
         self.top_details = elements
-        self._class_map(elements, groups.labels, reached)
+        if settings.LADDER_CLASS_MAP:
+            self._class_map(elements, groups.labels, reached)
         self._log_summary()
         self._observer.finish(self.reports, self.top_accuracy)
         self._observer.stage(reached.number, 0)
         return self.reports[-1].glued if self.reports else None
+
+    def _sample_train_numbers(self, count: int, seed: int) -> tuple[int, ...]:
+        """Случайные count номеров MNIST train из пула BENCH_TRAIN_POOL (зерно seed), по возрастанию (вне статьи)."""
+        low, high = (int(value) for value in settings.BENCH_TRAIN_POOL)
+        numbers = np.sort(np.random.default_rng(int(seed)).choice(np.arange(low, high), size=int(count), replace=False))
+        LOGGER.event("ladder.train_sample", section=OUTSIDE_ARTICLE,
+                     data={"seed": int(seed), "count": int(count), "pool": [low, high],
+                           "note": "обучение на случайной выборке MNIST train вместо первых картинок (проверка опоры)"})
+        return tuple(int(number) for number in numbers)
+
+    def _first_train_numbers(self, count: int, digits: Sequence[int], start: int) -> tuple[int, ...]:
+        """Номера первых count картинок MNIST train с меткой из digits, начиная с номера start (LADDER_TRAIN_DIGITS)."""
+        from torchvision.datasets import MNIST
+
+        root = getattr(self._digits, "_root", "./data")
+        targets = np.asarray(MNIST(root=root, train=True, download=True).targets)
+        wanted = np.flatnonzero(np.isin(targets, np.asarray([int(digit) for digit in digits])))
+        numbers = wanted[wanted >= int(start)][: int(count)]
+        if numbers.shape[0] < int(count):
+            raise ValueError(f"в MNIST train только {numbers.shape[0]} картинок цифр {list(digits)} с номера {start}")
+        LOGGER.event(
+            "ladder.train_digits",
+            section=OUTSIDE_ARTICLE,
+            data={"digits": [int(digit) for digit in digits], "count": int(count), "first": int(numbers[0]),
+                  "last": int(numbers[-1]), "note": "обучение только на этих цифрах: первые картинки MNIST train с их метками"},
+        )
+        return tuple(int(number) for number in numbers)
 
     def _glyph_file(self, name: str) -> str | None:
         """Рисунок карты name («level2», «classes») этого прогона, если он нарисован (LADDER_SAVE_MAPS)."""
@@ -317,19 +361,24 @@ class MnistLadderRunner:
             "element_x": elements.x,
         }
 
-    def _watch(self, number: int, *, recognition: bool = True, place: "Encoder | None" = None):  # noqa: ANN202
+    def _watch(self, number: int, *, recognition: bool = True, place: "Encoder | None" = None,
+               memory_extra: "Callable[[object], dict] | None" = None):  # noqa: ANN202
         """Смотритель прохода CycleStep.run: каждый готовый шаг — часть уровня, затем начинается следующий этап.
         recognition — после деталей идёт узнавание по уровню (этап 7); у уровня 0 его нет. place — кодер места окон
-        (None — кодер прохода уровней)."""
+        (None — кодер прохода уровней). memory_extra(память) — добавка к части «memory» (у уровня 0 — угол штриха
+        каждой точки карты, для показа пинвила)."""
 
         def watch(name: str, value: object) -> None:
             if name == "codes":
                 self._part(number, "codes", {
                     "keyhole_codes": value.packed, "code_length": int(value.code_length),
                     "place_length": int(value.place_length), "content_length": int(value.content_length),
-                    "place_encoder": self._step.coder.place if place is None else place,
+                    "place_encoder": self._step.coder.place(number) if place is None else place,
                 })
                 self._observer.stage(number, LEVEL_PARTS["memory"])
+            elif name == "codes_on_disk":
+                # Коды окон ушли во временный файл (CycleStep.on_disk): итог прохода держит их, а не массив в ОЗУ.
+                self._values["keyhole_codes"] = value.packed
             elif name == "memory":
                 layout = value.layout
                 table = layout.code_table
@@ -339,6 +388,7 @@ class MnistLadderRunner:
                     "map_labels": np.asarray([int(label) for label in table.labels()], dtype=np.int64),
                     "energies": np.asarray(value.energies, dtype=np.float64),
                     "energy_threshold": float(settings.ACTIVATION_ENERGY_THRESHOLD),
+                    **({} if memory_extra is None else memory_extra(value)),
                 })
                 self._observer.stage(number, LEVEL_PARTS["detectors"])
             elif name == "detectors":
@@ -372,7 +422,16 @@ class MnistLadderRunner:
         from damp.cycle.primary import StrokeLevel
         from damp.encoding.keyhole_code import KeyholeCoder
 
-        levels = self._watch(0, recognition=False, place=KeyholeCoder().place)
+        def pinwheel(memory) -> dict:  # noqa: ANN001
+            # Угол штриха каждой точки карты (точка — образец словаря, как в StrokeLevel.train): по нему карта уровня 0
+            # показывается пинвилом (§5.13.2; автор 2026-11-20: «пинвил 0 уровня» в Rerun).
+            from damp.layout.glyph_map import LayoutGlyphMap
+
+            sample = LayoutGlyphMap(memory.layout, memory.dictionary.packed).rows
+            stick = np.asarray(memory.rows, dtype=np.int64)[np.maximum(sample, 0)]
+            return {"map_angle": np.asarray(groups.atoms.angle, dtype=np.float64)[stick]}
+
+        levels = self._watch(0, recognition=False, place=KeyholeCoder().place(0), memory_extra=pinwheel)
         state: dict[str, object] = {}
 
         def watch(name: str, value: object) -> None:
@@ -492,7 +551,7 @@ class MnistLadderRunner:
             self._keyhole_glyphs(layout, dictionary, pieces, memory.rows, field, extent)
         rows, columns, levels = level.firing.rows, level.firing.columns, level.firing.levels
         # Для стенда: уровни активации детекторов по окнам; последний записанный уровень — верхний (§7.1.12).
-        self.top_firing = {
+        self.top_firing = None if not self._keep_top_firing else {
             "rows": rows, "columns": columns, "levels": levels, "detectors": int(found.built),
             "picture": np.asarray(pieces.picture),
             # Господство классов в детекторах (§8.2) — по точкам карты, то есть по обучающим окнам.
@@ -632,8 +691,17 @@ class MnistLadderRunner:
         )
         if self._keep_levels:
             self.levels.append(level.trained())
+            self._drop_dense_codes(self.levels[-1].memory.layout)
         level.release()
         return result
+
+    @staticmethod
+    def _drop_dense_codes(layout) -> None:  # noqa: ANN001
+        """Распакованные коды точек обученной карты (байт на бит; карта в 41 000 точек — 0.4–0.6 ГБ ОЗУ) больше не нужны:
+        срабатывания идут по упакованным кодам. Копия ленивая (Layout._code_matrix) — при обращении она строится заново
+        из тех же кодов. Сделано здесь, а не в модулях раскладки: их текст входит в ключ кеша карт."""
+        if layout is not None and getattr(layout, "_code_matrix_cache", None) is not None:
+            layout._code_matrix_cache = None
 
     def _detail_measures(self, level: LevelPass, memory: LevelMemory) -> dict[str, float | int]:
         """Мерки статьи по уровню: Ē карты (§5.8), разрешение и наибольший набор окон с одним кодом детали

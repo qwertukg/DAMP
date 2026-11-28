@@ -320,15 +320,15 @@ class LargeEnergyTests(unittest.TestCase):
 
         layout = self._layout()
         engine = layout._torch_engine
-        limit = TorchPairEnergyEngine.FLOAT_CODES_MAX_BYTES
-        TorchPairEnergyEngine.FLOAT_CODES_MAX_BYTES = 0
+        limit = TorchPairEnergyEngine.DENSE_CODES_MAX_BYTES
+        TorchPairEnergyEngine.DENSE_CODES_MAX_BYTES = 0
         try:
             packed_layout = self._layout()
         finally:
-            TorchPairEnergyEngine.FLOAT_CODES_MAX_BYTES = limit
+            TorchPairEnergyEngine.DENSE_CODES_MAX_BYTES = limit
         packed_engine = packed_layout._torch_engine
-        self.assertTrue(engine.has_float_codes)
-        self.assertFalse(packed_engine.has_float_codes)
+        self.assertTrue(engine.has_dense_codes)
+        self.assertFalse(packed_engine.has_dense_codes)
         indices = engine.torch_mod.arange(layout.point_count, device=engine.torch_device)
         self.assertTrue(bool(engine.torch_mod.equal(packed_engine._code_rows(indices), engine.codes)))
         subset = random.Random(3).sample(range(layout.point_count), 96)

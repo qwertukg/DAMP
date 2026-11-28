@@ -1,0 +1,17 @@
+# Стенд: в git — скрипты, опора (base.json), журнал прогонов (tune2_log.jsonl), рисунок «X» (x_image.b64).
+# Остальное — рабочее состояние прогонщика, роутера и пар.
+*.out
+*.err
+*.log
+*.pid
+*.done
+*.table.md
+tune2-*.json
+claude.heartbeat
+glm_trial
+comments_seen.json
+router_handled.json
+maps_uploaded.json
+arrivals.json
+maps_pending.json
+watchdog.log

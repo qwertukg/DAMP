@@ -9,6 +9,7 @@ import numpy as np
 
 from damp import settings
 from damp.activation import DbscanClusterer, Detector, DetectorHierarchyBuilder, DetectorLayerConfig
+from damp.activation.activation import quiet_detector_init
 from damp.activation.hierarchy_detection import HierarchyDetection
 from damp.encoding.bitarray import BitArray
 from damp.layout.code_dictionary import PairwiseSimilarity
@@ -28,10 +29,19 @@ class Firing:
     levels: "np.ndarray"  # уровень активации E(d) ≥ μ_d
     scale: "np.ndarray | None" = None  # делители нормировки уровней по детекторам (scaled), None — без нормировки
 
+    # Троек за один кусок счёта в strength, train_maxima и scaled: временные float64 живут по куску, а не по всем тройкам
+    # (на 2.5 млн окон уровня 0 — 55 млн троек: копии float64 по 443 МБ разом давали +3.4 ГБ ОЗУ, замер 2026-11-26).
+    # Числа те же: максимум не зависит от порядка, остальное — поэлементно.
+    CHUNK = 1 << 22
+
+    def _chunks(self):  # noqa: ANN202
+        return (slice(start, start + self.CHUNK) for start in range(0, int(self.rows.shape[0]), self.CHUNK))
+
     def strength(self) -> "np.ndarray":
         """Уровень активации каждого набора — самый сильный из сработавших на нём детекторов (П.1)."""
         strength = np.zeros(int(self.sets), dtype=np.float64)
-        np.maximum.at(strength, self.rows, self.levels.astype(np.float64))
+        for part in self._chunks():
+            np.maximum.at(strength, self.rows[part], self.levels[part].astype(np.float64))
         return strength
 
     def train_maxima(self, trained: "np.ndarray", detectors: int) -> "np.ndarray":
@@ -39,9 +49,10 @@ class Firing:
         trained = np.asarray(trained, dtype=bool)
         if trained.shape != (int(self.sets),):
             raise ValueError("trained: нужна маска по числу наборов")
-        inside = trained[self.rows]
         maxima = np.zeros(int(detectors), dtype=np.float64)
-        np.maximum.at(maxima, self.columns[inside], self.levels[inside].astype(np.float64))
+        for part in self._chunks():
+            inside = trained[self.rows[part]]
+            np.maximum.at(maxima, self.columns[part][inside], self.levels[part][inside].astype(np.float64))
         return maxima
 
     def normalised(self, trained: "np.ndarray", detectors: int) -> "Firing":
@@ -64,10 +75,12 @@ class Firing:
         """Уровни, делённые на maxima своего детектора и обрезанные единицей (normalised, вне статьи); maxima
         запоминаются в scale — так нормируется новая картинка обученного уровня теми же делителями."""
         maxima = np.asarray(maxima, dtype=np.float64)
-        scale = maxima[self.columns]
-        levels = self.levels.astype(np.float64)
-        levels = np.minimum(np.where(scale > 0.0, levels / np.where(scale > 0.0, scale, 1.0), levels), 1.0)
-        return Firing(sets=self.sets, rows=self.rows, columns=self.columns, levels=levels.astype(self.levels.dtype), scale=maxima)
+        found = np.empty(self.levels.shape, dtype=self.levels.dtype)
+        for part in self._chunks():
+            scale = maxima[self.columns[part]]
+            levels = self.levels[part].astype(np.float64)
+            found[part] = np.minimum(np.where(scale > 0.0, levels / np.where(scale > 0.0, scale, 1.0), levels), 1.0)
+        return Firing(sets=self.sets, rows=self.rows, columns=self.columns, levels=found, scale=maxima)
 
 
 def map_hierarchy(
@@ -116,6 +129,8 @@ def map_hierarchy(
         attempts_without_change=settings.ACTIVATION_DETECTOR_ATTEMPTS_WITHOUT_CHANGE,
         seed=settings.ACTIVATION_DETECTOR_SEED,
         clusterer=DbscanClusterer(eps=settings.ACTIVATION_DBSCAN_EPS, min_samples=settings.ACTIVATION_DBSCAN_MIN_SAMPLES),
+        fill_cell=float(settings.ACTIVATION_DETECTOR_FILL_CELL),
+        radius_mode=str(settings.ACTIVATION_DETECTOR_RADIUS_MODE),
     ).build()
     return detectors, levels, energies
 
@@ -171,7 +186,8 @@ class LevelDetectors:
             "width": int(layout.width), "height": int(layout.height), "energies": np.asarray(memory.energies, dtype=np.float64),
             "codes": memory.dictionary.packed,
         }
-        found = CACHE.run("activation.detectors", inputs, compute, modules=cls.MODULES)
+        found = CACHE.run("activation.detectors", inputs, compute, modules=cls.MODULES,
+                          ignore=("damp.activation.hierarchy_detection",))  # С3: срабатывание (.detection) детекторы не строит
         detectors = cls._unpack(found)
         return cls(layout, detectors, found["thresholds"], memory.energies, float(found["activation_lambda"]), name)
 
@@ -195,6 +211,11 @@ class LevelDetectors:
     @staticmethod
     def _unpack(found: dict[str, object]) -> list[Detector]:
         center, starts, ones = found["center"].tolist(), found["output_starts"], found["output_ones"]
+        with quiet_detector_init():
+            return LevelDetectors._unpack_rows(found, center, starts, ones)
+
+    @staticmethod
+    def _unpack_rows(found: dict[str, object], center: list, starts: "np.ndarray", ones: "np.ndarray") -> list[Detector]:
         return [
             Detector(
                 center=(float(center[i][0]), float(center[i][1])),
@@ -226,6 +247,7 @@ class LevelDetectors:
                 local_energy_threshold=settings.ACTIVATION_LOCAL_ENERGY_THRESHOLD,
                 local_energy_radius=settings.ACTIVATION_POINT_ENERGY_RADIUS,
                 use_gpu=settings.ACTIVATION_USE_GPU,
+                int8_codes=settings.ACTIVATION_INT8_CODES,
                 name=self.name,
             )
         return self._detection
