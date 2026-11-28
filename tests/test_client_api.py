@@ -130,7 +130,9 @@ class CycleBlocksTest(unittest.TestCase):
             elements = damp.cycle.level0(elements)
             self.assertIsNotNone(runner.primary)  # дальше коды окон уровня 1 сверяются с прогоном — значит, и коды штрихов те же
         firings = []
-        for trace in traces.levels:
+        # След уровня 0 (первичная раскладка штрихов) наблюдатель получает тоже; кубик уровня 0 сверен выше — здесь
+        # сверяются проходы уровней 1, 2, … (как в tests/test_trained_ladder.py).
+        for trace in [trace for trace in traces.levels if int(trace.number) > 0]:
             with self.subTest(level=trace.number):
                 level = damp.cycle.step(elements)
                 self.assertEqual(level.number, trace.number)

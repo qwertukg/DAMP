@@ -1,6 +1,6 @@
 {
  "plan": "v3",
- "base": "1464",
+ "base": "1566",
  "nodes": [
   {
    "key": "664",
@@ -3856,6 +3856,546 @@
     "PVTI_lAHOAENbFs4BslBdzhLeTr8"
    ],
    "variant": "PVTI_lAHOAENbFs4BslBdzhLcVZM"
+  },
+  {
+   "key": "1486",
+   "runs": [
+    1486,
+    1487
+   ],
+   "card": "опора на зёрнах 1/3",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLij2c",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLij2c",
+    "PVTI_lAHOAENbFs4BslBdzhLipjo"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLij2c"
+  },
+  {
+   "key": "1488",
+   "runs": [
+    1488,
+    1489
+   ],
+   "card": "опора на зёрнах 1/3",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLij2c",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLij2c",
+    "PVTI_lAHOAENbFs4BslBdzhLipjo"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLij2c"
+  },
+  {
+   "key": "1490",
+   "runs": [
+    1490,
+    1491
+   ],
+   "card": "опора на зёрнах 1/3",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLij2c",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLij2c",
+    "PVTI_lAHOAENbFs4BslBdzhLipjo"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLij2c"
+  },
+  {
+   "key": "1492",
+   "runs": [
+    1492,
+    1493
+   ],
+   "card": "опора на зёрнах 2/8",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLijuM",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLijuM",
+    "PVTI_lAHOAENbFs4BslBdzhLkGds"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLijuM"
+  },
+  {
+   "key": "1494",
+   "runs": [
+    1494,
+    1495
+   ],
+   "card": "опора на зёрнах 0/11",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLijmo",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLijmo",
+    "PVTI_lAHOAENbFs4BslBdzhLkf6Q"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLijmo"
+  },
+  {
+   "key": "1496",
+   "runs": [
+    1496,
+    1497
+   ],
+   "card": "опора на зёрнах 5/7",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLijcY",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLijcY",
+    "PVTI_lAHOAENbFs4BslBdzhLk5TE"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLijcY"
+  },
+  {
+   "key": "1498",
+   "runs": [
+    1498,
+    1499
+   ],
+   "card": "опора на зёрнах 4/6",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLijTg",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLijTg",
+    "PVTI_lAHOAENbFs4BslBdzhLlbhg"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLijTg"
+  },
+  {
+   "key": "1500",
+   "runs": [
+    1500,
+    1501
+   ],
+   "card": "опора на зёрнах 9/10",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLijKs",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLijKs",
+    "PVTI_lAHOAENbFs4BslBdzhLl1Wo"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLijKs"
+  },
+  {
+   "key": "1502",
+   "runs": [
+    1502,
+    1503
+   ],
+   "card": "опора на зёрнах 9/10",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLm1JU",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLm1JU",
+    "PVTI_lAHOAENbFs4BslBdzhLm2ME"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLm1JU"
+  },
+  {
+   "key": "1504",
+   "runs": [
+    1504,
+    1505
+   ],
+   "card": "опора на зёрнах 1/3",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLm1us",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLm1us",
+    "PVTI_lAHOAENbFs4BslBdzhLndto"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLm1us"
+  },
+  {
+   "key": "1506",
+   "runs": [
+    1506,
+    1507
+   ],
+   "card": "опора на зёрнах 2/8",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLm1lk",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLm1lk",
+    "PVTI_lAHOAENbFs4BslBdzhLoEQM"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLm1lk"
+  },
+  {
+   "key": "1508",
+   "runs": [
+    1508,
+    1509
+   ],
+   "card": "опора на зёрнах 0/11",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLm1e4",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLm1e4",
+    "PVTI_lAHOAENbFs4BslBdzhLori0"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLm1e4"
+  },
+  {
+   "key": "1510",
+   "runs": [
+    1510,
+    1511
+   ],
+   "card": "опора на зёрнах 5/7",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLm1Xo",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLm1Xo",
+    "PVTI_lAHOAENbFs4BslBdzhLpRjA"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLm1Xo"
+  },
+  {
+   "key": "1512",
+   "runs": [
+    1512,
+    1513
+   ],
+   "card": "опора на зёрнах 4/6",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLm1Qo",
+   "parent": "1464",
+   "status": "base",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLm1Qo",
+    "PVTI_lAHOAENbFs4BslBdzhLp3YQ"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLm1Qo"
+  },
+  {
+   "key": "1514",
+   "runs": [
+    1514,
+    1515,
+    1516,
+    1517,
+    1518,
+    1519
+   ],
+   "card": "[верхняя карта раскладывается один раз] → [лучшая из 3 раскладок по мерке соседства] выбор раскладки верха без меток",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLqRaQ",
+   "parent": "1464",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLqRaQ",
+    "PVTI_lAHOAENbFs4BslBdzhLqT6A",
+    "PVTI_lAHOAENbFs4BslBdzhLqZvU",
+    "PVTI_lAHOAENbFs4BslBdzhLqaBE",
+    "PVTI_lAHOAENbFs4BslBdzhLqg_s",
+    "PVTI_lAHOAENbFs4BslBdzhLqhRM"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLqRaQ"
+  },
+  {
+   "key": "1520",
+   "runs": [
+    1520,
+    1521
+   ],
+   "card": "[нет] → [41000] map_max_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLqdrc",
+   "parent": "1464",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLqdrc",
+    "PVTI_lAHOAENbFs4BslBdzhLqm9w"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLqdrc"
+  },
+  {
+   "key": "1524",
+   "runs": [
+    1524,
+    1525,
+    1526,
+    1527,
+    1528,
+    1529,
+    1530,
+    1531,
+    1532,
+    1533,
+    1534,
+    1535
+   ],
+   "card": "[доводка после гладкого старта — с радиуса 0.1 ширины карты] → [с радиуса 0.05] доводка верха бережнее",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLqRTU",
+   "parent": "1464",
+   "status": "bad",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLqRTU",
+    "PVTI_lAHOAENbFs4BslBdzhLquy4",
+    "PVTI_lAHOAENbFs4BslBdzhLqz9Q",
+    "PVTI_lAHOAENbFs4BslBdzhLq0P8",
+    "PVTI_lAHOAENbFs4BslBdzhLq6Gk",
+    "PVTI_lAHOAENbFs4BslBdzhLq6XQ",
+    "PVTI_lAHOAENbFs4BslBdzhLq_uc",
+    "PVTI_lAHOAENbFs4BslBdzhLrAAo",
+    "PVTI_lAHOAENbFs4BslBdzhLrE_o",
+    "PVTI_lAHOAENbFs4BslBdzhLrFWE",
+    "PVTI_lAHOAENbFs4BslBdzhLrLAM",
+    "PVTI_lAHOAENbFs4BslBdzhLrLT0"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLqRTU"
+  },
+  {
+   "key": "1536",
+   "runs": [
+    1536,
+    1537
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLqw50",
+   "parent": "1464",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLqw50",
+    "PVTI_lAHOAENbFs4BslBdzhLrRqA"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLqw50"
+  },
+  {
+   "key": "1538",
+   "runs": [
+    1538,
+    1539
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLqwzA",
+   "parent": "1464",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLqwzA",
+    "PVTI_lAHOAENbFs4BslBdzhLrqj4"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLqwzA"
+  },
+  {
+   "key": "1540",
+   "runs": [
+    1540,
+    1541
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLqwtc",
+   "parent": "1464",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLqwtc",
+    "PVTI_lAHOAENbFs4BslBdzhLsBrc"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLqwtc"
+  },
+  {
+   "key": "1542",
+   "runs": [
+    1542,
+    1543
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLskFE",
+   "parent": "1540",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLskFE",
+    "PVTI_lAHOAENbFs4BslBdzhLsmIg"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLskFE"
+  },
+  {
+   "key": "1544",
+   "runs": [
+    1544,
+    1545
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLtOWc",
+   "parent": "1540",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLtOWc",
+    "PVTI_lAHOAENbFs4BslBdzhLtPK8"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLtOWc"
+  },
+  {
+   "key": "1546",
+   "runs": [
+    1546,
+    1547
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLuDB0",
+   "parent": "1542",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLuDB0",
+    "PVTI_lAHOAENbFs4BslBdzhLuFnE"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLuDB0"
+  },
+  {
+   "key": "1548",
+   "runs": [
+    1548,
+    1549
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLvLGo",
+   "parent": "1544",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLvLGo",
+    "PVTI_lAHOAENbFs4BslBdzhLvMpI"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLvLGo"
+  },
+  {
+   "key": "1550",
+   "runs": [
+    1550,
+    1551
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLwucU",
+   "parent": "1546",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLwucU",
+    "PVTI_lAHOAENbFs4BslBdzhLwvPo"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLwucU"
+  },
+  {
+   "key": "1552",
+   "runs": [
+    1552,
+    1553
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhLyin8",
+   "parent": "1548",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhLyin8",
+    "PVTI_lAHOAENbFs4BslBdzhLyk2s"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhLyin8"
+  },
+  {
+   "key": "1554",
+   "runs": [
+    1554,
+    1555
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhL2GfY",
+   "parent": "1550",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhL2GfY",
+    "PVTI_lAHOAENbFs4BslBdzhL2IF4"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhL2GfY"
+  },
+  {
+   "key": "1558",
+   "runs": [
+    1558,
+    1559
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhL8NwA",
+   "parent": "1554",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhL8NwA",
+    "PVTI_lAHOAENbFs4BslBdzhL8Osw"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhL8NwA"
+  },
+  {
+   "key": "1560",
+   "runs": [
+    1560,
+    1561
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhMAML4",
+   "parent": "1554",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhMAML4",
+    "PVTI_lAHOAENbFs4BslBdzhMAMvU"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhMAML4"
+  },
+  {
+   "key": "1562",
+   "runs": [
+    1562,
+    1563
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhMB7C8",
+   "parent": "1558",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhMB7C8",
+    "PVTI_lAHOAENbFs4BslBdzhMB-hY"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhMB7C8"
+  },
+  {
+   "key": "1566",
+   "runs": [
+    1566,
+    1567
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhMFo08",
+   "parent": "1562",
+   "status": "good",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhMFo08",
+    "PVTI_lAHOAENbFs4BslBdzhMFqF8"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhMFo08"
+  },
+  {
+   "key": "1568",
+   "runs": [
+    1568,
+    1569
+   ],
+   "card": "[нет] → [41000] dashboard_map_points",
+   "item": "PVTI_lAHOAENbFs4BslBdzhMLuZo",
+   "parent": "1562",
+   "status": "run",
+   "items": [
+    "PVTI_lAHOAENbFs4BslBdzhMLuZo",
+    "PVTI_lAHOAENbFs4BslBdzhMLwfU"
+   ],
+   "variant": "PVTI_lAHOAENbFs4BslBdzhMLuZo"
   }
  ],
  "tested": {

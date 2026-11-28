@@ -83,18 +83,32 @@ class FusedEnergyTests(unittest.TestCase):
 
     def _configure(self, layout: Layout, *, source: str) -> None:
         """Источник сходства слитого расчёта: таблица sim_λ, таблица общих бит (по точкам, по классам), на лету."""
+        from damp.layout.fused_pair_energy import CommonBitsTable
+
         points = layout._point_count
+        classes = int(np.unique(np.packbits(np.asarray(layout.code_table.bits(), dtype=np.uint8), axis=1), axis=0).shape[0])
         table_bytes = {
             "similarity": 1 << 30,
             "common": 1 << 30,
             # Таблица по точкам не помещается на байт: строится по классам одинаковых кодов.
             "classes": (points + 1) ** 2 - 1,
+            # Не помещается и квадратная по классам: половина таблицы по точкам (коды теста — uint8-таблица, байт на пару).
+            "triangle": min((classes + 1) ** 2 - 1, CommonBitsTable.triangle_cells(points)),
+            # Не помещается и половина по точкам: половина по классам.
+            "triangle_classes": CommonBitsTable.triangle_cells(classes),
             "product": 0,
         }[source]
         layout._torch_engine.configure_fused(
             enabled=True, block_elements=3_000_000, table_max_bytes=table_bytes, table_memory_fraction=1.0,
             verify_every=0, similarity_table=source == "similarity",
         )
+        table = layout._torch_engine._fused_engine()._table
+        if source in ("triangle", "triangle_classes"):
+            # Тест проверяет именно этот путь: половина таблицы, по точкам либо по классам.
+            self.assertTrue(table is not None and table.triangle, source)
+            self.assertEqual(table._class_of_points is not None, source == "triangle_classes", source)
+        elif source in ("common", "classes"):
+            self.assertTrue(table is not None and not table.triangle, source)
 
     def _assert_fused_equals_reference(self, layout: Layout, label: str) -> None:
         engine = layout._torch_engine
@@ -142,7 +156,7 @@ class FusedEnergyTests(unittest.TestCase):
         self.assertTrue(np.array_equal(_bits(fused[1]), _bits(reference[1])), f"{label} point energies swapped")
 
     def test_fused_energies_equal_reference_pass_bitwise_for_every_similarity_source(self) -> None:
-        for source in ("similarity", "common", "classes", "product"):
+        for source in ("similarity", "common", "classes", "triangle", "triangle_classes", "product"):
             layout = self._engine_layout(points=700)
             self._configure(layout, source=source)
             for step in range(12):

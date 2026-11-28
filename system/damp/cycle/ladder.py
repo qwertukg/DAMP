@@ -110,6 +110,7 @@ class MnistLadderRunner:
         validation_numbers: Sequence[int] | None = None,
         test_numbers: Sequence[int] | None = None,
         keep_levels: bool = False,
+        keep_top_firing: bool = True,
     ) -> None:
         evaluate_limit = settings.LADDER_EVALUATE_LIMIT if evaluate_limit is None else evaluate_limit
         if count <= 0:
@@ -169,6 +170,10 @@ class MnistLadderRunner:
         # keep_levels — сохранить уровни после обучения (TrainedLevel): по ним идёт новая картинка (дашборд). На счёт
         # прогона не влияет; карта и детекторы уровня остаются в памяти, видеокарта под ними освобождается как обычно.
         self._keep_levels = bool(keep_levels)
+        # keep_top_firing — держать срабатывания верхнего уровня по окнам (top_firing; читает только стенд сравнения
+        # моделей, decode/bench.py). Обученному циклу они не нужны, а держались весь следующий уровень: на 40 000
+        # картинках — около гигабайта ОЗУ на стыке уровней 3 и 4 (2026-11-26).
+        self._keep_top_firing = bool(keep_top_firing)
         self.levels: list = []  # TrainedLevel по уровням (при keep_levels)
         # Уровень 0 — первичная раскладка штрихов (LADDER_LEVEL0): штрихи идут в уровень 1 с выученными кодами.
         self.primary = None
@@ -269,6 +274,7 @@ class MnistLadderRunner:
             # карта уровня 0 (30 тыс. точек на 500 цифрах) держит видеокарту всё обучение уровней 1–3, и раскладка
             # следующей карты упирается в память (прогон 446, 2026-11-19).
             self.primary.release()
+            self._drop_dense_codes(self.primary.memory.layout)
         elements, reached = self._ladder(elements, responses)
         if reached is None:
             raise RuntimeError("лестница не построила ни одного уровня")
@@ -370,6 +376,9 @@ class MnistLadderRunner:
                     "place_encoder": self._step.coder.place(number) if place is None else place,
                 })
                 self._observer.stage(number, LEVEL_PARTS["memory"])
+            elif name == "codes_on_disk":
+                # Коды окон ушли во временный файл (CycleStep.on_disk): итог прохода держит их, а не массив в ОЗУ.
+                self._values["keyhole_codes"] = value.packed
             elif name == "memory":
                 layout = value.layout
                 table = layout.code_table
@@ -542,7 +551,7 @@ class MnistLadderRunner:
             self._keyhole_glyphs(layout, dictionary, pieces, memory.rows, field, extent)
         rows, columns, levels = level.firing.rows, level.firing.columns, level.firing.levels
         # Для стенда: уровни активации детекторов по окнам; последний записанный уровень — верхний (§7.1.12).
-        self.top_firing = {
+        self.top_firing = None if not self._keep_top_firing else {
             "rows": rows, "columns": columns, "levels": levels, "detectors": int(found.built),
             "picture": np.asarray(pieces.picture),
             # Господство классов в детекторах (§8.2) — по точкам карты, то есть по обучающим окнам.
@@ -682,8 +691,17 @@ class MnistLadderRunner:
         )
         if self._keep_levels:
             self.levels.append(level.trained())
+            self._drop_dense_codes(self.levels[-1].memory.layout)
         level.release()
         return result
+
+    @staticmethod
+    def _drop_dense_codes(layout) -> None:  # noqa: ANN001
+        """Распакованные коды точек обученной карты (байт на бит; карта в 41 000 точек — 0.4–0.6 ГБ ОЗУ) больше не нужны:
+        срабатывания идут по упакованным кодам. Копия ленивая (Layout._code_matrix) — при обращении она строится заново
+        из тех же кодов. Сделано здесь, а не в модулях раскладки: их текст входит в ключ кеша карт."""
+        if layout is not None and getattr(layout, "_code_matrix_cache", None) is not None:
+            layout._code_matrix_cache = None
 
     def _detail_measures(self, level: LevelPass, memory: LevelMemory) -> dict[str, float | int]:
         """Мерки статьи по уровню: Ē карты (§5.8), разрешение и наибольший набор окон с одним кодом детали

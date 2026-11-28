@@ -488,6 +488,9 @@ class StrokeLevel:
         lap("codes", lambda: codes)
         # Первичные коды соседних штрихов похожи сильнее кодов окон: порог слияния — свой, как у первичной карты.
         memory = step.remember(codes, keyholes, merge_similarity=float(settings.LADDER_PRIMARY_MERGE_SIMILARITY))
+        # Коды штрихов дальше читают только срабатывания: большие — во временный файл (CycleStep.on_disk; на 40 000
+        # картинках — 4.4 ГБ ОЗУ).
+        codes = step.on_disk(codes, watch)
         lap("memory", lambda: memory)
         detectors = step.detect(memory)
         lap("detectors", lambda: detectors)

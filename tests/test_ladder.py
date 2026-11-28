@@ -769,7 +769,8 @@ class SameResultFasterTest(unittest.TestCase):
 
         with_table, fast = build(20000)
         whole_map, _ = build(20000, windowed=False)  # с таблицей, но по всей карте, как до окна вокруг диска
-        blocks, large = build(0, cells=500)
+        blocks, large = build(0, cells=500)  # без таблицы: строки общих бит по запросу, счёт в окне
+        whole_blocks, _ = build(0, cells=500, windowed=False)  # без таблицы, по всей карте
         single, plain = build(0, batched=False)
         self.assertEqual(with_table, whole_map)
         self.assertIsNotNone(fast._common)
@@ -785,6 +786,7 @@ class SameResultFasterTest(unittest.TestCase):
         self.assertGreater(len(with_table), 1)
         self.assertEqual(with_table, single)
         self.assertEqual(blocks, single)
+        self.assertEqual(whole_blocks, single)
 
 
 class LateralInhibitionTest(unittest.TestCase):

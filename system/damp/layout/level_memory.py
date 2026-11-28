@@ -91,7 +91,7 @@ class MemoryMap:
             similarity_threshold=float(merge_similarity),
             max_size=int(max_points),
             use_gpu=settings.ACTIVATION_USE_GPU,
-        ).select(codes[train_rows], int(code_length))
+        ).select(codes, int(code_length), order=train_rows)  # обход train_rows без копии всех кодов
         return dictionary, train_rows
 
     @staticmethod
@@ -151,6 +151,7 @@ class MemoryMap:
             "LADDER_LAYOUT_RELAYOUT_RADIUS": float(settings.LADDER_LAYOUT_RELAYOUT_RADIUS) if relayout else None,
             "LADDER_LAYOUT_BEST_OF": tries if tries > 1 else 1,
             "LADDER_LAYOUT_BEST_OF_FROM": None,
+            "LADDER_LAYOUT_BEST_OF_MEASURE": str(settings.LADDER_LAYOUT_BEST_OF_MEASURE) if tries > 1 else None,
             "LADDER_LAYOUT_RESCUE_PASSES": passes if rescue else 0,
             "LADDER_LAYOUT_RESCUE_FROM": None,
             "LADDER_LAYOUT_RESCUE_SHARE": float(settings.LADDER_LAYOUT_RESCUE_SHARE) if rescue else None,
@@ -161,8 +162,12 @@ class MemoryMap:
         """Раскладка кодов тем же Layout и с той же настройкой, что первая; цвет точки — класс цифры.
 
         Р5 (задача #20, вне статьи по способу, по статье по мере): с уровня LADDER_LAYOUT_BEST_OF_FROM карта раскладывается
-        LADDER_LAYOUT_BEST_OF раз с разными зёрнами, остаётся раскладка с наименьшей дальней энергией статьи
-        φ = Σ s·d по парам с s ≥ λ (§5.5.1: «penalises strongly correlated points that are distant») — без меток цифр."""
+        LADDER_LAYOUT_BEST_OF раз с разными зёрнами, остаётся раскладка с наименьшей меркой LADDER_LAYOUT_BEST_OF_MEASURE —
+        без меток цифр: "far" — дальняя энергия статьи φ = Σ s·d по парам с s ≥ λ (§5.5.1: «penalises strongly correlated
+        points that are distant»), "near" — среднее расстояние на карте до 10 ближайших по коду соседей (near_distance).
+        Попытка — та же раскладка уровня, что без выбора (гладкий старт и две фазы — как настроено на уровне), с зерном
+        LAYOUT_RANDOM_SEED + 1009·номер: попытка 0 — раскладка без выбора. До 0.13.5 попытки шли со случайного старта, и
+        на картах с гладким стартом выбор терял его (стенд верха, 750 картинок: −0.043 М1u)."""
         table = self._table(bits, labels)
         params, schedule = self._tuner().tune(table.count), self.lambda_schedule(bits, name)
         level = self.level(name)
@@ -170,11 +175,17 @@ class MemoryMap:
         if tries <= 1:
             layout = self._smooth_start(table, params, schedule, bits, labels, name, level)
             return self._rescue(table, self._relayout(layout, params, schedule, bits, name, level), name, level)
+        measure = str(self.level_settings(level)["LADDER_LAYOUT_BEST_OF_MEASURE"])
+        if measure not in ("far", "near"):
+            raise ValueError(f"LADDER_LAYOUT_BEST_OF_MEASURE: {measure!r} — ждём \"far\" или \"near\"")
         best, best_energy, energies = None, None, []
         for attempt in range(tries):
             with settings.overridden({"LAYOUT_RANDOM_SEED": int(settings.LAYOUT_RANDOM_SEED) + 1009 * attempt}):
-                layout = _layout_from_codes(table, params, self.colorizer, lambda_schedule=schedule)
-            energy = self.far_energy(table.bits(), layout.cells_array(), float(layout.lambda_threshold))
+                layout = self._smooth_start(table, params, schedule, bits, labels, name, level)
+            if measure == "near":
+                energy = self.near_distance(table.bits(), layout.cells_array())
+            else:
+                energy = self.far_energy(table.bits(), layout.cells_array(), float(layout.lambda_threshold))
             energies.append(round(energy, 4))
             if best_energy is None or energy < best_energy:
                 if best is not None:
@@ -183,8 +194,10 @@ class MemoryMap:
             else:
                 layout.release_device()
         LOGGER.event("layout.best_of", section=OUTSIDE_ARTICLE,
-                     data={"name": name, "tries": tries, "energies": energies, "chosen": energies.index(round(best_energy, 4)),
-                           "note": "лучшая из K раскладок по дальней энергии статьи φ = Σ s·d (§5.5.1), без меток"})
+                     data={"name": name, "tries": tries, "measure": measure, "energies": energies,
+                           "chosen": energies.index(round(best_energy, 4)),
+                           "note": "лучшая из K раскладок по мерке без меток: far — дальняя энергия статьи φ = Σ s·d "
+                                   "(§5.5.1), near — расстояние на карте до 10 ближайших по коду соседей"})
         return self._rescue(table, self._relayout(best, params, schedule, bits, name, level), name, level)
 
     @staticmethod
@@ -215,11 +228,11 @@ class MemoryMap:
         plan = self.level_settings(level)
         if not plan["LADDER_LAYOUT_SMOOTH_START"]:
             return self._coarse_first(table, params, schedule, bits, labels, name, level)
-        from damp.layout.smooth_start import LIMIT, smooth_cells
+        from damp.layout.smooth_start import LARGE_LIMIT, LIMIT, smooth_cells
 
-        if table.count > LIMIT:
+        if table.count > LARGE_LIMIT:
             LOGGER.event("layout.smooth_start.skipped.warning", section=OUTSIDE_ARTICLE,
-                         data={"name": name, "points": int(table.count), "limit": int(LIMIT),
+                         data={"name": name, "points": int(table.count), "limit": int(LARGE_LIMIT),
                                "note": "карта крупнее предела гладкого старта — раскладывается со случайного старта"})
             return self._coarse_first(table, params, schedule, bits, labels, name, level)
         layout = _new_layout(table, params, self.colorizer, lambda_threshold=schedule.start)
@@ -234,6 +247,7 @@ class MemoryMap:
         _run_short_phase(layout, params, step_offset=1 + steps, similarity_cutoff=schedule.short_cutoff, lambda_max=schedule.maximum)
         LOGGER.event("layout.smooth_start", section=OUTSIDE_ARTICLE,
                      data={"name": name, "points": int(cells.shape[0]), "radius": radius, "long_steps": steps,
+                           "path": "blocked" if int(cells.shape[0]) > LIMIT else "dense",
                            "perplexity": float(plan["LADDER_LAYOUT_SMOOTH_START_PERPLEXITY"]),
                            "note": "гладкий старт раскладки (план v19.15, вне статьи): точки расставлены по сходству кодов без "
                                    "меток, затем дальняя фаза с малого радиуса и ближняя фаза"})
@@ -343,6 +357,29 @@ class MemoryMap:
             total += float((sim[keep] * dist[keep]).sum())
             pairs += int(keep.sum())
         return total / max(1, pairs)
+
+    NEAR_NEIGHBOURS = 10
+
+    @classmethod
+    def near_distance(cls, bits: "np.ndarray", cells: "np.ndarray") -> float:
+        """Мерка соседства на готовой карте (вне статьи по способу; по смыслу §5.1 — похожие коды рядом): среднее по точкам
+        расстояние на карте до NEAR_NEIGHBOURS ближайших по коду соседей (косинус кодов; при равенстве — меньший номер).
+        Меньше — ближайшие по коду точки лежат рядом. Замер на верхней карте в 750 точек (48 раскладок): корреляция с
+        целостью классов −0.5, у дальней энергии φ — −0.16; выбор лучшей из 3 даёт +0.013…0.020 М1u."""
+        codes = np.asarray(bits, dtype=np.float32)
+        count = int(codes.shape[0])
+        if count < 2:
+            return 0.0
+        norms = np.sqrt(np.maximum(codes.sum(axis=1), 1e-9))
+        place = np.asarray(cells, dtype=np.float64)
+        nearest = min(int(cls.NEAR_NEIGHBOURS), count - 1)
+        total, step = 0.0, 512
+        for start in range(0, count, step):
+            sim = (codes[start:start + step] @ codes.T) / (norms[start:start + step, None] * norms[None, :])
+            sim[np.arange(sim.shape[0]), np.arange(start, start + sim.shape[0])] = -np.inf
+            order = np.argsort(-sim, axis=1, kind="stable")[:, :nearest]
+            total += float(np.sqrt(((place[start:start + step, None, :] - place[order]) ** 2).sum(axis=2)).sum())
+        return total / (count * nearest)
 
     def restore(self, bits: "np.ndarray", labels: "np.ndarray", cells: "np.ndarray", width: int, lambda_threshold: float,
                 pair_radius: int | None) -> Layout:

@@ -70,7 +70,12 @@ TODO, QUEUE, RUN, ANALYSIS, GOOD, BAD = "Todo", "Очередь", "Прогон"
 # Опора v27.3 (2026-11-24, прогоны 1464–1475, М1u 0.936, на верху 3958–3992 точки — 500 обучающих и 3500 добавочных картинок,
 # доводка гладкого старта с радиуса 0.05): среднее опоры на первых 2 / 4 / 6 / 8 зёрнах — 0.936 / 0.935 / 0.936 / 0.936 при
 # 0.936 по 12. Было (опора v27.2): [4, 10], [0, 6], [5, 9], [3, 11], [1, 2], [7, 8] — на новой опоре 0.943 / 0.935 / 0.936 / 0.934.
-STAGES = [[1, 7], [6, 11], [2, 10], [4, 5], [0, 3], [8, 9]]
+# Опора снова «все уровни на 500 картинках» (2026-11-24, 20:50, прогоны 1432–1443, М1u 0.916): принцип автора — на верхних
+# уровнях не больше картинок, чем на нижних; опоры v27.2 / v27.3 с добавочными картинками верха — замеры, не опора
+# (base.v27.3.json, base_runs.v27.3.json). Порядок пар — тот, что был у этой опоры утром.
+# Опора на 1000 картинках (2026-11-25, прогоны 1502–1513, М1u 0.906): порядок пар — среднее опоры на первых 2 / 4 / 6 / 8
+# зёрнах 0.906 / 0.906 / 0.906 / 0.907 при 0.906 по 12 (прежний порядок давал 0.912 / 0.908 / 0.905 / 0.906).
+STAGES = [[3, 10], [2, 6], [0, 1], [4, 8], [5, 7], [9, 11]]
 CHECKPOINTS = {1: (-0.01, 0.04), 3: (0.015, 0.05), 6: (0.025, 0.045)}  # этап: (порог Δ М1u, порог Δ слабых) — правило v3.3; v3.5 добавило T_GATES
 SPEC = re.compile(r"```прогон\s*\n(.*?)\n```", re.S)
 STATE = re.compile(r"\n*```состояние\s*\n(.*?)\n```", re.S)
@@ -609,24 +614,33 @@ def next_number() -> int:
 
 # Обучающих картинок на стенде (проверочных — STAND_TESTS). Автор 2026-11-24: «увеличь число картинок на стенде» — 250 → 500;
 # опора на 250 (прогоны 1298–1309) — в base_runs.250.json, с прогонами на 500 она несравнима.
-STAND_COUNT = 500
+# 500 → 750 (2026-11-24, 22:50; слово автора «следующий план — поднимаем кол-во картинок… на верхних уровнях не должно быть
+# больше, чем на нижних», «надо увеличивать кол-во подаваемых картинок на входе»): все уровни на 750 картинках. Опора на
+# 500 (прогоны 1432–1443, М1u 0.916) — в base_runs.500.json. 1000 — следующая ступень: карта ур. 1 там — 57 тыс. точек,
+# полная таблица общих бит раскладки (6.5 ГБ) в 8 ГБ видеопамяти не входит (docs/SPEEDUP.md).
+# 750 → 1000 (2026-11-25): опора на 750 (прогоны 1490–1501, М1u 0.889, верх 745–750 точек) — в base_runs.750.json; 750 оказалась
+# ямой набора картинок (docs/CONVERGENCE.md §2.38), на 1000 верх по замеру стенда верха лучше и 500, и 750.
+STAND_COUNT = 1000
 STAND_TESTS = 100
 
 
-def launch(numbers: list[int], seeds: list[int], changes: dict, label: str) -> None:
+def launch(numbers: list[int], seeds: list[int], changes: dict, label: str, count: int | None = None) -> None:
+    # Число обучающих картинок пары: своё у карточки («count» в блоке «прогон» — ступени «больше картинок» идут
+    # карточками-проверками) либо число стенда STAND_COUNT.
+    pictures = int(count or STAND_COUNT)
     base = json.load(open(os.path.join(STAND, "base.json"), encoding="utf-8-sig"))
     for number, seed in zip(numbers, seeds):
         over = {**base, **changes}
         if seed:
             over["ENCODER_RANDOM_SEED"] = seed
-        spec = {"label": f"{STAND_COUNT} цифр: {label}, зерно {seed}", "changes": over}
+        spec = {"label": f"{pictures} цифр: {label}, зерно {seed}", "changes": over}
         json.dump(spec, open(os.path.join(STAND, f"tune2-{number}.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     done = os.path.join(STAND, "tune_pair.done")
     if os.path.exists(done):
         os.remove(done)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
     subprocess.Popen(["pwsh", "-NoProfile", "-File", os.path.join(STAND, "tune_pair.ps1"), "-List", ",".join(map(str, numbers)),
-                      "-Count", str(STAND_COUNT), "-Tests", str(STAND_TESTS)], creationflags=flags, cwd=ROOT)
+                      "-Count", str(pictures), "-Tests", str(STAND_TESTS)], creationflags=flags, cwd=ROOT)
     say(f"запущено {numbers} (зёрна {seeds}) — {label}")
 
 
@@ -1352,7 +1366,10 @@ def patches_better(state: dict, rows: dict, base: dict, mean: float) -> tuple[bo
     return mean >= -0.01 and fewer == len(pairs) and same, text
 
 
-RULE = "v3.7"  # v3.6 (порядок пар зёрен без перекоса первого этапа, STAGES) + точки верхней карты (TOP_GROWTH)
+RULE = "v3.8"  # v3.7 (точки верхней карты, TOP_GROWTH) без пути для добавочных картинок верха
+# Правило v3.8 (слово автора 2026-11-24: «не должно быть на верхних уровнях больше [картинок], чем на нижних; если хотим
+# увеличить на верхних — увеличиваем и на нижних»): путь «точек верха больше при той же сходимости» не действует для правок
+# с добавочными картинками (LADDER_EXTRA_PICTURES) — такие правки в опору не идут вовсе. Страж TOP_SHRINK остаётся.
 # Правило v3.7 (цель автора 2026-11-24: «сходимость на верхнем уровне важнее, если в ней больше точек»; толкование — моё,
 # память top-convergence-more-points). Точки верха правки — к точкам верха опоры на тех же зёрнах (среднее отношение):
 # не меньше TOP_GROWTH — правка проходит этап при сходимости не хуже опоры (Δ М1u ≥ TOP_M1_GATE, честная не ниже −0.05) и
@@ -1493,9 +1510,14 @@ def decide(state: dict, rows: dict) -> tuple[str, str | None]:
         by_t_m1 = t_m1 >= gate_t_m1 and pair_m1 >= least_m1
         by_t_weak = t_weak >= gate_t_weak and pair_weak >= least_weak and pair_m1 >= 0.0 and honest >= -0.05
     # v3.7: точек на верхней карте заметно больше, а сходимость не хуже опоры.
-    by_top = grown >= TOP_GROWTH and mean >= TOP_M1_GATE and honest >= -0.05
+    extra = any((rows[int(n)].get("changes") or {}).get("LADDER_EXTRA_PICTURES") not in (None, 0, [])
+                for n in state["runs"].values() if int(n) in rows)
+    by_top = grown >= TOP_GROWTH and mean >= TOP_M1_GATE and honest >= -0.05 and not extra
     text = (f"Δ М1u {mean:+.3f} {against}; слабые 2, 4, 5 {weak_mean:+.3f}; честная {honest:+.3f}; точек верха ×{grown:.2f}; {spots_text}; "
             f"монопятен больше на {more} из {len(pairs)}; t парных разностей: М1u {t_m1:+.1f}, слабые {t_weak:+.1f} [правило {RULE}]")
+    if extra:
+        return "bad", (f"этап {stage} ({len(runs)} зёрен): {text} — правка с добавочными картинками верха: на верхних уровнях не должно "
+                       "быть больше картинок, чем на нижних (слово автора 2026-11-24) → в опору не идёт, закрыто")
     if grown <= TOP_SHRINK:
         return "bad", (f"этап {stage} ({len(runs)} зёрен): {text} — верхняя карта меньше, чем у опоры: рост М1u на маленькой карте "
                        "не считается (цель автора 2026-11-24) → закрыто")
@@ -1746,7 +1768,8 @@ def seed_launch(project: dict, items: list[dict], rows: dict) -> str | None:
     spec, spec_text = card_spec(item)
     state = card_state(item) or {}
     vid, stage = variant_of(item), state.get("stage", 1)
-    seeds = spec.get("seeds") if spec.get("base") else STAGES[stage - 1]
+    # Свои зёрна — у карточки-опоры и у карточки-проверки (если заданы); у правок — пара этапа.
+    seeds = spec.get("seeds") if (spec.get("base") or spec.get("check")) and spec.get("seeds") else STAGES[stage - 1]
     before = state.get("before") or {key: config_value(key) for key in spec.get("changes", {})}
     base_state = state.get("base") or base_now()
     cards = [(i, s) for i, s in siblings(items, vid) if s.get("stage") == stage and s.get("status") == "queued"]
@@ -1768,7 +1791,8 @@ def seed_launch(project: dict, items: list[dict], rows: dict) -> str | None:
     for (card, card_st), number in zip(cards, numbers):
         card_st.update({"run": number, "status": "running", "await": False})
     # План ускорения П1 (docs/SPEEDUP.md): пара стартует сразу, карточки пишутся уже во время её счёта.
-    launch(numbers, [int(s["seed"]) for _, s in cards], spec.get("changes", {}), spec.get("label", item["content"]["title"]))
+    launch(numbers, [int(s["seed"]) for _, s in cards], spec.get("changes", {}), spec.get("label", item["content"]["title"]),
+           count=spec.get("count"))
     for (card, card_st), number in zip(cards, numbers):
         write_seed_card(card, card_st, rows, project)
         move(project, card, RUN, f"запущен прогон {tag(PLAN, [number])}: зерно {card_st['seed']}, этап {card_st['stage']} — "
@@ -1939,7 +1963,7 @@ def launch_step(project: dict, items: list[dict], rows: dict) -> str | None:
             spec = json.loads(spec_found.group(1))
             state["runs"].update({str(s): n for s, n in zip(seeds, numbers)})
             state["pending"], state["await"] = numbers, False
-            launch(numbers, seeds, spec.get("changes", {}), spec.get("label", content["title"]))  # П1: сначала запуск
+            launch(numbers, seeds, spec.get("changes", {}), spec.get("label", content["title"]), count=spec.get("count"))  # П1
             write_body(item, state, rows, project)
             move(project, item, RUN)
             return f"этап {state['stage']} — {content['title']}"

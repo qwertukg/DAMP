@@ -63,6 +63,21 @@ def _strongest_py(starts, columns, levels, saturation, kept):  # noqa: ANN001, A
 
 _strongest_compiled = None if numba is None else numba.njit(cache=True, nogil=True)(_strongest_py)
 
+# Пар за один шаг проверки порядка (_descends).
+ORDER_CHUNK = 1 << 22
+
+
+def _descends(values: "np.ndarray") -> bool:
+    """Есть ли спад: values[i + 1] < values[i] хоть где-то — то же, что np.any(np.diff(values) < 0), но кусками, без
+    массива разностей во все пары (на уровне 3 при 40 000 картинках — 111 млн пар: 0.9 ГБ int64 и 0.1 ГБ флагов разом;
+    разбор 2026-11-26)."""
+    count = int(values.shape[0])
+    for start in range(1, count, ORDER_CHUNK):
+        stop = min(count, start + ORDER_CHUNK)
+        if np.any(values[start:stop] < values[start - 1 : stop - 1]):
+            return True
+    return False
+
 
 class DetectorEmbeddings:
     """Коды наборов по сработавшим детекторам: выбор σ сильнейших, длина под плотность, один бит на детектор."""
@@ -154,7 +169,7 @@ class DetectorEmbeddings:
         if self._saturation == 0 or rows.size == 0:
             return rows, columns
         levels = np.asarray(levels)
-        if np.any(np.diff(rows) < 0):
+        if _descends(rows):
             order = np.argsort(rows, kind="stable")
             rows, columns, levels = rows[order], columns[order], levels[order]
         if _strongest_compiled is not None:
@@ -290,7 +305,7 @@ class DetectorEmbeddings:
         """
         length = int(length)
         rows, place = self._pairs(np.asarray(rows, dtype=np.int64), self.detector_bits(length)[columns])
-        if rows.size and np.any(np.diff(rows) < 0):
+        if rows.size and _descends(rows):
             order = np.argsort(rows, kind="stable")
             rows, place = rows[order], place[order]
         sets = int(rows[-1]) + 1 if rows.size else 0

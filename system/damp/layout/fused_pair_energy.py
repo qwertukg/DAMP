@@ -11,7 +11,9 @@
      в память — таблицей самих значений sim_λ(a, v) float32 [точки × точки] (SimilarityTable): её считает
      функция сходства исходного прохода, при смене λ (§7.1.7) она строится заново. Иначе — таблицей числа
      общих бит кодов (§2.2.4) uint8 [точки × точки] или [классы одинаковых кодов]² (CommonBitsTable):
-     целые числа, от λ и η не зависят; sim_λ тогда считает ядро. Если не помещается и она — общие биты
+     целые числа, от λ и η не зависят; sim_λ тогда считает ядро. Не помещается квадратная — та же таблица
+     половиной (нижний треугольник: общие биты a и v те же, что v и a), памяти вдвое меньше, элемент
+     находится по большему и меньшему номеру пары. Если не помещается и она — общие биты
      считаются на лету: по окну ячеек — ядром popcount(a & v) по упакованным 64-битным словам кодов
      (одна выборка слов кода точки окна и два запуска ядра вместо десятка операций над словами),
      по всему V — произведением кодов, как в исходном проходе. Число общих бит — целое, все способы
@@ -141,15 +143,23 @@ class CommonBitsTable:
     Класс — множество точек с одним и тем же кодом. Пока таблица [точки]² помещается в память, класс —
     сама точка (без лишней выборки номера класса); иначе таблица строится по различным кодам. Последние
     строка и столбец — нули: «точки нет» (пустая ячейка окна, пустая вторая ячейка пары).
+
+    Не помещается и квадратная таблица по классам — таблица хранится половиной (triangle): строка i — элементы
+    (i, 0) … (i, i) подряд, начало строки — i·(i + 1)/2. Число общих бит симметрично, поэтому элемент (a, v)
+    лежит в строке большего из номеров, в столбце меньшего. Памяти вдвое меньше; числа те же.
     """
 
     # Предел элементов (строки × классы) на блок матричного произведения при построении.
     BLOCK_ELEMENTS = 32_000_000
 
-    def __init__(self, torch_mod: Any, table: Any, class_of_points: Any | None, point_count: int) -> None:
+    def __init__(
+        self, torch_mod: Any, table: Any, class_of_points: Any | None, point_count: int, triangle_classes: int | None = None,
+    ) -> None:
         self._torch = torch_mod
         self._table = table
-        self._classes = int(table.shape[0]) - 1
+        # Половина таблицы: table — одномерный тензор, triangle_classes — число классов (строк без строки «точки нет»).
+        self._triangle = triangle_classes is not None
+        self._classes = int(triangle_classes) if self._triangle else int(table.shape[0]) - 1
         self._point_count = int(point_count)
         self._flat = table.view(-1)
         # Номер класса точки; у «точки нет» (номер N) — нулевая строка таблицы.
@@ -157,7 +167,7 @@ class CommonBitsTable:
         if class_of_points is None:
             self._class_ext = None
             self._class_ext_np = None
-            self._rows_view = table[:, : self._point_count]
+            self._rows_view = None if self._triangle else table[:, : self._point_count]
         else:
             class_ext = torch_mod.empty(self._point_count + 1, dtype=class_of_points.dtype, device=table.device)
             class_ext[: self._point_count] = class_of_points
@@ -190,35 +200,65 @@ class CommonBitsTable:
         class_of_points = None
         class_codes = codes
         classes = count
+        triangle = False
         if (count + 1) ** 2 * item_bytes > max_bytes:
             # Точек слишком много: таблица по различным кодам (у одинаковых кодов строки таблицы равны).
             packed = np.packbits(codes.to(torch.uint8).cpu().numpy(), axis=1)
             _, first, inverse = np.unique(packed, axis=0, return_index=True, return_inverse=True)
+            by_classes = True
             classes = int(first.size)
             if (classes + 1) ** 2 * item_bytes > max_bytes:
-                LOGGER.event(
-                    "layout.fused.table.skipped",
-                    section=OPTIM_SIM_MATRIX,
-                    data={
-                        "points": count,
-                        "classes": classes,
-                        "table_mb": (classes + 1) ** 2 * item_bytes / 1e6,
-                        "max_mb": max_bytes / 1e6,
-                        "note": "таблица общих бит не помещается в память: общие биты считаются на лету (§5.9.5)",
-                    },
-                )
-                return None
-            index_dtype = torch.int32 if (classes + 1) ** 2 < 2**31 else torch.int64
-            class_of_points = torch.as_tensor(inverse.reshape(-1).astype(np.int64), device=device).to(index_dtype)
-            class_codes = codes[torch.as_tensor(first.astype(np.int64), device=device)]
+                # Не помещается и по классам: половина таблицы (нижний треугольник) — по точкам, а если не помещается
+                # и она — по классам. Число общих бит симметрично, числа те же.
+                triangle = True
+                if cls.triangle_cells(count) * item_bytes <= max_bytes:
+                    by_classes, classes = False, count
+                elif cls.triangle_cells(classes) * item_bytes > max_bytes:
+                    LOGGER.event(
+                        "layout.fused.table.skipped",
+                        section=OPTIM_SIM_MATRIX,
+                        data={
+                            "points": count,
+                            "classes": classes,
+                            "table_mb": (classes + 1) ** 2 * item_bytes / 1e6,
+                            "triangle_mb": cls.triangle_cells(classes) * item_bytes / 1e6,
+                            "max_mb": max_bytes / 1e6,
+                            "note": "таблица общих бит не помещается в память и половиной: общие биты считаются на лету "
+                            "(§5.9.5)",
+                        },
+                    )
+                    return None
+            if by_classes:
+                cells = cls.triangle_cells(classes) if triangle else (classes + 1) ** 2
+                index_dtype = torch.int32 if cells < 2**31 else torch.int64
+                class_of_points = torch.as_tensor(inverse.reshape(-1).astype(np.int64), device=device).to(index_dtype)
+                class_codes = codes[torch.as_tensor(first.astype(np.int64), device=device)]
         with torch.no_grad():
-            table = torch.zeros((classes + 1, classes + 1), dtype=dtype, device=device)
-            block = max(1, cls.BLOCK_ELEMENTS // max(1, classes))
-            for start in range(0, classes, block):
-                stop = min(classes, start + block)
-                # Сумма произведений бит — целое не больше длины кода: в float32 точна при любом порядке
-                # (коды int8 — целочисленное произведение, то же число: TorchPairEnergyEngine.common_bits).
-                table[start:stop, :classes] = engine.common_bits(class_codes[start:stop], class_codes).to(dtype)
+            if triangle:
+                # Начала строк половины таблицы: строка i — с элемента i·(i + 1)/2; строка «точки нет» — нули.
+                starts = np.arange(classes + 1, dtype=np.int64)
+                starts = starts * (starts + 1) // 2
+                table = torch.zeros(cls.triangle_cells(classes), dtype=dtype, device=device)
+                block = max(1, cls.BLOCK_ELEMENTS // max(1, classes))
+                for start in range(0, classes, block):
+                    stop = min(classes, start + block)
+                    # Строки start … stop − 1 со всеми столбцами (тот же вызов, что у квадратной таблицы); из строки i
+                    # берутся столбцы 0 … i — в половине таблицы они идут подряд (выборка по маске — построчно).
+                    common = engine.common_bits(class_codes[start:stop], class_codes)[:, :stop].to(dtype)
+                    lower = (
+                        torch.arange(stop, device=device).unsqueeze(0)
+                        <= torch.arange(start, stop, device=device).unsqueeze(1)
+                    )
+                    table[int(starts[start]) : int(starts[stop])] = common[lower]
+                    del common, lower
+            else:
+                table = torch.zeros((classes + 1, classes + 1), dtype=dtype, device=device)
+                block = max(1, cls.BLOCK_ELEMENTS // max(1, classes))
+                for start in range(0, classes, block):
+                    stop = min(classes, start + block)
+                    # Сумма произведений бит — целое не больше длины кода: в float32 точна при любом порядке
+                    # (коды int8 — целочисленное произведение, то же число: TorchPairEnergyEngine.common_bits).
+                    table[start:stop, :classes] = engine.common_bits(class_codes[start:stop], class_codes).to(dtype)
         LOGGER.event(
             "layout.fused.table.build",
             section=OPTIM_SIM_MATRIX,
@@ -226,18 +266,35 @@ class CommonBitsTable:
                 "points": count,
                 "classes": classes,
                 "by_code_classes": class_of_points is not None,
-                "table_mb": (classes + 1) ** 2 * item_bytes / 1e6,
+                "triangle": triangle,
+                "table_mb": (cls.triangle_cells(classes) if triangle else (classes + 1) ** 2) * item_bytes / 1e6,
                 "dtype": "uint8" if item_bytes == 1 else "int16",
                 "note": "число общих бит кодов всех пар (§2.2.4) предвычислено один раз (§5.9.5); "
-                "от λ и η не зависит",
+                "от λ и η не зависит; triangle — таблица хранится половиной (она симметрична)",
             },
         )
-        return cls(torch, table, class_of_points, count)
+        return cls(torch, table, class_of_points, count, classes if triangle else None)
+
+    @staticmethod
+    def triangle_cells(classes: int) -> int:
+        """Элементов в половине таблицы: строки 0 … classes (последняя — «точки нет»), в строке i — i + 1 элемент."""
+        return (classes + 1) * (classes + 2) // 2
+
+    @property
+    def triangle(self) -> bool:
+        """Таблица хранится половиной (нижний треугольник)."""
+        return self._triangle
 
     @property
     def index_dtype(self) -> Any:
-        """Тип линейного индекса таблицы: int32, пока (классы + 1)² < 2³¹."""
-        return self._torch.int32 if (self._classes + 1) ** 2 < 2**31 else self._torch.int64
+        """Тип линейного индекса таблицы: int32, пока элементов таблицы меньше 2³¹."""
+        cells = self.triangle_cells(self._classes) if self.triangle else (self._classes + 1) ** 2
+        return self._torch.int32 if cells < 2**31 else self._torch.int64
+
+    @property
+    def keys_int32(self) -> bool:
+        """Ключ строки точки пары (row_offsets) помещается в int32: у половины таблицы ключ — номер класса."""
+        return self.triangle or self.index_dtype == self._torch.int32
 
     @property
     def stride(self) -> int:
@@ -248,14 +305,55 @@ class CommonBitsTable:
         return self._flat
 
     def row_offsets(self, points_ext: "np.ndarray") -> "np.ndarray":
-        """Начало строки таблицы для точек (номер N — «точки нет»): класс · (классы + 1), на хосте."""
-        if self._class_ext_np is None:
-            return points_ext.astype(np.int64) * self.stride
-        return self._class_ext_np[points_ext] * self.stride
+        """Ключ строки таблицы для точек (номер N — «точки нет»), на хосте: начало строки класс · (классы + 1);
+        у половины таблицы — номер класса (начало строки зависит ещё и от точки окна: window)."""
+        classes = points_ext.astype(np.int64) if self._class_ext_np is None else self._class_ext_np[points_ext]
+        return classes if self.triangle else classes * self.stride
+
+    def window(self, columns: Any, keys: Any) -> Any:
+        """Общие биты точек пар (keys — row_offsets, [2, строки, 1]) с точками окна (columns, [1, строки, ячейки]):
+        одномерный тензор типа таблицы, по элементу на (сторона пары, строка, ячейка)."""
+        torch = self._torch
+        if not self.triangle:
+            # Линейный индекс таблицы: начало строки точки пары + столбец точки окна — для a и b сразу.
+            return torch.index_select(self._flat, 0, (columns + keys).view(-1))
+        # Половина таблицы: строка — больший из номеров пары (точка пары, точка окна), столбец — меньший; индекс
+        # считает одно ядро на элемент (отдельными операциями torch — вдвое дольше всей раскладки).
+        dtype = self.index_dtype
+        index = self._triangle_kernel()(columns.to(dtype), keys.to(dtype))
+        return torch.index_select(self._flat, 0, index.view(-1))
+
+    _TRIANGLE_KERNEL: Any = None
+
+    @classmethod
+    def _triangle_kernel(cls) -> Any:
+        """Индекс элемента половины таблицы: начало строки большего номера u·(u + 1)/2 и меньший номер. Чётный из
+        множителей u, u + 1 делится на 2 до умножения: произведение не выходит за тип индекса, пока в него
+        помещается число элементов таблицы."""
+        if cls._TRIANGLE_KERNEL is None:
+            from torch.cuda.jiterator import _create_jit_fn
+
+            source = """
+template <typename T> T damp_triangle(T column, T key) {
+  T upper = column > key ? column : key;
+  T lower = column > key ? key : column;
+  T start = (upper & 1) ? upper * ((upper + 1) / 2) : (upper / 2) * (upper + 1);
+  return start + lower;
+}
+"""
+            cls._TRIANGLE_KERNEL = _Kernel(_create_jit_fn(source))
+        return cls._TRIANGLE_KERNEL
 
     def rows(self, points_ext: Any) -> Any:
         """Общие биты точек points_ext со всеми точками V: [точки пар, N]."""
         torch = self._torch
+        if self.triangle:
+            classes = points_ext if self._class_ext is None else torch.index_select(self._class_ext, 0, points_ext)
+            if self._class_of_points is None:
+                others = torch.arange(self._point_count, dtype=classes.dtype, device=classes.device)
+            else:
+                others = self._class_of_points.to(classes.dtype)
+            return self.window(others.view(1, -1), classes.view(-1, 1)).view(int(classes.shape[0]), self._point_count)
         if self._class_ext is None:
             return torch.index_select(self._rows_view, 0, points_ext)
         by_class = torch.index_select(self._table, 0, torch.index_select(self._class_ext, 0, points_ext))
@@ -361,6 +459,11 @@ class FusedPairEnergy:
     _POINT_A, _POINT_B, _CELL_A, _CELL_B, _NORM_A, _NORM_B, _ROW_A, _ROW_B, _CELL_AF, _CELL_BF = range(10)
 
     _KERNEL_CACHE: dict[Any, Any] = {}
+    # Таблица sim_λ берётся, только если занимает не больше этой доли предела памяти таблиц (остальное — запас под
+    # таблицу общих бит той же карты, которая в 2–4 раза меньше и так же быстра). Замер 2026-11-24 на карте в 32.8 тыс.
+    # точек (750 картинок, код 15 056 бит): таблица sim_λ 4.3 ГБ помещалась в предел «впритык» — раскладка шла 180–248 с
+    # при 7.8 из 8 ГБ видеопамяти; с таблицей общих бит (2.1 ГБ) — 84 с. Расстановка у обоих путей одна.
+    SIMILARITY_TABLE_SHARE = 0.75
 
     def __init__(
         self,
@@ -411,14 +514,14 @@ class FusedPairEnergy:
         # общих бит; уровень 3: общие биты на лету.
         self._sim_enabled = (
             bool(similarity_table)
-            and SimilarityTable.bytes_needed(count) <= max_bytes
+            and SimilarityTable.bytes_needed(count) <= max_bytes * self.SIMILARITY_TABLE_SHARE
             and (count + 1) ** 2 < 2**31
         )
         self._sim: SimilarityTable | None = None
         self._table = (
             CommonBitsTable.build(engine, max_bytes=max_bytes) if max_bytes > 0 and not self._sim_enabled else None
         )
-        self._int32_index = self._table is None or self._table.index_dtype == torch.int32
+        self._int32_index = self._table is None or self._table.keys_int32
         # Блок слитого ядра держит на устройстве до BLOCK_BYTES_PER_ELEMENT байт на элемент: блоки
         # не должны занимать больше трети памяти, оставшейся после таблицы сходства.
         reserve = SimilarityTable.bytes_needed(count) if self._sim_enabled else 0
@@ -440,8 +543,8 @@ class FusedPairEnergy:
                 "points": count,
                 "grid": (self._height, self._width),
                 "similarity": self._similarity,
-                "source": "similarity_table" if self._sim_enabled else "common_bits_table" if self._table is not None
-                else "common_bits_on_the_fly",
+                "source": "similarity_table" if self._sim_enabled else "common_bits_on_the_fly" if self._table is None
+                else "common_bits_half_table" if self._table.triangle else "common_bits_table",
                 "block_elements": self._block_elements,
                 "note": "слагаемые φ_c, φ_s (§5.5) считает одно ядро на элемент (пара, точка); суммы — та же "
                 "редукция float32, что у прохода по всему V или по окну ячеек (§5.12)",
@@ -1216,9 +1319,8 @@ template <typename T> T damp_popcount(T a0, T a1, T a2, T a3, T v0, T v1, T v2, 
         norm_v = torch.index_select(self._norm, 0, point).view(rows, cells)
         if self._table is not None:
             column = self._table.columns(point).view(1, rows, cells)
-            # Линейный индекс таблицы: начало строки точки пары + столбец точки окна — для a и b сразу.
-            index = column + row_offsets[:, first:last].unsqueeze(2)
-            common = torch.index_select(self._table.flat, 0, index.view(-1)).to(torch.float32).view(2, rows, cells)
+            # Элементы таблицы для a и b сразу: ключ строки точки пары и столбец точки окна (CommonBitsTable.window).
+            common = self._table.window(column, row_offsets[:, first:last].unsqueeze(2)).to(torch.float32).view(2, rows, cells)
             return common[0], common[1], norm_v
         # Общие биты на лету: слова кода каждой точки окна берутся одной выборкой (у пустой ячейки — нули)
         # и сравниваются со словами кодов точек a и b ядром popcount, по POPCOUNT_WORDS слов за запуск.

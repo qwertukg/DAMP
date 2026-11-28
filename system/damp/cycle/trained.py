@@ -132,7 +132,7 @@ class TrainedLadder:
         with settings.overridden({"LADDER_SAVE_MAPS": False}):
             runner = MnistLadderRunner(
                 count=int(count), evaluate_limit=0, map_max_points=map_points, shifts=(), file_prefix=prefix,
-                observer=observer, keep_levels=True,
+                observer=observer, keep_levels=True, keep_top_firing=False,
             )
             runner.run()
             primary = runner.primary  # уровень 0 цикла (LADDER_LEVEL0): построен прогоном, штрихи прошли через него

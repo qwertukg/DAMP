@@ -435,22 +435,37 @@ class PositionBindingEncoder:
             colour[keyhole[mine], address[mine]] = number
         return colour
 
-    def _paint_device(self, source: dict, pair: "np.ndarray", bit: "np.ndarray", keyholes: int, length: int):  # noqa: ANN202
-        """То же, что _paint для маски адреса, на видеокарте: тензор цветов «окна × биты содержания»."""
+    def _on_device(self, values):  # noqa: ANN001, ANN202
+        """Массив numpy — на видеокарту (тензор — как есть)."""
+        torch = self._torch
+        return values if torch.is_tensor(values) else torch.as_tensor(np.ascontiguousarray(values), device=self._device)
+
+    def _paint_device(self, source: dict, pair, bit, keyholes: int, length: int):  # noqa: ANN001, ANN202
+        """То же, что _paint для маски адреса, на видеокарте: тензор цветов «окна × биты содержания». pair и bit —
+        массивы numpy или уже тензоры на видеокарте (подбор длины кода раскрашивает один кусок окон восемью длинами —
+        данные куска передаются один раз). Адреса, слои и номера клеток считаются на видеокарте теми же целочисленными
+        действиями, что прежде на процессоре (2026-11-25: numpy здесь занимал половину времени кодов окон)."""
         torch = self._torch
         detectors = int(self._layers.shape[0])
         colour = torch.full((keyholes, int(length)), self._UNSET, dtype=torch.uint8, device=self._device)
-        if pair.size == 0:
+        if int(pair.shape[0]) == 0:
             return colour
+        pair, bit = self._on_device(pair), self._on_device(bit)
+        detector = pair % detectors
         # XOR маски с адресом бита: перестановка битов кода признака, своя у каждого детектора.
-        address = bit ^ source["address_masks"][pair % detectors]
-        layer = self._layers[pair % detectors]
-        cell = torch.as_tensor((pair // detectors) * int(length) + address, device=self._device)
-        layer_device = torch.as_tensor(layer, device=self._device)
+        cell = (pair // detectors) * int(length) + (bit ^ self._on_device(source["address_masks"])[detector])
+        layers = self.__dict__.get("_layers_device")
+        if layers is None:
+            layers = self._layers_device = torch.as_tensor(self._layers, device=self._device)
+        layer_device = layers[detector]
+        del detector
         flat = colour.view(-1)
-        # Цвет бита — слой детектора (§3.2): от узких слоёв к широким, чтобы у общего бита остался цвет широкого.
-        for number in np.unique(layer)[::-1]:
-            flat[cell[layer_device == int(number)]] = int(number)
+        # Цвет бита — слой детектора (§3.2): от узких слоёв к широким, чтобы у общего бита остался цвет широкого. Слои
+        # без бит пропускаются — тот же порядок записей, что по встретившимся слоям.
+        for number in range(int(self._layers.max()), -1, -1):
+            mine = cell[layer_device == number]
+            if int(mine.shape[0]):
+                flat[mine] = number
         return colour
 
     def _merge_device(self, colour, budget: int, priority) -> int:  # noqa: ANN001
@@ -504,6 +519,8 @@ class PositionBindingEncoder:
         for first in range(0, keyholes, step):
             last = min(keyholes, first + step)
             _, pair, bit, active, _ = self._passes(source, first, last)
+            if self._device is not None:
+                pair, bit = self._on_device(pair), self._on_device(bit)  # кусок — на видеокарту один раз на все длины
             for size in lengths:
                 source["address_masks"] = self.address_masks(size)
                 if self._device is not None:

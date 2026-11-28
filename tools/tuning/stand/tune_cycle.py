@@ -6,7 +6,7 @@
 Сходимость — доля соседних точек карты одной цифры:
     честная — только пары точек с РАЗНЫХ обучающих картинок (собрались ли вместе разные картинки одной цифры);
     прежняя — все пары (завышена: окна одной картинки ложатся рядом).
-Случайная карта даёт ≈ 0.10. Побочно: ответ читателя на 200 проверочных цифрах MNIST t10k.
+Случайная карта даёт ≈ 0.10. Побочно: ответ читателя и памяти на первых N проверочных цифрах MNIST t10k (N — четвёртый аргумент; прогонщик — STAND_TESTS = 100; поля журнала accuracy200 / memory200 названы по прежним 200, число — test_count).
 Рабочие файлы цикла — отдельно от дашборда (data/tune/ladder). Итог дописывается в tune2_log.jsonl.
 """
 import json
@@ -83,7 +83,17 @@ def collect_levels_during_training() -> None:
     class Collector(LadderObserver):
         def part(self, number: int, name: str, values: dict) -> None:
             if name == "keyholes":
-                LEVELS.setdefault(int(number), {}).update(values)
+                # Таблице по уровням нужны только числа окон, вхождений и элементов, доля видимого, радиус и средний размер
+                # окна — массивы всех окон уровня не хранятся (на 30 000 картинках они держали ~1.5 ГБ ОЗУ до конца прогона).
+                extent = np.asarray(values["keyhole_extent"])
+                LEVELS.setdefault(int(number), {}).update({
+                    "windows": int(np.asarray(values["keyhole_picture"]).shape[0]),
+                    "elements": int(np.asarray(values["element_picture"]).shape[0]),
+                    "entries": int(np.asarray(values["entry_keyhole"]).shape[0]),
+                    "seen": float(values["seen"]),
+                    "keyhole_radius": float(values.get("keyhole_radius", 0.0)),
+                    "extent_mean": float(extent.mean()) if extent.size else 0.0,
+                })
 
         def level(self, trace) -> None:  # noqa: ANN001
             LEVELS.setdefault(int(trace.number), {})["points"] = int(np.asarray(trace.map_cells).reshape(-1, 2).shape[0])
@@ -103,15 +113,15 @@ def level_rows(pictures: int) -> list:
         found = LEVELS[number]
         if "points" not in found:
             continue  # уровень не сложился: окна были, карты нет
-        windows = int(np.asarray(found["keyhole_picture"]).shape[0])
+        windows = int(found["windows"])
         rows.append({
             "level": number,
-            "elements_per_picture": round(int(np.asarray(found["element_picture"]).shape[0]) / pictures, 1),
+            "elements_per_picture": round(int(found["elements"]) / pictures, 1),
             "windows_per_picture": round(windows / pictures, 1),
-            "elements_per_window": round(int(np.asarray(found["entry_keyhole"]).shape[0]) / max(1, windows), 1),
+            "elements_per_window": round(int(found["entries"]) / max(1, windows), 1),
             "window_sees": round(float(found["seen"]), 3),
             "window_radius": round(float(found.get("keyhole_radius", 0.0)), 2),
-            "window_field": round(float(np.asarray(found["keyhole_extent"]).mean()), 2) if windows else 0.0,
+            "window_field": round(float(found["extent_mean"]), 2) if windows else 0.0,
             "points": int(found["points"]),
         })
     return rows
@@ -376,10 +386,10 @@ def main() -> None:
     label, changes = spec["label"], dict(spec["changes"])
     here = os.path.dirname(os.path.abspath(__file__))
 
-    # Ресурсы машины автора (2026-11-21: «оставляй ресурсы для работы системы»): без Rerun картинки раскладки не нужны,
-    # потоков на прогон — 4 у кодера и 2 у детекторов (пара — около 8 из 12). TUNE_FULL_RESOURCES=1 — как раньше.
-    light = {} if os.environ.get("TUNE_FULL_RESOURCES") == "1" else {
-        "LAYOUT_LOG_VISUALS": False, "ENCODING_WORKERS": 4, "ACTIVATION_PARALLEL_WORKERS": 2, "LADDER_CLASS_MAP": False}
+    # Ресурсы: без Rerun картинки раскладки и карта классов не нужны. Потоки кодера и детекторов не ограничиваются (автор
+    # 2026-11-25: «отдать стенду все ядра» — прогоны идут по одному; было 4 и 2 из 12, когда шли парами).
+    # TUNE_FULL_RESOURCES=1 — и картинки раскладки, как раньше.
+    light = {} if os.environ.get("TUNE_FULL_RESOURCES") == "1" else {"LAYOUT_LOG_VISUALS": False, "LADDER_CLASS_MAP": False}
     damp = Damp(changes={**changes, **light, "DASHBOARD_FILE_PREFIX": "data/tune/ladder"})
     started = time.perf_counter()
     ladder = damp.cycle.trained(count)  # предел карты — DASHBOARD_MAP_POINTS (его можно задать и в changes)
@@ -513,7 +523,7 @@ def main() -> None:
               f"{zero_found['m3_rubbish']:.3f}; разных кодов {zero_found['m6_codes']} из {zero_found['points']}, "
               f"больше всего одинаковых {zero_found['m6_largest']}; Ē {zero_found['energy']:.3f}")
 
-    # Побочно: ответы на 200 проверочных цифрах (в обучении их нет).
+    # Побочно: ответы на первых tests проверочных цифрах MNIST t10k (в обучении их нет; у стенда — 100, поле test_count).
     # Отбор без проверочных картинок (tests = 0): мерки — только по картам обучения.
     digits = damp.stimuli.digits(train=1, test=tests, train_views=()) if tests > 0 else None
     first, last = digits.groups["test"] if digits is not None else (0, 0)
@@ -607,8 +617,26 @@ def main() -> None:
     relayouts = int(os.environ.get("TUNE_RELAYOUTS", "2"))
     m1c_runs, m1_runs = [digits["m1c"]], [digits["m1_digits"]]
     if relayouts > 0:
+        import gc
+
+        import torch
+
         from damp import settings as live
         from damp.layout.level_memory import MemoryMap
+
+        def free_device() -> None:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # Срабатывания уровней на видеокарте (коды карт int8 и матрицы покрытия — 2.4 ГБ на 2000 картинках и пределе карты
+        # 41 000) на время перекладок верха не нужны: проверочные картинки уже пройдены, а для нашего «X» в конце они
+        # строятся заново при первом обращении (LevelDetectors.detection) — те же. Вместе с запасом torch они держали
+        # 7.6–7.9 ГБ видеопамяти на 30 000 картинках (2026-11-25).
+        for trained_level in [*ladder._ladder.levels, ladder._ladder.primary]:
+            if trained_level is not None and getattr(trained_level, "detectors", None) is not None:
+                trained_level.detectors.release()
+        free_device()
 
         top_layout = ladder._ladder.levels[-1].memory.layout
         top_number = int(ladder._ladder.levels[-1].number)
@@ -629,6 +657,9 @@ def main() -> None:
                 fresh = MemoryMap().lay_out(top_bits, top_labels, f"level{top_number}")
             got = np.asarray([int(v) for v in fresh.code_table.labels()], dtype=np.int64)
             again = class_by_digit(fresh.cells_array(), got, np.full(got.size, -1), int(fresh.height), int(fresh.width), np.asarray(groups.labels)[first:last])
+            fresh.release_device()  # таблицы перекладки — не дожидаясь сборщика мусора
+            del fresh
+            free_device()
             m1_runs.append(again["m1_digits"])
             m1c_runs.append(round(float(np.mean([a * b for a, b in zip(again["m1_digits"], digits["cover_digits"])])), 4))
     mean_digits = np.mean(np.asarray(m1_runs, dtype=np.float64), axis=0)
@@ -735,7 +766,17 @@ def main() -> None:
         with open(temporary, "w", encoding="utf-8") as stream:
             for item in sorted(known, key=lambda item: item["run"]):
                 stream.write(json.dumps(item, ensure_ascii=False) + "\n")
-        os.replace(temporary, log_path)
+        # На Windows подмена файла, который в этот миг читает другой процесс (прогонщик доски, сводки), падает с отказом в
+        # доступе: 2026-11-25 так потерялся итог прогона 1551 после 45 минут счёта. Читатели держат журнал доли секунды —
+        # подмена повторяется до минуты; не вышло — временный файл остаётся (из него журнал восстанавливается вручную).
+        for attempt in range(120):
+            try:
+                os.replace(temporary, log_path)
+                break
+            except PermissionError:
+                if attempt == 119:
+                    raise
+                time.sleep(0.5)
     finally:
         if handle is not None:
             os.close(handle)
@@ -754,7 +795,7 @@ def main() -> None:
     print(f"  М3 нитей {entry['m3_threads']}, мостов {entry['m3_bridges']}; М5 свечение λ0.7 {entry['glow70']}, λ0.8 {entry['glow80']}; "
           f"М6 точек на код {entry['m6_per_code']}, больше всего одинаковых {entry['m6_largest']}")
     print(f"  окно видит по уровням {[row['window_sees'] for row in entry['funnel']]}; деталей в окне {[row['elements_per_window'] for row in entry['funnel']]}")
-    print(f"  точек {entry['points']}; доля пар с разных картинок {entry['other_pairs']}; ответ на 200 проверочных: читатель {accuracy:.3f}, память {memory}; обучение {trained_seconds:.0f} с")
+    print(f"  точек {entry['points']}; доля пар с разных картинок {entry['other_pairs']}; ответ на {tests} проверочных: читатель {accuracy:.3f}, память {memory}; обучение {trained_seconds:.0f} с")
 
 
 # Раскладка малой карты запускает параллельные процессы; на Windows они заново читают этот файл —

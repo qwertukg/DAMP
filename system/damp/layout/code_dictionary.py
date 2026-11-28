@@ -51,18 +51,93 @@ class LeaderDictionary:
         self.max_size = int(max_size)
         self._use_gpu = bool(use_gpu)
 
-    def select(self, packed: "np.ndarray", code_length: int) -> CodeDictionary:
-        """Образцы для набора кодов (строки × ⌈L/8⌉ упакованных бит)."""
+    # Строк кодов в одном куске при поиске одинаковых кодов (хеш строк): память — кусок, а не весь набор.
+    HASH_ROWS = 65536
+    # Попыток хеша с разными зёрнами, прежде чем искать одинаковые коды сортировкой копии всего набора.
+    HASH_ATTEMPTS = 3
+
+    @staticmethod
+    def _mix(words: "np.ndarray") -> "np.ndarray":
+        """Перемешивание 64-битных слов (финализатор splitmix64): взаимно однозначно, и каждый бит слова влияет на все
+        биты результата. Без него сумма слов с нечётными множителями mod 2⁶⁴ теряет разность старших бит: коды,
+        различные только старшими битами двух слов (2⁶³ + 2⁶³ ≡ 0), получали один хеш (на 50 000 картинках так и
+        вышло — и отбор образцов уровня 1 ушёл в сортировку копии всех кодов, +6 ГБ ОЗУ)."""
+        mixed = words ^ (words >> np.uint64(30))
+        mixed *= np.uint64(0xBF58476D1CE4E5B9)
+        mixed ^= mixed >> np.uint64(27)
+        mixed *= np.uint64(0x94D049BB133111EB)
+        mixed ^= mixed >> np.uint64(31)
+        return mixed
+
+    @classmethod
+    def _groups(cls, packed: "np.ndarray", order: "np.ndarray", attempt: int = 0) -> "tuple[np.ndarray, np.ndarray] | None":
+        """Одинаковые коды в обходе order: (первое вхождение каждого различного кода — номер в обходе, сколько раз он
+        встретился) — то же, что np.unique по строкам с return_index и return_counts, но без копий всего набора: хеш
+        строки — 128 бит (две суммы перемешанных 64-битных слов, у каждой свои нечётные множители; соль слов — своя у
+        каждого места в строке), группы по хешу сверяются побайтно. Не сошлось — None. attempt — номер попытки: своё
+        зерно соли и множителей."""
+        count, width = int(order.shape[0]), int(packed.shape[1])
+        words = -(-width // 8)
+        rng = np.random.default_rng(20261125 + 7919 * int(attempt))
+        factors = rng.integers(1, 2**63, size=(2, words), dtype=np.uint64) | np.uint64(1)
+        salt = rng.integers(0, 2**63, size=words, dtype=np.uint64)
+        keys = np.empty((count, 2), dtype=np.uint64)
+        with np.errstate(over="ignore"):
+            for start in range(0, count, cls.HASH_ROWS):
+                rows = np.zeros((min(cls.HASH_ROWS, count - start), words * 8), dtype=np.uint8)
+                rows[:, :width] = packed[order[start : start + cls.HASH_ROWS]]
+                view = rows.view(np.uint64)
+                view ^= salt
+                mixed = cls._mix(view)
+                for half in (0, 1):
+                    keys[start : start + rows.shape[0], half] = (mixed * factors[half]).sum(axis=1, dtype=np.uint64)
+                del rows, view, mixed
+        _, first, inverse, counts = np.unique(keys, axis=0, return_index=True, return_inverse=True, return_counts=True)
+        inverse = inverse.reshape(-1)
+        # Сверка: каждый не первый член группы побайтно равен первому (иначе хеши двух разных кодов совпали).
+        others = np.flatnonzero(first[inverse] != np.arange(count))
+        for start in range(0, others.shape[0], cls.HASH_ROWS):
+            part = others[start : start + cls.HASH_ROWS]
+            if not np.array_equal(packed[order[part]], packed[order[first[inverse[part]]]]):
+                return None
+        return first.astype(np.int64), counts.astype(np.int64)
+
+    def select(self, packed: "np.ndarray", code_length: int, order: "np.ndarray | None" = None) -> CodeDictionary:
+        """Образцы для набора кодов (строки × ⌈L/8⌉ упакованных бит). order — порядок обхода строк (None — по порядку):
+        коды берутся по нему кусками, без копии всего набора. Номера в словаре (rows) — места в этом обходе."""
         import torch
 
-        packed = np.ascontiguousarray(packed, dtype=np.uint8)
         if packed.ndim != 2 or packed.shape[0] == 0:
             raise ValueError("packed codes must be a non-empty matrix")
-        view = packed.view(np.dtype((np.void, packed.shape[1]))).reshape(-1)
-        _, first, counts = np.unique(view, return_index=True, return_counts=True)
+        if packed.dtype != np.uint8:
+            packed = packed.astype(np.uint8)
+        order = np.arange(packed.shape[0], dtype=np.int64) if order is None else np.asarray(order, dtype=np.int64)
+        if order.shape[0] == 0:
+            raise ValueError("packed codes must be a non-empty matrix")
+        grouped = None
+        for attempt in range(self.HASH_ATTEMPTS):
+            grouped = self._groups(packed, order, attempt)
+            if grouped is not None:
+                break
+            LOGGER.event(
+                "dictionary.hash_collision",
+                section=OUTSIDE_ARTICLE,
+                data={"codes": int(order.shape[0]), "attempt": attempt,
+                      "note": "у двух разных кодов совпал 128-битный хеш строки: следующая попытка — другое зерно хеша, "
+                      "после последней — одинаковые коды сортировкой копии всего набора"},
+            )
+        if grouped is None:
+            # Хеши разных кодов совпали — прежний путь: одинаковые строки по сортировке копии.
+            copy = np.ascontiguousarray(packed[order])
+            view = copy.view(np.dtype((np.void, copy.shape[1]))).reshape(-1)
+            _, first, counts = np.unique(view, return_index=True, return_counts=True)
+            del copy, view
+        else:
+            first, counts = grouped
         # От частых к редким; при равной частоте — по первому вхождению (детерминированно).
-        order = np.lexsort((first, -counts))
-        first = first[order]
+        ranking = np.lexsort((first, -counts))
+        first = first[ranking]
+        int8 = None  # коды int8 на видеокарте: (дополненная длина, блок int8 под умножение)
         device = torch.device("cuda" if self._use_gpu and torch.cuda.is_available() else "cpu")
         part_size = min(self.BANK_PART, self.max_size)
         banks: list["torch.Tensor"] = []  # части банка: (part_size, L) коды образцов
@@ -73,19 +148,28 @@ class LeaderDictionary:
             if len(chosen) >= self.max_size:
                 break
             rows = first[start : start + self.BLOCK]
-            block = torch.as_tensor(np.unpackbits(packed[rows], axis=1, count=code_length), device=device).to(torch.float32)
-            ones = block.sum(dim=1)
+            unpacked = torch.as_tensor(np.unpackbits(packed[order[rows]], axis=1, count=code_length), device=device)
+            if int8 is None and start == 0:
+                int8 = self._int8_ready(torch, device, unpacked, code_length)
+            if int8:
+                block = self._int8_rows(torch, unpacked, int8)
+                ones = block.sum(dim=1, dtype=torch.int32).to(torch.float32)
+            else:
+                block = unpacked.to(torch.float32)
+                ones = block.sum(dim=1)
+            del unpacked
             # Наибольшее сходство кода блока с уже выбранными образцами — по частям банка.
             best = torch.zeros(block.shape[0], dtype=torch.float32, device=device)
             for part, (bank, bank_ones) in enumerate(zip(banks, banks_ones)):
                 used = min(part_size, len(chosen) - part * part_size)
-                cosine = (block @ bank[:used].T) / torch.sqrt(
+                cosine = self._common(torch, block, bank, used, int8) / torch.sqrt(
                     torch.clamp(ones[:, None] * bank_ones[None, :used], min=1.0)
                 )
                 best = torch.maximum(best, cosine.max(dim=1).values)
             free = (best < self.similarity_threshold).cpu().numpy()
             inner = (
-                (block @ block.T) / torch.sqrt(torch.clamp(ones[:, None] * ones[None, :], min=1.0))
+                self._common(torch, block, block, int(block.shape[0]), int8)
+                / torch.sqrt(torch.clamp(ones[:, None] * ones[None, :], min=1.0))
                 >= self.similarity_threshold
             ).cpu().numpy()
             taken = 0
@@ -101,7 +185,10 @@ class LeaderDictionary:
             while written < taken:
                 part, offset = divmod(len(chosen), part_size)
                 if part == len(banks):
-                    banks.append(torch.zeros((part_size, code_length), dtype=torch.float32, device=device))
+                    # Банк int8 — с длиной и числом строк, дополненными до кратных 8 (нулевые строки и биты общих бит не
+                    # добавляют; в сравнение идут только занятые строки).
+                    shape = (-(-part_size // 8) * 8, int8) if int8 else (part_size, code_length)
+                    banks.append(torch.zeros(shape, dtype=torch.int8 if int8 else torch.float32, device=device))
                     banks_ones.append(torch.ones(part_size, dtype=torch.float32, device=device))
                 step = min(taken - written, part_size - offset)
                 picked = torch.as_tensor(fresh[written : written + step], device=device)
@@ -109,15 +196,18 @@ class LeaderDictionary:
                 banks_ones[part][offset : offset + step] = ones[picked]
                 chosen.extend(int(rows[row]) for row in fresh[written : written + step])
                 written += step
+        del banks, banks_ones
         selected = np.asarray(chosen, dtype=np.int64)
         dictionary = CodeDictionary(
-            packed=packed[selected], rows=selected, code_length=int(code_length), distinct=int(first.shape[0])
+            packed=np.ascontiguousarray(packed[order[selected]]), rows=selected, code_length=int(code_length),
+            distinct=int(first.shape[0]),
         )
         LOGGER.event(
             "dictionary.select",
             section=OUTSIDE_ARTICLE,
             data={
-                "codes": int(packed.shape[0]),
+                "codes": int(order.shape[0]),
+                "int8": bool(int8),
                 "distinct": dictionary.distinct,
                 "samples": dictionary.count,
                 "compression": float(packed.shape[0]) / max(1, dictionary.count),
@@ -129,6 +219,55 @@ class LeaderDictionary:
             },
         )
         return dictionary
+
+
+def _leader_int8_helpers() -> None:
+    """Помощники LeaderDictionary для кодов int8 (вынесены, чтобы select читался как прежде)."""
+
+    def int8_ready(self, torch, device, unpacked, code_length: int):  # noqa: ANN001, ANN202
+        """Длина кода, дополненная до кратной 8, если коды int8 можно взять: видеокарта, torch._int_mm, LAYOUT_INT8_CODES
+        и совпадение числа общих бит первого блока с произведением float32; иначе 0 (прежний счёт float32)."""
+        from damp import settings
+
+        if device.type != "cuda" or not hasattr(torch, "_int_mm") or not bool(settings.LAYOUT_INT8_CODES):
+            return 0
+        width = -(-int(code_length) // 8) * 8
+        try:
+            block = LeaderDictionary._int8_rows(torch, unpacked, width)
+            found = LeaderDictionary._common(torch, block, block, int(block.shape[0]), width)
+            plain = unpacked.to(torch.float32)
+            exact = plain @ plain.T
+        except Exception:  # noqa: BLE001 — нет целочисленного произведения на этом устройстве
+            return 0
+        return width if bool(torch.equal(found, exact)) else 0
+
+    def int8_rows(torch, unpacked, width: int):  # noqa: ANN001, ANN202
+        """Коды блока 0 / 1 → int8 с длиной width (дополнение нулями)."""
+        block = torch.zeros((int(unpacked.shape[0]), int(width)), dtype=torch.int8, device=unpacked.device)
+        block[:, : unpacked.shape[1]] = unpacked.to(torch.int8)
+        return block
+
+    def common(torch, block, bank, used: int, int8):  # noqa: ANN001, ANN202
+        """Число общих бит строк блока с первыми used строками банка, float32 (строки × used): float32 — произведение
+        матриц, как прежде; int8 — torch._int_mm (int8 × int8 → int32; левая — не меньше 17 строк, правая — кратна 8
+        по строкам): то же целое число."""
+        if not int8:
+            return block @ bank[:used].T
+        taken = int(block.shape[0])
+        rows = max(taken, 17)
+        if rows != taken:
+            block = torch.cat((block, block.new_zeros((rows - taken, block.shape[1]))))
+        right = -(-int(used) // 8) * 8
+        if right > bank.shape[0]:
+            bank = torch.cat((bank, bank.new_zeros((right - bank.shape[0], bank.shape[1]))))
+        return torch._int_mm(block, bank[:right].T)[:taken, :used].to(torch.float32)
+
+    LeaderDictionary._int8_ready = int8_ready
+    LeaderDictionary._int8_rows = staticmethod(int8_rows)
+    LeaderDictionary._common = staticmethod(common)
+
+
+_leader_int8_helpers()
 
 
 class PairwiseSimilarity:

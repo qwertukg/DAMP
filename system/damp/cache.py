@@ -39,7 +39,7 @@ FORMAT = 2  # версия формата записей: меняется — �
 SYSTEM_ROOT = Path(__file__).resolve().parents[1]  # папка system/: в ней пакет damp
 
 
-def _digest(*parts: bytes) -> str:
+def _digest(*parts: "bytes | memoryview") -> str:
     hasher = hashlib.blake2b(digest_size=20)
     for part in parts:
         hasher.update(len(part).to_bytes(8, "little"))
@@ -47,11 +47,21 @@ def _digest(*parts: bytes) -> str:
     return hasher.hexdigest()
 
 
+def _array_bytes(array: np.ndarray) -> "memoryview | bytes":
+    """Байты непрерывного массива для хеша — без копии (memoryview); те же байты и та же длина, что у array.tobytes().
+    Копия tobytes() на входах шагов была временным пиком ОЗУ: на уровне 3 при 40 000 картинках тройки срабатываний —
+    0.9 ГБ на столбец (разбор 2026-11-26). Типы без буфера (даты, записи) — через tobytes(), как раньше."""
+    try:
+        return memoryview(array).cast("B")
+    except (TypeError, ValueError, NotImplementedError, BufferError):
+        return array.tobytes()
+
+
 def fingerprint(value: object) -> str:
     """Хеш значения входа: массив — по типу, форме и байтам; остальное — по repr (числа, строки, кортежи)."""
     if isinstance(value, np.ndarray):
         array = np.ascontiguousarray(value)
-        return _digest(b"array", str(array.dtype).encode(), str(array.shape).encode(), array.tobytes())
+        return _digest(b"array", str(array.dtype).encode(), str(array.shape).encode(), _array_bytes(array))
     if isinstance(value, (list, tuple)) and any(isinstance(item, np.ndarray) for item in value):
         return _digest(b"seq", *(fingerprint(item).encode() for item in value))
     if isinstance(value, (np.integer, np.floating, np.bool_)):
