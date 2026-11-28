@@ -85,6 +85,7 @@ from .reports import (
     Prediction,
     Sight,
     SightLevel,
+    SnapshotReport,
     Stage,
     Stimulus,
     TrainingSticks,
@@ -121,6 +122,7 @@ __all__ = [
     "PrimaryMap",
     "PrimarySight",
     "TrainingSticks",
+    "SnapshotReport",
     "Prediction",
     "Evaluation",
     # честное сравнение

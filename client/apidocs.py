@@ -161,7 +161,8 @@ class ReadmeApiLinks:
 
     def _damp_span(self, match) -> str:  # noqa: ANN001
         span = match.group(1)
-        keys = (("Damp(", "Damp.__init__"), ("with_settings(", "Damp.with_settings"), ("settings[", "Settings.__getitem__"))
+        keys = (("Damp(", "Damp.__init__"), ("with_settings(", "Damp.with_settings"), ("from_snapshot(", "Damp.from_snapshot"),
+                ("settings[", "Settings.__getitem__"))
         for prefix, key in keys:
             if span.startswith(prefix):
                 return self._link(span, "damp.py", key)

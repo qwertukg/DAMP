@@ -464,6 +464,35 @@ class TrainingSticks:
 
 
 @dataclass(frozen=True)
+class SnapshotReport:
+    """Снимок обученного цикла: что в нём и как прошла сверка (вне статьи: хранение без обучения).
+
+    Attributes:
+        path: папка снимка.
+        label: подпись снимка (например, «прогон стенда 1553, зерно 10»).
+        version: версия DAMP, записавшая снимок.
+        commit: коммит рабочей копии при записи («+правки» — с незакоммиченными изменениями).
+        created: когда записан.
+        train_pictures: обучающих картинок цикла.
+        levels: обученных уровней над уровнем 0.
+        megabytes: размер папки, МБ.
+        control: картинок MNIST t10k в сверке.
+        same: из них ответили так же, как при записи (класс, вероятности до бита, вердикт памяти); при записи — все.
+    """
+
+    path: str
+    label: str
+    version: str
+    commit: str
+    created: str
+    train_pictures: int
+    levels: int
+    megabytes: float
+    control: int
+    same: int
+
+
+@dataclass(frozen=True)
 class Prediction:
     """Ответ распознавания одной картинки (§2.2.5).
 

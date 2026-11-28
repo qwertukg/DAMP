@@ -1,6 +1,6 @@
 # DAMP: разреженные коды, раскладка и цикл уровней на MNIST
 
-**Версия 0.13.7** · [журнал версий](CHANGELOG.md) · [сверка со статьёй](docs/ARTICLE_COMPLIANCE.md) · [ход подбора](docs/TUNING.md) · [сходимость верха](docs/CONVERGENCE.md) · [скорость](docs/SPEEDUP.md) · [таблица прогонов](docs/RUNS.md)
+**Версия 0.13.8** · [журнал версий](CHANGELOG.md) · [сверка со статьёй](docs/ARTICLE_COMPLIANCE.md) · [ход подбора](docs/TUNING.md) · [сходимость верха](docs/CONVERGENCE.md) · [скорость](docs/SPEEDUP.md) · [таблица прогонов](docs/RUNS.md)
 
 Реализация DAMP по статье [DAMP](docs/DAMP.pdf) и её [продолжению](docs/DAMP_continuation.md). Проверка — на MNIST: весь обучающий набор, 60 000 картинок, проходит все уровни.
 
@@ -68,6 +68,7 @@
   - [Функции API по этапам](#функции-api-по-этапам)
   - [Документация API](#документация-api)
 - [Живой дашборд](#живой-дашборд)
+  - [Снимок: дашборд без обучения](#снимок-дашборд-без-обучения)
 - [Рисунки README](#рисунки-readme)
 - [Кеш](#кеш)
 - [Логирование](#логирование)
@@ -123,6 +124,7 @@ system/damp/
 ├── decode/                 # этап 7: читатель, голоса памяти, отклики уровней, чистота слияния; эталоны и стенд bench
 ├── figures/                # рисунки команды figures, вкладки Rerun
 ├── rows_on_disk.py         # коды окон уровня во временном файле (большие наборы)
+├── snapshot.py             # граф объектов на диске без pickle: снимок обученного цикла
 ├── settings.py, cache.py, environment.py, logging.py, article_refs.py
 tools/
 ├── tuning/                 # стенд подбора: прогонщик доски, опора (base.json), журнал прогонов, разборы верха (top/)
@@ -706,7 +708,7 @@ python client/run.py bench --count 100 --sets 5 --validation 100 --test 100
 | Команда | Что делает | Ключи |
 |---|---|---|
 | `python client/run.py ladder` | цикл уровней и распознавание (этапы 1–7); готовые шаги — из [кеша](#кеш) | `--count`, `--limit`, `--split`, `--verify-cache` |
-| `python client/run.py dashboard` | [живой дашборд](#живой-дашборд), http://127.0.0.1:8765/ | `--count`, `--map-points`, `--port`, `--no-browser`, `--snapshot ФАЙЛ` |
+| `python client/run.py dashboard` | [живой дашборд](#живой-дашборд), http://127.0.0.1:8765/; `--save` / `--load` — [снимок без обучения](#снимок-дашборд-без-обучения) | `--count`, `--map-points`, `--port`, `--no-browser`, `--snapshot ФАЙЛ`, `--save ПАПКА`, `--load ПАПКА`, `--workers` |
 | `python client/run.py bench` | честное сравнение DAMP, kNN и CNN | `--count`, `--sets`, `--validation`, `--test`, `--map-points`, `--methods`, `--augment` |
 | `python client/run.py figures` | рисунки команды в `docs/`, снимок дашборда; `--rerun` — вкладки Rerun | `--rerun` |
 | `python client/run.py layout` | один проход без цикла: раскладка, детекторы, база эмбеддингов | `--count`, `--label`, `--activation-samples`, `--rebuild`, `--layout-only` |
@@ -788,84 +790,85 @@ damp.recognition.vote(elements)                      # этап 7: голосо�
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`digits(train, test=0, split="test", shifts=(), train_views=None)`](client/damp_api/stages.py#L97) | цифры MNIST со штрихами: обучающие и их сдвинутые виды (§7.1.4; `None` — `LADDER_TRAIN_VIEWS`), затем проверочные и их сдвиги | `Digits` |
-| ▶️ | [`of_image(картинка)`](client/damp_api/stages.py#L124) | штрихи картинки 28×28 | список `Stimulus` |
-| ▶️ | [`sketch(цифра)`](client/damp_api/stages.py#L143) | цифра из линий её штрихов в окне Rerun | — |
-| ▶️ | [`contour_table()`](client/damp_api/stages.py#L178) | таблица: цифры 0…9 из штрихов | путь к картинке |
+| 🧩 | [`digits(train, test=0, split="test", shifts=(), train_views=None)`](client/damp_api/stages.py#L99) | цифры MNIST со штрихами: обучающие и их сдвинутые виды (§7.1.4; `None` — `LADDER_TRAIN_VIEWS`), затем проверочные и их сдвиги | `Digits` |
+| ▶️ | [`of_image(картинка)`](client/damp_api/stages.py#L126) | штрихи картинки 28×28 | список `Stimulus` |
+| ▶️ | [`sketch(цифра)`](client/damp_api/stages.py#L145) | цифра из линий её штрихов в окне Rerun | — |
+| ▶️ | [`contour_table()`](client/damp_api/stages.py#L180) | таблица: цифры 0…9 из штрихов | путь к картинке |
 
 **Этап 2. Первичное кодирование ↻** — `damp.coding`
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`sticks(digits)`](client/damp_api/stages.py#L240) | код наклона каждого штриха — элементы уровня 0 | `Elements` |
-| 🧩 | [`keyholes(keyholes)`](client/damp_api/stages.py#L255) | код каждого окна: что в нём и где (П.4–П.7) | `KeyholeCodes` |
-| ▶️ | [`encode(угол, x, y)`](client/damp_api/stages.py#L275) | код стимула первичным кодером команды `layout` | `Code` |
-| ▶️ | [`detectors_picture()`](client/damp_api/stages.py#L291) | картинка детекторов кодера: кольца угла, полосы X и Y | путь к картинке |
+| 🧩 | [`sticks(digits)`](client/damp_api/stages.py#L242) | код наклона каждого штриха — элементы уровня 0 | `Elements` |
+| 🧩 | [`keyholes(keyholes)`](client/damp_api/stages.py#L257) | код каждого окна: что в нём и где (П.4–П.7) | `KeyholeCodes` |
+| ▶️ | [`encode(угол, x, y)`](client/damp_api/stages.py#L277) | код стимула первичным кодером команды `layout` | `Code` |
+| ▶️ | [`detectors_picture()`](client/damp_api/stages.py#L293) | картинка детекторов кодера: кольца угла, полосы X и Y | путь к картинке |
 
 **Этап 3. Раскладка** — `damp.layout`
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`memory(codes, map_points=None)`](client/damp_api/stages.py#L334) | карта памяти уровня из кодов окон обучающих картинок (§5) | `Memory` |
-| ▶️ | [`build(count)`](client/damp_api/stages.py#L355) | проход без цикла: раскладка всех штрихов `count` цифр | `LayoutSummary` |
-| ▶️ | [`pinwheel()`](client/damp_api/stages.py#L370) | тест пинвила: 360 кодов угла на позицию | `PinwheelReport` |
+| 🧩 | [`memory(codes, map_points=None)`](client/damp_api/stages.py#L336) | карта памяти уровня из кодов окон обучающих картинок (§5) | `Memory` |
+| ▶️ | [`build(count)`](client/damp_api/stages.py#L357) | проход без цикла: раскладка всех штрихов `count` цифр | `LayoutSummary` |
+| ▶️ | [`pinwheel()`](client/damp_api/stages.py#L372) | тест пинвила: 360 кодов угла на позицию | `PinwheelReport` |
 
 **Этап 4. Детекторы и активации** — `damp.detectors`
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`build(memory)`](client/damp_api/stages.py#L396) | детекторы над картой по слоям порогов (§6.4) | `MapDetectors` |
-| 🧩 | [`detectors.fire(codes)`](client/damp_api/parts.py#L388) | какие детекторы сработали на каждом окне (§6.5) | `Firing` |
+| 🧩 | [`build(memory)`](client/damp_api/stages.py#L398) | детекторы над картой по слоям порогов (§6.4) | `MapDetectors` |
+| 🧩 | [`detectors.fire(codes)`](client/damp_api/parts.py#L400) | какие детекторы сработали на каждом окне (§6.5) | `Firing` |
 
 **Этап 5. Эмбеддинги** — `damp.embeddings`
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`details(firing)`](client/damp_api/stages.py#L439) | код детали каждого окна по сработавшим детекторам; детали — элементы следующего уровня | `Elements` |
-| ▶️ | [`build(count)`](client/damp_api/stages.py#L458) | проход без цикла: раскладка, детекторы и база эмбеддингов | `LayoutSummary` |
+| 🧩 | [`details(firing)`](client/damp_api/stages.py#L441) | код детали каждого окна по сработавшим детекторам; детали — элементы следующего уровня | `Elements` |
+| ▶️ | [`build(count)`](client/damp_api/stages.py#L460) | проход без цикла: раскладка, детекторы и база эмбеддингов | `LayoutSummary` |
 
 **Этап 6. Цикл ↺** — `damp.cycle`
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`level0(elements, map_points=None)`](client/damp_api/stages.py#L501) | уровень 0 — первичная раскладка штрихов: окно на штрихе, память, детекторы; штрихи с выученными кодами (`LADDER_LEVEL0`) | `Elements` |
-| 🧩 | [`keyholes(elements)`](client/damp_api/stages.py#L537) | окна внимания следующего уровня: окно на каждом элементе, растёт от уровня к уровню (П.2, П.3) | `Keyholes` |
-| 🧩 | [`step(elements)`](client/damp_api/stages.py#L566) | весь проход уровня разом: окна → коды → память → детекторы → срабатывания → детали | `Level` |
-| 🧩 | [`covers(level)`](client/damp_api/stages.py#L591) | окно уровня уже видит цифру целиком — цикл окончен | `True` / `False` |
-| 🧩 | [`trained(train=None, map_points=None, decay=None)`](client/damp_api/stages.py#L603) | обученный цикл и линейный читатель: по ним идёт любая новая картинка — путь тот же, что у картинки прогона, цифра в цифру ([дашборд](#живой-дашборд)) | `TrainedLadder` |
-| ▶️ | [`run(train, test)`](client/damp_api/stages.py#L633) | весь цикл с мерками уровней (команда `ladder`) | `CycleReport` |
+| 🧩 | [`level0(elements, map_points=None)`](client/damp_api/stages.py#L503) | уровень 0 — первичная раскладка штрихов: окно на штрихе, память, детекторы; штрихи с выученными кодами (`LADDER_LEVEL0`) | `Elements` |
+| 🧩 | [`keyholes(elements)`](client/damp_api/stages.py#L539) | окна внимания следующего уровня: окно на каждом элементе, растёт от уровня к уровню (П.2, П.3) | `Keyholes` |
+| 🧩 | [`step(elements)`](client/damp_api/stages.py#L568) | весь проход уровня разом: окна → коды → память → детекторы → срабатывания → детали | `Level` |
+| 🧩 | [`covers(level)`](client/damp_api/stages.py#L593) | окно уровня уже видит цифру целиком — цикл окончен | `True` / `False` |
+| 🧩 | [`trained(train=None, map_points=None, decay=None)`](client/damp_api/stages.py#L605) | обученный цикл и линейный читатель: по ним идёт любая новая картинка — путь тот же, что у картинки прогона, цифра в цифру ([дашборд](#живой-дашборд)) | `TrainedLadder` |
+| 🧩 | [`load(path, check=None)`](client/damp_api/stages.py#L635) | обученный цикл из снимка (`TrainedLadder.save`) без обучения, с настройками снимка и сверкой ответов на картинках t10k | `TrainedLadder` |
+| ▶️ | [`run(train, test)`](client/damp_api/stages.py#L669) | весь цикл с мерками уровней (команда `ladder`) | `CycleReport` |
 
 **Этап 7. Распознавание** — `damp.recognition`
 
 | | Функция | Что делает | Возвращает |
 |---|---|---|---|
-| 🧩 | [`by_response(firing)`](client/damp_api/stages.py#L743) | ответ по отклику уровня: какие детекторы сработали на окнах картинки | доля верных `{k: …}` |
-| 🧩 | [`vote(details)`](client/damp_api/stages.py#L770) | ответ голосованием деталей: каждая голосует классами похожих обучающих | доля верных `{k: …}` |
-| 🧩 | [`linear(firings, decays=None)`](client/damp_api/stages.py#L691) | линейный читатель (§9.3): один слой softmax над самыми сильными уровнями активации детекторов уровней 1…k | доля верных `{λ: …}` |
-| ▶️ | [`evaluate(count)`](client/damp_api/stages.py#L888) | проход без цикла: точность на проверочных | `Evaluation` |
-| ▶️ | [`predict(файл, count)`](client/damp_api/stages.py#L909) | проход без цикла: цифра на картинке | `Prediction` |
-| ▶️ | [`predict_dataset(count)`](client/damp_api/stages.py#L928), [`calibrate(count)`](client/damp_api/stages.py#L949) | точность с журналом ответов; подбор температуры softmax | `Evaluation`; (температура, точность) |
-| ▶️ | [`bench(train, sets, validation, test, map_points, methods, augment)`](client/damp_api/stages.py#L792) | честное сравнение DAMP, kNN и CNN: select/report/test, интервалы по наборам (команда `bench`) | `BenchReport` |
+| 🧩 | [`by_response(firing)`](client/damp_api/stages.py#L779) | ответ по отклику уровня: какие детекторы сработали на окнах картинки | доля верных `{k: …}` |
+| 🧩 | [`vote(details)`](client/damp_api/stages.py#L806) | ответ голосованием деталей: каждая голосует классами похожих обучающих | доля верных `{k: …}` |
+| 🧩 | [`linear(firings, decays=None)`](client/damp_api/stages.py#L727) | линейный читатель (§9.3): один слой softmax над самыми сильными уровнями активации детекторов уровней 1…k | доля верных `{λ: …}` |
+| ▶️ | [`evaluate(count)`](client/damp_api/stages.py#L924) | проход без цикла: точность на проверочных | `Evaluation` |
+| ▶️ | [`predict(файл, count)`](client/damp_api/stages.py#L945) | проход без цикла: цифра на картинке | `Prediction` |
+| ▶️ | [`predict_dataset(count)`](client/damp_api/stages.py#L964), [`calibrate(count)`](client/damp_api/stages.py#L985) | точность с журналом ответов; подбор температуры softmax | `Evaluation`; (температура, точность) |
+| ▶️ | [`bench(train, sets, validation, test, map_points, methods, augment)`](client/damp_api/stages.py#L828) | честное сравнение DAMP, kNN и CNN: select/report/test, интервалы по наборам (команда `bench`) | `BenchReport` |
 
-**Рисунки** — `damp.figures`: [`readme()`](client/damp_api/stages.py#L977) — все рисунки README, [`structure()`](client/damp_api/stages.py#L987) — только схема устройства проекта.
+**Рисунки** — `damp.figures`: [`readme()`](client/damp_api/stages.py#L1013) — все рисунки README, [`structure()`](client/damp_api/stages.py#L1023) — только схема устройства проекта.
 
 **Кеш шагов** — `damp.cache`: `summary()` — записи и место по шагам, `clear(шаг)` — очистить шаг или весь кеш, `size()` — байт на диске.
 
-**Сам `Damp`**: [`Damp(config=None, *, changes=None)`](client/damp_api/damp.py#L99) — подключиться; [`with_settings(ИМЯ=значение)`](client/damp_api/damp.py#L117) — тот же `Damp` со своими настройками; [`settings["ИМЯ"]`](client/damp_api/damp.py#L35) — значение настройки; [`stages`](client/damp_api/damp.py#L140) — этапы по порядку; [`version`](client/damp_api/damp.py#L135) — версия.
+**Сам `Damp`**: [`Damp(config=None, *, changes=None)`](client/damp_api/damp.py#L99) — подключиться; [`with_settings(ИМЯ=значение)`](client/damp_api/damp.py#L138) — тот же `Damp` со своими настройками; [`settings["ИМЯ"]`](client/damp_api/damp.py#L35) — значение настройки; [`stages`](client/damp_api/damp.py#L161) — этапы по порядку; [`version`](client/damp_api/damp.py#L156) — версия; [`from_snapshot(папка)`](client/damp_api/damp.py#L118) — `Damp` с настройками счёта снимка.
 
 **Что можно узнать у результатов кубиков**
 
 | Часть | Что это | Главное |
 |---|---|---|
-| [`Digits`](client/damp_api/parts.py#L75) | цифры прогона | `pictures`, `train`, `test`, `groups`, `labels`, `sticks`; [`picture(i)`](client/damp_api/parts.py#L138) — картинка, цифра и её штрихи |
-| [`Elements`](client/damp_api/parts.py#L157) | элементы уровня: штрихи или детали | `level`, `count`, `code_length`, `distinct_codes`, `ones`, `per_picture` |
-| [`Keyholes`](client/damp_api/parts.py#L200) | окна внимания уровня | `level`, `count`, `radius`, `keyhole_radius` (средний радиус окна, клеток), `picture_seen`, `per_picture`, `elements_per_keyhole` |
-| [`KeyholeCodes`](client/damp_api/parts.py#L253) | коды окон | `count`, `length`, `place_length`, `content_length`, `ones` |
-| [`Memory`](client/damp_api/parts.py#L294) | карта памяти уровня | `points`, `width`, `height`, `same_label`, `merge` (чистота слияния); [`release()`](client/damp_api/parts.py#L339) — освободить видеокарту |
-| [`MapDetectors`](client/damp_api/parts.py#L357) | детекторы над картой | `count`, `layers`, `activation_threshold`; [`fire(codes)`](client/damp_api/parts.py#L388) |
-| [`Firing`](client/damp_api/parts.py#L407) | срабатывания | `keyholes`, `fired`, `per_keyhole`, `silent` |
-| [`Level`](client/damp_api/parts.py#L446) | проход уровня целиком | `number`, `keyholes`, `codes`, `memory`, `detectors`, `firing`, `details` |
-| [`TrainedLadder`](client/damp_api/parts.py#L473) | обученный цикл и читатель (дашборд) | `levels`, `train_pictures`, `decay`; [`see(картинка)`](client/damp_api/parts.py#L511) → `Sight`; [`maps()`](client/damp_api/parts.py#L575) → `LevelMap` по уровням; [`sticks()`](client/damp_api/parts.py#L646) → `TrainingSticks` |
+| [`Digits`](client/damp_api/parts.py#L87) | цифры прогона | `pictures`, `train`, `test`, `groups`, `labels`, `sticks`; [`picture(i)`](client/damp_api/parts.py#L150) — картинка, цифра и её штрихи |
+| [`Elements`](client/damp_api/parts.py#L169) | элементы уровня: штрихи или детали | `level`, `count`, `code_length`, `distinct_codes`, `ones`, `per_picture` |
+| [`Keyholes`](client/damp_api/parts.py#L212) | окна внимания уровня | `level`, `count`, `radius`, `keyhole_radius` (средний радиус окна, клеток), `picture_seen`, `per_picture`, `elements_per_keyhole` |
+| [`KeyholeCodes`](client/damp_api/parts.py#L265) | коды окон | `count`, `length`, `place_length`, `content_length`, `ones` |
+| [`Memory`](client/damp_api/parts.py#L306) | карта памяти уровня | `points`, `width`, `height`, `same_label`, `merge` (чистота слияния); [`release()`](client/damp_api/parts.py#L351) — освободить видеокарту |
+| [`MapDetectors`](client/damp_api/parts.py#L369) | детекторы над картой | `count`, `layers`, `activation_threshold`; [`fire(codes)`](client/damp_api/parts.py#L400) |
+| [`Firing`](client/damp_api/parts.py#L419) | срабатывания | `keyholes`, `fired`, `per_keyhole`, `silent` |
+| [`Level`](client/damp_api/parts.py#L458) | проход уровня целиком | `number`, `keyholes`, `codes`, `memory`, `detectors`, `firing`, `details` |
+| [`TrainedLadder`](client/damp_api/parts.py#L485) | обученный цикл и читатель (дашборд) | `levels`, `train_pictures`, `decay`; [`see(картинка)`](client/damp_api/parts.py#L556) → `Sight`; [`maps()`](client/damp_api/parts.py#L620) → `LevelMap` по уровням; [`sticks()`](client/damp_api/parts.py#L691) → `TrainingSticks`; [`save(папка)`](client/damp_api/parts.py#L514) → `SnapshotReport`; `snapshot` — снимок, из которого загружен |
 | **Итого** | 9 частей; все держат системные объекты внутри и отдают простые значения | |
 
 **Что можно узнать у отчёта стенда** (`damp.recognition.bench`, `damp_api/reports.py`): `BenchReport` (весь отчёт: методы, уровни, наборы, путь к JSON, разрыв DAMP − CNN), `BenchMethod` (метод и аугментация), `BenchScore` (точность по наборам и интервал), `BenchRobustness` (устойчивость к сдвигу), `BenchLevel` (мерки уровня DAMP) — все простые значения.
@@ -909,7 +912,41 @@ python client/run.py dashboard --count 2000    # больше цифр
 | След | по полю на уровень: выбранное, из чего собрано и куда вошло | колесо, двойной щелчок |
 | **Итого** | холст, ответ, по три панели на уровень, след | |
 
-Сервер (`client/dashboard/server.py`) обучает цикл кубиком `damp.cycle.trained()` — тот же цикл, что у прогона, поэтому у цифры MNIST путь тот же, цифра в цифру (`tests/test_trained_ladder.py`). Дашборд читает `config.toml`, а не опору стенда; рисунки посреди штриха считают `DASHBOARD_WORKERS` = 2 рабочих процесса.
+Сервер (`client/dashboard/server.py`) обучает цикл кубиком `damp.cycle.trained()` — тот же цикл, что у прогона, поэтому у цифры MNIST путь тот же, цифра в цифру (`tests/test_trained_ladder.py`). Дашборд читает `config.toml`, а не опору стенда (опора — `python tools/tuning/dashboard_base.py [зерно] [картинок]` или `run <номер прогона>`); рисунки посреди штриха считают `DASHBOARD_WORKERS` = 2 рабочих процесса.
+
+### Снимок: дашборд без обучения
+
+Обученный цикл сохраняется в папку и запускается из неё без обучения — на своей машине или у коллеги.
+
+```powershell
+# у себя: обучить (готовые шаги — из кеша) и записать снимок
+python client/run.py dashboard --count 500 --save data/dashboard/trained-500
+python tools/tuning/dashboard_base.py run 1553 --save data/dashboard/trained-1553   # на настройках прогона стенда
+
+# у себя или у коллеги: запуск из снимка, без обучения
+python client/run.py dashboard --load data/dashboard/trained-1553
+```
+
+```text
+trained-1553/
+├── snapshot.json   # подпись, версия DAMP, коммит, все настройки счёта, ответы сверки (первые 100 картинок MNIST t10k)
+├── graph.json      # граф объектов обученного цикла: уровни 0–4, карты, детекторы, читатель, голоса памяти
+└── arrays.npz      # все массивы графа (без pickle)
+```
+
+- **Что нужно коллеге:** репозиторий на том же коммите, окружение проекта (PyTorch с CUDA, numpy, scipy, numba), папка снимка. MNIST скачается сам. Кеш и стенд не нужны.
+- **Настройки** счёта берутся из снимка, из своего `config.toml` — только машина и страница (`DASHBOARD_*`, `LOG_*`, `CACHE_*`, `RERUN_*`, `FIGURE_*`, `README_FIGURES_*`, `BENCH_*`).
+- **Сверка.** При записи цикл отвечает на первые 100 картинок t10k; при загрузке — ещё раз, ответы сравниваются до бита: класс, вероятности читателя, вердикт памяти. Разошлись — в выводе «ВНИМАНИЕ» и предупреждение `cycle.snapshot.check.warning` в журнале: другой коммит или версии библиотек.
+- **Рабочие процессы** со снимком по умолчанию не поднимаются (`--workers 0`): каждая копия цикла держит свою видеопамять.
+- **Запись** не меняет цикл: перед ней освобождается видеокарта, кеши строятся заново при следующем рисунке (тест `tests/test_snapshot.py`: исходный, записанный и загруженный цикл ведут картинки цифра в цифру).
+
+| Снимок | Картинок | Размер | Запись | Загрузка со сверкой |
+|---|---|---|---|---|
+| проверочный, опора стенда | 100 | 53 МБ | 13 с | 15 с |
+| `trained-1553` — прогон стенда 1553, самые чёткие кластеры верха | 20 000 | 584 МБ | 29 с | 45 с до готовой страницы, сверка 100 из 100 |
+| **Итого** | | | | вместо часа обучения — меньше минуты; граф — JSON, массивы — npz, читаются только классы `damp` |
+
+Из кода — `ladder.save(папка)` и `damp.cycle.load(папка)` ([функции API](#функции-api-по-этапам)); настройки снимка без загрузки цикла — `Damp.from_snapshot(папка)`.
 
 [↑ к содержанию](#содержание)
 
@@ -974,6 +1011,7 @@ python client/run.py ladder --verify-cache        # пересчитать ша�
 | `ladder.merge` | чистота слияния уровня | вне статьи |
 | `layout.smooth_start`, `layout.best_of` | гладкий старт (поле `path`: плотный / блочный), выбор лучшей раскладки | вне статьи |
 | `dictionary.hash_collision` | хеш групп кодов не сошёлся — повтор с другим зерном | вне статьи |
+| `cycle.snapshot.save`, `cycle.snapshot.load`, `cycle.snapshot.check` | снимок обученного цикла: записан, загружен, сверка ответов (`.warning` — не совпали) | вне статьи |
 | `activation.lateral_inhibition` | пятна: деталей до и после | §6.4.5 |
 | `recognition.vote`, `recognition.linear` | голосование деталей; читатель | §2.2.5, §9.3 |
 | **Итого** | | полный список — по `rg '"event"' logs/damp.jsonl` |
@@ -1017,11 +1055,12 @@ python -m unittest discover -s tests -t .
 | `test_code_dictionary.py`, `test_merge_purity.py` | отбор образцов (хеш, int8), чистота слияния |
 | `test_layout_*.py`, `test_fused_energy.py`, `test_smooth_start_large.py` | раскладка: быстрые пути, int8, лучшая из K, гладкий старт больших карт (повтор до бита) |
 | `test_cache.py`, `test_trained_ladder.py`, `test_client_api.py` | кеш бит в бит; обученный цикл = прогон; фреймворк и ссылки README на код |
+| `test_snapshot.py` | снимок: граф объектов без pickle (общие ссылки, циклы, генераторы, отказ чужим объектам); загруженный цикл = исходный до бита |
 | `test_extra_pictures.py`, `test_memory_votes.py`, `test_fuzzy_search.py` | добавочные картинки; голоса памяти; нечёткий поиск |
 | `test_article_invariants.py` | кодер, раскладка, детекторы и активация по статье, тест пинвила |
 | `test_figures.py`, `test_rerun_cycle.py`, `test_logging.py`, `test_imports.py` | рисунки, Rerun, журнал, импорты |
 | `test_protocol.py`, `test_honest_measures.py`, `test_bench.py`, `test_baselines.py` | протокол и стенд `bench`; `test_protocol.py` устарел |
-| **Итого** | 36 файлов | |
+| **Итого** | 37 файлов | |
 
 [↑ к содержанию](#содержание)
 

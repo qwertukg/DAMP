@@ -259,15 +259,16 @@ class SightAnswers:
         return encoded({"ok": True, **DashboardData.point(self._path(image, False), level, index)})
 
 
-def worker(connection, changes: dict, count: "int | None", map_points: "int | None") -> None:  # noqa: ANN001
-    """Рабочий процесс: свой обученный цикл (шаги — из кеша) и ответы на рисунки по запросам главного процесса.
+def worker(connection, changes: dict, count: "int | None", map_points: "int | None", load: "str | None" = None) -> None:  # noqa: ANN001
+    """Рабочий процесс: свой обученный цикл (шаги — из кеша; load — из снимка, без сверки) и ответы на рисунки по
+    запросам главного процесса.
 
     Запрос — ("see", рисунок, точка) или ("point", рисунок, уровень, номер точки); ответ — ("ok", байты JSON) или
     ("error", причина). Главный процесс закрылся — соединение рвётся, и рабочий выходит сам.
     """
     try:
         damp = Damp(changes=changes or None, log_file=False)
-        ladder = damp.cycle.trained(count, map_points=map_points)
+        ladder = damp.cycle.load(load, check=0) if load else damp.cycle.trained(count, map_points=map_points)
         answers = SightAnswers(ladder, ladder.maps(), int(damp.settings["DASHBOARD_LIT_PER_PIECE"]))
         connection.send(("ready", ""))
     except Exception as error:  # noqa: BLE001 — причину видит главный процесс
@@ -296,8 +297,10 @@ class SightWorkers:
     главный процесс убит, соединение рвётся и рабочие выходят сами.
     """
 
-    def __init__(self, count: int, changes: dict, train: "int | None", map_points: "int | None") -> None:
+    def __init__(self, count: int, changes: dict, train: "int | None", map_points: "int | None",
+                 load: "str | None" = None) -> None:
         self.count = int(count)
+        self._load = load
         self.ready = 0
         self.failed = ""
         self._changes = dict(changes)
@@ -320,7 +323,8 @@ class SightWorkers:
             before = os.environ.get("RERUN")
             os.environ["RERUN"] = "off"  # окно Rerun — у главного процесса
             try:
-                process = context.Process(target=worker, args=(child, self._changes, self._train, self._map_points), daemon=False)
+                process = context.Process(target=worker, args=(child, self._changes, self._train, self._map_points, self._load),
+                                          daemon=False)
                 process.start()
                 self._processes.append((process, parent))
             finally:
@@ -375,10 +379,19 @@ class SightWorkers:
 class DashboardServer:
     """Обученный цикл и сервер страницы на этом компьютере (адрес 127.0.0.1: снаружи недоступен)."""
 
-    def __init__(self, damp: Damp, *, count: int | None = None, map_points: int | None = None, port: int | None = None) -> None:
+    def __init__(self, damp: Damp, *, count: int | None = None, map_points: int | None = None, port: int | None = None,
+                 load: str | None = None, save: str | None = None, label: str = "", workers: int | None = None) -> None:
+        """load — папка снимка обученного цикла: цикл берётся из неё без обучения (damp — с настройками снимка,
+        `Damp.from_snapshot`); save — записать снимок после обучения (label — его подпись); workers — рабочих
+        процессов, None — DASHBOARD_WORKERS."""
         self._damp = damp
         self._count = count
         self._map_points = map_points
+        self._load = load
+        self._save = save
+        self._label = str(label)
+        self._worker_count = workers
+        self.saved = None  # SnapshotReport записанного снимка (save)
         self._host = str(damp.settings["DASHBOARD_HOST"])
         self._port = int(damp.settings["DASHBOARD_PORT"] if port is None else port)
         self._ladder: TrainedLadder | None = None
@@ -395,8 +408,14 @@ class DashboardServer:
         return f"http://{self._host}:{self._port}/"
 
     def prepare(self) -> TrainedLadder:
-        """Обучить цикл (шаги — из кеша, если такой цикл уже был) и собрать карты уровней для страницы."""
-        self._ladder = self._damp.cycle.trained(self._count, map_points=self._map_points)
+        """Обучить цикл (шаги — из кеша, если такой цикл уже был) либо взять его из снимка (load), при save — записать
+        снимок, и собрать карты уровней для страницы."""
+        if self._load:
+            self._ladder = self._damp.cycle.load(self._load)
+        else:
+            self._ladder = self._damp.cycle.trained(self._count, map_points=self._map_points)
+        if self._save:
+            self.saved = self._ladder.save(self._save, label=self._label)
         self._maps = self._ladder.maps()
         self._answers = SightAnswers(self._ladder, self._maps, self._lit)
         model = DashboardData.model(self._ladder, self._maps, self._ladder.sticks(), self._damp.settings)
@@ -457,9 +476,9 @@ class DashboardServer:
 
     def serve(self) -> None:
         """Обслуживать страницу, пока процесс не остановят (Ctrl+C). Рабочие процессы поднимаются в фоне."""
-        count = int(self._damp.settings["DASHBOARD_WORKERS"])
+        count = int(self._damp.settings["DASHBOARD_WORKERS"] if self._worker_count is None else self._worker_count)
         if count > 0:
-            self._workers = SightWorkers(count, self._damp.settings.changes, self._count, self._map_points)
+            self._workers = SightWorkers(count, self._damp.settings.changes, self._count, self._map_points, self._load)
             self._workers.start()
         http = self._http()
         try:

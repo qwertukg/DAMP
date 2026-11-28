@@ -26,7 +26,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from ._system import system
-from .parts import Digits, Elements, Firing, Level, MapDetectors, Memory, Session, KeyholeCodes, Keyholes, TrainedLadder
+from .parts import (
+    Digits, Elements, Firing, Level, MapDetectors, Memory, Session, KeyholeCodes, Keyholes, TrainedLadder, _snapshot_report,
+)
 from .reports import (
     Code,
     CycleLevel,
@@ -629,6 +631,40 @@ class Cycle(_Stage):
                 decay=float(s.DASHBOARD_LINEAR_DECAY if decay is None else decay),
             )
         return TrainedLadder(self._session, ladder)
+
+    def load(self, path: str, *, check: int | None = None) -> TrainedLadder:
+        """Кубик. Обученный цикл из снимка (`TrainedLadder.save`) — без обучения (вне статьи: хранение).
+
+        Счёт идёт с настройками снимка; из своих настроек берутся только настройки машины и страницы
+        (`DASHBOARD_*`, `LOG_*`, `CACHE_*`, `RERUN_*`, `FIGURE_*`, `README_FIGURES_*`, `BENCH_*`). Затем цикл отвечает на
+        картинки сверки (первые картинки MNIST t10k) — ответы должны совпасть с записанными до бита; иначе в журнале
+        предупреждение `cycle.snapshot.check.warning` (другой коммит или версии библиотек).
+
+        Args:
+            path: папка снимка.
+            check: картинок сверки; `None` — все, что записаны (обычно 100); 0 — без сверки.
+
+        Returns:
+            `TrainedLadder` с полем `snapshot` (`SnapshotReport`: подпись, коммит, сколько картинок сверки совпало).
+
+        Raises:
+            FileNotFoundError: в папке нет снимка.
+
+        Example:
+            >>> ladder = Damp().cycle.load("data/dashboard/trained-1553")
+            >>> ladder.snapshot.same, ladder.snapshot.control
+            (100, 100)
+        """
+        changes, meta = system.snapshot_settings(path)
+        local = tuple(meta.get("local_prefixes", ()))
+        own = {name: value for name, value in self._session.changes.items() if local and name.startswith(local)}
+        session = Session({**changes, **own})
+        with session.active():
+            ladder, meta = system.trained_ladder_class().load(path)
+            same = ladder.check(meta["control"], check)
+        total = int(meta["control"]["pictures"]) if check is None else min(int(check), int(meta["control"]["pictures"]))
+        report = _snapshot_report(path, {**meta, "control": {"pictures": total}}, same=same)
+        return TrainedLadder(session, ladder, report)
 
     def run(self, train: int, test: int, *, split: str = "test", map_points: int | None = None,
             shifts: tuple[tuple[int, int], ...] | None = None) -> CycleReport:
