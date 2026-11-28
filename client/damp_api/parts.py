@@ -33,7 +33,9 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._system import system
-from .reports import LevelMap, LevelVotes, Picture, PrimaryMap, PrimarySight, Sight, SightLevel, Stimulus, TrainingSticks
+from .reports import (
+    LevelMap, LevelVotes, Picture, PrimaryMap, PrimarySight, Sight, SightLevel, SnapshotReport, Stimulus, TrainingSticks,
+)
 
 
 class Session:
@@ -59,6 +61,16 @@ class Session:
         """Контекст: пока он открыт, системный слой читает настройки этой сессии."""
         with system.session(self.changes):
             yield
+
+
+def _snapshot_report(path: str, meta: Mapping[str, object], *, same: int) -> SnapshotReport:
+    """Описание снимка (snapshot.json) → `SnapshotReport`."""
+    return SnapshotReport(
+        path=str(path), label=str(meta.get("label", "")), version=str(meta.get("version", "")),
+        commit=str(meta.get("commit", "")), created=str(meta.get("created", "")),
+        train_pictures=int(meta.get("train_pictures", 0)), levels=int(meta.get("levels", 0)),
+        megabytes=float(meta.get("megabytes", 0.0)), control=int(meta["control"]["pictures"]), same=int(same),
+    )
 
 
 def _ones(packed: "np.ndarray") -> "np.ndarray":
@@ -484,14 +496,47 @@ class TrainedLadder(_Part):
         >>> sight.digit, [len(level.keyhole_extent) for level in sight.levels]
     """
 
-    def __init__(self, session: Session, ladder) -> None:  # noqa: ANN001
+    def __init__(self, session: Session, ladder, snapshot: SnapshotReport | None = None) -> None:  # noqa: ANN001
         super().__init__(session)
         self._ladder = ladder
+        self._snapshot = snapshot
 
     @property
     def levels(self) -> int:
         """Сколько уровней у обученного цикла."""
         return len(self._ladder.levels)
+
+    @property
+    def snapshot(self) -> SnapshotReport | None:
+        """Снимок, из которого загружен цикл (`Damp.cycle.load`), со сверкой ответов; `None` — цикл обучен здесь."""
+        return self._snapshot
+
+    def save(self, path: str, *, label: str = "", control: int = 100) -> SnapshotReport:
+        """Снимок обученного цикла в папку: потом `Damp.cycle.load(path)` даёт тот же цикл без обучения (вне статьи).
+
+        В снимок идут все уровни (карты памяти, детекторы, всё подобранное по обучающим картинкам), читатель, голоса
+        памяти и все настройки этого `Damp`; граф объектов — JSON, массивы — npz, без pickle. Перед записью цикл
+        отвечает на первые `control` картинок MNIST t10k: при загрузке ответы сверяются. Память видеокарты
+        освобождается и строится заново при следующем `see`.
+
+        Args:
+            path: папка снимка; новая, пустая либо прежний снимок (он перезаписывается).
+            label: подпись снимка, видна при загрузке.
+            control: картинок t10k для сверки.
+
+        Returns:
+            `SnapshotReport`: что записано и сколько весит.
+
+        Raises:
+            FileExistsError: папка не пуста и это не снимок.
+
+        Example:
+            >>> ladder = damp.cycle.trained(1000)
+            >>> ladder.save("data/dashboard/trained-1000", label="1000 картинок").megabytes
+        """
+        with self._session.active():
+            meta = self._ladder.save(path, values=system.settings_values(), label=label, control=int(control))
+        return _snapshot_report(path, meta, same=int(meta["control"]["pictures"]))
 
     @property
     def train_pictures(self) -> int:

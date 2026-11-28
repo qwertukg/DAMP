@@ -114,6 +114,27 @@ class Damp:
         self.figures = Figures(self._session)
         self.cache = Cache(self._session)
 
+    @classmethod
+    def from_snapshot(cls, path: str | Path, *, log_file: bool = True, changes: Mapping[str, object] | None = None) -> "Damp":
+        """`Damp` с настройками счёта из снимка обученного цикла (`TrainedLadder.save`); настройки машины и страницы —
+        из своего файла, `changes` — поверх всего.
+
+        Args:
+            path: папка снимка.
+            log_file: писать журнал в файл.
+            changes: свои значения поверх настроек снимка (например, порт дашборда).
+
+        Returns:
+            `Damp`, чьи этапы считают так же, как цикл снимка.
+
+        Example:
+            >>> damp = Damp.from_snapshot("data/dashboard/trained-1553")
+            >>> ladder = damp.cycle.load("data/dashboard/trained-1553")
+        """
+        system.connect(None, log_file=log_file)
+        values, _ = system.snapshot_settings(str(path))
+        return cls(log_file=log_file, changes={**values, **dict(changes or {})})
+
     def with_settings(self, **changes: object) -> "Damp":
         """Новый `Damp` с другими значениями настроек поверх нынешних; сам `Damp` не меняется.
 

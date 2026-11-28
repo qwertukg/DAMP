@@ -13,6 +13,7 @@ decode/memory_votes.py) и линейный читатель (§9.3, мерка 
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -442,6 +443,178 @@ class TrainedLadder:
             peak=np.asarray(peak[0], dtype=np.float32),
         )
         return level, DetailCoder.elements(details, length, pieces.picture, pieces.centre, extent, strength)
+
+    # ------------------------------------------------------------------ снимок: сохранить и загрузить без обучения
+    SNAPSHOT_META = "snapshot.json"
+    SNAPSHOT_FORMAT = 1
+    # Кеши видеокарты, которые объекты строят сами по запросу: в снимок идут пустыми (LevelDetectors.detection,
+    # Layout — расчёт энергий и распакованные коды точек).
+    SNAPSHOT_TRANSIENT = {
+        "LevelDetectors": {"_detection"},
+        "Layout": {"_code_matrix_cache", "_torch_engine", "_sparse_long", "_device_short", "_device_state", "_device_owner",
+                   "_packed_codes"},
+    }
+    # Что строится заново при чтении: коды точек 64-битными словами — та же строка, что в Layout.__init__ (из таблицы
+    # кодов, которая в снимке есть): без неё каждая карта лежала бы в снимке дважды.
+    SNAPSHOT_REBUILD = {
+        "Layout": lambda layout: setattr(layout, "_packed_codes",
+                                         layout._table.words64() if hasattr(np, "bitwise_count") else None),  # noqa: SLF001
+    }
+    # Настройки машины и страницы, а не счёта: при загрузке снимка они берутся из своего config.toml.
+    SNAPSHOT_LOCAL = ("DASHBOARD_", "LOG_", "CACHE_", "RERUN_", "FIGURE_", "README_FIGURES_", "BENCH_")
+
+    def release_device(self) -> None:
+        """Освободить видеокарту и распакованные коды карт всех уровней; при следующем пути картинки они строятся заново."""
+        for level in (*self.levels, self.primary):
+            if level is None:
+                continue
+            level.detectors.release()
+            level.memory.release()
+            level.memory.layout._code_matrix_cache = None  # noqa: SLF001 — тот же сброс, что MnistLadderRunner._drop_dense_codes
+
+    def control(self, count: int) -> dict:
+        """Ответы на первые count картинок MNIST t10k: читатель (класс и вероятности) и вердикт памяти — сверка снимка."""
+        from torchvision.datasets import MNIST
+
+        images = MNIST(root="./data", train=False, download=True).data[: int(count)].numpy()
+        sights = [self.see(image) for image in images]
+        return {
+            "pictures": int(len(sights)),
+            "answers": [int(sight.answer) for sight in sights],
+            "probabilities": [[float(value) for value in sight.probabilities] for sight in sights],
+            "verdicts": [[str(sight.verdict.kind), int(sight.verdict.digit)] for sight in sights],
+        }
+
+    @staticmethod
+    def control_same(saved: dict, found: dict) -> int:
+        """Сколько картинок сверки ответили так же, как при записи снимка: класс, вероятности до бита и вердикт памяти."""
+        pairs = zip(saved["answers"], found["answers"], saved["probabilities"], found["probabilities"], saved["verdicts"],
+                    found["verdicts"])
+        return sum(1 for a, b, p, q, v, w in pairs if a == b and p == q and list(v) == list(w))
+
+    def check(self, saved: dict, count: "int | None" = None) -> int:
+        """Сверка загруженного снимка: ответы на первые count картинок сверки (None — на все) против записанных; вернуть,
+        сколько совпало. Расхождение — предупреждение cycle.snapshot.check.warning (другой код или библиотеки)."""
+        from damp.article_refs import OUTSIDE_ARTICLE
+
+        total = int(saved["pictures"]) if count is None else min(int(count), int(saved["pictures"]))
+        if total <= 0:
+            return 0
+        found = self.control(total)
+        subset = {key: (value[:total] if isinstance(value, list) else value) for key, value in saved.items()}
+        same = self.control_same(subset, found)
+        LOGGER.event(
+            "cycle.snapshot.check" if same == total else "cycle.snapshot.check.warning",
+            section=OUTSIDE_ARTICLE,
+            data={"pictures": total, "same": same,
+                  "note": "ответы цикла из снимка на картинки MNIST t10k против записанных: класс, вероятности до бита, вердикт памяти"},
+        )
+        return same
+
+    @staticmethod
+    def _commit() -> str:
+        """Коммит рабочей копии; «+правки» — в ней есть незакоммиченные изменения; пусто — git недоступен."""
+        import subprocess
+
+        root = Path(__file__).resolve().parents[3]
+        try:
+            head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root, capture_output=True, text=True, timeout=10)
+            dirty = subprocess.run(["git", "status", "--porcelain", "--", "system", "client"], cwd=root, capture_output=True,
+                                   text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if head.returncode != 0:
+            return ""
+        return head.stdout.strip() + (" +правки" if dirty.stdout.strip() else "")
+
+    def save(self, folder: "str | Path", *, values: dict, label: str = "", control: int = 100) -> dict:
+        """Снимок обученного цикла в папку folder: всё, что нужно новой картинке, без обучения (вне статьи: хранение).
+
+        values — все настройки сессии (ключ файла → значение): при загрузке счёт идёт с ними. Перед записью цикл
+        отвечает на первые control картинок t10k — их ответы лежат в снимке для сверки при загрузке. Видеокарта
+        освобождается (кеши строятся заново по запросу). Возвращает описание снимка (то же, что в snapshot.json).
+        """
+        from damp import __version__
+        from damp.article_refs import OUTSIDE_ARTICLE
+        from damp.snapshot import GraphSnapshot
+
+        folder = Path(folder)
+        if folder.exists() and any(folder.iterdir()) and not (folder / self.SNAPSHOT_META).exists():
+            raise FileExistsError(f"{folder}: папка не пуста и это не снимок — выберите другую")
+        started = time.perf_counter()
+        checks = self.control(control)
+        self.release_device()
+        counts = GraphSnapshot(self.SNAPSHOT_TRANSIENT).save(self, folder)
+        meta = {
+            "format": self.SNAPSHOT_FORMAT,
+            "label": str(label),
+            "version": __version__,
+            "commit": self._commit(),
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "train_pictures": int(self.groups.train_pictures),
+            "levels": len(self.levels),
+            "map_points": [int(level.memory.points) for level in self.levels],
+            "settings": {key: values[key] for key in sorted(values)},
+            "local_prefixes": list(self.SNAPSHOT_LOCAL),
+            "control": checks,
+            **counts,
+            "megabytes": round(sum(path.stat().st_size for path in folder.iterdir()) / 2**20, 1),
+            "seconds": round(time.perf_counter() - started, 1),
+        }
+        with open(folder / self.SNAPSHOT_META, "w", encoding="utf-8") as stream:
+            json.dump(meta, stream, ensure_ascii=False, indent=1)
+        LOGGER.event(
+            "cycle.snapshot.save",
+            section=OUTSIDE_ARTICLE,
+            data={key: meta[key] for key in ("label", "version", "commit", "train_pictures", "levels", "objects", "arrays",
+                                             "megabytes", "seconds")}
+            | {"folder": str(folder), "note": "снимок обученного цикла: граф объектов — JSON, массивы — npz, без pickle"},
+        )
+        return meta
+
+    @classmethod
+    def snapshot_meta(cls, folder: "str | Path") -> dict:
+        """Описание снимка (snapshot.json): версия, коммит, настройки, ответы сверки."""
+        path = Path(folder) / cls.SNAPSHOT_META
+        if not path.exists():
+            raise FileNotFoundError(f"{folder}: это не снимок обученного цикла (нет {cls.SNAPSHOT_META})")
+        with open(path, encoding="utf-8") as stream:
+            meta = json.load(stream)
+        if meta.get("format") != cls.SNAPSHOT_FORMAT:
+            raise ValueError(f"{folder}: формат снимка {meta.get('format')}, этот код читает {cls.SNAPSHOT_FORMAT}")
+        return meta
+
+    @classmethod
+    def snapshot_changes(cls, meta: dict) -> dict:
+        """Настройки счёта из снимка — всё, кроме настроек машины и страницы (SNAPSHOT_LOCAL)."""
+        prefixes = tuple(meta.get("local_prefixes", cls.SNAPSHOT_LOCAL))
+        return {key: value for key, value in meta["settings"].items() if not key.startswith(prefixes)}
+
+    @classmethod
+    def load(cls, folder: "str | Path") -> "tuple[TrainedLadder, dict]":
+        """Обученный цикл из снимка (save) и его описание. Счёт идёт с настройками снимка — их ставит вызывающий
+        (snapshot_changes); сверку ответов делает control / control_same."""
+        from damp import __version__
+        from damp.article_refs import OUTSIDE_ARTICLE
+        from damp.snapshot import GraphSnapshot
+
+        started = time.perf_counter()
+        meta = cls.snapshot_meta(folder)
+        ladder = GraphSnapshot(rebuild=cls.SNAPSHOT_REBUILD).load(folder)
+        if not isinstance(ladder, cls):
+            raise ValueError(f"{folder}: в снимке не обученный цикл, а {type(ladder).__name__}")
+        commit = cls._commit()
+        LOGGER.event(
+            "cycle.snapshot.load",
+            section=OUTSIDE_ARTICLE,
+            data={
+                "folder": str(folder), "label": meta.get("label", ""), "saved_version": meta.get("version"),
+                "version": __version__, "saved_commit": meta.get("commit"), "commit": commit,
+                "train_pictures": meta.get("train_pictures"), "seconds": round(time.perf_counter() - started, 1),
+                "note": "обученный цикл из снимка, без обучения",
+            },
+        )
+        return ladder, meta
 
     @staticmethod
     def _pixels(image: "np.ndarray") -> "np.ndarray":

@@ -175,6 +175,24 @@ class System:
 
         return TrainedLadder.train(int(count), map_points=map_points, decay=float(decay))
 
+    def trained_ladder_class(self):  # noqa: ANN201
+        """Класс обученного цикла: снимок — save, load, snapshot_meta, snapshot_changes, control (вне статьи: хранение)."""
+        from damp.cycle.trained import TrainedLadder
+
+        return TrainedLadder
+
+    def snapshot_settings(self, path: str) -> tuple[dict[str, object], dict]:
+        """Настройки счёта из снимка (только ключи нынешнего файла настроек) и описание снимка."""
+        ladder = self.trained_ladder_class()
+        meta = ladder.snapshot_meta(path)
+        keys = self.settings.KEYS
+        return {name: value for name, value in ladder.snapshot_changes(meta).items() if name in keys}, meta
+
+    def settings_values(self) -> dict[str, object]:
+        """Все ключи файла настроек с нынешними значениями (с изменениями открытой сессии)."""
+        settings = self.settings
+        return {name: getattr(settings, name) for name in sorted(settings.KEYS)}
+
     # ------------------------------------------------------------------ этап 7: распознавание
     def linear_reader(self):  # noqa: ANN201
         """Линейный читатель класса над нормированными уровнями активации (§9.3): класс LinearReader."""

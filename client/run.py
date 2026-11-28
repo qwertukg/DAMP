@@ -83,6 +83,12 @@ class Commands:
         dashboard.add_argument("--no-browser", action="store_true", help="не открывать страницу в браузере")
         dashboard.add_argument("--snapshot", type=str, default=None,
                                help="только снимок страницы в файл (пример-пятёрка и след кусочка; нужен playwright)")
+        dashboard.add_argument("--save", type=str, default=None, metavar="ПАПКА",
+                               help="после обучения записать снимок обученного цикла в папку (потом --load ПАПКА)")
+        dashboard.add_argument("--load", type=str, default=None, metavar="ПАПКА",
+                               help="обученный цикл из снимка, без обучения: настройки счёта — из снимка")
+        dashboard.add_argument("--workers", type=int, default=None,
+                               help="рабочих процессов пути рисунка; по умолчанию DASHBOARD_WORKERS, со снимком — 0")
 
         figures = commands.add_parser("figures", help="все рисунки README в docs/")
         figures.add_argument("--rerun", action="store_true", help="только скриншоты вкладок цикла в Rerun (окна ненадолго откроются)")
@@ -145,9 +151,20 @@ class Commands:
 
         from dashboard.server import DashboardServer
 
-        server = DashboardServer(self.damp, count=args.count, map_points=args.map_points, port=args.port)
-        print(f"dashboard: учу цикл на {args.count} обучающих цифрах (шаги — из кеша, если такой цикл уже был)…", flush=True)
+        damp = Damp.from_snapshot(args.load) if args.load else self.damp
+        workers = args.workers if args.workers is not None else (0 if args.load else None)
+        server = DashboardServer(damp, count=args.count, map_points=args.map_points, port=args.port, load=args.load,
+                                 save=args.save, label=f"настройки {damp.settings.path.name}", workers=workers)
+        if args.load:
+            print(f"dashboard: беру обученный цикл из снимка {args.load} (без обучения), сверяю ответы…", flush=True)
+        else:
+            print(f"dashboard: учу цикл на {args.count} обучающих цифрах (шаги — из кеша, если такой цикл уже был)…", flush=True)
         ladder = server.prepare()
+        if ladder.snapshot is not None:
+            print(self.snapshot_line(ladder.snapshot), flush=True)
+        if server.saved is not None:
+            print(f"dashboard: снимок записан — {server.saved.path}, {server.saved.megabytes} МБ "
+                  f"(запуск без обучения: python client/run.py dashboard --load {server.saved.path})", flush=True)
         if args.snapshot:
             print(f"dashboard: снимок страницы — {server.snapshot(args.snapshot)}")
             return
@@ -156,6 +173,15 @@ class Commands:
         if not args.no_browser:
             webbrowser.open(server.address)
         server.serve()
+
+    @staticmethod
+    def snapshot_line(report) -> str:  # noqa: ANN001
+        """Строка о загруженном снимке: подпись, картинки, коммит и сверка ответов."""
+        check = (f"сверка на {report.control} картинках t10k — совпало {report.same} из {report.control}"
+                 if report.control else "без сверки")
+        warn = "" if report.same == report.control else " — ВНИМАНИЕ: другой код или версии библиотек, ответы могут отличаться"
+        return (f"dashboard: снимок {Path(report.path).name} — {report.label or 'без подписи'}, {report.train_pictures} "
+                f"картинок, версия {report.version}, коммит {report.commit or '—'}; {check}{warn}")
 
     def _bench(self, args: argparse.Namespace) -> None:
         report = self.damp.recognition.bench(
